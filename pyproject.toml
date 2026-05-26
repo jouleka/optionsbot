@@ -13,6 +13,9 @@ dependencies = [
     "alembic>=1.13",
     "typer>=0.12",
     "python-dotenv>=1.0",
+    "ib_async>=1.0",
+    "pandas>=2.2",
+    "pyarrow>=15",
 ]
 
 [project.scripts]
@@ -33,6 +36,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pandas-stubs>=2.2",
 ]
 
 [tool.ruff]
@@ -53,4 +57,8 @@ packages = ["optionsbot"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q"
+addopts = "-ra -q -m 'not live'"
+markers = [
+    "live: requires a running paper IB Gateway on the configured port; excluded by default",
+]
+asyncio_mode = "auto"
