@@ -1,8 +1,9 @@
 """Tests for SQLite schema and connection setup."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from sqlalchemy import inspect, text
 
 from optionsbot.storage import schema
@@ -98,9 +99,63 @@ def test_can_insert_into_watchlist(tmp_path: Path) -> None:
                 view_override_dir=None,
                 view_override_iv=None,
                 notes="initial watchlist entry",
-                added_at=datetime(2026, 5, 26, 0, 0, 0),
+                added_at=datetime(2026, 5, 26, 0, 0, 0, tzinfo=UTC),
             )
         )
         rows = conn.execute(schema.watchlist.select()).fetchall()
     assert len(rows) == 1
     assert rows[0].symbol == "SPY"
+
+
+def test_watchlist_view_override_dir_check_constraint(tmp_path: Path) -> None:
+    db_path = tmp_path / "ck1.db"
+    _apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    from sqlalchemy.exc import IntegrityError
+    with engine.begin() as conn:
+        with pytest.raises(IntegrityError):
+            conn.execute(
+                schema.watchlist.insert().values(
+                    symbol="SPY",
+                    view_override_dir="bullish",  # invalid; not in enum
+                    view_override_iv=None,
+                    notes=None,
+                    added_at=datetime(2026, 5, 26, 0, 0, 0, tzinfo=UTC),
+                )
+            )
+
+
+def test_snapshots_regime_iv_check_constraint(tmp_path: Path) -> None:
+    db_path = tmp_path / "ck2.db"
+    _apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    from sqlalchemy.exc import IntegrityError
+    with engine.begin() as conn:
+        with pytest.raises(IntegrityError):
+            conn.execute(
+                schema.snapshots.insert().values(
+                    symbol="SPY",
+                    ts=datetime(2026, 5, 26, tzinfo=UTC),
+                    regime_iv="MEGA-HIGH",  # invalid
+                )
+            )
+
+
+def test_snapshot_raw_json_roundtrips_as_dict(tmp_path: Path) -> None:
+    # Demonstrates the JSON column accepts a dict directly and returns one
+    # (no manual json.dumps/loads on the caller side).
+    db_path = tmp_path / "json.db"
+    _apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    payload = {"iv_rank": 0.42, "tags": ["high-iv", "neutral"]}
+    with engine.begin() as conn:
+        conn.execute(
+            schema.snapshots.insert().values(
+                symbol="SPY",
+                ts=datetime(2026, 5, 26, tzinfo=UTC),
+                raw_json=payload,
+            )
+        )
+        row = conn.execute(schema.snapshots.select()).fetchone()
+    assert row is not None
+    assert row.raw_json == payload
