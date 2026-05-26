@@ -1,7 +1,7 @@
 """Strategy registry.
 
-Tasks 1-5 ship 14 of the planned 16 strategies. Later tasks (IBK-43..44)
-extend ``_STRATEGIES`` to the full set.
+All 16 strategies are now registered. IBK-43 (Long Call) and IBK-44 (Long
+Put), shipped in :mod:`optionsbot.strategies.singles`, complete the set.
 """
 
 from optionsbot.strategies.base import (
@@ -13,6 +13,7 @@ from optionsbot.strategies.base import (
 from optionsbot.strategies.calendar import CalendarSpread, DiagonalSpread
 from optionsbot.strategies.iron_butterfly import IronButterfly
 from optionsbot.strategies.iron_condor import IronCondor
+from optionsbot.strategies.singles import LongCall, LongPut
 from optionsbot.strategies.stock_legs import CashSecuredPut, CoveredCall
 from optionsbot.strategies.straddles import (
     LongStraddle,
@@ -42,6 +43,8 @@ _STRATEGIES: tuple[Strategy, ...] = (
     DiagonalSpread(),
     CoveredCall(),
     CashSecuredPut(),
+    LongCall(),
+    LongPut(),
 )
 
 _BY_NAME: dict[str, Strategy] = {s.name: s for s in _STRATEGIES}
@@ -67,6 +70,8 @@ __all__ = [
     "IronButterfly",
     "IronCondor",
     "Leg",
+    "LongCall",
+    "LongPut",
     "LongStraddle",
     "LongStrangle",
     "ShortStraddle",
