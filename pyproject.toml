@@ -1,0 +1,54 @@
+[project]
+name = "optionsbot"
+version = "0.0.1"
+description = "IBKR options analysis and alert tool (paper trading)"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Jurgen", email = "58989038+jouleka@users.noreply.github.com" }]
+
+dependencies = [
+    "pydantic-settings>=2.5",
+    "pydantic>=2.8",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "typer>=0.12",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+optionsbot = "optionsbot.cli:app"
+optionsbot-mcp = "optionsbot.mcp_server.__main__:main"
+optionsbot-daemon = "optionsbot.daemon.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/optionsbot"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+packages = ["optionsbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"

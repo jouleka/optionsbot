@@ -1,2 +1,25 @@
 # Local worktrees created by superpowers:using-git-worktrees
 .worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv / venv
+.venv/
+uv.lock
+
+# secrets and local state
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# editors
+.vscode/
+.idea/
