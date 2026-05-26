@@ -66,6 +66,15 @@ def test_wal_mode_is_set_on_connect(tmp_path: Path) -> None:
     assert mode == "wal"
 
 
+def test_foreign_keys_pragma_is_on(tmp_path: Path) -> None:
+    db_path = tmp_path / "fk.db"
+    _apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    with engine.connect() as conn:
+        fk_on = conn.execute(text("PRAGMA foreign_keys")).scalar()
+    assert fk_on == 1
+
+
 def test_can_insert_into_watchlist(tmp_path: Path) -> None:
     db_path = tmp_path / "insert.db"
     _apply_migrations(db_path)

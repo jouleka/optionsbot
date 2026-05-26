@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     MetaData,
     Table,
@@ -80,6 +81,10 @@ alerts = Table(
         name="ck_alerts_status",
     ),
 )
+
+
+Index("ix_alerts_symbol_strategy", alerts.c.symbol, alerts.c.strategy)
+Index("ix_alerts_status_next_retry_ts", alerts.c.status, alerts.c.next_retry_ts)
 
 
 scan_runs = Table(

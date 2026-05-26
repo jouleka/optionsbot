@@ -1,7 +1,7 @@
 """initial schema
 
-Revision ID: 460f851478ec
-Revises: 
+Revision ID: 0001
+Revises:
 Create Date: 2026-05-26 17:08:45.376528
 
 """
@@ -37,6 +37,18 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_alerts_ts'), 'alerts', ['ts'], unique=False)
+    op.create_index(
+        op.f("ix_alerts_symbol_strategy"),
+        "alerts",
+        ["symbol", "strategy"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_alerts_status_next_retry_ts"),
+        "alerts",
+        ["status", "next_retry_ts"],
+        unique=False,
+    )
     op.create_table('scan_runs',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('started', sa.DateTime(), nullable=False),
@@ -96,6 +108,8 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_snapshots_symbol'), table_name='snapshots')
     op.drop_table('snapshots')
     op.drop_table('scan_runs')
+    op.drop_index(op.f("ix_alerts_status_next_retry_ts"), table_name="alerts")
+    op.drop_index(op.f("ix_alerts_symbol_strategy"), table_name="alerts")
     op.drop_index(op.f('ix_alerts_ts'), table_name='alerts')
     op.drop_table('alerts')
     # ### end Alembic commands ###
