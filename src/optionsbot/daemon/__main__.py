@@ -1,4 +1,4 @@
-"""Entry point for the  console script."""
+"""Entry point for the `optionsbot-daemon` console script."""
 import sys
 
 

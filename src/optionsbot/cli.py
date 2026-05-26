@@ -6,5 +6,5 @@ app = typer.Typer(help="Optionsbot: IBKR options analysis and alerts (paper trad
 
 @app.callback()
 def _root() -> None:
-    """Root callback (required so  has a body even before subcommands are added)."""
+    """Root callback (required so `app` has a body even before subcommands are added)."""
     return
