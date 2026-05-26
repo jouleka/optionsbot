@@ -7,8 +7,10 @@ Implementation is tracked in YouTrack project [IBK](https://tracker.example.inva
 ## Secrets
 
 Copy `.env.example` to `.env` and fill in:
-- `TELEGRAM_BOT_TOKEN` — from @BotFather in Telegram.
-- `TELEGRAM_CHAT_ID` — your numeric chat ID (send `/start` to your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates`).
+- `OPTIONSBOT_TELEGRAM__BOT_TOKEN` — from @BotFather in Telegram.
+- `OPTIONSBOT_TELEGRAM__CHAT_ID` — your numeric chat ID (send `/start` to your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates`).
+
+The double underscore is intentional: it's the `env_nested_delimiter` configured on `Settings`, mapping `OPTIONSBOT_TELEGRAM__BOT_TOKEN` to `settings.telegram.bot_token`. Bare names like `TELEGRAM_BOT_TOKEN` will be silently ignored.
 
 IBKR credentials are deliberately NOT in this repo. IB Gateway holds them.
 

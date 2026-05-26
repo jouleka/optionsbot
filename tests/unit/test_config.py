@@ -137,3 +137,32 @@ def test_env_var_beats_toml_for_top_level_field(
     monkeypatch.setenv("OPTIONSBOT_LOG_LEVEL", "DEBUG")
     s = load_settings(config_file=cfg)
     assert s.log_level == "DEBUG"
+
+
+def test_documented_telegram_env_vars_actually_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: README and .env.example must document env var names that
+    # the loader actually recognises. The pre-fix bug had bare
+    # TELEGRAM_BOT_TOKEN in both files, which pydantic-settings silently
+    # ignored due to the OPTIONSBOT_ prefix + __ nested delimiter on
+    # Settings. This test pins the contract for the documented names.
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__BOT_TOKEN", "abc:secret123")
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__CHAT_ID", "-1009876")
+    s = Settings()
+    assert s.telegram.bot_token == "abc:secret123"
+    assert s.telegram.chat_id == "-1009876"
+
+
+def test_bare_telegram_env_vars_are_silently_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Documents the (deliberate) behavior: bare TELEGRAM_BOT_TOKEN is NOT
+    # picked up. The env_prefix on Settings enforces the namespaced form.
+    # If we ever add validation_alias to also accept bare names, this
+    # test will need updating to reflect the new contract.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "should-be-ignored")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "ignored-too")
+    s = Settings()
+    assert s.telegram.bot_token is None
+    assert s.telegram.chat_id is None
