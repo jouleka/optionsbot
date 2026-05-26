@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,3 +18,16 @@ class IVRankResult:
     rank: float | None  # 0.0 .. 1.0, or None when no history at all
     warming_up: bool
     sample_size: int
+
+
+Direction = Literal["bull", "neutral", "bear"]
+Strength = Literal["strong", "weak"]
+
+
+@dataclass(frozen=True, slots=True)
+class TrendRegime:
+    direction: Direction
+    strength: Strength
+    adx: float | None
+    sma20: float | None
+    sma50: float | None
