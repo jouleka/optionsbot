@@ -75,6 +75,18 @@ def test_foreign_keys_pragma_is_on(tmp_path: Path) -> None:
     assert fk_on == 1
 
 
+def test_migration_creates_parent_directory(tmp_path: Path) -> None:
+    # Regression: on a fresh machine the data directory does not exist yet.
+    # `alembic upgrade head` must create it rather than failing with
+    # "unable to open database file".
+    nested = tmp_path / "does" / "not" / "exist" / "yet"
+    assert not nested.exists()
+    db_path = nested / "first_run.db"
+    _apply_migrations(db_path)
+    assert db_path.exists()
+    assert nested.is_dir()
+
+
 def test_can_insert_into_watchlist(tmp_path: Path) -> None:
     db_path = tmp_path / "insert.db"
     _apply_migrations(db_path)
