@@ -47,3 +47,23 @@ class TrendRegime:
     adx: float | None
     sma20: float | None
     sma50: float | None
+
+
+IVRegime = Literal["high", "neutral", "low"]
+
+
+@dataclass(frozen=True, slots=True)
+class MarketView:
+    """Synthesized snapshot of trend, IV, and earnings exposure.
+
+    Consumed by strategy scoring (IBK-4 / IBK-5). ``warming_up`` is
+    carried from ``IVRankResult`` so callers can downweight IV-driven
+    decisions when the history is too short to trust.
+    """
+
+    direction: Direction
+    direction_strength: Strength
+    iv_regime: IVRegime
+    iv_rank_value: float | None  # 0..1
+    earnings_in_window: bool
+    warming_up: bool
