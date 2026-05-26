@@ -6,6 +6,7 @@ submodules directly.
 
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
+from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.pacing import ConcurrencyLimiter, RateLimiter
 from optionsbot.ibkr.types import (
     AccountSummary,
@@ -20,6 +21,7 @@ __all__ = [
     "ConcurrencyLimiter",
     "ContractResolver",
     "IBKRClient",
+    "MarketDataClient",
     "OptionChainLeg",
     "OptionQuote",
     "PositionRecord",
