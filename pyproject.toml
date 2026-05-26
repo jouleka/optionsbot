@@ -16,6 +16,7 @@ dependencies = [
     "ib_async>=1.0",
     "pandas>=2.2",
     "pyarrow>=15",
+    "yfinance>=0.2.40",
 ]
 
 [project.scripts]
