@@ -3,7 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date as _date_type
 from typing import Literal
+
+
+@dataclass(frozen=True, slots=True)
+class EarningsInfo:
+    """Next earnings date for a symbol with provenance.
+
+    ``source`` indicates where the date came from:
+      * ``"manual"`` -- caller-supplied override
+      * ``"yfinance"`` -- looked up via the yfinance package
+      * ``"unknown"`` -- no date could be determined (network failure,
+        missing calendar, or symbol has no upcoming earnings)
+    """
+
+    next_date: _date_type | None
+    source: Literal["yfinance", "manual", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
