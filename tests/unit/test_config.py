@@ -113,3 +113,27 @@ def test_env_var_beats_toml_overlay(
     monkeypatch.setenv("OPTIONSBOT_IBKR__PORT", "4001")  # env says 4001
     s = load_settings(config_file=cfg)
     assert s.ibkr.port == 4001  # env wins
+
+
+def test_lowercase_env_var_still_beats_toml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Settings has case_sensitive=False by default, so lowercase env vars
+    # must override TOML too. (Regression test for the precedence helper.)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[ibkr]\nport = 7496\n")
+    monkeypatch.setenv("optionsbot_ibkr__port", "4001")
+    s = load_settings(config_file=cfg)
+    assert s.ibkr.port == 4001
+
+
+def test_env_var_beats_toml_for_top_level_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Top-level (non-nested) fields like log_level should follow the same
+    # env > TOML > defaults order.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('log_level = "WARNING"\n')
+    monkeypatch.setenv("OPTIONSBOT_LOG_LEVEL", "DEBUG")
+    s = load_settings(config_file=cfg)
+    assert s.log_level == "DEBUG"

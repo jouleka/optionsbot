@@ -74,9 +74,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
             raise ValueError(f"Failed to parse TOML config at {path}: {e}") from e
 
 
-def _strip_env_overridden(
-    data: dict[str, Any], prefix: str, path: tuple[str, ...] = ()
-) -> dict[str, Any]:
+def _strip_env_overridden(data: dict[str, Any], prefix: str) -> dict[str, Any]:
     """Drop keys from ``data`` whose corresponding env var is set.
 
     Pydantic-settings treats constructor kwargs as higher priority than env
@@ -84,19 +82,28 @@ def _strip_env_overridden(
     make TOML beat env. We instead drop any TOML key for which the matching
     ``OPTIONSBOT_...`` env var is present, letting pydantic-settings pick up
     the env value at its normal priority.
+
+    The lookup is case-insensitive to match ``Settings``' default
+    ``case_sensitive=False``: a user setting ``optionsbot_ibkr__port`` in
+    lowercase must still override TOML.
     """
-    pruned: dict[str, Any] = {}
-    for key, value in data.items():
-        next_path = path + (key,)
-        if isinstance(value, dict):
-            sub = _strip_env_overridden(value, prefix, next_path)
-            if sub:
-                pruned[key] = sub
-        else:
-            env_name = prefix + "__".join(p.upper() for p in next_path)
-            if env_name not in os.environ:
-                pruned[key] = value
-    return pruned
+    env_keys_lower = {k.lower() for k in os.environ}
+
+    def _walk(d: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+        pruned: dict[str, Any] = {}
+        for key, value in d.items():
+            next_path = path + (key,)
+            if isinstance(value, dict):
+                sub = _walk(value, next_path)
+                if sub:
+                    pruned[key] = sub
+            else:
+                env_name = (prefix + "__".join(next_path)).lower()
+                if env_name not in env_keys_lower:
+                    pruned[key] = value
+        return pruned
+
+    return _walk(data, ())
 
 
 def load_settings(config_file: Path | None = None) -> Settings:
