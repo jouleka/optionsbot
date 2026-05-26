@@ -129,5 +129,17 @@ def get_settings() -> Settings:
     environment variables change at runtime. Tests or any code that
     mutates the environment between calls must invoke
     ``get_settings.cache_clear()`` to force a re-read on the next call.
+
+    For long-running processes (e.g., the daemon in IBK-7) that should
+    pick up edits to ``~/.config/optionsbot/config.toml`` without a
+    restart, register a SIGHUP handler that clears the cache::
+
+        import signal
+        from optionsbot.config import get_settings
+
+        def _on_sighup(signum, frame):
+            get_settings.cache_clear()
+
+        signal.signal(signal.SIGHUP, _on_sighup)
     """
     return load_settings()
