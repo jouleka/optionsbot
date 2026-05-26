@@ -2,20 +2,23 @@
 
 Resolution order (highest priority first):
   1. Environment variables (prefix OPTIONSBOT_, nested via __).
-  2. Values in ~/.config/optionsbot/config.toml.
+  2. Values in ~/.config/optionsbot/config.toml (or a path passed to load_settings).
   3. Defaults defined on the Settings classes below.
 """
 
 from __future__ import annotations
 
-import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "optionsbot" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "optionsbot" / "optionsbot.db"
@@ -46,7 +49,11 @@ class StorageSettings(BaseModel):
 
 
 class Settings(BaseSettings):
-    """Top-level settings loaded from env + optional config.toml."""
+    """Top-level settings.
+
+    Source priority (highest first): init kwargs, env vars (OPTIONSBOT_FOO__BAR),
+    .env file, then the optional TOML config file. Defaults are the lowest.
+    """
 
     ibkr: IBKRSettings = IBKRSettings()
     telegram: TelegramSettings = TelegramSettings()
@@ -61,63 +68,63 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        toml_file=None,  # populated dynamically below
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        toml_path = cls.model_config.get("toml_file")
+        sources: tuple[PydanticBaseSettingsSource, ...] = (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+        )
+        if isinstance(toml_path, (str, Path)):
+            # Validate up front so we get our friendlier error message rather than
+            # whatever pydantic-settings produces when its lazy parse fails.
+            _validate_toml_file(Path(toml_path))
+            sources = sources + (TomlConfigSettingsSource(settings_cls, toml_file=toml_path),)
+        sources = sources + (file_secret_settings,)
+        return sources
 
-def _load_toml(path: Path) -> dict[str, Any]:
+
+def _validate_toml_file(path: Path) -> None:
+    """Raise a friendly ValueError if the TOML file is malformed."""
     if not path.exists():
-        return {}
+        return
     with path.open("rb") as f:
         try:
-            return tomllib.load(f)
+            tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
             raise ValueError(f"Failed to parse TOML config at {path}: {e}") from e
 
 
-def _strip_env_overridden(data: dict[str, Any], prefix: str) -> dict[str, Any]:
-    """Drop keys from ``data`` whose corresponding env var is set.
-
-    Pydantic-settings treats constructor kwargs as higher priority than env
-    vars, so passing the full TOML data to ``Settings(**toml_data)`` would
-    make TOML beat env. We instead drop any TOML key for which the matching
-    ``OPTIONSBOT_...`` env var is present, letting pydantic-settings pick up
-    the env value at its normal priority.
-
-    The lookup is case-insensitive to match ``Settings``' default
-    ``case_sensitive=False``: a user setting ``optionsbot_ibkr__port`` in
-    lowercase must still override TOML.
-    """
-    env_keys_lower = {k.lower() for k in os.environ}
-
-    def _walk(d: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
-        pruned: dict[str, Any] = {}
-        for key, value in d.items():
-            next_path = path + (key,)
-            if isinstance(value, dict):
-                sub = _walk(value, next_path)
-                if sub:
-                    pruned[key] = sub
-            else:
-                env_name = (prefix + "__".join(next_path)).lower()
-                if env_name not in env_keys_lower:
-                    pruned[key] = value
-        return pruned
-
-    return _walk(data, ())
-
-
 def load_settings(config_file: Path | None = None) -> Settings:
-    """Load Settings with optional config.toml overlay.
+    """Load Settings with an optional TOML overlay.
 
-    Resolution: env > TOML > defaults. TOML values fill in where env vars are
-    absent; env vars always win when present.
+    Resolution: env > TOML > defaults. Pass ``config_file`` to point at a
+    specific TOML file; pass ``None`` (default) to use
+    ``~/.config/optionsbot/config.toml`` if it exists.
     """
     cfg_path = config_file if config_file is not None else DEFAULT_CONFIG_FILE
-    toml_data = _load_toml(cfg_path)
-    if toml_data:
-        effective = _strip_env_overridden(toml_data, "OPTIONSBOT_")
-        if effective:
-            return Settings(**effective)
+    # Only attach the TOML source when the file actually exists -- otherwise
+    # pydantic-settings emits a noisy "file not found" log for the common
+    # "no config.toml yet" case.
+    if cfg_path.exists():
+        # Mutate model_config for THIS instantiation only. We restore after.
+        previous = Settings.model_config.get("toml_file")
+        Settings.model_config["toml_file"] = str(cfg_path)
+        try:
+            return Settings()
+        finally:
+            Settings.model_config["toml_file"] = previous
     return Settings()
 
 
