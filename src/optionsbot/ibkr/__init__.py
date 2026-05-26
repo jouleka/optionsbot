@@ -10,6 +10,7 @@ from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.pacing import ConcurrencyLimiter, RateLimiter
+from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.ibkr.types import (
     AccountSummary,
     OptionChainLeg,
@@ -29,6 +30,7 @@ __all__ = [
     "OptionChainLeg",
     "OptionQuote",
     "PositionRecord",
+    "PositionsClient",
     "RateLimiter",
     "StockQuote",
 ]
