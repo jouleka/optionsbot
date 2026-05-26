@@ -76,6 +76,11 @@ class Strategy(ABC):
     display_name: ClassVar[str]  # human-readable
     defined_risk: ClassVar[bool]
     applicable_views: ClassVar[frozenset[tuple[Direction, IVRegime]]]
+    # True for strategies that net-pay premium (long straddle/strangle,
+    # long call/put, long calendar/diagonal). The IBK-5 scoring engine
+    # inverts the iv_rank factor for these (long-premium wants LOW iv_rank,
+    # short-premium wants HIGH).
+    long_premium: ClassVar[bool] = False
     # Default factor weights consumed by IBK-5 scoring engine.
     # Standard factor names: iv_rank, iv_hv, liquidity, dte_match,
     # earnings_penalty, range_bound. Must sum to 1.0.

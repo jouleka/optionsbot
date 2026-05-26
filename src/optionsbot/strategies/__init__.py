@@ -1,6 +1,6 @@
 """Strategy registry.
 
-Tasks 1-2 ship 6 of the planned 16 strategies. Later tasks (IBK-31..44) extend
+Tasks 1-3 ship 10 of the planned 16 strategies. Later tasks (IBK-39..44) extend
 ``_STRATEGIES`` to the full set.
 """
 
@@ -12,6 +12,12 @@ from optionsbot.strategies.base import (
 )
 from optionsbot.strategies.iron_butterfly import IronButterfly
 from optionsbot.strategies.iron_condor import IronCondor
+from optionsbot.strategies.straddles import (
+    LongStraddle,
+    LongStrangle,
+    ShortStraddle,
+    ShortStrangle,
+)
 from optionsbot.strategies.verticals import (
     BearCallSpread,
     BearPutSpread,
@@ -26,6 +32,10 @@ _STRATEGIES: tuple[Strategy, ...] = (
     BearCallSpread(),
     BullCallSpread(),
     BearPutSpread(),
+    LongStraddle(),
+    LongStrangle(),
+    ShortStraddle(),
+    ShortStrangle(),
 )
 
 _BY_NAME: dict[str, Strategy] = {s.name: s for s in _STRATEGIES}
@@ -47,6 +57,10 @@ __all__ = [
     "IronButterfly",
     "IronCondor",
     "Leg",
+    "LongStraddle",
+    "LongStrangle",
+    "ShortStraddle",
+    "ShortStrangle",
     "Strategy",
     "StrategySnapshot",
     "StrategySuggestion",
