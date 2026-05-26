@@ -16,20 +16,26 @@ import pytest
 def mock_ib() -> MagicMock:
     """A MagicMock standing in for ``ib_async.IB`` with async methods on AsyncMock.
 
-    Methods callers may stub: connectAsync, disconnect, isConnected,
-    reqMarketDataType, qualifyContractsAsync, reqMktData, reqTickersAsync,
-    reqSecDefOptParams, reqHistoricalDataAsync, positions, accountSummary.
+    Important: only the methods that ARE actually async on the real
+    ``ib_async.IB`` are wired up as ``AsyncMock``. The sync wrappers
+    (e.g., ``reqSecDefOptParams``, ``positions``, ``accountSummary``,
+    ``isConnected``, ``disconnect``, ``reqMarketDataType``) are plain
+    ``MagicMock``. Code that calls the async sibling (e.g.
+    ``reqSecDefOptParamsAsync``) must mock the ``*Async`` name, not the
+    sync wrapper.
     """
     ib = MagicMock()
+    # Async methods (return coroutines on the real IB):
     ib.connectAsync = AsyncMock()
+    ib.qualifyContractsAsync = AsyncMock()
+    ib.reqTickersAsync = AsyncMock()
+    ib.reqSecDefOptParamsAsync = AsyncMock()
+    ib.reqHistoricalDataAsync = AsyncMock()
+    # Sync methods (return values directly on the real IB):
     ib.disconnect = MagicMock()
     ib.isConnected = MagicMock(return_value=False)
     ib.reqMarketDataType = MagicMock()
-    ib.qualifyContractsAsync = AsyncMock()
     ib.reqMktData = MagicMock()
-    ib.reqTickersAsync = AsyncMock()
-    ib.reqSecDefOptParams = AsyncMock()
-    ib.reqHistoricalDataAsync = AsyncMock()
     ib.positions = MagicMock()
     ib.accountSummary = MagicMock()
     return ib

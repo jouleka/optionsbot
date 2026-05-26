@@ -19,7 +19,7 @@ def _expiry(days_from_today: int) -> str:
 
 
 def _opt_params(expirations: list[str], strikes: list[float]) -> list[MagicMock]:
-    """Mock reqSecDefOptParams return shape (a list of OptionChain rows)."""
+    """Mock reqSecDefOptParamsAsync return shape (a list of OptionChain rows)."""
     p = MagicMock()
     p.exchange = "SMART"
     p.tradingClass = "SPY"
@@ -75,7 +75,7 @@ async def test_chain_filters_expiries_to_window(chain_client, mock_ib) -> None:
     # Three expiries: 10 DTE (out), 35 DTE (in), 70 DTE (out).
     expiries = [_expiry(10), _expiry(35), _expiry(70)]
     strikes = [395.0, 400.0, 405.0]
-    mock_ib.reqSecDefOptParams.return_value = _opt_params(expiries, strikes)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
     mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
@@ -86,7 +86,7 @@ async def test_chain_filters_expiries_to_window(chain_client, mock_ib) -> None:
 async def test_chain_emits_both_calls_and_puts(chain_client, mock_ib) -> None:
     expiries = [_expiry(35)]
     strikes = [400.0]
-    mock_ib.reqSecDefOptParams.return_value = _opt_params(expiries, strikes)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
     mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
@@ -97,7 +97,7 @@ async def test_chain_emits_both_calls_and_puts(chain_client, mock_ib) -> None:
 async def test_chain_leg_count_matches_strike_times_2(chain_client, mock_ib) -> None:
     expiries = [_expiry(35)]
     strikes = [395.0, 400.0, 405.0]  # 3 strikes
-    mock_ib.reqSecDefOptParams.return_value = _opt_params(expiries, strikes)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
     mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
@@ -107,7 +107,7 @@ async def test_chain_leg_count_matches_strike_times_2(chain_client, mock_ib) -> 
 async def test_chain_returns_empty_when_no_expiries_in_window(chain_client, mock_ib) -> None:
     expiries = [_expiry(70)]  # out of window
     strikes = [400.0]
-    mock_ib.reqSecDefOptParams.return_value = _opt_params(expiries, strikes)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
     mock_ib.reqTickersAsync.return_value = []
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
@@ -117,7 +117,7 @@ async def test_chain_returns_empty_when_no_expiries_in_window(chain_client, mock
 async def test_chain_leg_carries_greeks_and_oi(chain_client, mock_ib) -> None:
     expiries = [_expiry(35)]
     strikes = [400.0]
-    mock_ib.reqSecDefOptParams.return_value = _opt_params(expiries, strikes)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
     mock_ib.reqTickersAsync.return_value = [
         _ticker(bid=5.0, ask=5.1, iv=0.25, delta=0.45, oi=1234, vol=99)

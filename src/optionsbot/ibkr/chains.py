@@ -79,11 +79,11 @@ class ChainClient:
     ) -> list[OptionChainLeg]:
         underlying = await self._resolver.stock(symbol)
         await self._client.ensure_connected()
-        # reqSecDefOptParams returns OptionChain rows; pick the SMART/STK row.
-        # ib_async's type stubs annotate this as sync-blocking via ``_run``,
-        # but the underlying implementation returns an awaitable future. We
-        # use the documented method name and ignore the spurious mypy error.
-        params = await self._client.ib.reqSecDefOptParams(  # type: ignore[misc]
+        # ib_async.IB has TWO related methods:
+        #   - reqSecDefOptParams (synchronous, wraps the async sibling via IB._run)
+        #   - reqSecDefOptParamsAsync (the awaitable form)
+        # We use the async sibling so we don't block the event loop in _run.
+        params = await self._client.ib.reqSecDefOptParamsAsync(
             underlying.symbol,
             "",  # futFopExchange
             underlying.secType,
@@ -104,6 +104,8 @@ class ChainClient:
         if not expiries:
             return []
         # Fetch each (expiry, strike, right) under concurrency + rate limits.
+        # ``return_exceptions=True`` so a single transient per-leg failure
+        # doesn't cancel the whole chain; we drop failed legs after the fact.
         rights: tuple[OptionRight, ...] = ("C", "P")
         tasks = [
             self._fetch_one(symbol, expiry, strike, right)
@@ -111,9 +113,8 @@ class ChainClient:
             for strike in strikes
             for right in rights
         ]
-        results = await asyncio.gather(*tasks)
-        # Drop None entries (failed/missing fetches).
-        return [r for r in results if r is not None]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if isinstance(r, OptionChainLeg)]
 
     async def _fetch_one(
         self,
