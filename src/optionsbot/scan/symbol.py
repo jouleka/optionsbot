@@ -28,7 +28,7 @@ from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import score_all
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
-from optionsbot.strategies import StrategySnapshot
+from optionsbot.strategies import Leg, StrategySnapshot
 
 
 def _atm_iv(chain: list[OptionChainLeg], spot: float) -> float | None:
@@ -59,11 +59,13 @@ def _override_view(
         kwargs["direction"] = direction
     if iv_regime is not None:
         kwargs["iv_regime"] = iv_regime
+    # kwargs is dict[str, object] for partial-replace flexibility; the values
+    # are runtime-narrowed to Direction|IVRegime by the None-guards above.
     return replace(view, **kwargs) if kwargs else view  # type: ignore[arg-type]
 
 
-def _serialize_legs(legs: tuple[object, ...]) -> list[dict[str, object]]:
-    return [asdict(leg) for leg in legs]  # type: ignore[call-overload]
+def _serialize_legs(legs: tuple[Leg, ...]) -> list[dict[str, object]]:
+    return [asdict(leg) for leg in legs]
 
 
 async def scan_symbol(
@@ -161,6 +163,8 @@ async def scan_symbol(
                 raw_json=raw_extra,
             )
         )
+        # inserted_primary_key is a named-tuple; index-subscript is the supported API,
+        # but SQLAlchemy's stubs type it as Any so mypy reports a spurious index error.
         snapshot_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
         if scored:
             conn.execute(

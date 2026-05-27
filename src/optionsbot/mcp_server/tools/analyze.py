@@ -92,7 +92,7 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
         "iv_regime": row.regime_iv,
         "iv_rank_value": row.iv_rank,
         "earnings_in_window": None,
-        "warming_up": (row.raw_json or {}).get("warming_up") if row.raw_json else None,
+        "warming_up": row.raw_json.get("warming_up") if row.raw_json else None,
     }
     # Mirrors top_k(scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD) but
     # operates on DB rows instead of ScoredStrategy objects. The score_rows
@@ -133,6 +133,6 @@ def _watchlist_view_override(
     if row.view_override_dir is None and row.view_override_iv is None:
         return None
     return (
-        cast(Direction, row.view_override_dir),
-        cast(IVRegime, row.view_override_iv),
+        cast("Direction | None", row.view_override_dir),
+        cast("IVRegime | None", row.view_override_iv),
     )
