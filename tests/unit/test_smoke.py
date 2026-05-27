@@ -15,8 +15,9 @@ def test_cli_app_is_typer() -> None:
     assert isinstance(cli_app, typer.Typer)
 
 
-def test_mcp_main_returns_nonzero_for_now() -> None:
-    assert mcp_main.main() == 1
+def test_mcp_main_is_callable() -> None:
+    """mcp_main.main is a callable (real implementation replaces the old stub)."""
+    assert callable(mcp_main.main)
 
 
 def test_daemon_main_returns_nonzero_for_now() -> None:

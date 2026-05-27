@@ -17,6 +17,7 @@ dependencies = [
     "pandas>=2.2",
     "pyarrow>=15",
     "yfinance>=0.2.40",
+    "mcp>=1.13",
 ]
 
 [project.scripts]

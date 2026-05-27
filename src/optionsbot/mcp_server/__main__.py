@@ -1,13 +1,24 @@
 """Entry point for the `optionsbot-mcp` console script."""
-import sys
+
+from __future__ import annotations
+
+import logging
+
+from optionsbot.config import get_settings
+from optionsbot.mcp_server.server import build_server
 
 
 def main() -> int:
-    sys.stderr.write(
-        "optionsbot-mcp is not yet implemented. See IBK-6 for the implementation plan.\n"
+    """Run the optionsbot MCP server over stdio."""
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    return 1
+    server = build_server()
+    server.run()
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
