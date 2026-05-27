@@ -41,7 +41,13 @@ class Daemon:
             await self._stop_event.wait()
         finally:
             log.info("Stop signal received; shutting down scheduler")
-            scheduler.shutdown(wait=True)
+            try:
+                scheduler.shutdown(wait=True)
+            except Exception:
+                # SchedulerNotRunningError (or similar) must not prevent
+                # IBKR disconnect + engine dispose; we always want a clean
+                # process exit even if the scheduler self-terminated.
+                log.exception("Scheduler shutdown failed")
             await self._shutdown_context()
         return 0
 

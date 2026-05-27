@@ -21,9 +21,11 @@ def is_market_open(now: datetime) -> bool:
     """Return True iff ``now`` falls within an NYSE trading session.
 
     ``now`` MUST be timezone-aware. Naive datetimes are rejected to avoid
-    silent UTC/ET confusion. The function normalizes to ET before
-    comparing against the trading day's open/close, which correctly
-    handles half-days (e.g., day after Thanksgiving closes 13:00 ET).
+    silent UTC/ET confusion. The function normalizes to ET only to
+    determine the calendar date for the schedule lookup; the open/close
+    comparison itself uses the caller-supplied ``now`` (Python resolves
+    tz offsets transparently). This correctly handles half-days such as
+    the day after Thanksgiving, which closes 13:00 ET.
     """
     if now.tzinfo is None:
         raise ValueError("is_market_open requires a tz-aware datetime")
