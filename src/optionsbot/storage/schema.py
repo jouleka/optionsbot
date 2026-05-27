@@ -76,6 +76,11 @@ strategy_scores = Table(
     Column("score", Float, nullable=False),
     Column("rationale", Text),
     Column("legs_json", JSON),
+    # Suggestion blob: defined_risk, credit_or_debit, max_loss, max_profit,
+    # prob_profit, suggested_quantity. Persisted so retry alerts (see
+    # daemon/alert_pipeline._reconstruct_scored) can render the same UNDEFINED
+    # RISK warning + financial figures as the first attempt.
+    Column("suggestion_json", JSON),
 )
 
 

@@ -176,6 +176,18 @@ async def scan_symbol(
                         "score": s.score,
                         "rationale": s.rationale,
                         "legs_json": _serialize_legs(s.suggestion.legs),
+                        # Persist the StrategySuggestion fields the retry path
+                        # needs to render an identical alert. Without these the
+                        # retry alert silently drops the UNDEFINED RISK header
+                        # and all financial figures.
+                        "suggestion_json": {
+                            "defined_risk": s.suggestion.defined_risk,
+                            "credit_or_debit": s.suggestion.credit_or_debit,
+                            "max_loss": s.suggestion.max_loss,
+                            "max_profit": s.suggestion.max_profit,
+                            "prob_profit": s.suggestion.prob_profit,
+                            "suggested_quantity": s.suggestion.suggested_quantity,
+                        },
                     }
                     for s in scored
                 ],

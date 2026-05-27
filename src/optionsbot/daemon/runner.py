@@ -48,8 +48,18 @@ class Daemon:
             await self._shutdown_context()
             return 1
 
-        scheduler = build_scheduler(self._context, self._scan_tick)
-        scheduler.start()
+        try:
+            scheduler = build_scheduler(self._context, self._scan_tick)
+            scheduler.start()
+        except Exception:
+            # build_scheduler / scheduler.start can raise (APScheduler
+            # validates add_job args, executor configuration, etc.). Without
+            # this guard a failure here would skip _shutdown_context and
+            # leak the IBKR connection + Telegram client + engine.
+            log.exception("Failed to start scheduler; daemon will exit")
+            await self._shutdown_context()
+            return 1
+
         log.info("Daemon started; waiting for stop signal")
         try:
             await self._stop_event.wait()

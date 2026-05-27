@@ -30,12 +30,18 @@ async def enqueue_alert(
     symbol: str,
     scored: ScoredStrategy,
     snapshot_id: int,
-) -> None:
-    """Dedup-check, insert pending row, dispatch."""
+) -> bool:
+    """Dedup-check, insert pending row, dispatch.
+
+    Returns True when an alerts row was inserted (and dispatch was attempted),
+    False when the dedup gate suppressed it. The caller increments its
+    enqueued counter only on True so dedup-skipped attempts don't pad
+    scan_runs.alerts_fired with phantom rows.
+    """
     if not should_alert(
         context.engine, context.settings, symbol, scored.strategy_name, scored.score
     ):
-        return
+        return False
     now = datetime.now(UTC)
     with context.engine.begin() as conn:
         result = conn.execute(
@@ -46,6 +52,7 @@ async def enqueue_alert(
         )
         alert_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
     await dispatch_alert(context, alert_id, snapshot_id, scored)
+    return True
 
 
 async def dispatch_alert(
@@ -238,14 +245,20 @@ def _reconstruct_scored(
         )
         for leg in legs_data
     )
+    # Pull the suggestion fields back from suggestion_json. The fallback
+    # (defined_risk=True, financials None/0) only fires for legacy rows
+    # written before migration 0002 added the column -- post-migration
+    # retry alerts render exactly the same UNDEFINED RISK warning + figures
+    # as the first attempt.
+    sug_data = score_row.suggestion_json or {}
     sug = SimpleNamespace(
         legs=legs,
-        credit_or_debit=0.0,
-        max_loss=None,
-        max_profit=None,
-        prob_profit=None,
-        suggested_quantity=0,
-        defined_risk=True,
+        credit_or_debit=sug_data.get("credit_or_debit", 0.0),
+        max_loss=sug_data.get("max_loss"),
+        max_profit=sug_data.get("max_profit"),
+        prob_profit=sug_data.get("prob_profit"),
+        suggested_quantity=sug_data.get("suggested_quantity", 0),
+        defined_risk=sug_data.get("defined_risk", True),
     )
     return ScoredStrategy(
         strategy_name=strategy,

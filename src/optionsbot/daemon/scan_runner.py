@@ -72,8 +72,11 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
         for scored in selected:
             try:
-                await enqueue_alert(context, sym, scored, result.snapshot_id)
-                alerts_enqueued += 1
+                # enqueue_alert returns True when a row was actually inserted,
+                # False when the dedup gate suppressed it. Increment only on
+                # True so scan_runs.alerts_fired matches reality.
+                if await enqueue_alert(context, sym, scored, result.snapshot_id):
+                    alerts_enqueued += 1
             except Exception as e:  # noqa: BLE001
                 log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
                 errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
