@@ -128,7 +128,7 @@ def test_score_strategy_returns_scored_strategy_for_applicable_view(
     assert isinstance(scored, ScoredStrategy)
     assert scored.strategy_name == "iron_condor"
     assert 0.0 <= scored.score <= 100.0
-    assert scored.rationale == ""  # Task 3 fills it in
+    assert scored.rationale != ""  # filled in by build_rationale
     assert isinstance(scored.factors, FactorBreakdown)
 
 

@@ -1,7 +1,7 @@
 """Composite scoring engine for option strategies.
 
 Re-exports the six factor functions, the composite formula + top-K selector,
-and the output dataclasses. The rationale generator lands in a follow-up task.
+the rationale generator, and the output dataclasses.
 """
 
 from optionsbot.scoring.composite import (
@@ -21,6 +21,7 @@ from optionsbot.scoring.factors import (
     liquidity_score,
     range_bound_score,
 )
+from optionsbot.scoring.rationale import build_rationale
 from optionsbot.scoring.types import FactorBreakdown, FactorContext, ScoredStrategy
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "FactorBreakdown",
     "FactorContext",
     "ScoredStrategy",
+    "build_rationale",
     "compute_composite",
     "compute_factor_breakdown",
     "dte_match_score",

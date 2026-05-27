@@ -19,6 +19,7 @@ from optionsbot.scoring.factors import (
     liquidity_score,
     range_bound_score,
 )
+from optionsbot.scoring.rationale import build_rationale
 from optionsbot.scoring.types import FactorBreakdown, FactorContext, ScoredStrategy
 from optionsbot.strategies import (
     Strategy,
@@ -83,7 +84,8 @@ def score_strategy(
     :meth:`~optionsbot.strategies.Strategy.suggest_legs` can't find usable
     strikes/expiries in the chain.
 
-    ``rationale`` is left empty -- the Task 3 rationale generator fills it in.
+    ``rationale`` is populated by
+    :func:`optionsbot.scoring.rationale.build_rationale`.
     """
     suggestion = strategy.build_suggestion(
         snapshot, account_value=account_value, risk_pct=risk_pct
@@ -92,12 +94,13 @@ def score_strategy(
         return None
     breakdown = compute_factor_breakdown(snapshot, suggestion, strategy)
     score = compute_composite(breakdown, strategy.factor_weights)
+    rationale = build_rationale(score, breakdown, strategy)
     return ScoredStrategy(
         strategy_name=strategy.name,
         score=score,
         factors=breakdown,
         suggestion=suggestion,
-        rationale="",
+        rationale=rationale,
     )
 
 
