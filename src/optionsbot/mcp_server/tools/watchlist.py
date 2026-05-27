@@ -18,6 +18,15 @@ _VALID_DIRECTIONS = frozenset({"bull", "neutral", "bear"})
 _VALID_IV_REGIMES = frozenset({"high", "neutral", "low"})
 
 
+def _iso(dt: datetime | None) -> str | None:
+    """Return ISO-8601 with UTC offset, even if SQLite stripped tz info."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
 def register(server: FastMCP) -> None:
     """Attach the four watchlist tools to the FastMCP server."""
 
@@ -107,14 +116,6 @@ def register(server: FastMCP) -> None:
         )
         with lifespan.engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()
-        def _iso(dt: datetime | None) -> str | None:
-            """Return ISO-8601 with UTC offset, even if SQLite stripped tz info."""
-            if dt is None:
-                return None
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            return dt.isoformat()
-
         entries = [
             {
                 "symbol": r.symbol,

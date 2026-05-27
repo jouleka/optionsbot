@@ -223,6 +223,13 @@ async def test_set_view_override_sets_direction(
     )
     assert result["ok"] is True
     assert result["override"] == {"direction": "bull", "iv_regime": None}
+    with server_context.engine.connect() as conn:
+        row = conn.execute(
+            select(watchlist).where(watchlist.c.symbol == "AAPL")
+        ).fetchone()
+    assert row is not None
+    assert row.view_override_dir == "bull"
+    assert row.view_override_iv is None
 
 
 async def test_set_view_override_clears_with_none(
@@ -239,6 +246,13 @@ async def test_set_view_override_clears_with_none(
         symbol="AAPL", direction=None, iv_regime=None, ctx=_FakeCtx(server_context)
     )
     assert result["override"] == {"direction": None, "iv_regime": None}
+    with server_context.engine.connect() as conn:
+        row = conn.execute(
+            select(watchlist).where(watchlist.c.symbol == "AAPL")
+        ).fetchone()
+    assert row is not None
+    assert row.view_override_dir is None
+    assert row.view_override_iv is None
 
 
 async def test_set_view_override_rejects_invalid_direction(
