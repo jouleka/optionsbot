@@ -155,7 +155,11 @@ def _load_view_for_snapshot(context: DaemonContext, snapshot_id: int) -> MarketV
         raise RuntimeError(f"snapshot {snapshot_id} not found")
     return MarketView(
         direction=cast("Direction", row.regime_dir) if row.regime_dir else "neutral",
-        direction_strength="strong",  # not persisted; reasonable default for dispatch
+        # direction_strength and earnings_in_window are not persisted on the
+        # snapshots table. The formatter only reads direction/iv_regime/
+        # iv_rank_value, so the values chosen here never reach the rendered
+        # alert. Defaults kept simple.
+        direction_strength="strong",
         iv_regime=cast("IVRegime", row.regime_iv) if row.regime_iv else "neutral",
         iv_rank_value=row.iv_rank,
         earnings_in_window=False,

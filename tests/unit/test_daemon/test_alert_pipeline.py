@@ -156,6 +156,37 @@ async def test_sweep_retries_processes_failed_rows_past_next_retry_ts(
         row = conn.execute(select(alerts)).fetchone()
     assert row.status == "sent"
     assert row.telegram_msg_id == 99
+    # _mark_sent must scrub the previous failure trail; a sent row carrying
+    # stale last_error or next_retry_ts is a state-machine bug.
+    assert row.last_error is None
+    assert row.next_retry_ts is None
+
+
+async def test_sweep_retries_skips_row_when_reconstruct_returns_none(
+    daemon_context: DaemonContext,
+) -> None:
+    """If the strategy_scores history is missing (e.g., snapshots were never
+    persisted for this symbol), sweep_retries logs and skips the row rather
+    than crashing. The row's status stays unchanged so a later tick can
+    retry once the data lands."""
+    past = datetime.now(UTC) - timedelta(minutes=5)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(alerts).values(
+            ts=datetime.now(UTC), symbol="NEVERSCANNED", strategy="iron_condor",
+            score=85.0, status="failed", retry_count=1,
+            next_retry_ts=past, last_error="prev fail",
+        ))
+
+    # No snapshot rows exist for NEVERSCANNED, so _latest_snapshot_id_for_symbol
+    # returns None inside _reconstruct_scored.
+    count = await sweep_retries(daemon_context)
+    assert count == 0
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(select(alerts)).fetchone()
+    # Row untouched -- status, retry_count, next_retry_ts all preserved.
+    assert row.status == "failed"
+    assert row.retry_count == 1
+    daemon_context.telegram.send_message.assert_not_awaited()
 
 
 async def test_sweep_retries_skips_rows_with_future_next_retry_ts(
