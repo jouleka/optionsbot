@@ -19,3 +19,6 @@ def _register_tools(server: FastMCP) -> None:
 
     Filled in by Task 2 (watchlist), Task 3 (analyze), Task 4 (snapshot tools).
     """
+    from optionsbot.mcp_server.tools import watchlist
+
+    watchlist.register(server)

@@ -24,8 +24,12 @@ def test_build_server_has_lifespan_configured() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_server_registers_zero_tools_before_task_2() -> None:
-    """Until Task 2 adds tools, the registry should be empty."""
+async def test_build_server_registers_watchlist_tools() -> None:
+    """Task 2 wires in the four watchlist tools."""
     server = build_server()
     tools = await server.list_tools()
-    assert tools == []
+    names = {t.name for t in tools}
+    assert {
+        "add_to_watchlist", "remove_from_watchlist",
+        "list_watchlist", "set_view_override",
+    } <= names
