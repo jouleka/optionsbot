@@ -12,19 +12,11 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.mcp_server.context import ServerContext
+from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.storage.schema import snapshots, watchlist
 
 _VALID_DIRECTIONS = frozenset({"bull", "neutral", "bear"})
 _VALID_IV_REGIMES = frozenset({"high", "neutral", "low"})
-
-
-def _iso(dt: datetime | None) -> str | None:
-    """Return ISO-8601 with UTC offset, even if SQLite stripped tz info."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.isoformat()
 
 
 def register(server: FastMCP) -> None:
@@ -124,8 +116,8 @@ def register(server: FastMCP) -> None:
                     "iv_regime": r.view_override_iv,
                 },
                 "notes": r.notes,
-                "added_at": _iso(r.added_at),
-                "last_scanned": _iso(r.last_scanned),
+                "added_at": iso_utc(r.added_at),
+                "last_scanned": iso_utc(r.last_scanned),
             }
             for r in rows
         ]

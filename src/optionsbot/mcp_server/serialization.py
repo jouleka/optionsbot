@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any
 
 from optionsbot.analysis.types import MarketView
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.strategies import Leg
+
+
+def iso_utc(dt: datetime | None) -> str | None:
+    """Return ISO-8601 with UTC offset, even if SQLite stripped tz info.
+
+    DateTime(timezone=True) columns round-trip through SQLite as naive
+    datetimes (tzinfo stripped on read). Bare ``.isoformat()`` on a naive
+    dt then loses the ``+00:00`` suffix that downstream JSON consumers
+    rely on to parse it as UTC. Use this helper everywhere a SQL-returned
+    timestamp is rendered to a response.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
 
 
 def dump_view(view: MarketView) -> dict[str, Any]:

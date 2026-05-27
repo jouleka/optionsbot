@@ -15,7 +15,7 @@ from sqlalchemy import desc, select
 
 from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.serialization import dump_scored, dump_view
+from optionsbot.mcp_server.serialization import dump_scored, dump_view, iso_utc
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
 from optionsbot.storage.schema import snapshots, strategy_scores, watchlist
@@ -56,7 +56,7 @@ async def _analyze_fresh(symbol: str, lifespan: ServerContext) -> dict[str, Any]
         "ok": True,
         "symbol": result.symbol,
         "snapshot_id": result.snapshot_id,
-        "snapshot_ts": result.snapshot_ts.isoformat(),
+        "snapshot_ts": iso_utc(result.snapshot_ts),
         "view": dump_view(result.view),
         "top_strategies": [dump_scored(s) for s in selected],
     }
@@ -104,7 +104,7 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
         "ok": True,
         "symbol": symbol,
         "snapshot_id": row.id,
-        "snapshot_ts": row.ts.isoformat() if row.ts else None,
+        "snapshot_ts": iso_utc(row.ts),
         "view": view,
         "top_strategies": [
             {

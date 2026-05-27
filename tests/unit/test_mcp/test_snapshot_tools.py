@@ -44,6 +44,25 @@ def _seed_snapshot_with_scores(
 
 # ---- latest_snapshot (IBK-56) ---------------------------------------------
 
+async def test_snapshot_ts_round_trips_with_utc_offset(
+    server_context: ServerContext,
+) -> None:
+    """SQLite strips tz info from DateTime(tz=True) reads. Both snapshot tools
+    must run timestamps through iso_utc() so callers always see +00:00."""
+    _seed_snapshot_with_scores(server_context)
+    tools = get_tools(register)
+    latest = tools["latest_snapshot"]
+    breakdown = tools["score_breakdown"]
+
+    latest_result = await latest(symbol="SPY", ctx=FakeCtx(server_context))
+    assert latest_result["snapshot"]["ts"].endswith("+00:00")
+
+    breakdown_result = await breakdown(
+        symbol="SPY", strategy="iron_condor", ctx=FakeCtx(server_context)
+    )
+    assert breakdown_result["snapshot_ts"].endswith("+00:00")
+
+
 async def test_latest_snapshot_returns_latest_with_all_scores(
     server_context: ServerContext,
 ) -> None:

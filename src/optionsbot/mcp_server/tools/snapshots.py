@@ -9,10 +9,12 @@ from mcp.server.session import ServerSession
 from sqlalchemy import desc, select
 
 from optionsbot.mcp_server.context import ServerContext
+from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.storage.schema import snapshots, strategy_scores
 
 
 def register(server: FastMCP) -> None:
+    """Attach the two snapshot read tools to the FastMCP server."""
 
     @server.tool()
     async def latest_snapshot(
@@ -46,7 +48,7 @@ def register(server: FastMCP) -> None:
             "snapshot": {
                 "id": snap.id,
                 "symbol": snap.symbol,
-                "ts": snap.ts.isoformat() if snap.ts else None,
+                "ts": iso_utc(snap.ts),
                 "spot": snap.spot,
                 "iv_rank": snap.iv_rank,
                 "hv20": snap.hv20,
@@ -114,7 +116,7 @@ def register(server: FastMCP) -> None:
             "symbol": symbol,
             "strategy": score.strategy,
             "snapshot_id": snap.id,
-            "snapshot_ts": snap.ts.isoformat() if snap.ts else None,
+            "snapshot_ts": iso_utc(snap.ts),
             "score": score.score,
             "rationale": score.rationale,
             "legs": score.legs_json or [],
