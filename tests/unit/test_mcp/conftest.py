@@ -56,3 +56,37 @@ def mock_ibkr_client() -> MagicMock:
 def server_context(mcp_settings: Settings, mcp_engine: Engine) -> ServerContext:
     """A ServerContext with real engine + settings but no IBKRClient (lazy)."""
     return ServerContext(settings=mcp_settings, engine=mcp_engine)
+
+
+# ---------------------------------------------------------------------------
+# Shared test-helper utilities (not fixtures -- imported explicitly by tests)
+# ---------------------------------------------------------------------------
+
+
+class FakeCtx:
+    """Minimal stand-in for FastMCP's Context. Tools only touch
+    ``ctx.request_context.lifespan_context``."""
+
+    def __init__(self, lifespan_context: object) -> None:
+        rc = MagicMock()
+        rc.lifespan_context = lifespan_context
+        self.request_context = rc
+
+
+def get_tools(register_fn: object) -> dict:  # type: ignore[type-arg]
+    """Build a throwaway FastMCP, run register_fn against it, return tools by name."""
+    from mcp.server.fastmcp import FastMCP
+
+    captured: dict[str, object] = {}
+
+    class _Capture(FastMCP):
+        def tool(self, *a: object, **kw: object) -> object:  # type: ignore[override]
+            def deco(fn: object) -> object:
+                captured[fn.__name__] = fn  # type: ignore[attr-defined]
+                return fn
+
+            return deco
+
+    server = _Capture("test")
+    register_fn(server)  # type: ignore[operator]
+    return captured
