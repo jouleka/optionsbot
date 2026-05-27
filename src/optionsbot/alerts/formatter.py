@@ -67,8 +67,11 @@ def format_alert_markdown(
 
     # Header line: bold symbol, strategy name in backticks (snake_case names
     # like iron_condor or bull_put_spread contain `_` which would otherwise
-    # parse as italic markers outside a code span).
-    lines.append(f"*{symbol}* — `{scored.strategy_name}` score `{scored.score:.1f}`")
+    # parse as italic markers outside a code span). The symbol is escaped
+    # because dotted tickers (BRK.B, BF.B) contain a `.` which is special
+    # even inside a bold span -- Telegram requires escaping all special
+    # chars inside formatting spans except the delimiter and `\`.
+    lines.append(f"*{_md_escape(symbol)}* — `{scored.strategy_name}` score `{scored.score:.1f}`")
 
     # View line: direction/regime are Literal values with no special chars.
     # iv_rank_value contains a `.` so it goes inside a code span; parens

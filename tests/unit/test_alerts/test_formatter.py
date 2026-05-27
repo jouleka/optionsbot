@@ -152,3 +152,16 @@ def test_format_wraps_iv_rank_decimal_in_code_span() -> None:
         snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
     )
     assert "`0.72`" in md
+
+
+def test_format_escapes_dotted_ticker_in_bold_header() -> None:
+    """Dotted tickers like BRK.B contain a `.` that is special even INSIDE
+    bold spans. Telegram rejects `*BRK.B*` with HTTP 400; the formatter
+    must emit `*BRK\\.B*` instead."""
+    md = format_alert_markdown(
+        symbol="BRK.B", view=_view(),
+        scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "*BRK\\.B*" in md
+    assert "*BRK.B*" not in md
