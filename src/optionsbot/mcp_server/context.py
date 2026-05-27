@@ -33,7 +33,15 @@ class ServerContext:
     _ibkr_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def ibkr(self) -> IBKRClient:
-        """Lazy IBKRClient: created on first call, connected on demand."""
+        """Return the shared IBKRClient, constructing it on first call.
+
+        The returned client is **not** auto-connected. This matches the
+        rest of the IBKR layer pattern: every sub-client (ContractResolver,
+        ChainClient, MarketDataClient, PositionsClient, HistoryClient) calls
+        ``await client.ensure_connected()`` itself before issuing any IBKR
+        call. Construct the sub-client of interest from this raw client and
+        let it handle connection lifecycle.
+        """
         async with self._ibkr_lock:
             if self._ibkr is None:
                 self._ibkr = IBKRClient(role="mcp", settings=self.settings)
