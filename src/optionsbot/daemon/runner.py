@@ -34,7 +34,7 @@ class Daemon:
             await self._shutdown_context()
             return 1
 
-        scheduler = build_scheduler(self._context, self._noop_scan_for_task1)
+        scheduler = build_scheduler(self._context, self._scan_tick)
         scheduler.start()
         log.info("Daemon started; waiting for stop signal")
         try:
@@ -83,6 +83,17 @@ class Daemon:
             log.exception("Telegram client close failed")
         self._context.engine.dispose()
 
-    async def _noop_scan_for_task1(self) -> None:
-        """Placeholder; Task 2 swaps in scan_runner.run_scan_tick."""
-        log.debug("noop scan tick (Task 1 placeholder)")
+    async def _scan_tick(self) -> None:
+        from optionsbot.daemon.scan_runner import run_scan_tick
+
+        assert self._context is not None
+        try:
+            summary = await run_scan_tick(self._context)
+            log.info(
+                "scan tick: scanned=%d alerts=%d errors=%d",
+                summary.tickers_scanned,
+                summary.alerts_enqueued,
+                len(summary.errors),
+            )
+        except Exception:
+            log.exception("scan tick failed catastrophically")
