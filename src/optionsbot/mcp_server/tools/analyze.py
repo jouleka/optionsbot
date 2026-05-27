@@ -83,6 +83,9 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
             .where(strategy_scores.c.snapshot_id == row.id)
             .order_by(desc(strategy_scores.c.score))
         ).fetchall()
+    # direction_strength and earnings_in_window are not persisted on the
+    # snapshots table -- both are derivable on the next fresh scan. The fresh
+    # path returns concrete values for both via dump_view(MarketView).
     view = {
         "direction": row.regime_dir,
         "direction_strength": None,
@@ -91,6 +94,11 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
         "earnings_in_window": None,
         "warming_up": (row.raw_json or {}).get("warming_up") if row.raw_json else None,
     }
+    # Mirrors top_k(scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD) but
+    # operates on DB rows instead of ScoredStrategy objects. The score_rows
+    # query above already orders by `desc(score)`, so filtering then slicing
+    # produces the same selection. If top_k ever grows tie-breaking or
+    # diversity logic, update this branch to match.
     selected = [r for r in score_rows if r.score >= DEFAULT_THRESHOLD][:DEFAULT_TOP_K]
     return {
         "ok": True,

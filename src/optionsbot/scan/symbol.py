@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import cast
@@ -106,6 +107,13 @@ async def scan_symbol(
     spot = stock.mid or stock.last or 0.0
     atm_iv = _atm_iv(chain, spot)
     hv20 = historical_volatility(bars["close"], window=20) if not bars.empty else None
+    # historical_volatility returns float('nan') (not None) when the bar history
+    # is shorter than window+1. The scoring layer's iv_hv_score guards `hv is
+    # None` but NOT `math.isnan(hv)`, and Python's min/max skip NaN -- so a NaN
+    # hv20 silently produces iv_hv_score=1.0 instead of the intended neutral 0.5.
+    # Normalize to None here so downstream guards work as written.
+    if hv20 is not None and math.isnan(hv20):
+        hv20 = None
     iv_history = (
         pd.Series([atm_iv]) if atm_iv is not None else pd.Series([], dtype=float)
     )

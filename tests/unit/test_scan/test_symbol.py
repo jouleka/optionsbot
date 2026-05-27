@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
+import pandas as pd
 from sqlalchemy import select
 
 from optionsbot.scan import ScanResult, scan_symbol
@@ -85,3 +88,39 @@ async def test_scan_symbol_partial_view_override_only_direction(
     )
     assert result.view.direction == "bear"
     assert result.view.iv_regime == inferred_iv
+
+
+async def test_scan_symbol_normalizes_nan_hv20_to_none(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    """historical_volatility returns NaN when bars are shorter than window+1;
+    scan_symbol must normalize that to None so the snapshots row stores NULL
+    and the scoring layer's `hv is None` guard catches it as intended.
+    """
+    # Replace the history fixture with one shorter than window=20.
+    import optionsbot.scan.symbol as symbol_mod
+    short_dates = [date(2026, 5, 1) + timedelta(days=i) for i in range(5)]
+    short_bars = pd.DataFrame(
+        {
+            "open": [400.0] * 5,
+            "high": [401.0] * 5,
+            "low": [399.0] * 5,
+            "close": [400.0 + i for i in range(5)],
+            "volume": [1_000_000] * 5,
+        },
+        index=pd.Index(short_dates, name="date"),
+    )
+    short_history = symbol_mod.HistoryClient.return_value  # type: ignore[attr-defined]
+    short_history.get_history.return_value = short_bars
+
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(
+            select(snapshots).where(snapshots.c.id == result.snapshot_id)
+        ).first()
+    assert row is not None
+    # Persisted column is NULL (None when read back), NOT NaN.
+    assert row.hv20 is None
+    # iv_hv_ratio should also be None since hv20 collapsed to None.
+    assert row.iv_hv_ratio is None
