@@ -15,11 +15,8 @@ def build_server() -> FastMCP:
 
 
 def _register_tools(server: FastMCP) -> None:
-    """Hook for tool modules to register their @server.tool() handlers.
-
-    Filled in by Task 2 (watchlist), Task 3 (analyze), Task 4 (snapshot tools).
-    """
-    from optionsbot.mcp_server.tools import analyze, watchlist
+    from optionsbot.mcp_server.tools import analyze, snapshots, watchlist
 
     watchlist.register(server)
     analyze.register(server)
+    snapshots.register(server)

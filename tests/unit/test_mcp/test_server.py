@@ -24,12 +24,18 @@ def test_build_server_has_lifespan_configured() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_server_registers_watchlist_tools() -> None:
-    """Task 2 wires in the four watchlist tools."""
+async def test_build_server_registers_all_seven_tools() -> None:
+    """Tasks 2-4 wire in all 7 MCP tools."""
     server = build_server()
     tools = await server.list_tools()
     names = {t.name for t in tools}
-    assert {
-        "add_to_watchlist", "remove_from_watchlist",
-        "list_watchlist", "set_view_override",
-    } <= names
+    expected = {
+        "add_to_watchlist",
+        "remove_from_watchlist",
+        "list_watchlist",
+        "set_view_override",
+        "analyze",
+        "latest_snapshot",
+        "score_breakdown",
+    }
+    assert expected <= names
