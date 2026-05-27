@@ -10,7 +10,7 @@ from typing import cast
 from sqlalchemy import insert, select
 
 from optionsbot.analysis.types import Direction, IVRegime
-from optionsbot.daemon.alert_pipeline import enqueue_alert
+from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.scan import scan_symbol
@@ -51,6 +51,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             errors=[],
         )
 
+    retries_dispatched = await sweep_retries(context)
     symbols = _load_watchlist(context)
     tickers_scanned = 0
     alerts_enqueued = 0
@@ -84,7 +85,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         finished_at=finished_at,
         tickers_scanned=tickers_scanned,
         alerts_enqueued=alerts_enqueued,
-        retries_dispatched=0,  # Task 5 wires sweep-retries into this number.
+        retries_dispatched=retries_dispatched,
         # Defensive copy: frozen=True freezes the field binding but not the
         # list itself; future callers mutating summary.errors must not
         # silently mutate the local list that already shaped the persisted

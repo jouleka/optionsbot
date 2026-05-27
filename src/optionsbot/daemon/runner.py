@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 
 from optionsbot.config import Settings, get_settings
 from optionsbot.daemon.context import DaemonContext
@@ -24,8 +25,21 @@ class Daemon:
         self._context: DaemonContext | None = None
         self._stop_event = asyncio.Event()
 
+    def install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Wire SIGTERM and SIGINT to request_stop() so Ctrl-C / systemd-stop
+        triggers graceful shutdown instead of a noisy KeyboardInterrupt."""
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self.request_stop)
+            except NotImplementedError:
+                # add_signal_handler isn't supported on Windows; the daemon
+                # runs in WSL Ubuntu so this is the unusual path.
+                pass
+
     async def start(self) -> int:
         """Build context, start scheduler, run until stop_event is set. Returns exit code."""
+        loop = asyncio.get_running_loop()
+        self.install_signal_handlers(loop)
         self._context = self._build_context()
         try:
             await self._context.ibkr.connect()
