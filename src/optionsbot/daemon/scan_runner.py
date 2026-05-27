@@ -85,7 +85,11 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         tickers_scanned=tickers_scanned,
         alerts_enqueued=alerts_enqueued,
         retries_dispatched=0,  # Task 5 wires sweep-retries into this number.
-        errors=errors,
+        # Defensive copy: frozen=True freezes the field binding but not the
+        # list itself; future callers mutating summary.errors must not
+        # silently mutate the local list that already shaped the persisted
+        # scan_runs row.
+        errors=list(errors),
     )
 
 
