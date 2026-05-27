@@ -33,16 +33,20 @@ def _md_escape(text: str) -> str:
 
 
 def _format_legs(legs: Iterable[Leg]) -> str:
+    # Wrap each leg's data in a backtick code span so fractional strikes
+    # (e.g., 410.5 -> the "." char) and any future leg-data special chars
+    # don't break MarkdownV2 parsing. Inside code spans, only ` and \
+    # need escaping.
     parts: list[str] = []
     for leg in legs:
         if leg.sec_type == "STK":
-            parts.append(f"  • {leg.side} {leg.quantity} shares {leg.symbol}")
+            parts.append(f"  • `{leg.side} {leg.quantity} shares {leg.symbol}`")
             continue
         strike = f"{leg.strike:g}" if leg.strike is not None else "?"
         right = leg.right or "?"
         expiry = leg.expiry or "?"
         parts.append(
-            f"  • {leg.side} {expiry} {strike}{right}"
+            f"  • `{leg.side} {expiry} {strike}{right}`"
         )
     return "\n".join(parts)
 
@@ -61,15 +65,17 @@ def format_alert_markdown(
     if not sug.defined_risk:
         lines.append("⚠ *UNDEFINED RISK*")
 
-    # Header line: bold symbol, plain strategy name (underscores safe in plain text between bold),
-    # score in a code span (no escaping needed inside backticks).
-    lines.append(f"*{symbol}* — {scored.strategy_name} score `{scored.score:.1f}`")
+    # Header line: bold symbol, strategy name in backticks (snake_case names
+    # like iron_condor or bull_put_spread contain `_` which would otherwise
+    # parse as italic markers outside a code span).
+    lines.append(f"*{symbol}* — `{scored.strategy_name}` score `{scored.score:.1f}`")
 
-    # View line: direction/regime are plain text strings (no special chars expected),
-    # iv_rank_value formatted as decimal inside parentheses — parens need escaping.
+    # View line: direction/regime are Literal values with no special chars.
+    # iv_rank_value contains a `.` so it goes inside a code span; parens
+    # around it are escaped because they live outside the backticks.
     if view.iv_rank_value is not None:
         lines.append(
-            f"view: {view.direction}/{view.iv_regime} \\(rank {view.iv_rank_value:.2f}\\)"
+            f"view: {view.direction}/{view.iv_regime} \\(rank `{view.iv_rank_value:.2f}`\\)"
         )
     else:
         lines.append(f"view: {view.direction}/{view.iv_regime}")
@@ -93,7 +99,9 @@ def format_alert_markdown(
     # Rationale: escape user-supplied text that may contain special chars.
     lines.append(_md_escape(scored.rationale))
     lines.append("")
-    # Snapshot timestamp in italic — escape the timestamp string (contains - and :).
-    lines.append(f"_snapshot {snapshot_ts.isoformat()}_")
+    # Snapshot timestamp inside italic: even inside _..._ all special chars
+    # except `_` and `\` still need escaping (Telegram MarkdownV2 rule).
+    # The isoformat() output has `-`, `:`, `+`, `.` — all of which must be escaped.
+    lines.append(f"_snapshot {_md_escape(snapshot_ts.isoformat())}_")
 
     return "\n".join(lines)

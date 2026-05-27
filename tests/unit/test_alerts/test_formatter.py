@@ -109,3 +109,46 @@ def test_format_includes_rationale() -> None:
         snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
     )
     assert "High IV rank" in md
+
+
+def test_format_wraps_underscore_strategy_name_in_code_span() -> None:
+    """Strategy names like iron_condor contain `_` which Telegram MarkdownV2
+    parses as italic markers OUTSIDE code spans. The formatter must wrap
+    the strategy name in backticks so the body never reaches Telegram with
+    unmatched italic markers (which would produce HTTP 400 or broken render).
+    """
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(),
+        scored=_scored(name="bull_put_spread"),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "`bull_put_spread`" in md
+
+
+def test_format_escapes_specials_outside_code_spans() -> None:
+    """Verify the rationale's `+` and `.` and the timestamp's `-` and `+`
+    are properly backslash-escaped (Telegram MarkdownV2 requires escaping
+    these even inside italic _..._ spans)."""
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(),
+        scored=_scored(),  # rationale contains "+" and "."
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    # Rationale "High IV rank + tight liquidity." -> "+" and "." escaped.
+    assert "\\+ tight liquidity" in md
+    assert "liquidity\\." in md
+    # Timestamp 2026-05-27T15:30:00+00:00 -> "-" and "+" escaped.
+    assert "2026\\-05\\-27" in md
+    assert "\\+00:00" in md
+
+
+def test_format_wraps_iv_rank_decimal_in_code_span() -> None:
+    """The IV rank value (0.72) contains a `.` which is special outside
+    code spans. The formatter wraps it in backticks so the message stays
+    valid MarkdownV2."""
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(),
+        scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "`0.72`" in md
