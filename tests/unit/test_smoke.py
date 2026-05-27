@@ -20,5 +20,6 @@ def test_mcp_main_is_callable() -> None:
     assert callable(mcp_main.main)
 
 
-def test_daemon_main_returns_nonzero_for_now() -> None:
-    assert daemon_main.main() == 1
+def test_daemon_main_is_callable() -> None:
+    """daemon_main.main is a callable (real implementation replaces the old stub)."""
+    assert callable(daemon_main.main)

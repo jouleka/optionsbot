@@ -18,6 +18,9 @@ dependencies = [
     "pyarrow>=15",
     "yfinance>=0.2.40",
     "mcp>=1.13",
+    "APScheduler>=3.11",
+    "pandas-market-calendars>=5.4",
+    "httpx>=0.28",
 ]
 
 [project.scripts]
@@ -55,6 +58,12 @@ python_version = "3.12"
 strict = true
 warn_unused_configs = true
 packages = ["optionsbot"]
+
+# APScheduler and pandas-market-calendars ship no py.typed marker or stubs;
+# ignore missing imports globally for these packages rather than per-call-site.
+[[tool.mypy.overrides]]
+module = ["apscheduler.*", "pandas_market_calendars.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

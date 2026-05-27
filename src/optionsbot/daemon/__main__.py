@@ -1,13 +1,23 @@
 """Entry point for the `optionsbot-daemon` console script."""
-import sys
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from optionsbot.config import get_settings
+from optionsbot.daemon.runner import Daemon
 
 
 def main() -> int:
-    sys.stderr.write(
-        "optionsbot-daemon is not yet implemented. See IBK-7 for the implementation plan.\n"
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    return 1
+    daemon = Daemon(settings=settings)
+    return asyncio.run(daemon.start())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
