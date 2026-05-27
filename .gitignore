@@ -23,3 +23,6 @@ uv.lock
 # editors
 .vscode/
 .idea/
+
+# Claude Code MCP config (machine-specific paths)
+.mcp.json

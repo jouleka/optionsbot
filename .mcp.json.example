@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "optionsbot": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/srv/optionsbot/source",
+        "optionsbot-mcp"
+      ],
+      "env": {
+        "OPTIONSBOT_IBKR__HOST": "127.0.0.1",
+        "OPTIONSBOT_IBKR__PORT": "4002",
+        "OPTIONSBOT_IBKR__CLIENT_ID_MCP": "1"
+      }
+    }
+  }
+}
