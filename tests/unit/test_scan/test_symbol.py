@@ -124,3 +124,20 @@ async def test_scan_symbol_normalizes_nan_hv20_to_none(
     assert row.hv20 is None
     # iv_hv_ratio should also be None since hv20 collapsed to None.
     assert row.iv_hv_ratio is None
+
+
+async def test_scan_symbol_passes_spot_and_strike_window_to_get_chain(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """scan_symbol feeds the underlying spot + configured strike window into
+    get_chain so it can bound the fetch to near-ATM strikes."""
+    import optionsbot.scan.symbol as symbol_mod
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    get_chain = symbol_mod.ChainClient.return_value.get_chain  # type: ignore[attr-defined]
+    get_chain.assert_awaited_once()
+    kwargs = get_chain.await_args.kwargs
+    assert kwargs["underlying_price"] == 400.0  # fake_stock_quote.mid
+    assert kwargs["strike_band_pct"] == scan_settings.scan.strike_band_pct  # type: ignore[attr-defined]
+    assert kwargs["max_strikes_per_side"] == scan_settings.scan.max_strikes_per_side  # type: ignore[attr-defined]

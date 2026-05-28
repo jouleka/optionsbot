@@ -68,7 +68,13 @@ def _qualify_side_effect(c: MagicMock) -> list[MagicMock]:
 def chain_client(mock_ib) -> ChainClient:
     mock_ib.isConnected.return_value = True
     client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
-    return ChainClient(client, max_concurrent=4, max_calls_per_window=50, window_seconds=10.0)
+    return ChainClient(
+        client,
+        max_concurrent=4,
+        max_calls_per_window=50,
+        window_seconds=10.0,
+        secdef_retry_delay=0.0,
+    )
 
 
 async def test_chain_filters_expiries_to_window(chain_client, mock_ib) -> None:
@@ -128,3 +134,82 @@ async def test_chain_leg_carries_greeks_and_oi(chain_client, mock_ib) -> None:
         assert leg.iv == pytest.approx(0.25)
         assert leg.open_interest == 1234
         assert leg.volume == 99
+
+
+async def test_chain_windows_strikes_by_band(chain_client, mock_ib) -> None:
+    # spot=400, band +/-10% => [360, 440]. 350 and 450 fall outside the band.
+    expiries = [_expiry(35)]
+    strikes = [350.0, 360.0, 400.0, 440.0, 450.0]
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    legs = await chain_client.get_chain(
+        "SPY",
+        dte_window=(25, 55),
+        underlying_price=400.0,
+        strike_band_pct=0.10,
+        max_strikes_per_side=10,
+    )
+    assert {leg.strike for leg in legs} == {360.0, 400.0, 440.0}
+
+
+async def test_chain_caps_strikes_per_side(chain_client, mock_ib) -> None:
+    # Wide band, but cap=2/side => nearest 2 below + ATM + nearest 2 above.
+    expiries = [_expiry(35)]
+    strikes = [395.0, 396.0, 397.0, 398.0, 399.0, 400.0, 401.0, 402.0, 403.0, 404.0, 405.0]
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    legs = await chain_client.get_chain(
+        "SPY",
+        dte_window=(25, 55),
+        underlying_price=400.0,
+        strike_band_pct=1.0,
+        max_strikes_per_side=2,
+    )
+    assert sorted({leg.strike for leg in legs}) == [398.0, 399.0, 400.0, 401.0, 402.0]
+
+
+async def test_chain_uses_median_strike_when_no_underlying_price(chain_client, mock_ib) -> None:
+    # No underlying_price -> reference = median of listed strikes (300).
+    # band +/-10% of 300 = [270, 330] -> only 300 survives.
+    expiries = [_expiry(35)]
+    strikes = [100.0, 200.0, 300.0, 400.0, 500.0]
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    legs = await chain_client.get_chain(
+        "SPY",
+        dte_window=(25, 55),
+        underlying_price=None,
+        strike_band_pct=0.10,
+        max_strikes_per_side=10,
+    )
+    assert {leg.strike for leg in legs} == {300.0}
+
+
+async def test_chain_retries_secdef_until_expiries_in_window(mock_ib) -> None:
+    # First secdef result is degenerate (only an out-of-window expiry); the
+    # retry returns the full set. get_chain should retry and then succeed.
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(client, secdef_retries=2, secdef_retry_delay=0.0)
+    bad = _opt_params([_expiry(5)], [400.0])  # 5 DTE -> outside (25, 55)
+    good = _opt_params([_expiry(35)], [400.0])  # 35 DTE -> inside the window
+    mock_ib.reqSecDefOptParamsAsync.side_effect = [bad, good]
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+    assert {leg.expiry for leg in legs} == {_expiry(35)}
+    assert mock_ib.reqSecDefOptParamsAsync.await_count == 2
+
+
+async def test_chain_returns_empty_after_secdef_retries_exhausted(mock_ib) -> None:
+    # Every secdef result is degenerate -> give up after retries+1 attempts.
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(client, secdef_retries=2, secdef_retry_delay=0.0)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(5)], [400.0])
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+    assert legs == []
+    assert mock_ib.reqSecDefOptParamsAsync.await_count == 3  # initial + 2 retries

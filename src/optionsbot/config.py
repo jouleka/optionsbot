@@ -42,6 +42,10 @@ class ScanSettings(BaseModel):
     score_threshold: int = Field(default=70, ge=0, le=100)
     alert_cooldown_hours: int = Field(default=4, ge=0)  # 0 disables the cooldown
     alert_rescore_delta: int = Field(default=10, ge=0, le=100)
+    # Chain fetch: bound the strike set to a near-ATM window so a scan doesn't
+    # pull the full ladder (~497 strikes for SPY) x every in-window expiry.
+    strike_band_pct: float = Field(default=0.15, gt=0.0, le=1.0)
+    max_strikes_per_side: int = Field(default=40, ge=1)
 
 
 class StorageSettings(BaseModel):

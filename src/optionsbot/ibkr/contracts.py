@@ -54,7 +54,7 @@ class ContractResolver:
         from ib_async import Stock
         contract = Stock(symbol, "SMART", "USD")
         qualified = await self._client.ib.qualifyContractsAsync(contract)
-        if not qualified:
+        if not qualified or qualified[0] is None:
             raise ValueError(f"Could not qualify stock contract for symbol={symbol!r}")
         # qualifyContractsAsync's default (returnAll=False) returns list[Contract];
         # the union return type in stubs is for the returnAll=True variant.
@@ -77,7 +77,7 @@ class ContractResolver:
         from ib_async import Option
         contract = Option(symbol, expiry, strike, right, exchange)
         qualified = await self._client.ib.qualifyContractsAsync(contract)
-        if not qualified:
+        if not qualified or qualified[0] is None:
             raise ValueError(
                 f"Could not qualify option contract: symbol={symbol!r} expiry={expiry!r} "
                 f"strike={strike!r} right={right!r}"
@@ -90,6 +90,6 @@ class ContractResolver:
         """Qualify an already-constructed Contract. Used for advanced flows."""
         await self._client.ensure_connected()
         qualified = await self._client.ib.qualifyContractsAsync(contract)
-        if not qualified:
+        if not qualified or qualified[0] is None:
             raise ValueError(f"Could not qualify contract: {contract!r}")
         return cast("Contract", qualified[0])

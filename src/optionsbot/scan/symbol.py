@@ -99,14 +99,21 @@ async def scan_symbol(
     market_client = MarketDataClient(ibkr, resolver=resolver)
     positions_client = PositionsClient(ibkr)
 
-    bars, chain, stock, positions = await asyncio.gather(
+    # Fetch the stock snapshot first so the spot can drive get_chain's near-ATM
+    # strike windowing; the remaining calls then run concurrently.
+    stock = await market_client.get_stock_snapshot(symbol)
+    spot = stock.mid or stock.last or 0.0
+    bars, chain, positions = await asyncio.gather(
         history_client.get_history(symbol, days=120),
-        chain_client.get_chain(symbol),
-        market_client.get_stock_snapshot(symbol),
+        chain_client.get_chain(
+            symbol,
+            underlying_price=spot,
+            strike_band_pct=settings.scan.strike_band_pct,
+            max_strikes_per_side=settings.scan.max_strikes_per_side,
+        ),
         positions_client.get_positions(),
     )
 
-    spot = stock.mid or stock.last or 0.0
     atm_iv = _atm_iv(chain, spot)
     hv20 = historical_volatility(bars["close"], window=20) if not bars.empty else None
     # historical_volatility returns float('nan') (not None) when the bar history

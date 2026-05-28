@@ -89,6 +89,21 @@ async def test_stock_raises_when_ib_returns_empty(resolver, mock_ib) -> None:
         await resolver.stock("NOTREAL")
 
 
+async def test_option_raises_when_ib_returns_list_with_none(resolver, mock_ib) -> None:
+    # ib_async returns [None] (a NON-empty list) for an unqualifiable
+    # (expiry, strike) combo, not []. The guard must still reject it so the
+    # caller gets a ValueError rather than a None contract.
+    mock_ib.qualifyContractsAsync.return_value = [None]
+    with pytest.raises(ValueError, match="Could not qualify"):
+        await resolver.option("SPY", "20260619", 99999.0, "C")
+
+
+async def test_stock_raises_when_ib_returns_list_with_none(resolver, mock_ib) -> None:
+    mock_ib.qualifyContractsAsync.return_value = [None]
+    with pytest.raises(ValueError, match="Could not qualify"):
+        await resolver.stock("NOTREAL")
+
+
 def test_contract_cache_key_is_deterministic() -> None:
     k1 = _contract_cache_key("STK", "SPY", None, None, None)
     k2 = _contract_cache_key("STK", "SPY", None, None, None)
