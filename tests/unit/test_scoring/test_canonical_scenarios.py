@@ -114,30 +114,24 @@ def test_neutral_high_iv_favours_short_premium_neutral_strategies() -> None:
 
 
 def test_neutral_low_iv_favours_long_premium_neutral_strategies() -> None:
-    """Low-IV neutral: long premium becomes the play. long_straddle,
-    long_strangle should dominate over short premium. calendar_spread may also
-    appear (applicable to neutral/low) but is not long_premium by classification."""
+    """Low-IV neutral: long premium becomes the play. long_straddle and
+    long_strangle should dominate.
+
+    Note: calendar_spread is technically applicable to neutral/low but is
+    filtered out by score_all here because the test fixture only contains
+    one expiry (calendar requires two). The iv_rank inversion specifically
+    is exercised by test_long_premium_plays_have_inverted_iv_rank_factor.
+    """
     view = _make_view("neutral", "weak", "low", iv_rank=0.10)
     snap = _build_snapshot(view, iv_rank=0.10, atm_iv=0.12, hv20=0.20)
     scored = _scored_by_name(snap)
-    # In neutral/low, applicable strategies are: long_straddle, long_strangle,
-    # calendar_spread. All three are expected to be in this scenario.
     long_premium_neutral = {"long_straddle", "long_strangle", "calendar_spread"}
-    # The top strategy should be one of these (they are the only applicable ones).
     assert len(scored) >= 1, "at least one strategy must be applicable to neutral-low"
     top_strategy = max(scored.items(), key=lambda x: x[1])[0]
     assert top_strategy in long_premium_neutral, (
         f"Expected a neutral-low strategy at the top, got {top_strategy} "
         f"with scores {sorted(scored.items(), key=lambda x: -x[1])[:5]}"
     )
-    # long_straddle and long_strangle should score higher than calendar_spread
-    # because they are long_premium=True and the iv_rank factor is inverted for them.
-    if "long_straddle" in scored and "calendar_spread" in scored:
-        assert scored["long_straddle"] >= scored["calendar_spread"], (
-            f"long_straddle (long_premium=True) should outrank calendar_spread "
-            f"(long_premium=False) at low iv_rank: "
-            f"straddle={scored['long_straddle']}, cal={scored['calendar_spread']}"
-        )
 
 
 def test_bullish_high_iv_favours_bull_short_premium() -> None:
