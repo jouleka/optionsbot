@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from optionsbot.ibkr._util import clean_float, clean_int
 
 
@@ -47,3 +49,9 @@ def test_clean_int_truncates_float_to_int() -> None:
 def test_clean_int_returns_none_for_unconvertible_string() -> None:
     """If a non-numeric string sneaks through, return None rather than crash."""
     assert clean_int("not-a-number") is None  # type: ignore[arg-type]
+
+
+def test_clean_int_returns_none_for_infinity() -> None:
+    """int(math.inf) raises OverflowError; the helper must catch it."""
+    assert clean_int(math.inf) is None
+    assert clean_int(-math.inf) is None

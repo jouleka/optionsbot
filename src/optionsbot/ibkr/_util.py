@@ -35,5 +35,7 @@ def clean_int(value: float | int | None) -> int | None:
         pass
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(math.inf) raises; treat as missing per the
+        # function's documented "or unconvertible -> None" contract.
         return None
