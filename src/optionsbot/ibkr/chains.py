@@ -14,9 +14,9 @@ hit the gateway is gated by RateLimiter to stay under IBKR pacing.
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import date, datetime
 
+from optionsbot.ibkr._util import clean_float, clean_int
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.pacing import ConcurrencyLimiter, RateLimiter
@@ -25,31 +25,6 @@ from optionsbot.ibkr.types import OptionChainLeg, OptionRight
 _DEFAULT_MAX_CONCURRENT = 8
 _DEFAULT_RATE_LIMIT = 50  # calls per window
 _DEFAULT_RATE_WINDOW = 10.0  # seconds
-
-
-def _clean(value: float | None) -> float | None:
-    if value is None:
-        return None
-    try:
-        if math.isnan(value):
-            return None
-    except TypeError:
-        return value
-    return value
-
-
-def _int_or_none(v: float | int | None) -> int | None:
-    if v is None:
-        return None
-    try:
-        if math.isnan(v):
-            return None
-    except TypeError:
-        pass
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
 
 
 def _dte(expiry: str, today: date | None = None) -> int:
@@ -133,8 +108,8 @@ class ChainClient:
             if not tickers:
                 return None
             t = tickers[0]
-            bid = _clean(getattr(t, "bid", None))
-            ask = _clean(getattr(t, "ask", None))
+            bid = clean_float(getattr(t, "bid", None))
+            ask = clean_float(getattr(t, "ask", None))
             g = getattr(t, "modelGreeks", None)
             return OptionChainLeg(
                 symbol=symbol,
@@ -143,11 +118,11 @@ class ChainClient:
                 right=right,
                 bid=bid,
                 ask=ask,
-                iv=_clean(getattr(g, "impliedVol", None)) if g is not None else None,
-                delta=_clean(getattr(g, "delta", None)) if g is not None else None,
-                gamma=_clean(getattr(g, "gamma", None)) if g is not None else None,
-                theta=_clean(getattr(g, "theta", None)) if g is not None else None,
-                vega=_clean(getattr(g, "vega", None)) if g is not None else None,
-                open_interest=_int_or_none(getattr(t, "openInterest", None)),
-                volume=_int_or_none(getattr(t, "volume", None)),
+                iv=clean_float(getattr(g, "impliedVol", None)) if g is not None else None,
+                delta=clean_float(getattr(g, "delta", None)) if g is not None else None,
+                gamma=clean_float(getattr(g, "gamma", None)) if g is not None else None,
+                theta=clean_float(getattr(g, "theta", None)) if g is not None else None,
+                vega=clean_float(getattr(g, "vega", None)) if g is not None else None,
+                open_interest=clean_int(getattr(t, "openInterest", None)),
+                volume=clean_int(getattr(t, "volume", None)),
             )
