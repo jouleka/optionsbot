@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import sys
+from pathlib import Path
 
 import typer
 
@@ -25,10 +28,256 @@ def _stub(name: str, epic: str) -> None:
     raise typer.Exit(code=2)
 
 
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CONFIG_TOML = """\
+# optionsbot configuration. Env vars (prefix OPTIONSBOT_, nested via __)
+# override these values at runtime.
+
+[ibkr]
+host = "127.0.0.1"
+port = 4002         # 4002 = paper IB Gateway; 4001 = live (do not use)
+paper = true
+# client_id_mcp = 1
+# client_id_daemon = 2
+
+[scan]
+interval_minutes = 15
+score_threshold = 70
+alert_cooldown_hours = 4
+alert_rescore_delta = 10
+
+[telegram]
+# bot_token = "123456:ABC-..."
+# chat_id = "123456789"
+
+[storage]
+# db_path = "~/.local/share/optionsbot/optionsbot.db"
+
+log_level = "INFO"
+"""
+
+_TELEGRAM_SECTION_RE = re.compile(
+    r"^\[telegram\][^\[]*",
+    re.MULTILINE,
+)
+
+
+def _ensure_config_dir(override: Path | None) -> Path:
+    """Create the config dir if missing. Return its absolute Path."""
+    cfg_dir = (
+        override if override is not None else Path.home() / ".config" / "optionsbot"
+    ).expanduser()
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    typer.echo(f"config dir: {cfg_dir}")
+    return cfg_dir
+
+
+def _write_default_config(cfg_dir: Path, non_interactive: bool) -> Path:
+    """Write the default config.toml if missing. Return its path.
+
+    If the file already exists, prompt before overwriting (or skip in
+    non-interactive mode).
+    """
+    cfg_path = cfg_dir / "config.toml"
+    if cfg_path.exists():
+        if non_interactive:
+            typer.echo(f"config exists, leaving in place: {cfg_path}")
+            return cfg_path
+        if not typer.confirm(
+            f"config.toml exists at {cfg_path}. Overwrite with defaults?",
+            default=False,
+        ):
+            typer.echo("keeping existing config")
+            return cfg_path
+    cfg_path.write_text(_DEFAULT_CONFIG_TOML)
+    typer.echo(f"wrote default config: {cfg_path}")
+    return cfg_path
+
+
+def _run_migrations() -> None:
+    """Run alembic upgrade head against the configured DB path."""
+    from alembic.config import Config
+
+    from alembic import command
+    from optionsbot.config import get_settings, load_settings
+
+    # Use load_settings so a freshly-written config.toml is read.
+    get_settings.cache_clear()
+    settings = load_settings()
+    db_path = settings.storage.db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    project_root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, "head")
+    typer.echo(f"db migrated: {db_path}")
+
+
+def _persist_telegram_creds(cfg_path: Path, token: str, chat_id: str) -> None:
+    """Replace (or append) the [telegram] section in config.toml with the
+    provided credentials. Preserves the rest of the file."""
+    body = cfg_path.read_text()
+    new_section = (
+        f"[telegram]\n"
+        f'bot_token = "{token}"\n'
+        f'chat_id = "{chat_id}"\n'
+    )
+    if _TELEGRAM_SECTION_RE.search(body):
+        body = _TELEGRAM_SECTION_RE.sub(new_section, body, count=1)
+    else:
+        if not body.endswith("\n"):
+            body += "\n"
+        body += "\n" + new_section
+    cfg_path.write_text(body)
+    typer.echo(f"  saved Telegram credentials to {cfg_path}")
+
+
+async def _send_telegram_test(token: str, chat_id: str) -> int | None:
+    """Try to send 'optionsbot init test message'. Return msg_id or None."""
+    from optionsbot.daemon.telegram_client import TelegramClient
+
+    client = TelegramClient(token, chat_id)
+    try:
+        msg_id = await client.send_message("optionsbot init test message")
+        return msg_id
+    except Exception as e:  # noqa: BLE001 -- surface a friendly error
+        msg = str(e)
+        hint = ""
+        if "401" in msg or "Unauthorized" in msg:
+            hint = " (check bot_token)"
+        elif "400" in msg or "chat not found" in msg.lower():
+            hint = " (start a chat with your bot first, then re-run)"
+        typer.secho(
+            f"  ✗ Telegram send failed: {type(e).__name__}: {msg}{hint}",
+            fg=typer.colors.RED,
+        )
+        return None
+    finally:
+        await client.aclose()
+
+
+def _configure_telegram(cfg_path: Path, non_interactive: bool, skip_test: bool) -> None:
+    """Prompt for Telegram credentials + optionally test send.
+
+    In non-interactive mode, uses whatever's already in config.toml /
+    env vars (no prompts). If credentials are blank after that, prints
+    a notice and returns.
+    """
+    from optionsbot.config import get_settings, load_settings
+
+    get_settings.cache_clear()
+    settings = load_settings()
+    token = settings.telegram.bot_token
+    chat_id = settings.telegram.chat_id
+
+    if not non_interactive and not (token and chat_id):
+        typer.echo("\nTelegram setup (skip with --skip-telegram):")
+        token_in = typer.prompt(
+            "  bot_token (leave blank to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+        chat_in = typer.prompt(
+            "  chat_id (leave blank to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+        if token_in and chat_in:
+            _persist_telegram_creds(cfg_path, token_in, chat_in)
+            token = token_in
+            chat_id = chat_in
+            # Re-load so subsequent steps see the new values.
+            get_settings.cache_clear()
+
+    if not (token and chat_id):
+        typer.echo(
+            "Telegram not configured -- daemon alerts will be disabled"
+            " until you set bot_token + chat_id."
+        )
+        return
+
+    if skip_test:
+        typer.echo("Telegram configured; skipping test send (--skip-test).")
+        return
+
+    typer.echo("Sending Telegram test message...")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        # Inside an already-running loop (e.g. typer test runner).
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _send_telegram_test(token, chat_id))
+            msg_id = future.result()
+    else:
+        msg_id = asyncio.run(_send_telegram_test(token, chat_id))
+    if msg_id is not None:
+        typer.secho(f"  ✓ message sent (id={msg_id})", fg=typer.colors.GREEN)
+
+
+def _final_summary(cfg_dir: Path) -> str:
+    return (
+        f"setup complete.\n\n"
+        f"next steps:\n"
+        f"  1. Review {cfg_dir / 'config.toml'} -- adjust ibkr.port if needed (4002 = paper).\n"
+        f"  2. Start IB Gateway on the configured port (paper account).\n"
+        f"  3. Run `optionsbot status` to verify connectivity.\n"
+        f"  4. Run `optionsbot-daemon` to start the scheduler.\n"
+    )
+
+
+async def _run_init(
+    non_interactive: bool,
+    skip_telegram: bool,
+    skip_test: bool,
+    config_dir: Path | None,
+) -> None:
+    typer.secho("optionsbot setup", fg=typer.colors.GREEN, bold=True)
+    cfg_dir = _ensure_config_dir(config_dir)
+    cfg_path = _write_default_config(cfg_dir, non_interactive)
+    _run_migrations()
+    if not skip_telegram:
+        _configure_telegram(cfg_path, non_interactive, skip_test)
+    typer.echo("\n" + _final_summary(cfg_dir))
+
+
 @app.command()
-def init() -> None:
+def init(
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help="Skip prompts; use existing config + env vars only.",
+    ),
+    skip_telegram: bool = typer.Option(
+        False,
+        "--skip-telegram",
+        help="Don't prompt for Telegram credentials and don't try to send a test message.",
+    ),
+    skip_test: bool = typer.Option(
+        False,
+        "--skip-test",
+        help="Skip the Telegram send test even if credentials are configured.",
+    ),
+    config_dir: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--config-dir",
+        help="Override the default ~/.config/optionsbot/ location (mainly for tests).",
+    ),
+) -> None:
     """Interactive setup: config dir, DB migrations, Telegram credentials."""
-    _stub("init", "IBK-73")
+    asyncio.run(_run_init(non_interactive, skip_telegram, skip_test, config_dir))
+
+
+# ---------------------------------------------------------------------------
+# Remaining stubs
+# ---------------------------------------------------------------------------
 
 
 @app.command()
