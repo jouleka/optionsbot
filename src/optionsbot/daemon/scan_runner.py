@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
@@ -13,6 +14,7 @@ from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
 from optionsbot.storage.schema import scan_runs, watchlist
@@ -39,62 +41,68 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
     closed (with tickers_scanned=0) so the daemon's heartbeat is visible.
     """
     started_at = datetime.now(UTC)
-    if not is_market_open(started_at):
+    scan_run_id = uuid.uuid4().hex
+    with bind_log_context(scan_run_id=scan_run_id, symbol=None):
+        if not is_market_open(started_at):
+            finished_at = datetime.now(UTC)
+            _persist_scan_run(context, started_at, finished_at, 0, 0, [])
+            log.info("scan tick skipped: market closed")
+            return ScanRunSummary(
+                started_at=started_at,
+                finished_at=finished_at,
+                tickers_scanned=0,
+                alerts_enqueued=0,
+                retries_dispatched=0,
+                errors=[],
+            )
+
+        retries_dispatched = await sweep_retries(context)
+        symbols = _load_watchlist(context)
+        tickers_scanned = 0
+        alerts_enqueued = 0
+        errors: list[str] = []
+
+        for sym, override in symbols:
+            with bind_log_context(symbol=sym):
+                try:
+                    result = await scan_symbol(
+                        sym, context.ibkr, context.engine, context.settings,
+                        resolver=context.resolver,
+                        view_override=override,
+                    )
+                except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
+                    log.exception("scan_symbol failed for %s", sym)
+                    errors.append(f"{sym}: {type(e).__name__}: {e}")
+                    continue
+                tickers_scanned += 1
+                selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+                for scored in selected:
+                    try:
+                        # enqueue_alert returns True when a row was actually inserted,
+                        # False when the dedup gate suppressed it. Increment only on
+                        # True so scan_runs.alerts_fired matches reality.
+                        if await enqueue_alert(context, sym, scored, result.snapshot_id):
+                            alerts_enqueued += 1
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
+                        errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
+
         finished_at = datetime.now(UTC)
-        _persist_scan_run(context, started_at, finished_at, 0, 0, [])
+        _persist_scan_run(
+            context, started_at, finished_at, tickers_scanned, alerts_enqueued, errors
+        )
         return ScanRunSummary(
             started_at=started_at,
             finished_at=finished_at,
-            tickers_scanned=0,
-            alerts_enqueued=0,
-            retries_dispatched=0,
-            errors=[],
+            tickers_scanned=tickers_scanned,
+            alerts_enqueued=alerts_enqueued,
+            retries_dispatched=retries_dispatched,
+            # Defensive copy: frozen=True freezes the field binding but not the
+            # list itself; future callers mutating summary.errors must not
+            # silently mutate the local list that already shaped the persisted
+            # scan_runs row.
+            errors=list(errors),
         )
-
-    retries_dispatched = await sweep_retries(context)
-    symbols = _load_watchlist(context)
-    tickers_scanned = 0
-    alerts_enqueued = 0
-    errors: list[str] = []
-
-    for sym, override in symbols:
-        try:
-            result = await scan_symbol(
-                sym, context.ibkr, context.engine, context.settings,
-                resolver=context.resolver,
-                view_override=override,
-            )
-        except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
-            log.exception("scan_symbol failed for %s", sym)
-            errors.append(f"{sym}: {type(e).__name__}: {e}")
-            continue
-        tickers_scanned += 1
-        selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
-        for scored in selected:
-            try:
-                # enqueue_alert returns True when a row was actually inserted,
-                # False when the dedup gate suppressed it. Increment only on
-                # True so scan_runs.alerts_fired matches reality.
-                if await enqueue_alert(context, sym, scored, result.snapshot_id):
-                    alerts_enqueued += 1
-            except Exception as e:  # noqa: BLE001
-                log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
-                errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
-
-    finished_at = datetime.now(UTC)
-    _persist_scan_run(context, started_at, finished_at, tickers_scanned, alerts_enqueued, errors)
-    return ScanRunSummary(
-        started_at=started_at,
-        finished_at=finished_at,
-        tickers_scanned=tickers_scanned,
-        alerts_enqueued=alerts_enqueued,
-        retries_dispatched=retries_dispatched,
-        # Defensive copy: frozen=True freezes the field binding but not the
-        # list itself; future callers mutating summary.errors must not
-        # silently mutate the local list that already shaped the persisted
-        # scan_runs row.
-        errors=list(errors),
-    )
 
 
 def _load_watchlist(

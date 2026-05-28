@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from optionsbot.config import get_settings
 from optionsbot.daemon.runner import Daemon
+from optionsbot.observability import configure_logging
 
 
 def main() -> int:
     settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(log_level=settings.log_level, env="dev")
     daemon = Daemon(settings=settings)
     return asyncio.run(daemon.start())
 

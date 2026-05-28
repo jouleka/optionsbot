@@ -21,6 +21,7 @@ dependencies = [
     "APScheduler>=3.11",
     "pandas-market-calendars>=5.4",
     "httpx>=0.28",
+    "structlog>=24.0",
 ]
 
 [project.scripts]

@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import logging
-
 from optionsbot.config import get_settings
 from optionsbot.mcp_server.server import build_server
+from optionsbot.observability import configure_logging
 
 
 def main() -> int:
     """Run the optionsbot MCP server over stdio."""
     settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(log_level=settings.log_level, env="dev")
     server = build_server()
     server.run()
     return 0
