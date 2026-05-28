@@ -57,3 +57,28 @@ async def test_concurrency_limiter_caps_inflight() -> None:
 async def test_concurrency_limiter_rejects_bad_param() -> None:
     with pytest.raises(ValueError):
         ConcurrencyLimiter(max_concurrent=0)
+
+
+async def test_rate_limiter_does_not_serialize_callers_during_sleep() -> None:
+    """While one caller sleeps waiting for the window to slide, other callers
+    must NOT be blocked on the lock. They should be able to acquire concurrently
+    once the window opens.
+
+    Pre-fix: all callers serialize on _lock during await asyncio.sleep(wait),
+    so even after the window slides they wake up one-by-one.
+
+    Post-fix: the lock is released before sleeping. When the window slides,
+    all waiters can re-check and acquire in parallel.
+    """
+    # 2 calls per 0.1s window. Fill the window, then have 3 callers race.
+    # Pre-fix elapsed for the 3 contenders would be ~3 * 0.1 = 0.3s minimum.
+    # Post-fix they should finish in ~0.1s (the wait), not ~0.3s.
+    lim = RateLimiter(max_calls=2, window_seconds=0.1)
+    for _ in range(2):
+        await lim.acquire()
+    start = time.monotonic()
+    await asyncio.gather(lim.acquire(), lim.acquire(), lim.acquire())
+    elapsed = time.monotonic() - start
+    # Loose upper bound: 2 wait windows (each contender may sleep once,
+    # but they overlap because the lock is released). Allow 0.25s budget.
+    assert elapsed < 0.25, f"expected concurrent re-check after sleep, got {elapsed}"

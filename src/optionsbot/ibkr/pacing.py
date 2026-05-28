@@ -35,8 +35,8 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            while True:
+        while True:
+            async with self._lock:
                 now = time.monotonic()
                 # Drop timestamps outside the trailing window.
                 while self._timestamps and now - self._timestamps[0] >= self._window:
@@ -44,9 +44,12 @@ class RateLimiter:
                 if len(self._timestamps) < self._max:
                     self._timestamps.append(now)
                     return
-                # Sleep until the oldest timestamp slides out of the window.
+                # Compute wait under the lock so the value is consistent with the deque state,
+                # but release the lock BEFORE sleeping so other callers can re-check the window.
                 wait = self._window - (now - self._timestamps[0])
-                await asyncio.sleep(wait)
+            # Sleep OUTSIDE the lock. After waking, the loop re-acquires the lock and
+            # re-evaluates the window from scratch (the deque may have changed in the meantime).
+            await asyncio.sleep(wait)
 
 
 class ConcurrencyLimiter:
