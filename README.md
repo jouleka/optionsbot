@@ -33,7 +33,9 @@ It does NOT place orders. Ever.
 
 ## Architecture
 
-Eight in-tree packages, each with a single responsibility:
+Eleven in-tree code units, each with a single responsibility (a few are
+modules rather than packages, hence "units" rather than strictly
+"packages"):
 
 | Package | Responsibility |
 |---|---|
