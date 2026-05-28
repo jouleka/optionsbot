@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import typer
@@ -271,14 +273,195 @@ def init(
 
 
 # ---------------------------------------------------------------------------
-# Remaining stubs
+# status
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _CheckResult:
+    name: str
+    state: str  # "ok" | "warn" | "fail"
+    detail: str
+
+
 @app.command()
-def status() -> None:
+def status(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of pretty text."
+    ),
+    no_telegram: bool = typer.Option(
+        False, "--no-telegram", help="Skip the Telegram getMe check."
+    ),
+) -> None:
     """Health check: DB, IB Gateway, daemon, Telegram bot reachability."""
-    _stub("status", "IBK-74")
+    code = asyncio.run(_run_status(json_output=json_output, no_telegram=no_telegram))
+    raise typer.Exit(code=code)
+
+
+async def _run_status(*, json_output: bool, no_telegram: bool) -> int:
+    from optionsbot.config import get_settings, load_settings
+
+    get_settings.cache_clear()
+    settings = load_settings()
+
+    db_check = _check_db(settings)
+    ibkr_check = _check_ibkr_socket(settings)
+    last_scan = _check_last_scan(settings)
+    last_alert = _check_last_alert(settings)
+    if no_telegram:
+        tg_check = _CheckResult("telegram", "warn", "skipped (--no-telegram)")
+    else:
+        tg_check = await _check_telegram(settings)
+
+    results = [db_check, ibkr_check, last_scan, last_alert, tg_check]
+
+    if json_output:
+        typer.echo(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        for r in results:
+            sigil = {"ok": "✓", "warn": "⚠", "fail": "✗"}[r.state]
+            color = {
+                "ok": typer.colors.GREEN,
+                "warn": typer.colors.YELLOW,
+                "fail": typer.colors.RED,
+            }[r.state]
+            typer.secho(f"{sigil} {r.name:14s} {r.detail}", fg=color)
+
+    # Critical subsystems: db + ibkr + telegram (only when not skipped).
+    critical = [db_check, ibkr_check]
+    if not no_telegram and tg_check.detail != "not configured":
+        critical.append(tg_check)
+    if any(c.state == "fail" for c in critical):
+        return 1
+    return 0
+
+
+def _check_db(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    from sqlalchemy import func, select
+
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.storage.schema import watchlist
+
+    db_path = settings.storage.db_path
+    if not db_path.exists():
+        return _CheckResult(
+            "db", "fail", f"{db_path} does not exist (run `optionsbot init`)"
+        )
+    try:
+        engine = create_engine_for_path(db_path)
+        with engine.connect() as conn:
+            count = (
+                conn.execute(select(func.count()).select_from(watchlist)).scalar() or 0
+            )
+        return _CheckResult("db", "ok", f"{db_path} ({count} watchlist entries)")
+    except Exception as e:  # noqa: BLE001
+        return _CheckResult("db", "fail", f"{db_path}: {type(e).__name__}: {e}")
+
+
+def _check_ibkr_socket(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    import socket
+
+    host = settings.ibkr.host
+    port = settings.ibkr.port
+    label = "paper" if settings.ibkr.paper else "live"
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            return _CheckResult("ibkr", "ok", f"{host}:{port} ({label})")
+    except (OSError, TimeoutError) as e:
+        return _CheckResult(
+            "ibkr",
+            "fail",
+            f"{host}:{port} ({label}): {type(e).__name__}: {e}",
+        )
+
+
+def _check_last_scan(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    from sqlalchemy import func, select
+
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.storage.schema import scan_runs
+
+    if not settings.storage.db_path.exists():
+        return _CheckResult("last scan", "warn", "db missing")
+    engine = create_engine_for_path(settings.storage.db_path)
+    try:
+        with engine.connect() as conn:
+            last = conn.execute(select(func.max(scan_runs.c.started))).scalar()
+    except Exception as e:  # noqa: BLE001
+        return _CheckResult("last scan", "warn", f"query failed: {e}")
+    if last is None:
+        return _CheckResult("last scan", "warn", "never")
+    if last.tzinfo is None:
+        from datetime import UTC
+
+        last = last.replace(tzinfo=UTC)
+    from datetime import UTC, datetime
+
+    age = datetime.now(UTC) - last
+    minutes = age.total_seconds() / 60
+    threshold = 2 * settings.scan.interval_minutes
+    state = "ok" if minutes <= threshold else "warn"
+    return _CheckResult(
+        "last scan",
+        state,
+        f"{last.isoformat()} ({minutes:.0f}m ago, threshold {threshold}m)",
+    )
+
+
+def _check_last_alert(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    from sqlalchemy import func, select
+
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.storage.schema import alerts
+
+    if not settings.storage.db_path.exists():
+        return _CheckResult("last alert", "warn", "db missing")
+    engine = create_engine_for_path(settings.storage.db_path)
+    try:
+        with engine.connect() as conn:
+            last = conn.execute(
+                select(func.max(alerts.c.ts)).where(alerts.c.status == "sent")
+            ).scalar()
+    except Exception as e:  # noqa: BLE001
+        return _CheckResult("last alert", "warn", f"query failed: {e}")
+    if last is None:
+        return _CheckResult("last alert", "warn", "none sent yet")
+    if last.tzinfo is None:
+        from datetime import UTC
+
+        last = last.replace(tzinfo=UTC)
+    from datetime import UTC, datetime
+
+    age = datetime.now(UTC) - last
+    return _CheckResult(
+        "last alert",
+        "ok",
+        f"{last.isoformat()} ({age.total_seconds() / 60:.0f}m ago)",
+    )
+
+
+async def _check_telegram(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    import httpx
+
+    token = settings.telegram.bot_token
+    chat_id = settings.telegram.chat_id
+    if not (token and chat_id):
+        return _CheckResult("telegram", "warn", "not configured")
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            username = data.get("result", {}).get("username", "?")
+            return _CheckResult("telegram", "ok", f"@{username}")
+    except Exception as e:  # noqa: BLE001
+        return _CheckResult("telegram", "fail", f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Remaining stubs
+# ---------------------------------------------------------------------------
 
 
 @app.command("scan-once")

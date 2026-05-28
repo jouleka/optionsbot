@@ -19,12 +19,6 @@ def test_no_login_command() -> None:
     assert "login" not in result.stdout.lower()
 
 
-def test_status_stub_exits_with_known_message() -> None:
-    result = runner.invoke(app, ["status"])
-    assert result.exit_code != 0
-    assert "IBK-74" in result.stdout or "IBK-74" in (result.stderr or "")
-
-
 def test_scan_once_stub_exits_with_known_message() -> None:
     result = runner.invoke(app, ["scan-once"])
     assert result.exit_code != 0
