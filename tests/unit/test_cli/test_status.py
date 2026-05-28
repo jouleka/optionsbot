@@ -174,3 +174,48 @@ def test_status_json_output(
     assert "db" in names
     assert "ibkr" in names
     assert "telegram" in names
+    # Every entry should carry the is_critical flag from the dataclass.
+    for entry in parsed:
+        assert "is_critical" in entry
+
+
+def test_status_telegram_unreachable_when_configured_exits_one(
+    runner: CliRunner,
+    configured_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Telegram credentials ARE configured but getMe fails, the
+    critical-list logic must include telegram and exit 1."""
+    import httpx
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__BOT_TOKEN", "bad-token")
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__CHAT_ID", "test-chat")
+
+    async_client = MagicMock()
+    async_client.__aenter__ = AsyncMock(return_value=async_client)
+    async_client.__aexit__ = AsyncMock(return_value=False)
+    async_client.get = AsyncMock(
+        side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock())
+    )
+    with (
+        patch("socket.create_connection", side_effect=_fake_socket_ok),
+        patch("httpx.AsyncClient", return_value=async_client),
+    ):
+        result = runner.invoke(app, ["status"])
+    assert result.exit_code == 1, result.output
+    assert "✗ telegram" in result.output
+
+
+def test_status_telegram_not_configured_does_not_gate_exit_code(
+    runner: CliRunner,
+    configured_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telegram unconfigured -> warn, but not critical -> exit 0 when
+    db + ibkr are ok (no --no-telegram needed)."""
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__BOT_TOKEN", "")
+    monkeypatch.setenv("OPTIONSBOT_TELEGRAM__CHAT_ID", "")
+    with patch("socket.create_connection", side_effect=_fake_socket_ok):
+        result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0, result.output
+    assert "⚠ telegram" in result.output
+    assert "not configured" in result.output

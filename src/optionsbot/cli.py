@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -282,6 +283,10 @@ class _CheckResult:
     name: str
     state: str  # "ok" | "warn" | "fail"
     detail: str
+    # True when this subsystem is configured (or always-on like db/ibkr) and
+    # should gate the process exit code. False when the user has skipped it
+    # or it's not configured -- exit code unaffected by state in that case.
+    is_critical: bool = True
 
 
 @app.command()
@@ -309,9 +314,15 @@ async def _run_status(*, json_output: bool, no_telegram: bool) -> int:
     last_scan = _check_last_scan(settings)
     last_alert = _check_last_alert(settings)
     if no_telegram:
-        tg_check = _CheckResult("telegram", "warn", "skipped (--no-telegram)")
+        tg_check = _CheckResult(
+            "telegram", "warn", "skipped (--no-telegram)", is_critical=False
+        )
     else:
         tg_check = await _check_telegram(settings)
+
+    # last scan / last alert are informational; exit code shouldn't depend on them.
+    last_scan.is_critical = False
+    last_alert.is_critical = False
 
     results = [db_check, ibkr_check, last_scan, last_alert, tg_check]
 
@@ -327,11 +338,9 @@ async def _run_status(*, json_output: bool, no_telegram: bool) -> int:
             }[r.state]
             typer.secho(f"{sigil} {r.name:14s} {r.detail}", fg=color)
 
-    # Critical subsystems: db + ibkr + telegram (only when not skipped).
-    critical = [db_check, ibkr_check]
-    if not no_telegram and tg_check.detail != "not configured":
-        critical.append(tg_check)
-    if any(c.state == "fail" for c in critical):
+    # Exit non-zero iff any CRITICAL subsystem failed. Uses an explicit
+    # is_critical flag rather than a brittle string-match on detail text.
+    if any(c.is_critical and c.state == "fail" for c in results):
         return 1
     return 0
 
@@ -392,11 +401,7 @@ def _check_last_scan(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
     if last is None:
         return _CheckResult("last scan", "warn", "never")
     if last.tzinfo is None:
-        from datetime import UTC
-
         last = last.replace(tzinfo=UTC)
-    from datetime import UTC, datetime
-
     age = datetime.now(UTC) - last
     minutes = age.total_seconds() / 60
     threshold = 2 * settings.scan.interval_minutes
@@ -427,11 +432,7 @@ def _check_last_alert(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
     if last is None:
         return _CheckResult("last alert", "warn", "none sent yet")
     if last.tzinfo is None:
-        from datetime import UTC
-
         last = last.replace(tzinfo=UTC)
-    from datetime import UTC, datetime
-
     age = datetime.now(UTC) - last
     return _CheckResult(
         "last alert",
@@ -446,7 +447,8 @@ async def _check_telegram(settings) -> _CheckResult:  # type: ignore[no-untyped-
     token = settings.telegram.bot_token
     chat_id = settings.telegram.chat_id
     if not (token and chat_id):
-        return _CheckResult("telegram", "warn", "not configured")
+        # Not configured -> warn but don't gate the exit code (is_critical=False).
+        return _CheckResult("telegram", "warn", "not configured", is_critical=False)
     url = f"https://api.telegram.org/bot{token}/getMe"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
