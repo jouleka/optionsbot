@@ -42,7 +42,10 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
     """
     started_at = datetime.now(UTC)
     scan_run_id = uuid.uuid4().hex
-    with bind_log_context(scan_run_id=scan_run_id, symbol=None):
+    # Per-symbol inner bind sets `symbol=...` and unbinds (not restores) on
+    # exit, so an outer `symbol=None` would simply disappear after the first
+    # iteration. Bind only scan_run_id at the outer scope.
+    with bind_log_context(scan_run_id=scan_run_id):
         if not is_market_open(started_at):
             finished_at = datetime.now(UTC)
             _persist_scan_run(context, started_at, finished_at, 0, 0, [])

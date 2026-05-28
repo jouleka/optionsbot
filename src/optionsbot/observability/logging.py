@@ -40,11 +40,16 @@ def configure_logging(
     level = getattr(logging, log_level.upper(), logging.INFO)
 
     # Shared processors that run before the final renderer. Order matters.
+    # format_exc_info MUST be in the shared chain so log.exception() events
+    # render the full traceback in BOTH dev console mode AND prod JSON mode --
+    # without it, JSONRenderer emits {"exc_info": true} with no actual stack
+    # trace, silently dropping the debugging signal callers expect.
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.stdlib.add_logger_name,
+        structlog.processors.format_exc_info,
     ]
 
     if env == "prod":

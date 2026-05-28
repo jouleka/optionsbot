@@ -90,3 +90,44 @@ def test_stdlib_logging_is_routed_through_structlog(
     parsed = json.loads(line)
     assert parsed["event"] == "from stdlib"
     assert parsed["logger"] == "optionsbot.test"
+
+
+def test_log_exception_renders_traceback_in_prod_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The Opus 4.7 IBK-72 review caught: format_exc_info MUST be in the
+    shared processor chain or prod JSON emits {"exc_info": true} with no
+    actual traceback string, silently dropping the debug signal."""
+    configure_logging("INFO", env="prod")
+    stdlib_log = logging.getLogger("optionsbot.test")
+    try:
+        raise ValueError("simulated failure for traceback rendering")
+    except ValueError:
+        stdlib_log.exception("caught one")
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.err.strip())
+    assert parsed["event"] == "caught one"
+    assert parsed["level"] == "error"
+    # The full traceback string must be rendered into the "exception" field,
+    # not left as the bare boolean exc_info=True.
+    assert "exception" in parsed, f"missing traceback in JSON: {parsed}"
+    assert "ValueError" in parsed["exception"]
+    assert "simulated failure for traceback rendering" in parsed["exception"]
+
+
+def test_log_exception_via_native_structlog_renders_traceback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Native structlog .exception() must also produce a traceback string
+    in prod JSON mode."""
+    configure_logging("INFO", env="prod")
+    log = structlog.get_logger("test")
+    try:
+        raise RuntimeError("native structlog tb")
+    except RuntimeError:
+        log.exception("native caught")
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.err.strip())
+    assert "exception" in parsed
+    assert "RuntimeError" in parsed["exception"]
+    assert "native structlog tb" in parsed["exception"]

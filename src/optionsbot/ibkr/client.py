@@ -86,14 +86,9 @@ class IBKRClient:
             port = self._settings.ibkr.port
             client_id = self._client_id()
             log.info(
-                "Connecting to IB Gateway",
-                extra={
-                    "host": host,
-                    "port": port,
-                    "client_id": client_id,
-                    "paper": self._settings.ibkr.paper,
-                    "role": self._role,
-                },
+                "Connecting to IB Gateway "
+                "host=%s port=%s client_id=%s paper=%s role=%s",
+                host, port, client_id, self._settings.ibkr.paper, self._role,
             )
             last_exc: Exception | None = None
             for delay in (0.0, *self._backoff):
