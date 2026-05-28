@@ -36,6 +36,12 @@ _DEFAULT_CONFIG_TOML = """\
 # optionsbot configuration. Env vars (prefix OPTIONSBOT_, nested via __)
 # override these values at runtime.
 
+# log_level lives at the TOP because Settings.log_level is a top-level field.
+# Putting it under any [section] header would bind it to that section --
+# pydantic would silently drop the stray key and the user's edit would
+# appear to have no effect.
+log_level = "INFO"
+
 [ibkr]
 host = "127.0.0.1"
 port = 4002         # 4002 = paper IB Gateway; 4001 = live (do not use)
@@ -55,8 +61,6 @@ alert_rescore_delta = 10
 
 [storage]
 # db_path = "~/.local/share/optionsbot/optionsbot.db"
-
-log_level = "INFO"
 """
 
 _TELEGRAM_SECTION_RE = re.compile(
@@ -160,12 +164,15 @@ async def _send_telegram_test(token: str, chat_id: str) -> int | None:
         await client.aclose()
 
 
-def _configure_telegram(cfg_path: Path, non_interactive: bool, skip_test: bool) -> None:
+async def _configure_telegram(
+    cfg_path: Path, non_interactive: bool, skip_test: bool
+) -> None:
     """Prompt for Telegram credentials + optionally test send.
 
     In non-interactive mode, uses whatever's already in config.toml /
     env vars (no prompts). If credentials are blank after that, prints
-    a notice and returns.
+    a notice and returns. async so we can `await _send_telegram_test`
+    directly without nesting asyncio.run inside the outer asyncio.run.
     """
     from optionsbot.config import get_settings, load_settings
 
@@ -205,19 +212,7 @@ def _configure_telegram(cfg_path: Path, non_interactive: bool, skip_test: bool) 
         return
 
     typer.echo("Sending Telegram test message...")
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is not None and loop.is_running():
-        # Inside an already-running loop (e.g. typer test runner).
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, _send_telegram_test(token, chat_id))
-            msg_id = future.result()
-    else:
-        msg_id = asyncio.run(_send_telegram_test(token, chat_id))
+    msg_id = await _send_telegram_test(token, chat_id)
     if msg_id is not None:
         typer.secho(f"  ✓ message sent (id={msg_id})", fg=typer.colors.GREEN)
 
@@ -244,7 +239,7 @@ async def _run_init(
     cfg_path = _write_default_config(cfg_dir, non_interactive)
     _run_migrations()
     if not skip_telegram:
-        _configure_telegram(cfg_path, non_interactive, skip_test)
+        await _configure_telegram(cfg_path, non_interactive, skip_test)
     typer.echo("\n" + _final_summary(cfg_dir))
 
 
