@@ -72,3 +72,50 @@ def test_iv_rank_uses_last_252_days_by_default() -> None:
     # With last-252 only, range is [0.10, 0.20] -> rank 0.5.
     assert result.rank == pytest.approx(0.5)
     assert result.sample_size == 252
+
+
+# ---------------------------------------------------------------------------
+# Property-style tests (IBK-68): invariants over many inputs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "current_iv,expected_rank",
+    [(0.10, 0.0), (0.12, 0.2), (0.15, 0.5), (0.18, 0.8), (0.20, 1.0)],
+)
+def test_iv_rank_is_monotone_in_current_iv(
+    current_iv: float, expected_rank: float
+) -> None:
+    """For a fixed history, higher current_iv must produce a >= rank."""
+    hist = pd.Series([0.10, 0.20])  # min=0.10, max=0.20
+    result = iv_rank(current_iv=current_iv, history=hist)
+    assert result.rank == pytest.approx(expected_rank)
+
+
+@pytest.mark.parametrize(
+    "current_iv", [-1.0, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 1.0, 100.0]
+)
+def test_iv_rank_is_always_in_unit_interval_when_defined(current_iv: float) -> None:
+    """Whatever the current_iv, the returned rank (when defined) is in [0, 1]."""
+    hist = pd.Series([0.10, 0.15, 0.20])
+    result = iv_rank(current_iv=current_iv, history=hist)
+    if result.rank is not None:
+        assert 0.0 <= result.rank <= 1.0
+
+
+@pytest.mark.parametrize("sample_size", [1, 5, 10, 29])
+def test_iv_rank_warming_up_below_threshold(sample_size: int) -> None:
+    """Below the 30-sample confidence threshold, warming_up must be True."""
+    # Use distinct values so the rank itself is defined.
+    hist = pd.Series([0.10 + 0.01 * i for i in range(sample_size)])
+    result = iv_rank(current_iv=0.15, history=hist)
+    assert result.warming_up is True
+    assert result.sample_size == sample_size
+
+
+@pytest.mark.parametrize("sample_size", [30, 31, 100, 252])
+def test_iv_rank_not_warming_up_at_or_above_threshold(sample_size: int) -> None:
+    """At/above the 30-sample threshold, warming_up must be False."""
+    hist = pd.Series([0.10 + 0.001 * i for i in range(sample_size)])
+    result = iv_rank(current_iv=0.15, history=hist)
+    assert result.warming_up is False

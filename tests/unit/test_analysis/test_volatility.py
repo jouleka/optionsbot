@@ -71,3 +71,76 @@ def test_hv_default_window_is_20() -> None:
     # Calling with no window should equal calling with window=20.
     closes = pd.Series(np.random.default_rng(1).normal(loc=100, scale=1, size=30))
     assert historical_volatility(closes) == historical_volatility(closes, window=20)
+
+
+# ---------------------------------------------------------------------------
+# Property-style tests (IBK-68): invariants that should hold across inputs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scale", [0.5, 1.0, 2.0, 10.0, 100.0])
+def test_hv_is_scale_invariant(scale: float) -> None:
+    """HV is computed on log returns, so multiplying all closes by a constant
+    leaves the log returns (and therefore HV) unchanged."""
+    base = pd.Series([100.0 + i * 0.5 for i in range(30)])
+    scaled = base * scale
+    hv_base = historical_volatility(base, window=20)
+    hv_scaled = historical_volatility(scaled, window=20)
+    assert hv_scaled == pytest.approx(hv_base, rel=1e-9)
+
+
+@pytest.mark.parametrize("size", [21, 50, 100, 252])
+def test_hv_is_non_negative(size: int) -> None:
+    """HV is a standard deviation; cannot be negative for any non-empty input."""
+    rng = np.random.default_rng(42)
+    closes = pd.Series(100 + rng.normal(0, 1, size=size).cumsum())
+    hv = historical_volatility(closes, window=20)
+    assert hv >= 0.0
+
+
+def test_hv_monotone_in_noise() -> None:
+    """Higher-noise series should produce strictly higher HV than lower-noise."""
+    rng = np.random.default_rng(7)
+    low_noise = pd.Series(100 + rng.normal(0, 0.5, size=100).cumsum())
+    high_noise = pd.Series(100 + rng.normal(0, 5.0, size=100).cumsum())
+    hv_low = historical_volatility(low_noise, window=50)
+    hv_high = historical_volatility(high_noise, window=50)
+    assert hv_high > hv_low
+
+
+@pytest.mark.parametrize("iv_multiplier", [0.5, 1.0, 2.0, 5.0])
+def test_iv_hv_ratio_scales_linearly_with_iv(iv_multiplier: float) -> None:
+    """For fixed HV, the ratio is linear in IV."""
+    base_iv = 0.20
+    base_hv = 0.10
+    base_ratio = iv_hv_ratio(iv=base_iv, hv=base_hv)
+    scaled_ratio = iv_hv_ratio(iv=base_iv * iv_multiplier, hv=base_hv)
+    assert scaled_ratio == pytest.approx(base_ratio * iv_multiplier)
+
+
+@pytest.mark.parametrize("hv_multiplier", [0.5, 1.0, 2.0, 5.0])
+def test_iv_hv_ratio_inverse_in_hv(hv_multiplier: float) -> None:
+    """For fixed IV, the ratio is inversely proportional to HV."""
+    iv = 0.30
+    base_hv = 0.20
+    base_ratio = iv_hv_ratio(iv=iv, hv=base_hv)
+    scaled_ratio = iv_hv_ratio(iv=iv, hv=base_hv * hv_multiplier)
+    assert scaled_ratio == pytest.approx(base_ratio / hv_multiplier)
+
+
+@pytest.mark.parametrize("spot", [10.0, 100.0, 400.0, 5000.0])
+def test_expected_move_scales_linearly_with_spot(spot: float) -> None:
+    """Doubling spot doubles expected move (atm_iv and dte held constant)."""
+    em = expected_move(spot=spot, atm_iv=0.20, dte=30)
+    em_2x = expected_move(spot=spot * 2, atm_iv=0.20, dte=30)
+    assert em_2x == pytest.approx(em * 2)
+
+
+@pytest.mark.parametrize("dte_pair", [(1, 4), (5, 20), (10, 40), (16, 64)])
+def test_expected_move_scales_with_sqrt_dte(dte_pair: tuple[int, int]) -> None:
+    """Quadrupling DTE doubles expected move (since EM ~ sqrt(dte))."""
+    short_dte, long_dte = dte_pair
+    em_short = expected_move(spot=100.0, atm_iv=0.25, dte=short_dte)
+    em_long = expected_move(spot=100.0, atm_iv=0.25, dte=long_dte)
+    # long_dte = 4 * short_dte, so em_long = 2 * em_short
+    assert em_long == pytest.approx(em_short * 2, rel=1e-9)
