@@ -9,8 +9,14 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    from sqlalchemy import Engine
+
+    from optionsbot.config import Settings
 
 app = typer.Typer(
     help="Optionsbot: IBKR options analysis and alerts (paper trading).",
@@ -21,14 +27,6 @@ watch_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(watch_app, name="watch")
-
-
-def _stub(name: str, epic: str) -> None:
-    typer.echo(
-        f"`optionsbot {name}` is not yet implemented. See {epic}.",
-        err=True,
-    )
-    raise typer.Exit(code=2)
 
 
 # ---------------------------------------------------------------------------
@@ -462,32 +460,199 @@ async def _check_telegram(settings) -> _CheckResult:  # type: ignore[no-untyped-
 
 
 # ---------------------------------------------------------------------------
-# Remaining stubs
+# watch + scan-once
 # ---------------------------------------------------------------------------
 
 
-@app.command("scan-once")
-def scan_once() -> None:
-    """Run a single scan over the watchlist and exit (no daemon)."""
-    _stub("scan-once", "IBK-7 (Daemon)")
+def _load_settings_and_engine() -> tuple[Settings, Engine]:
+    """Fresh Settings + an Engine for the configured DB. Exits 1 if the DB is missing."""
+    from optionsbot.config import get_settings, load_settings
+    from optionsbot.storage.db import create_engine_for_path
 
-
-@watch_app.command("add")
-def watch_add(symbol: str) -> None:
-    """Add a ticker to the watchlist."""
-    _stub(f"watch add {symbol}", "IBK-51")
-
-
-@watch_app.command("remove")
-def watch_remove(symbol: str) -> None:
-    """Remove a ticker from the watchlist."""
-    _stub(f"watch remove {symbol}", "IBK-52")
+    get_settings.cache_clear()
+    settings = load_settings()
+    if not settings.storage.db_path.exists():
+        typer.secho(
+            "db not found -- run `optionsbot init` first.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+    return settings, create_engine_for_path(settings.storage.db_path)
 
 
 @watch_app.command("list")
 def watch_list() -> None:
     """List all tickers in the watchlist."""
-    _stub("watch list", "IBK-53")
+    from sqlalchemy import select
+
+    from optionsbot.storage.schema import watchlist
+
+    _settings, engine = _load_settings_and_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                watchlist.c.symbol,
+                watchlist.c.view_override_dir,
+                watchlist.c.view_override_iv,
+                watchlist.c.notes,
+            ).order_by(watchlist.c.symbol)
+        ).fetchall()
+    if not rows:
+        typer.echo("watchlist is empty -- add one with `optionsbot watch add SYMBOL`")
+        return
+    for r in rows:
+        bits: list[str] = []
+        if r.view_override_dir or r.view_override_iv:
+            bits.append(f"view={r.view_override_dir or '-'}/{r.view_override_iv or '-'}")
+        if r.notes:
+            bits.append(f"note={r.notes}")
+        suffix = ("  " + " ".join(bits)) if bits else ""
+        typer.echo(f"{r.symbol}{suffix}")
+
+
+@watch_app.command("remove")
+def watch_remove(symbol: str) -> None:
+    """Remove a ticker from the watchlist. Snapshot history is preserved."""
+    from sqlalchemy import delete
+
+    from optionsbot.storage.schema import watchlist
+
+    symbol = symbol.upper().strip()
+    _settings, engine = _load_settings_and_engine()
+    with engine.begin() as conn:
+        result = conn.execute(delete(watchlist).where(watchlist.c.symbol == symbol))
+    if result.rowcount > 0:
+        typer.secho(f"removed {symbol} from the watchlist", fg=typer.colors.GREEN)
+    else:
+        typer.echo(f"{symbol} is not in the watchlist")
+
+
+@watch_app.command("add")
+def watch_add(
+    symbol: str,
+    notes: str | None = typer.Option(
+        None, "--notes", help="Optional note stored with the entry."
+    ),
+) -> None:
+    """Add a ticker to the watchlist (validated against IBKR first)."""
+    raise typer.Exit(code=asyncio.run(_run_watch_add(symbol, notes)))
+
+
+async def _run_watch_add(symbol: str, notes: str | None) -> int:
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.contracts import ContractResolver
+    from optionsbot.storage.schema import watchlist
+
+    symbol = symbol.upper().strip()
+    if not symbol:
+        typer.secho("symbol is empty", fg=typer.colors.RED, err=True)
+        return 2
+    settings, engine = _load_settings_and_engine()
+
+    # Validate the symbol against IBKR before persisting (mirrors the MCP tool).
+    client = IBKRClient(role="cli", settings=settings)
+    try:
+        await client.connect()
+        await ContractResolver(client).stock(symbol)
+    except ConnectionError as e:
+        typer.secho(f"IBKR unavailable: {e}", fg=typer.colors.RED, err=True)
+        return 1
+    except ValueError:
+        typer.secho(
+            f"unknown symbol: {symbol} (IBKR could not qualify it)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        return 1
+    finally:
+        await client.disconnect()
+
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                insert(watchlist).values(
+                    symbol=symbol, notes=notes, added_at=datetime.now(UTC)
+                )
+            )
+        except IntegrityError:
+            typer.echo(f"{symbol} is already in the watchlist")
+            return 0
+    typer.secho(f"added {symbol} to the watchlist", fg=typer.colors.GREEN)
+    return 0
+
+
+@app.command("scan-once")
+def scan_once() -> None:
+    """Run a single scan over the watchlist and exit (no daemon, no alerts)."""
+    raise typer.Exit(code=asyncio.run(_run_scan_once()))
+
+
+async def _run_scan_once() -> int:
+    from sqlalchemy import insert, select
+
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.contracts import ContractResolver
+    from optionsbot.scan import scan_symbol
+    from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+    from optionsbot.storage.schema import scan_runs, watchlist
+
+    settings, engine = _load_settings_and_engine()
+    with engine.connect() as conn:
+        symbols = [
+            r.symbol
+            for r in conn.execute(
+                select(watchlist.c.symbol).order_by(watchlist.c.symbol)
+            ).fetchall()
+        ]
+    if not symbols:
+        typer.echo("watchlist is empty -- add one with `optionsbot watch add SYMBOL`")
+        return 0
+
+    client = IBKRClient(role="cli", settings=settings)
+    started = datetime.now(UTC)
+    scanned = 0
+    errors: list[str] = []
+    try:
+        await client.connect()
+        resolver = ContractResolver(client)
+        for sym in symbols:
+            try:
+                result = await scan_symbol(sym, client, engine, settings, resolver=resolver)
+            except Exception as e:  # noqa: BLE001 -- one symbol must not abort the sweep
+                typer.secho(
+                    f"{sym}: {type(e).__name__}: {e}", fg=typer.colors.RED, err=True
+                )
+                errors.append(f"{sym}: {type(e).__name__}: {e}")
+                continue
+            scanned += 1
+            selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+            if selected:
+                typer.secho(f"{sym}: {len(result.scored)} scored", fg=typer.colors.GREEN)
+                for s in selected:
+                    typer.echo(f"   {s.strategy_name}: {s.score:.0f}")
+            else:
+                typer.echo(
+                    f"{sym}: {len(result.scored)} scored "
+                    f"(none >= threshold {DEFAULT_THRESHOLD})"
+                )
+    finally:
+        await client.disconnect()
+
+    finished = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(scan_runs).values(
+                started=started,
+                finished=finished,
+                tickers_scanned=scanned,
+                alerts_fired=0,
+                errors_json=errors or None,
+            )
+        )
+    typer.echo(f"scanned {scanned}/{len(symbols)} symbol(s)")
+    return 0
 
 
 if __name__ == "__main__":

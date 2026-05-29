@@ -141,3 +141,35 @@ async def test_scan_symbol_passes_spot_and_strike_window_to_get_chain(
     assert kwargs["underlying_price"] == 400.0  # fake_stock_quote.mid
     assert kwargs["strike_band_pct"] == scan_settings.scan.strike_band_pct  # type: ignore[attr-defined]
     assert kwargs["max_strikes_per_side"] == scan_settings.scan.max_strikes_per_side  # type: ignore[attr-defined]
+
+
+async def test_scan_symbol_skips_scoring_when_chain_has_no_option_data(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    """If no chain leg has IV/greeks (e.g. missing OPRA option market data),
+    scan_symbol must NOT run the scorers -- strategies built off the directional
+    view alone would carry no real strikes/pricing and be misleading."""
+    from typing import cast
+    from unittest.mock import MagicMock
+
+    import optionsbot.scan.symbol as symbol_mod
+    from optionsbot.ibkr.types import OptionChainLeg, OptionRight
+
+    expiry = (date.today() + timedelta(days=45)).strftime("%Y%m%d")
+    nodata_chain = [
+        OptionChainLeg(
+            symbol="SPY", expiry=expiry, strike=k, right=cast("OptionRight", r),
+            bid=None, ask=None, iv=None, delta=None, gamma=None,
+            theta=None, vega=None, open_interest=None, volume=None,
+        )
+        for k in (400.0, 405.0, 410.0)
+        for r in ("C", "P")
+    ]
+    symbol_mod.ChainClient.return_value.get_chain.return_value = nodata_chain  # type: ignore[attr-defined]
+    spy_score = MagicMock(return_value=())
+    monkeypatch.setattr(symbol_mod, "score_all", spy_score)
+
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    spy_score.assert_not_called()
+    assert result.scored == ()

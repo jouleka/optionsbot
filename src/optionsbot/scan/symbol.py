@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
@@ -29,6 +30,8 @@ from optionsbot.scoring import score_all
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies import Leg, StrategySnapshot
+
+log = logging.getLogger(__name__)
 
 
 def _atm_iv(chain: list[OptionChainLeg], spot: float) -> float | None:
@@ -146,7 +149,22 @@ async def scan_symbol(
     )
 
     account_value = None  # account-summary integration deferred to IBK-7
-    scored = score_all(snapshot, account_value=account_value)
+    # Option scoring needs real per-leg data (IV/greeks). If the chain came back
+    # with no usable option data -- e.g. the account lacks an options (OPRA)
+    # market-data subscription -- skip scoring rather than emit strategies built
+    # off the directional view alone (they'd carry no real strikes/pricing).
+    has_option_data = any(leg.iv is not None or leg.delta is not None for leg in chain)
+    if has_option_data:
+        scored = score_all(snapshot, account_value=account_value)
+    else:
+        log.warning(
+            "No option market data for %s (%d chain legs, none with IV/greeks); "
+            "skipping strategy scoring -- check the options (OPRA) market-data "
+            "subscription.",
+            symbol,
+            len(chain),
+        )
+        scored = ()
 
     now = datetime.now(UTC)
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
