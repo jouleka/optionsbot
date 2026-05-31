@@ -189,4 +189,31 @@ def build_ib_mock(*fixtures: dict[str, Any]) -> MagicMock:
 
     ib.reqTickersAsync = AsyncMock(side_effect=_tickers)
 
+    # reqMktData (STREAMING, sync): the chain client now subscribes to streaming
+    # market data for option legs -- IBKR computes greeks only on the streaming
+    # feed. Returns a SINGLE ticker (vs reqTickersAsync's list) with greeks
+    # populated, so the leg fetch's greek-poll resolves on the first check.
+    def _mkt_data(contract: Any, *args: Any) -> MagicMock:
+        symbol = getattr(contract, "symbol", None)
+        sec_type = getattr(contract, "secType", "STK")
+        fx = by_symbol.get(symbol)
+        if fx is None:
+            return _ticker_mock({})
+        if sec_type != "OPT":
+            return _ticker_mock(fx["spot"])
+        expiry = getattr(contract, "lastTradeDateOrContractMonth", "")
+        strike = getattr(contract, "strike", 0.0)
+        right = getattr(contract, "right", "")
+        for leg in fx["option_chain"]:
+            if (
+                leg["expiry"] == expiry
+                and leg["strike"] == strike
+                and leg["right"] == right
+            ):
+                return _option_chain_ticker_mock(leg)
+        return _option_chain_ticker_mock({})
+
+    ib.reqMktData = MagicMock(side_effect=_mkt_data)
+    ib.cancelMktData = MagicMock()
+
     return ib

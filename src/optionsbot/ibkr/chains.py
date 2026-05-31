@@ -2,9 +2,11 @@
 
 Strategy:
   1. reqSecDefOptParams -> all (expirations, strikes) for the underlying.
-  2. Filter expiries to the DTE window.
-  3. For each (expiry, strike, right) in the cross-product, qualify the
-     option contract and request a snapshot ticker.
+  2. Filter expiries to the DTE window and strikes to a near-ATM band.
+  3. For each (expiry, strike, right), qualify the option contract and
+     subscribe to STREAMING market data. Greeks (IV/delta) are computed
+     server-side only on the streaming feed; an options *snapshot*
+     returns Error 10091 and would be billed per request.
   4. Adapt to OptionChainLeg and return as a list.
 
 Concurrency is bounded by ConcurrencyLimiter; the rate at which we
@@ -31,6 +33,8 @@ _DEFAULT_RATE_LIMIT = 50  # calls per window
 _DEFAULT_RATE_WINDOW = 10.0  # seconds
 _DEFAULT_SECDEF_RETRIES = 2
 _DEFAULT_SECDEF_RETRY_DELAY = 1.0  # seconds
+_DEFAULT_GREEK_TIMEOUT = 10.0  # seconds to wait for streaming greeks to populate
+_DEFAULT_GREEK_POLL = 0.5  # seconds between greek-readiness polls
 
 
 def _dte(expiry: str, today: date | None = None) -> int:
@@ -60,6 +64,15 @@ def _select_strikes(
     return sorted(below + at + above)
 
 
+def _clean_price(value: float | None) -> float | None:
+    """Like clean_float, but also nulls IBKR's -1 'no data' sentinel for delayed
+    bid/ask (a real option price is never negative)."""
+    cleaned = clean_float(value)
+    if cleaned is not None and cleaned < 0:
+        return None
+    return cleaned
+
+
 class ChainClient:
     def __init__(
         self,
@@ -70,6 +83,8 @@ class ChainClient:
         window_seconds: float = _DEFAULT_RATE_WINDOW,
         secdef_retries: int = _DEFAULT_SECDEF_RETRIES,
         secdef_retry_delay: float = _DEFAULT_SECDEF_RETRY_DELAY,
+        greek_wait_timeout: float = _DEFAULT_GREEK_TIMEOUT,
+        greek_poll_interval: float = _DEFAULT_GREEK_POLL,
     ) -> None:
         self._client = client
         self._resolver = resolver if resolver is not None else ContractResolver(client)
@@ -77,6 +92,8 @@ class ChainClient:
         self._rate = RateLimiter(max_calls_per_window, window_seconds)
         self._secdef_retries = secdef_retries
         self._secdef_retry_delay = secdef_retry_delay
+        self._greek_timeout = greek_wait_timeout
+        self._greek_poll = greek_poll_interval
 
     async def get_chain(
         self,
@@ -175,25 +192,47 @@ class ChainClient:
                 contract = await self._resolver.option(symbol, expiry, strike, right)
             except ValueError:
                 return None
-            tickers = await self._client.ib.reqTickersAsync(contract)
-            if not tickers:
-                return None
-            t = tickers[0]
-            bid = clean_float(getattr(t, "bid", None))
-            ask = clean_float(getattr(t, "ask", None))
-            g = getattr(t, "modelGreeks", None)
-            return OptionChainLeg(
-                symbol=symbol,
-                expiry=expiry,
-                strike=strike,
-                right=right,
-                bid=bid,
-                ask=ask,
-                iv=clean_float(getattr(g, "impliedVol", None)) if g is not None else None,
-                delta=clean_float(getattr(g, "delta", None)) if g is not None else None,
-                gamma=clean_float(getattr(g, "gamma", None)) if g is not None else None,
-                theta=clean_float(getattr(g, "theta", None)) if g is not None else None,
-                vega=clean_float(getattr(g, "vega", None)) if g is not None else None,
-                open_interest=clean_int(getattr(t, "openInterest", None)),
-                volume=clean_int(getattr(t, "volume", None)),
-            )
+            # Use STREAMING market data (reqMktData), NOT a snapshot
+            # (reqTickersAsync). IBKR computes option greeks (IV/delta) only on
+            # the streaming feed -- an options snapshot returns Error 10091 and
+            # is billed per request; streaming delayed data is free under the
+            # (shared) subscription. Greeks compute server-side and arrive a beat
+            # after subscribing, so poll until they populate (or timeout).
+            ticker = self._client.ib.reqMktData(contract, "", False, False)
+            try:
+                for _ in range(max(1, int(self._greek_timeout / self._greek_poll))):
+                    g = getattr(ticker, "modelGreeks", None)
+                    if g is not None and (
+                        getattr(g, "delta", None) is not None
+                        or getattr(g, "impliedVol", None) is not None
+                    ):
+                        break
+                    await asyncio.sleep(self._greek_poll)
+            finally:
+                self._client.ib.cancelMktData(contract)
+            return self._adapt_ticker(symbol, expiry, strike, right, ticker)
+
+    @staticmethod
+    def _adapt_ticker(
+        symbol: str,
+        expiry: str,
+        strike: float,
+        right: OptionRight,
+        ticker: object,
+    ) -> OptionChainLeg:
+        g = getattr(ticker, "modelGreeks", None)
+        return OptionChainLeg(
+            symbol=symbol,
+            expiry=expiry,
+            strike=strike,
+            right=right,
+            bid=_clean_price(getattr(ticker, "bid", None)),
+            ask=_clean_price(getattr(ticker, "ask", None)),
+            iv=clean_float(getattr(g, "impliedVol", None)) if g is not None else None,
+            delta=clean_float(getattr(g, "delta", None)) if g is not None else None,
+            gamma=clean_float(getattr(g, "gamma", None)) if g is not None else None,
+            theta=clean_float(getattr(g, "theta", None)) if g is not None else None,
+            vega=clean_float(getattr(g, "vega", None)) if g is not None else None,
+            open_interest=clean_int(getattr(ticker, "openInterest", None)),
+            volume=clean_int(getattr(ticker, "volume", None)),
+        )

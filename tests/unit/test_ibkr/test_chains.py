@@ -83,7 +83,7 @@ async def test_chain_filters_expiries_to_window(chain_client, mock_ib) -> None:
     strikes = [395.0, 400.0, 405.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
     expiries_seen = {leg.expiry for leg in legs}
     assert expiries_seen == {_expiry(35)}
@@ -94,7 +94,7 @@ async def test_chain_emits_both_calls_and_puts(chain_client, mock_ib) -> None:
     strikes = [400.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
     rights = {leg.right for leg in legs}
     assert rights == {"C", "P"}
@@ -105,7 +105,7 @@ async def test_chain_leg_count_matches_strike_times_2(chain_client, mock_ib) -> 
     strikes = [395.0, 400.0, 405.0]  # 3 strikes
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
     assert len(legs) == 3 * 2  # 3 strikes x 2 rights
 
@@ -125,9 +125,9 @@ async def test_chain_leg_carries_greeks_and_oi(chain_client, mock_ib) -> None:
     strikes = [400.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [
-        _ticker(bid=5.0, ask=5.1, iv=0.25, delta=0.45, oi=1234, vol=99)
-    ]
+    mock_ib.reqMktData.return_value = _ticker(
+        bid=5.0, ask=5.1, iv=0.25, delta=0.45, oi=1234, vol=99
+    )
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
     for leg in legs:
         assert isinstance(leg, OptionChainLeg)
@@ -142,7 +142,7 @@ async def test_chain_windows_strikes_by_band(chain_client, mock_ib) -> None:
     strikes = [350.0, 360.0, 400.0, 440.0, 450.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain(
         "SPY",
         dte_window=(25, 55),
@@ -159,7 +159,7 @@ async def test_chain_caps_strikes_per_side(chain_client, mock_ib) -> None:
     strikes = [395.0, 396.0, 397.0, 398.0, 399.0, 400.0, 401.0, 402.0, 403.0, 404.0, 405.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain(
         "SPY",
         dte_window=(25, 55),
@@ -177,7 +177,7 @@ async def test_chain_uses_median_strike_when_no_underlying_price(chain_client, m
     strikes = [100.0, 200.0, 300.0, 400.0, 500.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain(
         "SPY",
         dte_window=(25, 55),
@@ -198,7 +198,7 @@ async def test_chain_retries_secdef_until_expiries_in_window(mock_ib) -> None:
     good = _opt_params([_expiry(35)], [400.0])  # 35 DTE -> inside the window
     mock_ib.reqSecDefOptParamsAsync.side_effect = [bad, good]
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=5.0, ask=5.1)]
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
     assert {leg.expiry for leg in legs} == {_expiry(35)}
     assert mock_ib.reqSecDefOptParamsAsync.await_count == 2
@@ -213,3 +213,18 @@ async def test_chain_returns_empty_after_secdef_retries_exhausted(mock_ib) -> No
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
     assert legs == []
     assert mock_ib.reqSecDefOptParamsAsync.await_count == 3  # initial + 2 retries
+
+
+async def test_chain_uses_streaming_not_snapshot(chain_client, mock_ib) -> None:
+    """Greeks must be fetched via STREAMING reqMktData, never the snapshot
+    reqTickersAsync (options snapshots return no greeks / are billed). The
+    streaming subscription must also be cancelled."""
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [400.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1, iv=0.22, delta=0.5)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
+    assert len(legs) == 2  # 1 strike x {C, P}
+    assert legs[0].iv == pytest.approx(0.22)
+    assert mock_ib.reqMktData.called
+    mock_ib.reqTickersAsync.assert_not_awaited()
+    assert mock_ib.cancelMktData.called  # streaming lines released
