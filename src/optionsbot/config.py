@@ -50,6 +50,10 @@ class ScanSettings(BaseModel):
     # pull the full ladder (~497 strikes for SPY) x every in-window expiry.
     strike_band_pct: float = Field(default=0.15, gt=0.0, le=1.0)
     max_strikes_per_side: int = Field(default=40, ge=1)
+    # Per scan, fetch a near-target front expiry + the nearest back-month at
+    # least this many DTE beyond it (so Calendar/Diagonal spreads stay viable;
+    # matches strategies.calendar._MIN_BACK_OVER_FRONT_DTE).
+    back_month_dte_gap: int = Field(default=30, ge=1)
     # Per-trade position sizing: fraction of account net-liquidation used as the
     # risk budget (budget = net_liq * risk_pct; contracts = budget // max_loss).
     risk_pct: float = Field(default=0.02, gt=0.0, le=1.0)

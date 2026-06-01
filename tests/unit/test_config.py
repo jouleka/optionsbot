@@ -62,6 +62,17 @@ def test_scan_risk_pct_rejects_out_of_range() -> None:
         ScanSettings(risk_pct=1.5)
 
 
+def test_scan_back_month_dte_gap_default_is_30() -> None:
+    assert Settings().scan.back_month_dte_gap == 30
+
+
+def test_scan_back_month_dte_gap_rejects_below_one() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ScanSettings(back_month_dte_gap=0)
+
+
 def test_env_var_overrides_nested_field(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPTIONSBOT_IBKR__PORT", "7497")
     monkeypatch.setenv("OPTIONSBOT_IBKR__PAPER", "false")
