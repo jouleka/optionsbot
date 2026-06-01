@@ -43,6 +43,7 @@ _DEFAULT_SECDEF_RETRIES = 2
 _DEFAULT_SECDEF_RETRY_DELAY = 1.0  # seconds
 _DEFAULT_GREEK_TIMEOUT = 10.0  # seconds to wait for streaming greeks to populate
 _DEFAULT_GREEK_POLL = 0.5  # seconds between greek-readiness polls
+_DEFAULT_GREEK_STABLE_POLLS = 3  # consecutive no-improvement polls => coverage plateaued
 
 _LegSpec = tuple[str, float, OptionRight]
 
@@ -110,6 +111,7 @@ class ChainClient:
         secdef_retry_delay: float = _DEFAULT_SECDEF_RETRY_DELAY,
         greek_wait_timeout: float = _DEFAULT_GREEK_TIMEOUT,
         greek_poll_interval: float = _DEFAULT_GREEK_POLL,
+        greek_stable_polls: int = _DEFAULT_GREEK_STABLE_POLLS,
     ) -> None:
         self._client = client
         self._resolver = resolver if resolver is not None else ContractResolver(client)
@@ -118,6 +120,7 @@ class ChainClient:
         self._secdef_retry_delay = secdef_retry_delay
         self._greek_timeout = greek_wait_timeout
         self._greek_poll = greek_poll_interval
+        self._greek_stable_polls = greek_stable_polls
 
     async def get_chain(
         self,
@@ -229,9 +232,23 @@ class ChainClient:
             # until every live ticker has greeks, or the timeout elapses (a
             # permanently-illiquid leg simply adapts with iv/delta=None).
             tickers = [t for _, _, t in subscribed]
+            prev = -1
+            stable = 0
             for _ in range(max(1, int(self._greek_timeout / self._greek_poll))):
-                if all(_has_greeks(t) for t in tickers):
-                    break
+                count = sum(_has_greeks(t) for t in tickers)
+                if count == len(tickers):
+                    break  # full coverage
+                # Coverage is monotonic (modelGreeks, once set, stays set). Once
+                # it stops rising for greek_stable_polls polls the remaining legs
+                # are illiquid and won't resolve -- stop waiting. The count > 0
+                # guard avoids a false break during warmup (before any greeks).
+                if count > 0 and count == prev:
+                    stable += 1
+                    if stable >= self._greek_stable_polls:
+                        break
+                else:
+                    stable = 0
+                prev = count
                 await asyncio.sleep(self._greek_poll)
             return [
                 self._adapt_ticker(symbol, expiry, strike, right, ticker)

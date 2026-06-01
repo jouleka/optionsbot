@@ -324,3 +324,37 @@ async def test_chain_skips_leg_that_fails_to_qualify(chain_client, mock_ib) -> N
     assert {leg.right for leg in legs} == {"C"}
     assert mock_ib.reqMktData.call_count == 1
     assert mock_ib.cancelMktData.call_count == 1
+
+
+async def test_chain_greek_wait_exits_on_plateau(mock_ib, monkeypatch) -> None:
+    """Once greek coverage plateaus (some legs have greeks, others never will),
+    the per-chunk wait early-exits after ~greek_stable_polls polls instead of
+    waiting out the full greek_timeout."""
+    from unittest.mock import AsyncMock
+
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(client, secdef_retry_delay=0.0, greek_stable_polls=3)
+    # 2 strikes x 2 rights = 4 legs; calls get greeks, puts never -> coverage
+    # plateaus at 2/4.
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [400.0, 405.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+
+    def _sub(contract, *a, **k):
+        if contract.right == "C":
+            return _ticker(bid=5.0, ask=5.1, iv=0.2, delta=0.4)
+        t = _ticker(bid=4.0, ask=4.1)
+        t.modelGreeks = None
+        return t
+
+    mock_ib.reqMktData.side_effect = _sub
+
+    sleep_spy = AsyncMock()
+    monkeypatch.setattr("optionsbot.ibkr.chains.asyncio.sleep", sleep_spy)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+
+    # Calls carry greeks; puts don't.
+    assert {leg.right for leg in legs if leg.iv is not None} == {"C"}
+    # Plateau break fires after ~greek_stable_polls (3), far below the default
+    # greek_timeout/greek_poll = 10/0.5 = 20 polls.
+    assert sleep_spy.await_count <= 4
