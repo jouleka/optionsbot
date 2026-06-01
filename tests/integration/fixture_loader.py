@@ -121,22 +121,26 @@ def build_ib_mock(*fixtures: dict[str, Any]) -> MagicMock:
         )
     )
 
-    # qualifyContractsAsync: echo back the contract with a stable fake conId.
-    async def _qualify(contract: Any) -> list[Any]:
-        contract.conId = (
-            abs(
-                hash(
-                    (
-                        getattr(contract, "symbol", ""),
-                        getattr(contract, "lastTradeDateOrContractMonth", ""),
-                        getattr(contract, "strike", 0.0),
-                        getattr(contract, "right", ""),
+    # qualifyContractsAsync(*contracts): echo each back with a stable fake conId,
+    # positionally aligned with the input (matches ib_async's contract).
+    async def _qualify(*contracts: Any) -> list[Any]:
+        out: list[Any] = []
+        for contract in contracts:
+            contract.conId = (
+                abs(
+                    hash(
+                        (
+                            getattr(contract, "symbol", ""),
+                            getattr(contract, "lastTradeDateOrContractMonth", ""),
+                            getattr(contract, "strike", 0.0),
+                            getattr(contract, "right", ""),
+                        )
                     )
                 )
+                & 0xFFFFFFFF
             )
-            & 0xFFFFFFFF
-        )
-        return [contract]
+            out.append(contract)
+        return out
 
     ib.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
