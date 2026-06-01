@@ -4,6 +4,7 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -58,6 +59,15 @@ snapshots = Table(
         "regime_iv IN ('high','neutral','low') OR regime_iv IS NULL",
         name="ck_snapshots_regime_iv",
     ),
+)
+
+
+iv_history = Table(
+    "iv_history",
+    metadata,
+    Column("symbol", Text, primary_key=True),
+    Column("date", Date, primary_key=True),
+    Column("atm_iv", Float, nullable=False),
 )
 
 
