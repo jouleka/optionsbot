@@ -145,3 +145,43 @@ def test_snapshot_raw_json_roundtrips_as_dict(tmp_path: Path) -> None:
         row = conn.execute(schema.snapshots.select()).fetchone()
     assert row is not None
     assert row.raw_json == payload
+
+
+def test_record_atm_iv_upserts_latest_per_day(tmp_path: Path) -> None:
+    from datetime import date
+
+    from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
+
+    db_path = tmp_path / "ivh.db"
+    apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    d = date(2026, 5, 26)
+    record_atm_iv(engine, "SPY", d, 0.20)
+    record_atm_iv(engine, "SPY", d, 0.25)  # same (symbol, date) -> update, not duplicate
+    series = read_atm_iv_history(engine, "SPY")
+    assert list(series) == [0.25]
+
+
+def test_read_atm_iv_history_orders_oldest_to_newest(tmp_path: Path) -> None:
+    from datetime import date
+
+    from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
+
+    db_path = tmp_path / "ivh2.db"
+    apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    record_atm_iv(engine, "SPY", date(2026, 5, 27), 0.22)
+    record_atm_iv(engine, "SPY", date(2026, 5, 25), 0.18)
+    record_atm_iv(engine, "SPY", date(2026, 5, 26), 0.20)
+    series = read_atm_iv_history(engine, "SPY")
+    assert list(series) == [0.18, 0.20, 0.22]
+
+
+def test_read_atm_iv_history_unknown_symbol_is_empty(tmp_path: Path) -> None:
+    from optionsbot.storage.iv_history import read_atm_iv_history
+
+    db_path = tmp_path / "ivh3.db"
+    apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    series = read_atm_iv_history(engine, "NOPE")
+    assert len(series) == 0
