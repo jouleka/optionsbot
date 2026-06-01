@@ -355,6 +355,7 @@ async def test_chain_greek_wait_exits_on_plateau(mock_ib, monkeypatch) -> None:
 
     # Calls carry greeks; puts don't.
     assert {leg.right for leg in legs if leg.iv is not None} == {"C"}
-    # Plateau break fires after ~greek_stable_polls (3), far below the default
-    # greek_timeout/greek_poll = 10/0.5 = 20 polls.
+    # Plateau break fires after exactly greek_stable_polls (3) sleeps in this
+    # scenario; <= 4 leaves one count of headroom. Far below the all-or-timeout
+    # path's greek_timeout/greek_poll = 10/0.5 = 20 polls.
     assert sleep_spy.await_count <= 4
