@@ -81,6 +81,11 @@ async def test_get_account_summary_extracts_tags(positions_client, mock_ib) -> N
     assert summary.buying_power == Decimal("20000.00")
     assert summary.available_funds == Decimal("9500.00")
     assert summary.currency == "USD"
+    # Pin the async path: reverting to the blocking sync ib.accountSummary()
+    # (which raises "event loop is already running" inside a running loop)
+    # must fail this test, not pass by coincidence.
+    mock_ib.accountSummaryAsync.assert_awaited_once()
+    mock_ib.accountSummary.assert_not_called()
 
 
 async def test_get_account_summary_handles_missing_tags(positions_client, mock_ib) -> None:

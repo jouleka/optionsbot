@@ -3,13 +3,16 @@
 ``PositionsClient.get_positions()`` returns a list of flat
 ``PositionRecord`` objects derived from ``ib_async.IB.positions()``;
 ``get_account_summary()`` extracts ``NetLiquidation``, ``BuyingPower``
-and ``AvailableFunds`` from ``ib_async.IB.accountSummary()`` and wraps
-them in an ``AccountSummary``.
+and ``AvailableFunds`` from ``ib_async.IB.accountSummaryAsync()`` and
+wraps them in an ``AccountSummary``.
 
 Both calls are TTL-cached (default 60s) per ``PositionsClient`` instance.
-The underlying ``ib.positions()`` / ``ib.accountSummary()`` are
-synchronous methods on ib_async (they internally drive the asyncio
-event loop via ``IB._run``); do NOT ``await`` them.
+
+``ib.positions()`` is a passive read of already-received data and is
+synchronous -- do NOT ``await`` it. ``ib.accountSummary()``, by contrast,
+is a blocking wrapper that drives the event loop via ``IB._run`` (unsafe
+inside our running loop), so we use the awaitable
+``accountSummaryAsync()`` instead.
 """
 
 from __future__ import annotations
