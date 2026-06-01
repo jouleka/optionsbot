@@ -179,3 +179,26 @@ def test_diagonal_legs_have_different_strikes_and_expiries(
 
 def test_diagonal_factor_weights_sum_to_one() -> None:
     assert sum(DiagonalSpread().factor_weights.values()) == pytest.approx(1.0)
+
+
+def test_calendar_forms_under_scan_front_back_fetch(
+    chain_front_back: tuple[OptionChainLeg, ...],
+) -> None:
+    """Regression (IBK-91): the scan fetches only a front(~45)+back(~75); the
+    calendar must still produce a 2-expiry spread. The reverted 'N nearest 45'
+    fetch (adjacent weeklies ~7d apart) made this return None."""
+    legs = CalendarSpread().suggest_legs(
+        _snapshot(chain_front_back, make_view("neutral", "low"))
+    )
+    assert legs is not None
+    assert len({leg.expiry for leg in legs}) == 2
+
+
+def test_diagonal_forms_under_scan_front_back_fetch(
+    chain_front_back: tuple[OptionChainLeg, ...],
+) -> None:
+    legs = DiagonalSpread().suggest_legs(
+        _snapshot(chain_front_back, make_view("bull", "low"))
+    )
+    assert legs is not None
+    assert len({leg.expiry for leg in legs}) == 2

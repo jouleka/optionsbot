@@ -104,6 +104,25 @@ def chain_multi_dte() -> tuple[OptionChainLeg, ...]:
     return tuple(all_legs)
 
 
+@pytest.fixture()
+def chain_front_back() -> tuple[OptionChainLeg, ...]:
+    """Chain at 45 + 75 DTE -- the scan's front+back fetch (gap 30, the
+    minimum a calendar/diagonal needs)."""
+    all_legs: list[OptionChainLeg] = []
+    for dte in (45, 75):
+        exp = (date.today() + timedelta(days=dte)).strftime("%Y%m%d")
+        for k in (395, 400, 405):
+            for right, delta in (("C", 0.50), ("P", -0.50)):
+                base = 5.0 + dte * 0.05
+                all_legs.append(
+                    _make_leg(
+                        "SPY", exp, float(k), right,  # type: ignore[arg-type]
+                        bid=base, ask=base + 0.1, delta=delta,
+                    )
+                )
+    return tuple(all_legs)
+
+
 def make_view(
     direction: Direction = "neutral",
     iv_regime: IVRegime = "high",
