@@ -229,3 +229,61 @@ async def test_scan_symbol_account_value_none_when_no_net_liquidation(
     await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
 
     assert spy_score.call_args.kwargs["account_value"] is None
+
+
+async def test_scan_symbol_records_atm_iv_history(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """A scan with real option data records today's ATM IV into iv_history."""
+    from optionsbot.storage.iv_history import read_atm_iv_history
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    series = read_atm_iv_history(scan_engine, "SPY")  # type: ignore[arg-type]
+    assert len(series) == 1
+    assert series.iloc[0] == 0.20  # fake_chain ATM call iv
+
+
+async def test_scan_symbol_iv_rank_active_after_warmup(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """With >=30 prior daily ATM-IV samples, iv_rank stops warming up and
+    produces a real rank value."""
+    from optionsbot.storage.iv_history import record_atm_iv
+
+    for i in range(30):
+        record_atm_iv(
+            scan_engine,  # type: ignore[arg-type]
+            "SPY",
+            date(2026, 1, 1) + timedelta(days=i),
+            0.15 + i * 0.005,
+        )
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    assert result.view.warming_up is False
+    assert result.view.iv_rank_value is not None
+
+
+async def test_scan_symbol_no_iv_history_when_no_option_data(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    """No option data (atm_iv=None) -> no iv_history row, warming_up stays True."""
+    from typing import cast
+
+    import optionsbot.scan.symbol as symbol_mod
+    from optionsbot.ibkr.types import OptionChainLeg, OptionRight
+    from optionsbot.storage.iv_history import read_atm_iv_history
+
+    expiry = (date.today() + timedelta(days=45)).strftime("%Y%m%d")
+    nodata_chain = [
+        OptionChainLeg(
+            symbol="SPY", expiry=expiry, strike=k, right=cast("OptionRight", r),
+            bid=None, ask=None, iv=None, delta=None, gamma=None,
+            theta=None, vega=None, open_interest=None, volume=None,
+        )
+        for k in (400.0, 405.0)
+        for r in ("C", "P")
+    ]
+    symbol_mod.ChainClient.return_value.get_chain.return_value = nodata_chain  # type: ignore[attr-defined]
+
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    assert result.view.warming_up is True
+    assert len(read_atm_iv_history(scan_engine, "SPY")) == 0  # type: ignore[arg-type]

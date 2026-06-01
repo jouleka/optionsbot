@@ -27,6 +27,7 @@ from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg
 from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import score_all
+from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies import Leg, StrategySnapshot
@@ -131,9 +132,16 @@ async def scan_symbol(
     # Normalize to None here so downstream guards work as written.
     if hv20 is not None and math.isnan(hv20):
         hv20 = None
-    iv_history = (
-        pd.Series([atm_iv]) if atm_iv is not None else pd.Series([], dtype=float)
-    )
+    now = datetime.now(UTC)
+    if atm_iv is not None:
+        # Record today's ATM IV (latest scan of the day wins), then read the
+        # trailing daily series so iv_rank ranks against real history. Today is
+        # included in the window -> standard IV-rank, no spurious clamping.
+        record_atm_iv(engine, symbol, now.date(), atm_iv)
+        iv_history = read_atm_iv_history(engine, symbol)
+    else:
+        # No option data today: don't rank a bogus 0.0 against real history.
+        iv_history = pd.Series([], dtype=float)
     view = infer_view(symbol, bars, current_atm_iv=atm_iv or 0.0, atm_iv_history=iv_history)
     view = _override_view(view, view_override)
 
@@ -181,7 +189,6 @@ async def scan_symbol(
         )
         scored = ()
 
-    now = datetime.now(UTC)
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
     raw_extra: dict[str, object] = {
         "delayed": stock.delayed,
