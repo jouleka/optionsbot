@@ -381,3 +381,15 @@ async def test_chain_qualifies_once_per_chunk(mock_ib) -> None:
     assert len(legs) == 6
     # 1 stock qualify + 3 chunk batch-qualifies = 4 (per-leg would be 1 + 6 = 7).
     assert mock_ib.qualifyContractsAsync.await_count == 4
+
+
+async def test_chain_fetches_front_and_back_month(chain_client, mock_ib) -> None:
+    """With back_dte_gap set, fetch a near-target front + the nearest back-month
+    (>= front+gap, pulled from the FULL list, even outside the DTE window)."""
+    # In-window (25-55): 30, 45, 49. Back-month (full list, outside window): 75.
+    expiries = [_expiry(30), _expiry(45), _expiry(49), _expiry(75)]
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, [400.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), back_dte_gap=30)
+    assert {leg.expiry for leg in legs} == {_expiry(45), _expiry(75)}

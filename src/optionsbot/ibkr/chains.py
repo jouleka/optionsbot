@@ -129,6 +129,8 @@ class ChainClient:
         underlying_price: float | None = None,
         strike_band_pct: float = 0.15,
         max_strikes_per_side: int = 40,
+        dte_target: int = 45,
+        back_dte_gap: int | None = None,
     ) -> list[OptionChainLeg]:
         underlying = await self._resolver.stock(symbol)
         await self._client.ensure_connected()
@@ -152,7 +154,20 @@ class ChainClient:
                 smart = [p for p in params if getattr(p, "exchange", "") == "SMART"]
                 candidates = smart or list(params)
                 chosen = max(candidates, key=lambda p: (len(p.expirations), len(p.strikes)))
-                expiries = [e for e in sorted(chosen.expirations) if lo <= _dte(e) <= hi]
+                all_expiries = sorted(chosen.expirations)
+                in_window = [e for e in all_expiries if lo <= _dte(e) <= hi]
+                if back_dte_gap is None or not in_window:
+                    expiries = in_window
+                else:
+                    # Front = nearest dte_target in-window; back = nearest expiry
+                    # >= front+gap from the FULL list (the back-month lives
+                    # outside the window). Keeps Calendar/Diagonal viable.
+                    front = min(in_window, key=lambda e: abs(_dte(e) - dte_target))
+                    keep = {front}
+                    backs = [e for e in all_expiries if _dte(e) >= _dte(front) + back_dte_gap]
+                    if backs:
+                        keep.add(min(backs, key=_dte))
+                    expiries = sorted(keep)
                 if expiries:
                     strikes = sorted(chosen.strikes)
                     break
