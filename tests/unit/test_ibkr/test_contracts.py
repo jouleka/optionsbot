@@ -112,3 +112,40 @@ def test_contract_cache_key_is_deterministic() -> None:
     k_opt_call = _contract_cache_key("OPT", "SPY", "20260619", 400.0, "C")
     k_opt_put = _contract_cache_key("OPT", "SPY", "20260619", 400.0, "P")
     assert k_opt_call != k_opt_put
+
+
+async def test_qualify_options_returns_contract_per_spec(resolver, mock_ib) -> None:
+    specs = [("20260619", 400.0, "C"), ("20260619", 405.0, "C")]
+    mock_ib.qualifyContractsAsync.return_value = [
+        _qualified_option(strike=400.0, right="C"),
+        _qualified_option(strike=405.0, right="C"),
+    ]
+    out = await resolver.qualify_options("SPY", specs)
+    assert set(out.keys()) == set(specs)
+    assert out[("20260619", 400.0, "C")].strike == 400.0
+    mock_ib.qualifyContractsAsync.assert_awaited_once()
+
+
+async def test_qualify_options_omits_unqualifiable(resolver, mock_ib) -> None:
+    specs = [("20260619", 400.0, "C"), ("20260619", 99999.0, "C")]
+    mock_ib.qualifyContractsAsync.return_value = [_qualified_option(strike=400.0), None]
+    out = await resolver.qualify_options("SPY", specs)
+    assert set(out.keys()) == {("20260619", 400.0, "C")}  # None slot omitted
+
+
+async def test_qualify_options_serves_cache_without_requalifying(resolver, mock_ib) -> None:
+    specs = [("20260619", 400.0, "C")]
+    mock_ib.qualifyContractsAsync.return_value = [_qualified_option(strike=400.0)]
+    await resolver.qualify_options("SPY", specs)
+    await resolver.qualify_options("SPY", specs)  # cache hit -> no second call
+    assert mock_ib.qualifyContractsAsync.await_count == 1
+
+
+async def test_qualify_options_batches_misses_into_one_call(resolver, mock_ib) -> None:
+    specs = [("20260619", float(k), "C") for k in (400, 405, 410)]
+    mock_ib.qualifyContractsAsync.return_value = [
+        _qualified_option(strike=float(k)) for k in (400, 405, 410)
+    ]
+    await resolver.qualify_options("SPY", specs)
+    assert mock_ib.qualifyContractsAsync.await_count == 1
+    assert len(mock_ib.qualifyContractsAsync.await_args.args) == 3  # all 3 in one call

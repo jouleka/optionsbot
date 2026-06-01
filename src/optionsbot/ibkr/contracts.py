@@ -8,6 +8,7 @@ of truth and contracts don't change mid-session.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from optionsbot.ibkr.client import IBKRClient
@@ -84,6 +85,45 @@ class ContractResolver:
             )
         result = cast("Contract", qualified[0])
         self._cache[key] = result
+        return result
+
+    async def qualify_options(
+        self,
+        symbol: str,
+        specs: Sequence[tuple[str, float, OptionRight]],
+    ) -> dict[tuple[str, float, OptionRight], Contract]:
+        """Qualify many option contracts in ONE qualifyContractsAsync call.
+
+        Cache-preserving: cached specs are returned directly; only misses are
+        qualified, in a single batched call (ib_async runs them concurrently).
+        Unqualifiable specs (None in the positional result) are omitted.
+        """
+        result: dict[tuple[str, float, OptionRight], Contract] = {}
+        miss_specs: list[tuple[str, float, OptionRight]] = []
+        for spec in specs:
+            expiry, strike, right = spec
+            key = _contract_cache_key("OPT", symbol, expiry, strike, right)
+            cached = self._cache.get(key)
+            if cached is not None:
+                result[spec] = cached
+            else:
+                miss_specs.append(spec)
+        if miss_specs:
+            await self._client.ensure_connected()
+            from ib_async import Option
+            contracts = [
+                Option(symbol, expiry, strike, right, "SMART")
+                for expiry, strike, right in miss_specs
+            ]
+            qualified = await self._client.ib.qualifyContractsAsync(*contracts)
+            for spec, q in zip(miss_specs, qualified, strict=True):
+                if q is None:
+                    continue
+                expiry, strike, right = spec
+                key = _contract_cache_key("OPT", symbol, expiry, strike, right)
+                contract = cast("Contract", q)
+                self._cache[key] = contract
+                result[spec] = contract
         return result
 
     async def qualify(self, contract: Contract) -> Contract:
