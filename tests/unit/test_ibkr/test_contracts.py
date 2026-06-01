@@ -149,3 +149,18 @@ async def test_qualify_options_batches_misses_into_one_call(resolver, mock_ib) -
     await resolver.qualify_options("SPY", specs)
     assert mock_ib.qualifyContractsAsync.await_count == 1
     assert len(mock_ib.qualifyContractsAsync.await_args.args) == 3  # all 3 in one call
+
+
+async def test_qualify_options_only_qualifies_the_misses(resolver, mock_ib) -> None:
+    """A mixed call qualifies ONLY the cache-miss specs; cached specs are
+    returned without re-qualifying (the cache filter feeds the batch)."""
+    seeded = ("20260619", 400.0, "C")
+    fresh = ("20260619", 405.0, "C")
+    mock_ib.qualifyContractsAsync.return_value = [_qualified_option(strike=400.0)]
+    await resolver.qualify_options("SPY", [seeded])  # seed cache for 400C
+    mock_ib.qualifyContractsAsync.reset_mock()
+    mock_ib.qualifyContractsAsync.return_value = [_qualified_option(strike=405.0)]
+    out = await resolver.qualify_options("SPY", [seeded, fresh])  # 400C cached, 405C miss
+    assert set(out.keys()) == {seeded, fresh}  # both returned
+    mock_ib.qualifyContractsAsync.assert_awaited_once()  # only the miss qualified
+    assert len(mock_ib.qualifyContractsAsync.await_args.args) == 1  # just 405C
