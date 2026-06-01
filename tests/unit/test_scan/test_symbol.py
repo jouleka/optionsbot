@@ -186,3 +186,46 @@ async def test_scan_symbol_passes_line_cap_to_chain_client(
 
     ctor_kwargs = symbol_mod.ChainClient.call_args.kwargs  # type: ignore[attr-defined]
     assert ctor_kwargs["max_market_data_lines"] == scan_settings.ibkr.max_market_data_lines  # type: ignore[attr-defined]
+
+
+async def test_scan_symbol_passes_account_value_and_risk_pct_to_score_all(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    """scan_symbol derives account_value from net_liquidation and passes it
+    plus the configured risk_pct into score_all."""
+    from unittest.mock import MagicMock
+
+    import optionsbot.scan.symbol as symbol_mod
+
+    spy_score = MagicMock(return_value=())
+    monkeypatch.setattr(symbol_mod, "score_all", spy_score)
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    spy_score.assert_called_once()
+    kwargs = spy_score.call_args.kwargs
+    assert kwargs["account_value"] == 100000.0
+    assert kwargs["risk_pct"] == scan_settings.scan.risk_pct  # type: ignore[attr-defined]
+
+
+async def test_scan_symbol_account_value_none_when_no_net_liquidation(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    """When the account summary has no net_liquidation, account_value is None
+    (position sizing skipped)."""
+    from unittest.mock import MagicMock
+
+    import optionsbot.scan.symbol as symbol_mod
+    from optionsbot.ibkr.types import AccountSummary
+
+    symbol_mod.PositionsClient.return_value.get_account_summary.return_value = (  # type: ignore[attr-defined]
+        AccountSummary(
+            net_liquidation=None, buying_power=None, available_funds=None, currency="USD"
+        )
+    )
+    spy_score = MagicMock(return_value=())
+    monkeypatch.setattr(symbol_mod, "score_all", spy_score)
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    assert spy_score.call_args.kwargs["account_value"] is None

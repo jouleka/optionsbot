@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,7 +13,7 @@ from sqlalchemy import Engine
 
 from optionsbot.config import Settings
 from optionsbot.ibkr import IBKRClient
-from optionsbot.ibkr.types import OptionChainLeg, StockQuote
+from optionsbot.ibkr.types import AccountSummary, OptionChainLeg, StockQuote
 from optionsbot.storage.db import create_engine_for_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -137,6 +138,14 @@ def mock_ibkr_for_scan(
 
     positions_mock = MagicMock()
     positions_mock.get_positions = AsyncMock(return_value=[])
+    positions_mock.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("100000"),
+            buying_power=Decimal("100000"),
+            available_funds=Decimal("100000"),
+            currency="USD",
+        )
+    )
     monkeypatch.setattr(symbol_mod, "PositionsClient", MagicMock(return_value=positions_mock))
 
     return ibkr

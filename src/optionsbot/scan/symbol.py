@@ -110,7 +110,7 @@ async def scan_symbol(
     # strike windowing; the remaining calls then run concurrently.
     stock = await market_client.get_stock_snapshot(symbol)
     spot = stock.mid or stock.last or 0.0
-    bars, chain, positions = await asyncio.gather(
+    bars, chain, positions, account = await asyncio.gather(
         history_client.get_history(symbol, days=120),
         chain_client.get_chain(
             symbol,
@@ -119,6 +119,7 @@ async def scan_symbol(
             max_strikes_per_side=settings.scan.max_strikes_per_side,
         ),
         positions_client.get_positions(),
+        positions_client.get_account_summary(),
     )
 
     atm_iv = _atm_iv(chain, spot)
@@ -152,14 +153,24 @@ async def scan_symbol(
         position=sym_position,
     )
 
-    account_value = None  # account-summary integration deferred to IBK-7
+    account_value = (
+        float(account.net_liquidation) if account.net_liquidation is not None else None
+    )
+    if account_value is None:
+        log.info(
+            "No account net-liquidation for %s; position sizing skipped "
+            "(suggested_quantity will be 0).",
+            symbol,
+        )
     # Option scoring needs real per-leg data (IV/greeks). If the chain came back
     # with no usable option data -- e.g. the account lacks an options (OPRA)
     # market-data subscription -- skip scoring rather than emit strategies built
     # off the directional view alone (they'd carry no real strikes/pricing).
     has_option_data = any(leg.iv is not None or leg.delta is not None for leg in chain)
     if has_option_data:
-        scored = score_all(snapshot, account_value=account_value)
+        scored = score_all(
+            snapshot, account_value=account_value, risk_pct=settings.scan.risk_pct
+        )
     else:
         log.warning(
             "No option market data for %s (%d chain legs, none with IV/greeks); "
