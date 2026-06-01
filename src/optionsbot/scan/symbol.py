@@ -98,7 +98,11 @@ async def scan_symbol(
     await ibkr.ensure_connected()
 
     history_client = HistoryClient(ibkr, resolver=resolver)
-    chain_client = ChainClient(ibkr, resolver=resolver)
+    chain_client = ChainClient(
+        ibkr,
+        resolver=resolver,
+        max_market_data_lines=settings.ibkr.max_market_data_lines,
+    )
     market_client = MarketDataClient(ibkr, resolver=resolver)
     positions_client = PositionsClient(ibkr)
 

@@ -173,3 +173,16 @@ async def test_scan_symbol_skips_scoring_when_chain_has_no_option_data(
 
     spy_score.assert_not_called()
     assert result.scored == ()
+
+
+async def test_scan_symbol_passes_line_cap_to_chain_client(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """scan_symbol must construct ChainClient with the configured
+    max_market_data_lines so the streaming-line cap is honored."""
+    import optionsbot.scan.symbol as symbol_mod
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    ctor_kwargs = symbol_mod.ChainClient.call_args.kwargs  # type: ignore[attr-defined]
+    assert ctor_kwargs["max_market_data_lines"] == scan_settings.ibkr.max_market_data_lines  # type: ignore[attr-defined]
