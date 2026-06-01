@@ -68,13 +68,7 @@ def _qualify_side_effect(c: MagicMock) -> list[MagicMock]:
 def chain_client(mock_ib) -> ChainClient:
     mock_ib.isConnected.return_value = True
     client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
-    return ChainClient(
-        client,
-        max_concurrent=4,
-        max_calls_per_window=50,
-        window_seconds=10.0,
-        secdef_retry_delay=0.0,
-    )
+    return ChainClient(client, secdef_retry_delay=0.0)
 
 
 async def test_chain_filters_expiries_to_window(chain_client, mock_ib) -> None:
@@ -228,3 +222,106 @@ async def test_chain_uses_streaming_not_snapshot(chain_client, mock_ib) -> None:
     assert mock_ib.reqMktData.called
     mock_ib.reqTickersAsync.assert_not_awaited()
     assert mock_ib.cancelMktData.called  # streaming lines released
+
+
+async def test_chain_caps_simultaneous_open_lines(mock_ib) -> None:
+    """Never hold more streaming lines open at once than max_market_data_lines."""
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(client, max_market_data_lines=2, secdef_retry_delay=0.0)
+    # 3 strikes x 2 rights = 6 legs; cap = 2 lines.
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [395.0, 400.0, 405.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+
+    open_lines = 0
+    max_open = 0
+
+    def _sub(contract, *a, **k):
+        nonlocal open_lines, max_open
+        open_lines += 1
+        max_open = max(max_open, open_lines)
+        return _ticker(bid=5.0, ask=5.1)
+
+    def _cancel(contract):
+        nonlocal open_lines
+        open_lines -= 1
+
+    mock_ib.reqMktData.side_effect = _sub
+    mock_ib.cancelMktData.side_effect = _cancel
+
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+    assert len(legs) == 6
+    assert max_open <= 2
+
+
+async def test_chain_releases_every_streaming_line(chain_client, mock_ib) -> None:
+    """Every subscribed line is cancelled (cancel count == subscribe count)."""
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [395.0, 400.0, 405.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
+    assert len(legs) == 6
+    assert mock_ib.reqMktData.call_count == 6
+    assert mock_ib.cancelMktData.call_count == 6
+
+
+async def test_chain_wait_is_batched_not_per_leg(chain_client, mock_ib, monkeypatch) -> None:
+    """With greeks present immediately, the batched wait issues zero poll-sleeps
+    regardless of leg count -- proving the wait is per-chunk, not per-leg."""
+    from unittest.mock import AsyncMock
+
+    sleep_spy = AsyncMock()
+    monkeypatch.setattr("optionsbot.ibkr.chains.asyncio.sleep", sleep_spy)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(
+        [_expiry(35)], [390.0, 395.0, 400.0, 405.0, 410.0]
+    )
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1, iv=0.2, delta=0.3)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
+    assert len(legs) == 10  # 5 strikes x 2 rights
+    sleep_spy.assert_not_awaited()
+
+
+async def test_chain_leg_without_greeks_returns_none_iv(mock_ib) -> None:
+    """A leg whose greeks never populate is still returned (iv/delta=None) and
+    the chunk wait ends at timeout rather than hanging."""
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(
+        client, secdef_retry_delay=0.0, greek_wait_timeout=0.05, greek_poll_interval=0.01
+    )
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [400.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+
+    def _sub(contract, *a, **k):
+        if contract.right == "C":
+            return _ticker(bid=5.0, ask=5.1, iv=0.3, delta=0.5)
+        t = _ticker(bid=4.0, ask=4.1)
+        t.modelGreeks = None  # puts never get greeks
+        return t
+
+    mock_ib.reqMktData.side_effect = _sub
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
+    by_right = {leg.right: leg for leg in legs}
+    assert by_right["C"].iv == pytest.approx(0.3)
+    assert by_right["P"].iv is None
+    assert by_right["P"].delta is None
+
+
+async def test_chain_skips_leg_that_fails_to_qualify(chain_client, mock_ib) -> None:
+    """A leg whose contract can't be qualified is dropped; the rest still
+    subscribe, and every opened line is released."""
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [400.0])
+
+    def _qualify(c):
+        # Stock qualifies (right == ""); the put option is unqualifiable.
+        if getattr(c, "right", "") == "P":
+            return [None]  # resolver.option raises ValueError on [None]
+        return _qualify_side_effect(c)
+
+    mock_ib.qualifyContractsAsync.side_effect = _qualify
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
+    assert {leg.right for leg in legs} == {"C"}
+    assert mock_ib.reqMktData.call_count == 1
+    assert mock_ib.cancelMktData.call_count == 1

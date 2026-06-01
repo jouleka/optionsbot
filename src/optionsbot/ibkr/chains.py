@@ -3,14 +3,20 @@
 Strategy:
   1. reqSecDefOptParams -> all (expirations, strikes) for the underlying.
   2. Filter expiries to the DTE window and strikes to a near-ATM band.
-  3. For each (expiry, strike, right), qualify the option contract and
-     subscribe to STREAMING market data. Greeks (IV/delta) are computed
-     server-side only on the streaming feed; an options *snapshot*
-     returns Error 10091 and would be billed per request.
+  3. Build the (expiry, strike, right) leg set and fetch it in CHUNKS of
+     ``max_market_data_lines`` legs. For each chunk: qualify + subscribe every
+     leg to STREAMING market data (reqMktData), wait ONCE for greeks to
+     populate across the whole chunk, read every ticker, then cancel every
+     subscription. Greeks (IV/delta) are computed server-side only on the
+     streaming feed; an options *snapshot* returns Error 10091 and would be
+     billed per request.
   4. Adapt to OptionChainLeg and return as a list.
 
-Concurrency is bounded by ConcurrencyLimiter; the rate at which we
-hit the gateway is gated by RateLimiter to stay under IBKR pacing.
+Pacing: the only IBKR streaming limit we self-enforce is the simultaneous
+market-data line count, capped by the chunk size (``max_market_data_lines``,
+default 50, under the 100-line account default). ib_async throttles the
+outgoing request *rate* on its own (MaxRequests=45 / RequestsInterval=1s), so
+no per-leg rate limiter is needed.
 """
 
 from __future__ import annotations
@@ -18,23 +24,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import statistics
+from collections.abc import Iterator
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 
 from optionsbot.ibkr._util import clean_float, clean_int
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
-from optionsbot.ibkr.pacing import ConcurrencyLimiter, RateLimiter
 from optionsbot.ibkr.types import OptionChainLeg, OptionRight
+
+if TYPE_CHECKING:
+    from ib_async import Contract
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_MAX_CONCURRENT = 8
-_DEFAULT_RATE_LIMIT = 50  # calls per window
-_DEFAULT_RATE_WINDOW = 10.0  # seconds
+_DEFAULT_MAX_LINES = 50  # simultaneous streaming market-data lines per chunk
 _DEFAULT_SECDEF_RETRIES = 2
 _DEFAULT_SECDEF_RETRY_DELAY = 1.0  # seconds
 _DEFAULT_GREEK_TIMEOUT = 10.0  # seconds to wait for streaming greeks to populate
 _DEFAULT_GREEK_POLL = 0.5  # seconds between greek-readiness polls
+
+_LegSpec = tuple[str, float, OptionRight]
 
 
 def _dte(expiry: str, today: date | None = None) -> int:
@@ -73,14 +83,29 @@ def _clean_price(value: float | None) -> float | None:
     return cleaned
 
 
+def _chunked(seq: list[_LegSpec], size: int) -> Iterator[list[_LegSpec]]:
+    """Yield successive ``size``-length chunks of ``seq``."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _has_greeks(ticker: object) -> bool:
+    """True once the streaming feed has populated model greeks for this ticker."""
+    g = getattr(ticker, "modelGreeks", None)
+    if g is None:
+        return False
+    return (
+        getattr(g, "delta", None) is not None
+        or getattr(g, "impliedVol", None) is not None
+    )
+
+
 class ChainClient:
     def __init__(
         self,
         client: IBKRClient,
         resolver: ContractResolver | None = None,
-        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-        max_calls_per_window: int = _DEFAULT_RATE_LIMIT,
-        window_seconds: float = _DEFAULT_RATE_WINDOW,
+        max_market_data_lines: int = _DEFAULT_MAX_LINES,
         secdef_retries: int = _DEFAULT_SECDEF_RETRIES,
         secdef_retry_delay: float = _DEFAULT_SECDEF_RETRY_DELAY,
         greek_wait_timeout: float = _DEFAULT_GREEK_TIMEOUT,
@@ -88,8 +113,7 @@ class ChainClient:
     ) -> None:
         self._client = client
         self._resolver = resolver if resolver is not None else ContractResolver(client)
-        self._concurrency = ConcurrencyLimiter(max_concurrent)
-        self._rate = RateLimiter(max_calls_per_window, window_seconds)
+        self._max_lines = max_market_data_lines
         self._secdef_retries = secdef_retries
         self._secdef_retry_delay = secdef_retry_delay
         self._greek_timeout = greek_wait_timeout
@@ -113,8 +137,6 @@ class ChainClient:
         expiries: list[str] = []
         strikes: list[float] = []
         for attempt in range(self._secdef_retries + 1):
-            # ib_async exposes reqSecDefOptParams (sync wrapper) and the async
-            # sibling; use the async form so we don't block the event loop.
             params = await self._client.ib.reqSecDefOptParamsAsync(
                 underlying.symbol,
                 "",  # futFopExchange
@@ -122,11 +144,8 @@ class ChainClient:
                 underlying.conId,
             )
             if params:
-                # One row per (exchange, tradingClass, multiplier). A single
-                # underlying can expose MULTIPLE SMART rows: e.g. SPY returns
-                # both the standard class (~37 expiries / ~497 strikes) and a
-                # degenerate 4-expiry / 4-strike class. Pick SMART rows, then
-                # the richest by (#expirations, #strikes) for the full listing.
+                # One row per (exchange, tradingClass, multiplier). Pick SMART
+                # rows, then the richest by (#expirations, #strikes).
                 smart = [p for p in params if getattr(p, "exchange", "") == "SMART"]
                 candidates = smart or list(params)
                 chosen = max(candidates, key=lambda p: (len(p.expirations), len(p.strikes)))
@@ -153,11 +172,10 @@ class ChainClient:
         if not strikes:
             return []
         # Bound the strike set to a near-ATM window. reqSecDefOptParams returns
-        # the UNION of strikes across all expiries (~497 for SPY) -- fetching the
-        # full ladder x every in-window expiry x {C,P} is thousands of legs and
-        # minutes under IBKR pacing. Keep strikes within +/-strike_band_pct of a
-        # reference price (the underlying spot when known, else the median listed
-        # strike as an ATM proxy), capped at max_strikes_per_side on each side.
+        # the UNION of strikes across all expiries (~497 for SPY); fetching the
+        # full ladder would be thousands of legs. Keep strikes within
+        # +/-strike_band_pct of a reference price (the underlying spot when
+        # known, else the median listed strike), capped at max_strikes_per_side.
         reference = (
             underlying_price
             if underlying_price is not None and underlying_price > 0
@@ -166,51 +184,62 @@ class ChainClient:
         strikes = _select_strikes(strikes, reference, strike_band_pct, max_strikes_per_side)
         if not strikes:
             return []
-        # Fetch each (expiry, strike, right) under concurrency + rate limits.
-        # ``return_exceptions=True`` so a single transient per-leg failure
-        # doesn't cancel the whole chain; we drop failed legs after the fact.
+        # Build the full leg set, then fetch it in chunks bounded by the
+        # simultaneous market-data line cap. Each chunk subscribes all its legs,
+        # waits ONCE, reads, then cancels -- so greeks for a whole chunk compute
+        # in parallel server-side instead of one leg at a time.
         rights: tuple[OptionRight, ...] = ("C", "P")
-        tasks = [
-            self._fetch_one(symbol, expiry, strike, right)
+        specs: list[_LegSpec] = [
+            (expiry, strike, right)
             for expiry in expiries
             for strike in strikes
             for right in rights
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return [r for r in results if isinstance(r, OptionChainLeg)]
+        legs: list[OptionChainLeg] = []
+        for chunk in _chunked(specs, self._max_lines):
+            legs.extend(await self._fetch_chunk(symbol, chunk))
+        return legs
 
-    async def _fetch_one(
-        self,
-        symbol: str,
-        expiry: str,
-        strike: float,
-        right: OptionRight,
-    ) -> OptionChainLeg | None:
-        await self._rate.acquire()
-        async with self._concurrency:
-            try:
-                contract = await self._resolver.option(symbol, expiry, strike, right)
-            except ValueError:
-                return None
-            # Use STREAMING market data (reqMktData), NOT a snapshot
-            # (reqTickersAsync). IBKR computes option greeks (IV/delta) only on
-            # the streaming feed -- an options snapshot returns Error 10091 and
-            # is billed per request; streaming delayed data is free under the
-            # (shared) subscription. Greeks compute server-side and arrive a beat
-            # after subscribing, so poll until they populate (or timeout).
-            ticker = self._client.ib.reqMktData(contract, "", False, False)
-            try:
-                for _ in range(max(1, int(self._greek_timeout / self._greek_poll))):
-                    g = getattr(ticker, "modelGreeks", None)
-                    if g is not None and (
-                        getattr(g, "delta", None) is not None
-                        or getattr(g, "impliedVol", None) is not None
-                    ):
-                        break
-                    await asyncio.sleep(self._greek_poll)
-            finally:
+    async def _fetch_chunk(
+        self, symbol: str, specs: list[_LegSpec]
+    ) -> list[OptionChainLeg]:
+        """Qualify + subscribe every leg in the chunk, wait once for greeks,
+        adapt every ticker, then release every streaming line."""
+        subscribed: list[tuple[_LegSpec, Contract, object]] = []
+        try:
+            for expiry, strike, right in specs:
+                try:
+                    contract = await self._resolver.option(symbol, expiry, strike, right)
+                except ValueError:
+                    continue
+                # STREAMING reqMktData (NOT a snapshot): IBKR computes option
+                # greeks only on the streaming feed. reqMktData returns a live
+                # Ticker synchronously; it fills in over the next seconds.
+                try:
+                    ticker = self._client.ib.reqMktData(contract, "", False, False)
+                except Exception:  # noqa: BLE001 -- one bad leg must not kill the chunk
+                    log.warning(
+                        "reqMktData failed for %s %s %.2f %s; skipping leg",
+                        symbol, expiry, strike, right,
+                    )
+                    continue
+                subscribed.append(((expiry, strike, right), contract, ticker))
+            # ONE wait for the whole chunk. The await yields to the event loop so
+            # ib_async can process inbound greek ticks and fill the tickers. Poll
+            # until every live ticker has greeks, or the timeout elapses (a
+            # permanently-illiquid leg simply adapts with iv/delta=None).
+            tickers = [t for _, _, t in subscribed]
+            for _ in range(max(1, int(self._greek_timeout / self._greek_poll))):
+                if all(_has_greeks(t) for t in tickers):
+                    break
+                await asyncio.sleep(self._greek_poll)
+            return [
+                self._adapt_ticker(symbol, expiry, strike, right, ticker)
+                for (expiry, strike, right), _, ticker in subscribed
+            ]
+        finally:
+            for _, contract, _ in subscribed:
                 self._client.ib.cancelMktData(contract)
-            return self._adapt_ticker(symbol, expiry, strike, right, ticker)
 
     @staticmethod
     def _adapt_ticker(
