@@ -109,7 +109,6 @@ async def test_chain_returns_empty_when_no_expiries_in_window(chain_client, mock
     strikes = [400.0]
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(expiries, strikes)
     mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
-    mock_ib.reqTickersAsync.return_value = []
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55))
     assert legs == []
 
