@@ -49,6 +49,19 @@ def test_scan_interval_default_is_15_minutes() -> None:
     assert Settings().scan.interval_minutes == 15
 
 
+def test_scan_risk_pct_default_is_2_percent() -> None:
+    assert Settings().scan.risk_pct == 0.02
+
+
+def test_scan_risk_pct_rejects_out_of_range() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ScanSettings(risk_pct=0.0)
+    with pytest.raises(ValidationError):
+        ScanSettings(risk_pct=1.5)
+
+
 def test_env_var_overrides_nested_field(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPTIONSBOT_IBKR__PORT", "7497")
     monkeypatch.setenv("OPTIONSBOT_IBKR__PAPER", "false")
