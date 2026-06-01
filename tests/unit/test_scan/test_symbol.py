@@ -287,3 +287,15 @@ async def test_scan_symbol_no_iv_history_when_no_option_data(
     result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
     assert result.view.warming_up is True
     assert len(read_atm_iv_history(scan_engine, "SPY")) == 0  # type: ignore[arg-type]
+
+
+async def test_scan_symbol_passes_back_dte_gap_to_get_chain(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """scan_symbol fetches a back-month via settings.scan.back_month_dte_gap."""
+    import optionsbot.scan.symbol as symbol_mod
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    kwargs = symbol_mod.ChainClient.return_value.get_chain.await_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["back_dte_gap"] == scan_settings.scan.back_month_dte_gap  # type: ignore[attr-defined]

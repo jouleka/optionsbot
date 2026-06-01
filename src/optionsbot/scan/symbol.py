@@ -118,6 +118,7 @@ async def scan_symbol(
             underlying_price=spot,
             strike_band_pct=settings.scan.strike_band_pct,
             max_strikes_per_side=settings.scan.max_strikes_per_side,
+            back_dte_gap=settings.scan.back_month_dte_gap,
         ),
         positions_client.get_positions(),
         positions_client.get_account_summary(),
