@@ -86,12 +86,12 @@ async def scan_symbol(
     MarketView (after applying view_override if given), and every scored
     strategy.
 
-    The IV-rank input is intentionally degenerate in v1 -- the analysis
-    layer needs a multi-day ATM IV history that the IBKR layer doesn't yet
-    expose. Until IBK-7 lands the history-collection daemon, we pass a
-    single-element series and accept that iv_rank will return None with
-    warming_up=True. The scoring engine treats this as neutral (0.5), so
-    the scan is still meaningful for the other 5 factors.
+    IV-rank uses a forward-accumulated daily ATM IV history (IBK-89): each
+    scan records today's ATM IV into ``iv_history`` (latest scan of the day
+    wins) and feeds the trailing daily series to ``iv_rank``. Until ~30
+    trading days accumulate, ``iv_rank`` reports ``warming_up=True`` and the
+    scoring engine treats IV-rank as neutral (0.5); the other 5 factors are
+    unaffected.
     """
     symbol = symbol.upper().strip()
     if resolver is None:
@@ -134,9 +134,10 @@ async def scan_symbol(
         hv20 = None
     now = datetime.now(UTC)
     if atm_iv is not None:
-        # Record today's ATM IV (latest scan of the day wins), then read the
-        # trailing daily series so iv_rank ranks against real history. Today is
-        # included in the window -> standard IV-rank, no spurious clamping.
+        # Record today's ATM IV (keyed by UTC date; latest scan of the day
+        # wins -- US sessions don't cross UTC midnight), then read the trailing
+        # daily series so iv_rank ranks against real history. Today is included
+        # in the window -> standard IV-rank, no spurious clamping.
         record_atm_iv(engine, symbol, now.date(), atm_iv)
         iv_history = read_atm_iv_history(engine, symbol)
     else:
