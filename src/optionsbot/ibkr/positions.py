@@ -75,7 +75,12 @@ class PositionsClient:
             if self._summary_cache and now - self._summary_cache[0] < self._ttl:
                 return self._summary_cache[1]
             await self._client.ensure_connected()
-            rows = self._client.ib.accountSummary()  # sync; do NOT await
+            # Unlike ib.positions() (a passive read of already-received data,
+            # safe to call sync), ib.accountSummary() is a BLOCKING wrapper that
+            # drives the event loop via ib._run() -- calling it inside our
+            # running loop raises "This event loop is already running". Use the
+            # async variant and await it.
+            rows = await self._client.ib.accountSummaryAsync()
             by_tag: dict[str, tuple[str, str]] = {}  # tag -> (value, currency)
             for row in rows:
                 tag = getattr(row, "tag", None)

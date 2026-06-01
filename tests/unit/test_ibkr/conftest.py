@@ -31,6 +31,7 @@ def mock_ib() -> MagicMock:
     ib.reqTickersAsync = AsyncMock()
     ib.reqSecDefOptParamsAsync = AsyncMock()
     ib.reqHistoricalDataAsync = AsyncMock()
+    ib.accountSummaryAsync = AsyncMock()
     # Sync methods (return values directly on the real IB):
     ib.disconnect = MagicMock()
     ib.isConnected = MagicMock(return_value=False)

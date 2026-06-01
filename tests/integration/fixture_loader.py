@@ -4,7 +4,7 @@
 The mock returns ib_async-shaped objects (MagicMocks with the right
 attributes) for each low-level call (``connectAsync``,
 ``qualifyContractsAsync``, ``reqSecDefOptParamsAsync``, ``reqTickersAsync``,
-``reqHistoricalDataAsync``, ``positions``, ``accountSummary``). The mock
+``reqHistoricalDataAsync``, ``positions``, ``accountSummaryAsync``). The mock
 honours the symbol mapping from the fixture so a single test instance can
 simulate a multi-symbol scan.
 
@@ -115,7 +115,7 @@ def build_ib_mock(*fixtures: dict[str, Any]) -> MagicMock:
     ib.isConnected = MagicMock(return_value=True)
     ib.reqMarketDataType = MagicMock()
     ib.positions = MagicMock(return_value=[])
-    ib.accountSummary = MagicMock(
+    ib.accountSummaryAsync = AsyncMock(
         return_value=_account_summary_rows(
             next(iter(by_symbol.values()))["account_summary"]
         )

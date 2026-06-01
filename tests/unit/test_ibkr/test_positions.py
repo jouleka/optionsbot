@@ -69,7 +69,7 @@ async def test_get_positions_refreshes_after_ttl(mock_ib) -> None:
 
 
 async def test_get_account_summary_extracts_tags(positions_client, mock_ib) -> None:
-    mock_ib.accountSummary.return_value = [
+    mock_ib.accountSummaryAsync.return_value = [
         _account_value("NetLiquidation", "10000.00"),
         _account_value("BuyingPower", "20000.00"),
         _account_value("AvailableFunds", "9500.00"),
@@ -84,7 +84,7 @@ async def test_get_account_summary_extracts_tags(positions_client, mock_ib) -> N
 
 
 async def test_get_account_summary_handles_missing_tags(positions_client, mock_ib) -> None:
-    mock_ib.accountSummary.return_value = [_account_value("BuyingPower", "5000.00")]
+    mock_ib.accountSummaryAsync.return_value = [_account_value("BuyingPower", "5000.00")]
     summary = await positions_client.get_account_summary()
     assert summary.net_liquidation is None
     assert summary.buying_power == Decimal("5000.00")
