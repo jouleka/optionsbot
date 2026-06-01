@@ -30,6 +30,10 @@ class IBKRSettings(BaseModel):
     client_id_mcp: int = 1
     client_id_daemon: int = 2
     paper: bool = True
+    # Max simultaneous streaming market-data lines to subscribe at once when
+    # fetching an option chain. IBKR's default account allowance is 100; a
+    # conservative 50 stays safely under it. Bump if your data tier permits.
+    max_market_data_lines: int = Field(default=50, ge=1)
 
 
 class TelegramSettings(BaseModel):

@@ -30,6 +30,17 @@ def test_ibkr_port_defaults_to_paper_4002() -> None:
     assert Settings().ibkr.port == 4002
 
 
+def test_ibkr_max_market_data_lines_default_is_50() -> None:
+    assert Settings().ibkr.max_market_data_lines == 50
+
+
+def test_ibkr_max_market_data_lines_rejects_below_one() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        IBKRSettings(max_market_data_lines=0)
+
+
 def test_scan_threshold_default_is_70() -> None:
     assert Settings().scan.score_threshold == 70
 
