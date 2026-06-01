@@ -54,13 +54,14 @@ def _ticker(*, bid, ask, iv=0.2, delta=0.3, oi=100, vol=50) -> MagicMock:
     return t
 
 
-def _qualify_side_effect(c: MagicMock) -> list[MagicMock]:
+def _qualify_side_effect(*cs: MagicMock) -> list[MagicMock]:
     return [
         _qualified_option(
             expiry=c.lastTradeDateOrContractMonth,
             strike=c.strike,
             right=c.right,
         )
+        for c in cs
     ]
 
 
@@ -312,11 +313,17 @@ async def test_chain_skips_leg_that_fails_to_qualify(chain_client, mock_ib) -> N
     subscribe, and every opened line is released."""
     mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [400.0])
 
-    def _qualify(c):
-        # Stock qualifies (right == ""); the put option is unqualifiable.
-        if getattr(c, "right", "") == "P":
-            return [None]  # resolver.option raises ValueError on [None]
-        return _qualify_side_effect(c)
+    def _qualify(*cs):
+        # Stock qualifies (right == ""); puts are unqualifiable (None at that
+        # positional slot -> omitted by qualify_options).
+        return [
+            None
+            if getattr(c, "right", "") == "P"
+            else _qualified_option(
+                expiry=c.lastTradeDateOrContractMonth, strike=c.strike, right=c.right
+            )
+            for c in cs
+        ]
 
     mock_ib.qualifyContractsAsync.side_effect = _qualify
     mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
@@ -359,3 +366,18 @@ async def test_chain_greek_wait_exits_on_plateau(mock_ib, monkeypatch) -> None:
     # scenario; <= 4 leaves one count of headroom. Far below the all-or-timeout
     # path's greek_timeout/greek_poll = 10/0.5 = 20 polls.
     assert sleep_spy.await_count <= 4
+
+
+async def test_chain_qualifies_once_per_chunk(mock_ib) -> None:
+    """Each chunk qualifies its contracts in a single batched call, not per leg."""
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    chain_client = ChainClient(client, max_market_data_lines=2, secdef_retry_delay=0.0)
+    # 3 strikes x 2 rights = 6 legs; cap=2 -> 3 chunks.
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([_expiry(35)], [395.0, 400.0, 405.0])
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+    assert len(legs) == 6
+    # 1 stock qualify + 3 chunk batch-qualifies = 4 (per-leg would be 1 + 6 = 7).
+    assert mock_ib.qualifyContractsAsync.await_count == 4

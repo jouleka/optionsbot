@@ -210,11 +210,14 @@ class ChainClient:
         adapt every ticker, then release every streaming line."""
         subscribed: list[tuple[_LegSpec, Contract, object]] = []
         try:
-            for expiry, strike, right in specs:
-                try:
-                    contract = await self._resolver.option(symbol, expiry, strike, right)
-                except ValueError:
-                    continue
+            # Qualify the whole chunk in ONE call (ib_async qualifies concurrently)
+            # instead of a round-trip per leg.
+            contracts = await self._resolver.qualify_options(symbol, specs)
+            for spec in specs:
+                contract = contracts.get(spec)
+                if contract is None:
+                    continue  # unqualifiable -> skip (same as the old per-leg ValueError)
+                expiry, strike, right = spec
                 # STREAMING reqMktData (NOT a snapshot): IBKR computes option
                 # greeks only on the streaming feed. reqMktData returns a live
                 # Ticker synchronously; it fills in over the next seconds.
@@ -226,7 +229,7 @@ class ChainClient:
                         symbol, expiry, strike, right,
                     )
                     continue
-                subscribed.append(((expiry, strike, right), contract, ticker))
+                subscribed.append((spec, contract, ticker))
             # ONE wait for the whole chunk. The await yields to the event loop so
             # ib_async can process inbound greek ticks and fill the tickers. Poll
             # until every live ticker has greeks, or the timeout elapses (a
