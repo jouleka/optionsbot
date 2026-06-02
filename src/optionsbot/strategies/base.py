@@ -64,6 +64,7 @@ class StrategySuggestion:
     suggested_quantity: int  # contracts (or share-sets for stock-leg strategies)
     defined_risk: bool
     rationale: str
+    reward_risk: float | None = None  # max_profit / max_loss; None if either is None
 
 
 class Strategy(ABC):
@@ -165,6 +166,11 @@ class Strategy(ABC):
         credit = self.estimate_credit(legs, snapshot)
         max_loss = self.estimate_max_loss(legs, snapshot)
         max_profit = self.estimate_max_profit(legs, snapshot)
+        reward_risk = (
+            max_profit / max_loss
+            if max_profit is not None and max_loss is not None and max_loss > 0
+            else None
+        )
         prob_profit = self.estimate_prob_profit(legs, snapshot)
         size = (
             self.suggest_size(account_value, max_loss, risk_pct)
@@ -181,6 +187,7 @@ class Strategy(ABC):
             suggested_quantity=size,
             defined_risk=self.defined_risk,
             rationale=self._build_rationale(snapshot, legs, credit, max_loss),
+            reward_risk=reward_risk,
         )
 
     def _build_rationale(
