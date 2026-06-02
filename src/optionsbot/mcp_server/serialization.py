@@ -56,5 +56,6 @@ def dump_scored(s: ScoredStrategy) -> dict[str, Any]:
             "prob_profit": s.suggestion.prob_profit,
             "suggested_quantity": s.suggestion.suggested_quantity,
             "defined_risk": s.suggestion.defined_risk,
+            "reward_risk": s.suggestion.reward_risk,
         },
     }

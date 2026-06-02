@@ -94,6 +94,7 @@ async def test_scan_pipeline_produces_persisted_snapshot_and_top_strategies(
             "max_profit",
             "prob_profit",
             "suggested_quantity",
+            "reward_risk",
         ):
             assert key in sj, (
                 f"suggestion_json for {row.strategy!r} is missing key {key!r}: {sj}"

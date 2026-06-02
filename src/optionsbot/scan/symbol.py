@@ -236,6 +236,7 @@ async def scan_symbol(
                             "max_profit": s.suggestion.max_profit,
                             "prob_profit": s.suggestion.prob_profit,
                             "suggested_quantity": s.suggestion.suggested_quantity,
+                            "reward_risk": s.suggestion.reward_risk,
                         },
                     }
                     for s in scored
