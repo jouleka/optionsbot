@@ -26,3 +26,7 @@ uv.lock
 
 # Claude Code MCP config (machine-specific paths)
 .mcp.json
+
+# Local-only agent instructions — never commit
+CLAUDE.md
+.claude/
