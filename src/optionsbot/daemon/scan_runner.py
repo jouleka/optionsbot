@@ -16,7 +16,7 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
-from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+from optionsbot.scoring import DEFAULT_TOP_K, top_k
 from optionsbot.storage.schema import scan_runs, watchlist
 
 log = logging.getLogger(__name__)
@@ -78,7 +78,11 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                     errors.append(f"{sym}: {type(e).__name__}: {e}")
                     continue
                 tickers_scanned += 1
-                selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+                selected = top_k(
+                    result.scored,
+                    k=DEFAULT_TOP_K,
+                    threshold=context.settings.scan.score_threshold,
+                )
                 for scored in selected:
                     try:
                         # enqueue_alert returns True when a row was actually inserted,

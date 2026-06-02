@@ -1,0 +1,118 @@
+"""Daemon alert path: configured-threshold gating + full-tick e2e (IBK-92)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from sqlalchemy import insert
+
+from optionsbot.analysis.types import MarketView
+from optionsbot.daemon.context import DaemonContext
+from optionsbot.daemon.scan_runner import run_scan_tick
+from optionsbot.scan.types import ScanResult
+from optionsbot.scoring import ScoredStrategy
+from optionsbot.scoring.types import FactorBreakdown
+from optionsbot.storage.schema import snapshots, watchlist
+
+
+def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
+    """A ScoredStrategy whose MagicMock suggestion carries REAL numeric fields
+    so format_alert_markdown's f-string formatting works (legs=() renders an
+    empty leg block, which is valid MarkdownV2)."""
+    sug = MagicMock()
+    sug.legs = ()
+    sug.credit_or_debit = 1.25
+    sug.max_loss = 3.75
+    sug.max_profit = 1.25
+    sug.prob_profit = 0.68
+    sug.suggested_quantity = 5
+    sug.defined_risk = True
+    return ScoredStrategy(
+        strategy_name=name,
+        score=score,
+        factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
+        suggestion=sug,
+        rationale="test rationale",
+    )
+
+
+def _scan_result(
+    *, scored: tuple[ScoredStrategy, ...], snapshot_id: int = 1, symbol: str = "SPY"
+) -> ScanResult:
+    view = MarketView(
+        direction="neutral",
+        direction_strength="weak",
+        iv_regime="high",
+        iv_rank_value=0.7,
+        earnings_in_window=False,
+        warming_up=False,
+    )
+    return ScanResult(
+        symbol=symbol,
+        snapshot_id=snapshot_id,
+        snapshot_ts=datetime(2026, 6, 2, 15, 30, tzinfo=UTC),
+        view=view,
+        scored=scored,
+    )
+
+
+def _seed_snapshot(daemon_context: DaemonContext, *, symbol: str = "SPY") -> int:
+    """Insert a schema-valid snapshots row; dispatch_alert reads it to build
+    the MarketView. Returns the new snapshot id."""
+    with daemon_context.engine.begin() as conn:
+        result = conn.execute(
+            insert(snapshots).values(
+                symbol=symbol,
+                ts=datetime.now(UTC),
+                spot=400.0,
+                regime_dir="neutral",
+                regime_iv="high",
+            )
+        )
+        return int(result.inserted_primary_key[0])
+
+
+def _add_watchlist(daemon_context: DaemonContext, symbol: str = "SPY") -> None:
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol=symbol, added_at=datetime.now(UTC)))
+
+
+async def test_daemon_skips_score_below_configured_threshold(
+    daemon_context: DaemonContext,
+) -> None:
+    """A score below scan.score_threshold must NOT be enqueued, even though it
+    clears the hardcoded scoring DEFAULT_THRESHOLD (70). enqueue_alert is mocked
+    so the assertion isolates the top_k threshold decision."""
+    daemon_context.settings.scan.score_threshold = 95
+    _add_watchlist(daemon_context)
+    result = _scan_result(scored=(_scored("iron_condor", 85.0),))
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
+        "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
+    ), patch(
+        "optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock()
+    ) as mock_enqueue:
+        summary = await run_scan_tick(daemon_context)
+
+    assert mock_enqueue.await_count == 0
+    assert summary.alerts_enqueued == 0
+
+
+async def test_daemon_enqueues_score_at_configured_threshold(
+    daemon_context: DaemonContext,
+) -> None:
+    """A score >= the configured threshold IS enqueued."""
+    daemon_context.settings.scan.score_threshold = 80
+    _add_watchlist(daemon_context)
+    result = _scan_result(scored=(_scored("iron_condor", 85.0),))
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
+        "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
+    ), patch(
+        "optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock(return_value=True)
+    ) as mock_enqueue:
+        summary = await run_scan_tick(daemon_context)
+
+    assert mock_enqueue.await_count == 1
+    assert summary.alerts_enqueued == 1
