@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import ClassVar, Literal
 
 from optionsbot.analysis.types import Direction, IVRegime, MarketView
@@ -112,8 +113,23 @@ class Strategy(ABC):
     def estimate_prob_profit(
         self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
     ) -> float | None:
-        """Default: None. Strategies with clear breakeven/delta info should override."""
-        return None
+        """P(profit) at expiry via the lognormal payoff model.
+
+        Returns None for non-modelable positions (stock legs, or legs spanning
+        more than one expiry -- calendars/diagonals). Computes the front DTE
+        from the (single) leg expiry.
+        """
+        from optionsbot.scoring.payoff import is_terminal_modelable, prob_of_profit
+
+        if not is_terminal_modelable(legs):
+            return None
+        expiry = legs[0].expiry
+        assert expiry is not None  # guaranteed by is_terminal_modelable
+        dte_days = (
+            datetime.strptime(expiry, "%Y%m%d").replace(tzinfo=UTC) - datetime.now(UTC)
+        ).days
+        credit = self.estimate_credit(legs, snapshot)
+        return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, float(dte_days))
 
     def suggest_size(
         self,

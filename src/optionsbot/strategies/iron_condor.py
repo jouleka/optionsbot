@@ -158,9 +158,4 @@ class IronCondor(Strategy):
         # Iron condor max profit = credit received
         return self.estimate_credit(legs, snapshot)
 
-    def estimate_prob_profit(
-        self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
-    ) -> float | None:
-        # Rough estimate: P(spot stays between short strikes) ~= 1 - 2*short_delta
-        # Each short leg has ~delta probability of finishing ITM.
-        return max(0.0, 1.0 - 2 * _DEFAULT_SHORT_DELTA)
+
