@@ -259,6 +259,9 @@ def _reconstruct_scored(
         prob_profit=sug_data.get("prob_profit"),
         suggested_quantity=sug_data.get("suggested_quantity", 0),
         defined_risk=sug_data.get("defined_risk", True),
+        reward_risk=sug_data.get("reward_risk"),
+        expected_value=sug_data.get("expected_value"),
+        risk_tier=sug_data.get("risk_tier", "balanced"),
     )
     return ScoredStrategy(
         strategy_name=strategy,
