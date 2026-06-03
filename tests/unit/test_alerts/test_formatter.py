@@ -37,6 +37,9 @@ def _scored(
     sug.prob_profit = 0.68
     sug.suggested_quantity = 5
     sug.defined_risk = defined_risk
+    sug.reward_risk = 1.5
+    sug.expected_value = 50.0
+    sug.risk_tier = "balanced"
     return ScoredStrategy(
         strategy_name=name, score=score,
         factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
@@ -165,3 +168,34 @@ def test_format_escapes_dotted_ticker_in_bold_header() -> None:
     )
     assert "*BRK\\.B*" in md
     assert "*BRK.B*" not in md
+
+
+def test_formatter_includes_ev_reward_and_tier() -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from optionsbot.alerts import format_alert_markdown
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    sug = SimpleNamespace(
+        legs=(), credit_or_debit=1.0, max_loss=200.0, max_profit=300.0,
+        prob_profit=0.62, suggested_quantity=2, defined_risk=True,
+        reward_risk=1.5, expected_value=86.0, risk_tier="conservative",
+    )
+    scored = ScoredStrategy(
+        strategy_name="bull_put_spread", score=78.0,
+        factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        suggestion=sug, rationale="r",  # type: ignore[arg-type]
+    )
+    view = MarketView(
+        direction="bull", direction_strength="strong", iv_regime="high",
+        iv_rank_value=0.9, earnings_in_window=False, warming_up=False,
+    )
+    text = format_alert_markdown(
+        symbol="SPY", view=view, scored=scored, snapshot_ts=datetime.now(UTC)
+    )
+    assert "reward:risk" in text
+    assert "exp value" in text
+    assert "conservative" in text

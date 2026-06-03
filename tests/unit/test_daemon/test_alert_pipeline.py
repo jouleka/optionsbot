@@ -30,6 +30,9 @@ def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
     sug.prob_profit = 0.68
     sug.suggested_quantity = 5
     sug.defined_risk = True
+    sug.reward_risk = 1.5
+    sug.expected_value = 50.0
+    sug.risk_tier = "balanced"
     return ScoredStrategy(
         strategy_name=name, score=score,
         factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
