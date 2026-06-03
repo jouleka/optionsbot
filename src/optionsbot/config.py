@@ -63,6 +63,15 @@ class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
 
+class ScreenerSettings(BaseModel):
+    # When set, REPLACES screener.universe.DEFAULT_UNIVERSE.
+    universe: list[str] | None = None
+    # Stage-1 liquidity gate: minimum trailing average daily dollar volume.
+    min_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
+    # Default number of candidates the `screen` command prints.
+    top_n: int = Field(default=20, ge=1)
+
+
 class Settings(BaseSettings):
     """Top-level settings.
 
@@ -73,6 +82,7 @@ class Settings(BaseSettings):
     ibkr: IBKRSettings = IBKRSettings()
     telegram: TelegramSettings = TelegramSettings()
     scan: ScanSettings = ScanSettings()
+    screener: ScreenerSettings = ScreenerSettings()
     storage: StorageSettings = StorageSettings()
 
     log_level: str = "INFO"
