@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, date, datetime
+from typing import Any
 
 from sqlalchemy import Engine, insert, select
 
@@ -71,7 +72,7 @@ def load_unevaluated_expired(engine: Engine, today: date) -> list[UnevaluatedPic
                 predicted_prob_profit=sug.get("prob_profit"),
                 score=float(row.score), max_profit=sug.get("max_profit"),
                 max_loss=sug.get("max_loss"),
-                risk_tier=sug.get("risk_tier", "balanced"),
+                risk_tier=sug.get("risk_tier") or "balanced",
             ))
     return out
 
@@ -103,7 +104,7 @@ async def evaluate_pending(
     return n
 
 
-def _group(label: str, rows: Sequence) -> OutcomeGroup:  # type: ignore[type-arg]
+def _group(label: str, rows: Sequence[Any]) -> OutcomeGroup:
     count = len(rows)
     if count == 0:
         return OutcomeGroup(label, 0, 0.0, 0.0, 0.0, 0.0)
