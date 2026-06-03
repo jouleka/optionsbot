@@ -67,3 +67,4 @@ class MarketView:
     iv_rank_value: float | None  # 0..1
     earnings_in_window: bool
     warming_up: bool
+    iv_rank_is_proxy: bool = False  # True when iv_rank_value came from the HV-rank proxy
