@@ -17,6 +17,7 @@ EXPECTED_TABLES = {
     "alerts",
     "scan_runs",
     "iv_history",
+    "pick_outcomes",
 }
 
 
