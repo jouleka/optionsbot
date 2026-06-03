@@ -17,6 +17,16 @@ from optionsbot.storage.db import create_engine_for_path
 log = logging.getLogger(__name__)
 
 
+def _config_summary(settings: Settings) -> str:
+    """One-line, log-safe summary of the settings a running daemon is using."""
+    configured = bool(settings.telegram.bot_token and settings.telegram.chat_id)
+    return (
+        f"telegram_configured={configured} "
+        f"threshold={settings.scan.score_threshold} "
+        f"interval_min={settings.scan.interval_minutes}"
+    )
+
+
 class Daemon:
     """Top-level daemon coordinator."""
 
@@ -61,6 +71,7 @@ class Daemon:
             return 1
 
         log.info("Daemon started; waiting for stop signal")
+        log.info("daemon config: %s", _config_summary(self._settings))
         try:
             await self._stop_event.wait()
         finally:

@@ -62,3 +62,14 @@ async def test_start_returns_1_on_ibkr_connect_failure(
     monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _fail_connect)
     code = await d.start()
     assert code == 1
+
+
+def test_config_summary_includes_key_fields(daemon_settings) -> None:
+    from optionsbot.daemon.runner import _config_summary
+
+    daemon_settings.scan.score_threshold = 65
+    daemon_settings.scan.interval_minutes = 12
+    s = _config_summary(daemon_settings)
+    assert "telegram_configured=True" in s
+    assert "threshold=65" in s
+    assert "interval_min=12" in s
