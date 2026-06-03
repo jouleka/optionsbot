@@ -660,8 +660,17 @@ def screen(
     top: int | None = typer.Option(
         None, "--top", min=1, help="How many candidates to show (default: config screener.top_n)."
     ),
+    scan: bool = typer.Option(
+        False, "--scan", help="Full-scan the top screened candidates and show their option picks."
+    ),
+    scan_top: int | None = typer.Option(
+        None, "--scan-top", min=1,
+        help="How many top candidates to full-scan (default: config screener.scan_top_n).",
+    ),
 ) -> None:
-    """Rank the configured universe by realized-vol (HV) rank + liquidity (no chains)."""
+    """Rank the universe by HV-rank + liquidity; with --scan, full-scan the top picks."""
+    if scan:
+        raise typer.Exit(code=asyncio.run(_run_screen_scan(scan_top)))
     raise typer.Exit(code=asyncio.run(_run_screen(top)))
 
 
@@ -696,6 +705,73 @@ async def _run_screen(top: int | None) -> int:
     )
     for c in candidates[:top_n]:
         typer.echo(f"  {c.symbol:6} hv_rank={c.hv_rank:.2f}  $vol={c.dollar_volume:,.0f}")
+    return 0
+
+
+async def _run_screen_scan(scan_top: int | None) -> int:
+    from datetime import UTC, datetime
+
+    from sqlalchemy import insert
+
+    from optionsbot.config import get_settings, load_settings
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.contracts import ContractResolver
+    from optionsbot.ibkr.history import HistoryClient
+    from optionsbot.scan import scan_symbol
+    from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+    from optionsbot.screener.screen import screen_and_scan
+    from optionsbot.screener.universe import DEFAULT_UNIVERSE
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.storage.schema import scan_runs
+
+    get_settings.cache_clear()
+    settings = load_settings()
+    universe = settings.screener.universe or list(DEFAULT_UNIVERSE)
+    scan_n = scan_top if scan_top is not None else settings.screener.scan_top_n
+    engine = create_engine_for_path(settings.storage.db_path)
+
+    client = IBKRClient(role="cli", settings=settings)
+    started = datetime.now(UTC)
+    pairs: list = []
+    try:
+        await client.connect()
+        history = HistoryClient(client)
+        resolver = ContractResolver(client)
+
+        async def scan_one(symbol: str):
+            return await scan_symbol(symbol, client, engine, settings, resolver=resolver)
+
+        pairs = await screen_and_scan(
+            history, universe, settings.screener.min_dollar_volume,
+            scan_top_n=scan_n, scan_one=scan_one,
+        )
+    finally:
+        await client.disconnect()
+
+    finished = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(insert(scan_runs).values(
+            started=started, finished=finished, tickers_scanned=len(pairs),
+            alerts_fired=0, errors_json=None,
+        ))
+
+    if not pairs:
+        typer.echo("no candidates scanned (screen produced nothing, or all scans failed)")
+        return 0
+    typer.secho(f"scanned top {len(pairs)} screened candidate(s):", fg=typer.colors.GREEN)
+    for cand, result in pairs:
+        header = (
+            f"{cand.symbol:6} hv_rank={cand.hv_rank:.2f}  $vol={cand.dollar_volume:,.0f}"
+        )
+        selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+        if selected:
+            typer.secho(f"{header}  ({len(result.scored)} scored)", fg=typer.colors.GREEN)
+            for s in selected:
+                typer.echo(f"   {s.strategy_name}: {s.score:.0f}")
+        else:
+            typer.echo(
+                f"{header}  ({len(result.scored)} scored, none >= {DEFAULT_THRESHOLD})"
+            )
     return 0
 
 
