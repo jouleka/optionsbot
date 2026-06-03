@@ -718,8 +718,9 @@ async def _run_screen_scan(scan_top: int | None) -> int:
     from optionsbot.ibkr.contracts import ContractResolver
     from optionsbot.ibkr.history import HistoryClient
     from optionsbot.scan import scan_symbol
+    from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
-    from optionsbot.screener.screen import screen_and_scan
+    from optionsbot.screener.screen import ScreenCandidate, screen_and_scan
     from optionsbot.screener.universe import DEFAULT_UNIVERSE
     from optionsbot.storage.db import create_engine_for_path
     from optionsbot.storage.schema import scan_runs
@@ -732,13 +733,13 @@ async def _run_screen_scan(scan_top: int | None) -> int:
 
     client = IBKRClient(role="cli", settings=settings)
     started = datetime.now(UTC)
-    pairs: list = []
+    pairs: list[tuple[ScreenCandidate, ScanResult]] = []
     try:
         await client.connect()
         history = HistoryClient(client)
         resolver = ContractResolver(client)
 
-        async def scan_one(symbol: str):
+        async def scan_one(symbol: str) -> ScanResult:
             return await scan_symbol(symbol, client, engine, settings, resolver=resolver)
 
         pairs = await screen_and_scan(
