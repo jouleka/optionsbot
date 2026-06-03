@@ -54,3 +54,36 @@ class BacktestReport:
     overall_mean_pred: float = 0.0
     overall_mean_raw: float = 0.0
     overall_mean_dedrift: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class UnevaluatedPick:
+    strategy_score_id: int
+    symbol: str
+    strategy: str
+    expiry: str
+    entry_spot: float
+    legs: tuple[Leg, ...]
+    credit_or_debit: float
+    predicted_prob_profit: float | None
+    score: float
+    max_profit: float | None
+    max_loss: float | None
+    risk_tier: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomeGroup:
+    label: str
+    count: int
+    win_rate: float
+    mean_pred_pop: float
+    total_pnl: float
+    avg_pnl: float
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomesReport:
+    overall: OutcomeGroup
+    by_strategy: dict[str, OutcomeGroup]
+    by_risk_tier: dict[str, OutcomeGroup]
