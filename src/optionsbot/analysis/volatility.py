@@ -28,6 +28,23 @@ def historical_volatility(closes: pd.Series, window: int = 20) -> float:
     return float(tail.std(ddof=1) * math.sqrt(_ANNUALIZATION_FACTOR))
 
 
+def historical_volatility_series(closes: pd.Series, window: int = 20) -> pd.Series:
+    """Rolling annualized realized vol (stdev of daily log returns).
+
+    Returns a Series aligned to ``closes``; the first ``window`` entries are NaN
+    (insufficient returns). The last non-NaN value equals
+    ``historical_volatility(closes, window)``. Use it to rank current HV against
+    its own history (e.g. an HV-rank proxy while IV history is thin).
+    """
+    log_returns: pd.Series = pd.Series(
+        np.log(closes / closes.shift(1)), index=closes.index
+    )
+    return pd.Series(
+        log_returns.rolling(window).std(ddof=1) * math.sqrt(_ANNUALIZATION_FACTOR),
+        index=closes.index,
+    )
+
+
 def iv_hv_ratio(iv: float, hv: float) -> float:
     """Ratio of implied to historical volatility. NaN if hv == 0 or either is NaN."""
     if math.isnan(iv) or math.isnan(hv):
