@@ -129,3 +129,31 @@ scan_runs = Table(
     Column("alerts_fired", Integer),
     Column("errors_json", JSON),
 )
+
+
+pick_outcomes = Table(
+    "pick_outcomes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("symbol", Text, nullable=False),
+    Column("strategy", Text, nullable=False),
+    Column("expiry", Text, nullable=False),
+    Column("entry_spot", Float, nullable=False),
+    Column("predicted_prob_profit", Float),
+    Column("score", Float),
+    Column("credit_or_debit", Float),
+    Column("max_profit", Float),
+    Column("max_loss", Float),
+    Column("risk_tier", Text),
+    Column("terminal_spot", Float, nullable=False),
+    Column("realized_pnl", Float, nullable=False),
+    Column("win", Integer, nullable=False),
+    Column("evaluated_at", DateTime(timezone=True), nullable=False),
+)
