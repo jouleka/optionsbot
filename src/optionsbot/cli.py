@@ -655,5 +655,49 @@ async def _run_scan_once() -> int:
     return 0
 
 
+@app.command()
+def screen(
+    top: int | None = typer.Option(
+        None, "--top", min=1, help="How many candidates to show (default: config screener.top_n)."
+    ),
+) -> None:
+    """Rank the configured universe by realized-vol (HV) rank + liquidity (no chains)."""
+    raise typer.Exit(code=asyncio.run(_run_screen(top)))
+
+
+async def _run_screen(top: int | None) -> int:
+    from optionsbot.config import get_settings, load_settings
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.history import HistoryClient
+    from optionsbot.screener.screen import screen_universe
+    from optionsbot.screener.universe import DEFAULT_UNIVERSE
+
+    get_settings.cache_clear()
+    settings = load_settings()
+    universe = settings.screener.universe or list(DEFAULT_UNIVERSE)
+    top_n = top if top is not None else settings.screener.top_n
+
+    client = IBKRClient(role="cli", settings=settings)
+    try:
+        await client.connect()
+        history = HistoryClient(client)
+        candidates = await screen_universe(
+            history, universe, settings.screener.min_dollar_volume
+        )
+    finally:
+        await client.disconnect()
+
+    if not candidates:
+        typer.echo("no candidates passed the liquidity gate")
+        return 0
+    typer.secho(
+        f"top {min(top_n, len(candidates))} of {len(candidates)} candidates:",
+        fg=typer.colors.GREEN,
+    )
+    for c in candidates[:top_n]:
+        typer.echo(f"  {c.symbol:6} hv_rank={c.hv_rank:.2f}  $vol={c.dollar_volume:,.0f}")
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(app())
