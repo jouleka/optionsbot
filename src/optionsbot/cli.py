@@ -734,6 +734,7 @@ async def _run_screen_scan(scan_top: int | None) -> int:
     client = IBKRClient(role="cli", settings=settings)
     started = datetime.now(UTC)
     pairs: list[tuple[ScreenCandidate, ScanResult]] = []
+    errors: list[str] = []
     try:
         await client.connect()
         history = HistoryClient(client)
@@ -744,7 +745,7 @@ async def _run_screen_scan(scan_top: int | None) -> int:
 
         pairs = await screen_and_scan(
             history, universe, settings.screener.min_dollar_volume,
-            scan_top_n=scan_n, scan_one=scan_one,
+            scan_top_n=scan_n, scan_one=scan_one, errors=errors,
         )
     finally:
         await client.disconnect()
@@ -753,7 +754,7 @@ async def _run_screen_scan(scan_top: int | None) -> int:
     with engine.begin() as conn:
         conn.execute(insert(scan_runs).values(
             started=started, finished=finished, tickers_scanned=len(pairs),
-            alerts_fired=0, errors_json=None,
+            alerts_fired=0, errors_json=errors or None,
         ))
 
     if not pairs:

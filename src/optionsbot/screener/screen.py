@@ -96,21 +96,25 @@ async def screen_and_scan(
     min_dollar_volume: float,
     scan_top_n: int,
     scan_one: Callable[[str], Awaitable[ScanResult]],
+    errors: list[str] | None = None,
 ) -> list[tuple[ScreenCandidate, ScanResult]]:
     """Screen the universe, then full-scan the top-N candidates via ``scan_one``.
 
     ``scan_one`` is injected (the CLI binds it to ``scan_symbol``) so this stays
     free of IBKR/DB deps and is unit-testable. Per-symbol scan failures are
     logged and skipped so one bad symbol can't abort the batch (mirrors
-    ``screen_universe``).
+    ``screen_universe``); if an ``errors`` list is supplied, each failure is also
+    appended as ``"SYMBOL: ExcType: msg"`` for the caller to persist.
     """
     candidates = await screen_universe(history_client, universe, min_dollar_volume)
     out: list[tuple[ScreenCandidate, ScanResult]] = []
     for cand in candidates[:scan_top_n]:
         try:
             result = await scan_one(cand.symbol)
-        except Exception:  # noqa: BLE001 -- per-symbol scan failures are heterogeneous
+        except Exception as e:  # noqa: BLE001 -- per-symbol scan failures are heterogeneous
             log.exception("screen --scan: scan failed for %s", cand.symbol)
+            if errors is not None:
+                errors.append(f"{cand.symbol}: {type(e).__name__}: {e}")
             continue
         out.append((cand, result))
     return out

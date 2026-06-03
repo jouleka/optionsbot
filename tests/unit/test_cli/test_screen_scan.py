@@ -63,3 +63,73 @@ def test_screen_scan_runs_records_and_passes_scan_top(runner: CliRunner, db: Pat
         rows = conn.execute(select(scan_runs.c.tickers_scanned)).fetchall()
     assert len(rows) == 1
     assert rows[0].tickers_scanned == 1
+
+
+def test_screen_scan_renders_picks_and_records_errors(runner: CliRunner, db: Path) -> None:
+    """Real screen_and_scan + top_k: a >=70 pick renders; a failed Stage-2 scan
+    is skipped but recorded in scan_runs.errors_json."""
+    from optionsbot.screener.screen import ScreenCandidate
+
+    cand_spy = ScreenCandidate(symbol="SPY", hv_rank=0.82, dollar_volume=1e9)
+    cand_aapl = ScreenCandidate(symbol="AAPL", hv_rank=0.71, dollar_volume=5e8)
+
+    async def fake_screen_universe(hc, uni, mdv):
+        return (cand_spy, cand_aapl)
+
+    spy_result = MagicMock(scored=(MagicMock(strategy_name="bull_put_spread", score=85.0),))
+
+    async def fake_scan_symbol(symbol, *args, **kwargs):
+        if symbol == "AAPL":
+            raise RuntimeError("boom")
+        return spy_result
+
+    fake_client = MagicMock()
+    fake_client.connect = AsyncMock()
+    fake_client.disconnect = AsyncMock()
+
+    with (
+        patch("optionsbot.ibkr.IBKRClient", return_value=fake_client),
+        patch("optionsbot.screener.screen.screen_universe", fake_screen_universe),
+        patch("optionsbot.scan.scan_symbol", fake_scan_symbol),
+    ):
+        result = runner.invoke(app, ["screen", "--scan", "--scan-top", "2"])
+
+    assert result.exit_code == 0, result.output
+    assert "bull_put_spread: 85" in result.output  # the >=70 pick renders
+    assert "SPY" in result.output
+
+    engine = create_engine_for_path(db)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(scan_runs.c.tickers_scanned, scan_runs.c.errors_json)
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0].tickers_scanned == 1  # only SPY succeeded
+    assert rows[0].errors_json is not None
+    assert any("AAPL" in e for e in rows[0].errors_json)
+
+
+def test_plain_screen_writes_no_scan_runs(runner: CliRunner, db: Path) -> None:
+    """The plain `screen` (no --scan) path is unchanged: prints the ranking,
+    writes no scan_runs row."""
+    from optionsbot.screener.screen import ScreenCandidate
+
+    async def fake_screen_universe(hc, uni, mdv):
+        return (ScreenCandidate(symbol="SPY", hv_rank=0.8, dollar_volume=1e9),)
+
+    fake_client = MagicMock()
+    fake_client.connect = AsyncMock()
+    fake_client.disconnect = AsyncMock()
+
+    with (
+        patch("optionsbot.ibkr.IBKRClient", return_value=fake_client),
+        patch("optionsbot.screener.screen.screen_universe", fake_screen_universe),
+    ):
+        result = runner.invoke(app, ["screen"])
+
+    assert result.exit_code == 0, result.output
+    assert "SPY" in result.output
+    engine = create_engine_for_path(db)
+    with engine.connect() as conn:
+        rows = conn.execute(select(scan_runs.c.id)).fetchall()
+    assert rows == []  # plain screen writes no scan_runs heartbeat
