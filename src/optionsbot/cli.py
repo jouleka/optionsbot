@@ -775,5 +775,80 @@ async def _run_validate_backtest(years: int) -> int:
     return 0
 
 
+@validate_app.command("outcomes")
+def validate_outcomes() -> None:
+    """Evaluate recorded picks whose expiry has passed (from the real close) and report."""
+    raise typer.Exit(code=asyncio.run(_run_validate_outcomes()))
+
+
+async def _run_validate_outcomes() -> int:
+    from datetime import date, datetime, timedelta
+
+    from optionsbot.config import get_settings, load_settings
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.history import HistoryClient
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.validation.outcomes import (
+        evaluate_pending,
+        load_unevaluated_expired,
+        outcomes_report,
+    )
+
+    get_settings.cache_clear()
+    settings = load_settings()
+    engine = create_engine_for_path(settings.storage.db_path)
+    today = date.today()
+    pending = load_unevaluated_expired(engine, today)
+    if pending:
+        client = IBKRClient(role="cli", settings=settings)
+        try:
+            await client.connect()
+            history = HistoryClient(client)
+
+            async def fetch_close_at(symbol: str, expiry: str) -> float | None:
+                exp = datetime.strptime(expiry, "%Y%m%d").date()
+                df = await history.get_history(symbol, days=400)
+                by_date = {
+                    (d.date() if hasattr(d, "date") else d): float(c)
+                    for d, c in zip(df.index, df["close"].tolist(), strict=False)
+                }
+                for back in range(7):  # nearest trading day on/before expiry
+                    hit = by_date.get(exp - timedelta(days=back))
+                    if hit is not None:
+                        return hit
+                return None
+
+            evaluated = await evaluate_pending(engine, fetch_close_at, today)
+        finally:
+            await client.disconnect()
+        typer.echo(f"evaluated {evaluated} newly-expired pick(s)")
+    else:
+        typer.echo("no newly-expired picks to evaluate")
+
+    report = outcomes_report(engine)
+    o = report.overall
+    if o.count == 0:
+        typer.echo("no evaluated outcomes yet (picks resolve at expiry)")
+        return 0
+    typer.secho(
+        f"Outcomes: {o.count} picks, win-rate {o.win_rate:.2f} vs predicted "
+        f"{o.mean_pred_pop:.2f}; total P&L ${o.total_pnl:,.0f} (avg ${o.avg_pnl:,.0f})",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo("by strategy:")
+    for name, g in report.by_strategy.items():
+        typer.echo(
+            f"  {name:24} n={g.count} win={g.win_rate:.2f} pred={g.mean_pred_pop:.2f} "
+            f"avg_pnl=${g.avg_pnl:,.0f}"
+        )
+    typer.echo("by risk tier:")
+    for name, g in report.by_risk_tier.items():
+        typer.echo(
+            f"  {name:14} n={g.count} win={g.win_rate:.2f} pred={g.mean_pred_pop:.2f} "
+            f"avg_pnl=${g.avg_pnl:,.0f}"
+        )
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(app())
