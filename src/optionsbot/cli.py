@@ -699,5 +699,74 @@ async def _run_screen(top: int | None) -> int:
     return 0
 
 
+validate_app = typer.Typer(help="Validate the bot's predictions (backtest, outcomes).")
+app.add_typer(validate_app, name="validate")
+
+
+@validate_app.command("backtest")
+def validate_backtest(
+    years: int = typer.Option(3, "--years", min=1, help="Years of underlying history."),
+) -> None:
+    """Backtest model prob_profit vs historically-realized win-rate over recorded picks."""
+    raise typer.Exit(code=asyncio.run(_run_validate_backtest(years)))
+
+
+async def _run_validate_backtest(years: int) -> int:
+    from optionsbot.config import get_settings, load_settings
+    from optionsbot.ibkr import IBKRClient
+    from optionsbot.ibkr.history import HistoryClient
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.validation.backtest import load_pick_records, run_backtest
+
+    get_settings.cache_clear()
+    settings = load_settings()
+    engine = create_engine_for_path(settings.storage.db_path)
+    picks = load_pick_records(engine)
+    if not picks:
+        typer.echo("no terminal-modelable picks recorded yet")
+        return 0
+
+    client = IBKRClient(role="cli", settings=settings)
+    days = years * 252
+    try:
+        await client.connect()
+        history = HistoryClient(client)
+
+        async def fetch_closes(symbol: str) -> list[float]:
+            df = await history.get_history(symbol, days=days)
+            return [float(c) for c in df["close"].tolist()]
+
+        report = await run_backtest(picks, fetch_closes)
+    finally:
+        await client.disconnect()
+
+    typer.secho(
+        f"Calibration over {report.overall_count} picks "
+        f"(pred {report.overall_mean_pred:.2f} | raw {report.overall_mean_raw:.2f} | "
+        f"dedrift {report.overall_mean_dedrift:.2f}):",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(f"  {'pred_PoP':>10} {'raw_win':>8} {'dedrift':>8} {'n_picks':>8}")
+    for b in report.buckets:
+        if b.count == 0:
+            continue
+        typer.echo(
+            f"  [{b.lo:.1f},{b.hi:.1f}) {b.mean_pred:>9.2f} {b.mean_raw:>8.2f} "
+            f"{b.mean_dedrift:>8.2f} {b.count:>8}"
+        )
+    typer.echo("by strategy:")
+    for name, b in report.by_strategy.items():
+        typer.echo(
+            f"  {name:24} pred={b.mean_pred:.2f} raw={b.mean_raw:.2f} "
+            f"dedrift={b.mean_dedrift:.2f} n={b.count}"
+        )
+    typer.echo(
+        "note: raw uses realized returns incl. drift; dedrift removes mean drift "
+        "(model assumes zero drift). raw>dedrift = drift tailwind; dedrift vs pred "
+        "= vol/tail calibration (model uses IV, history uses realized vol)."
+    )
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(app())
