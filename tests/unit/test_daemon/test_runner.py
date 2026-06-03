@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from optionsbot.config import Settings
 from optionsbot.daemon.runner import Daemon
 
 
@@ -73,3 +74,50 @@ def test_config_summary_includes_key_fields(daemon_settings) -> None:
     assert "telegram_configured=True" in s
     assert "threshold=65" in s
     assert "interval_min=12" in s
+
+
+async def test_signal_handlers_register_sighup(daemon_settings) -> None:
+    d = Daemon(settings=daemon_settings)
+    loop = asyncio.get_event_loop()
+    with patch.object(loop, "add_signal_handler") as mock_add:
+        d.install_signal_handlers(loop)
+    hup_calls = [c for c in mock_add.call_args_list if c.args[0] == signal.SIGHUP]
+    assert len(hup_calls) == 1
+    assert hup_calls[0].args[1] == d.request_reload
+
+
+def test_request_reload_noop_without_context(daemon_settings) -> None:
+    d = Daemon(settings=daemon_settings)
+    assert d._context is None
+    d.request_reload()  # must not raise (no running loop / no context)
+
+
+async def test_reload_config_applies_new_settings(
+    daemon_settings, daemon_context, monkeypatch
+) -> None:
+    d = Daemon(settings=daemon_settings)
+    d._context = daemon_context
+    d._scheduler = MagicMock()
+
+    new = Settings()
+    new.telegram.bot_token = "new-token"
+    new.telegram.chat_id = "new-chat"
+    new.scan.interval_minutes = 9
+    monkeypatch.setattr("optionsbot.daemon.runner.load_settings", lambda: new)
+
+    new_tg = MagicMock()
+    new_tg.aclose = AsyncMock()
+    monkeypatch.setattr(
+        "optionsbot.daemon.runner.TelegramClient", MagicMock(return_value=new_tg)
+    )
+    old_tg = daemon_context.telegram
+
+    await d._reload_config()
+
+    assert d._settings is new
+    assert d._context.settings is new
+    assert d._context.telegram is new_tg
+    old_tg.aclose.assert_awaited_once()
+    d._scheduler.reschedule_job.assert_called_once()
+    _, kwargs = d._scheduler.reschedule_job.call_args
+    assert kwargs["trigger"].interval.total_seconds() == 9 * 60

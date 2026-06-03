@@ -6,7 +6,10 @@ import asyncio
 import logging
 import signal
 
-from optionsbot.config import Settings, get_settings
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+from optionsbot.config import Settings, get_settings, load_settings
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.scheduler import build_scheduler
 from optionsbot.daemon.telegram_client import TelegramClient
@@ -34,6 +37,7 @@ class Daemon:
         self._settings = settings if settings is not None else get_settings()
         self._context: DaemonContext | None = None
         self._stop_event = asyncio.Event()
+        self._scheduler: AsyncIOScheduler | None = None
 
     def install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Wire SIGTERM and SIGINT to request_stop() so Ctrl-C / systemd-stop
@@ -44,6 +48,14 @@ class Daemon:
             except NotImplementedError:
                 # add_signal_handler isn't supported on Windows; the daemon
                 # runs in WSL Ubuntu so this is the unusual path.
+                pass
+        # SIGHUP -> hot-reload config without a restart. Unix-only; getattr keeps
+        # this import-safe on platforms (Windows) where SIGHUP doesn't exist.
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            try:
+                loop.add_signal_handler(sighup, self.request_reload)
+            except NotImplementedError:
                 pass
 
     async def start(self) -> int:
@@ -59,13 +71,9 @@ class Daemon:
             return 1
 
         try:
-            scheduler = build_scheduler(self._context, self._scan_tick)
-            scheduler.start()
+            self._scheduler = build_scheduler(self._context, self._scan_tick)
+            self._scheduler.start()
         except Exception:
-            # build_scheduler / scheduler.start can raise (APScheduler
-            # validates add_job args, executor configuration, etc.). Without
-            # this guard a failure here would skip _shutdown_context and
-            # leak the IBKR connection + Telegram client + engine.
             log.exception("Failed to start scheduler; daemon will exit")
             await self._shutdown_context()
             return 1
@@ -77,7 +85,7 @@ class Daemon:
         finally:
             log.info("Stop signal received; shutting down scheduler")
             try:
-                scheduler.shutdown(wait=True)
+                self._scheduler.shutdown(wait=True)
             except Exception:
                 # SchedulerNotRunningError (or similar) must not prevent
                 # IBKR disconnect + engine dispose; we always want a clean
@@ -89,6 +97,35 @@ class Daemon:
     def request_stop(self) -> None:
         """Set the stop event. Called by signal handlers (wired in Task 5)."""
         self._stop_event.set()
+
+    def request_reload(self) -> None:
+        """Schedule an async config reload (wired to SIGHUP). No-op pre-start."""
+        if self._context is None or self._scheduler is None:
+            return
+        asyncio.create_task(self._reload_config())
+
+    async def _reload_config(self) -> None:
+        """Re-read settings and apply them live: telegram client, context
+        settings, and the scan interval. The IBKR connection + engine are NOT
+        reloaded (host/port/db changes still need a restart)."""
+        if self._context is None or self._scheduler is None:
+            return
+        get_settings.cache_clear()
+        new = load_settings()
+        self._settings = new
+        self._context.settings = new
+        old_telegram = self._context.telegram
+        self._context.telegram = TelegramClient(
+            new.telegram.bot_token, new.telegram.chat_id
+        )
+        try:
+            await old_telegram.aclose()
+        except Exception:  # noqa: BLE001 -- closing the old client must not abort reload
+            log.exception("closing old Telegram client during reload failed")
+        self._scheduler.reschedule_job(
+            "scan", trigger=IntervalTrigger(minutes=new.scan.interval_minutes)
+        )
+        log.info("config reloaded: %s", _config_summary(new))
 
     def _build_context(self) -> DaemonContext:
         engine = create_engine_for_path(self._settings.storage.db_path)
