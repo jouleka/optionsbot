@@ -70,6 +70,10 @@ class ScreenerSettings(BaseModel):
     min_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
     # Default number of candidates the `screen` command prints.
     top_n: int = Field(default=20, ge=1)
+    # Stage-2: how many of the top screened candidates to full-scan with
+    # `screen --scan`. Each is a full option-chain fetch (~40-50s), so keep it
+    # small for pacing. Overridable per-run with --scan-top.
+    scan_top_n: int = Field(default=5, ge=1)
 
 
 class Settings(BaseSettings):

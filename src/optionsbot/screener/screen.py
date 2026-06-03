@@ -9,7 +9,7 @@ DB writes. The pure ``rank_candidates`` / ``screen_metrics`` are unit-tested;
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -20,6 +20,7 @@ from optionsbot.analysis.volatility import historical_volatility_series
 
 if TYPE_CHECKING:
     from optionsbot.ibkr.history import HistoryClient
+    from optionsbot.scan.types import ScanResult
 
 log = logging.getLogger(__name__)
 
@@ -87,3 +88,29 @@ async def screen_universe(
         if m is not None:
             metrics[symbol] = m
     return rank_candidates(metrics, min_dollar_volume)
+
+
+async def screen_and_scan(
+    history_client: HistoryClient,
+    universe: Sequence[str],
+    min_dollar_volume: float,
+    scan_top_n: int,
+    scan_one: Callable[[str], Awaitable[ScanResult]],
+) -> list[tuple[ScreenCandidate, ScanResult]]:
+    """Screen the universe, then full-scan the top-N candidates via ``scan_one``.
+
+    ``scan_one`` is injected (the CLI binds it to ``scan_symbol``) so this stays
+    free of IBKR/DB deps and is unit-testable. Per-symbol scan failures are
+    logged and skipped so one bad symbol can't abort the batch (mirrors
+    ``screen_universe``).
+    """
+    candidates = await screen_universe(history_client, universe, min_dollar_volume)
+    out: list[tuple[ScreenCandidate, ScanResult]] = []
+    for cand in candidates[:scan_top_n]:
+        try:
+            result = await scan_one(cand.symbol)
+        except Exception:  # noqa: BLE001 -- per-symbol scan failures are heterogeneous
+            log.exception("screen --scan: scan failed for %s", cand.symbol)
+            continue
+        out.append((cand, result))
+    return out
