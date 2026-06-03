@@ -11,6 +11,8 @@ input :class:`~optionsbot.strategies.StrategySnapshot`.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from optionsbot.scoring.factors import (
     dte_match_score,
     earnings_penalty,
@@ -131,15 +133,24 @@ def top_k(
     scored: tuple[ScoredStrategy, ...],
     k: int = DEFAULT_TOP_K,
     threshold: float = DEFAULT_THRESHOLD,
+    rank_by: Literal["score", "expectancy"] = "score",
 ) -> tuple[ScoredStrategy, ...]:
-    """Return up to ``k`` strategies with ``score >= threshold``, descending.
+    """Return up to ``k`` strategies with ``score >= threshold``, best first.
 
-    Filters first, then sorts -- so a high-scoring but sub-threshold strategy
-    is dropped regardless of ``k``.
+    Always filters on the quality ``score`` threshold first (the quality gate).
+    ``rank_by`` then orders the survivors: by ``score`` (default) or by
+    ``expectancy`` (the suggestion's ``expected_value``; None sorts last).
     """
-    filtered = sorted(
-        (s for s in scored if s.score >= threshold),
-        key=lambda s: s.score,
-        reverse=True,
-    )
+    filtered = [s for s in scored if s.score >= threshold]
+    if rank_by == "expectancy":
+        filtered.sort(
+            key=lambda s: (
+                s.suggestion.expected_value
+                if s.suggestion.expected_value is not None
+                else float("-inf")
+            ),
+            reverse=True,
+        )
+    else:
+        filtered.sort(key=lambda s: s.score, reverse=True)
     return tuple(filtered[:k])
