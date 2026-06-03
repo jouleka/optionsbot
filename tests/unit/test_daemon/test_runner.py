@@ -121,3 +121,31 @@ async def test_reload_config_applies_new_settings(
     d._scheduler.reschedule_job.assert_called_once()
     _, kwargs = d._scheduler.reschedule_job.call_args
     assert kwargs["trigger"].interval.total_seconds() == 9 * 60
+
+
+async def test_request_reload_retains_task_and_guards_reentrancy(
+    daemon_settings, daemon_context, monkeypatch
+) -> None:
+    """request_reload keeps a strong ref to the task (no GC) and a second call
+    while one is in flight does not spawn a duplicate reload."""
+    d = Daemon(settings=daemon_settings)
+    d._context = daemon_context
+    d._scheduler = MagicMock()
+    release = asyncio.Event()
+
+    async def _blocking_reload() -> None:
+        await release.wait()
+
+    monkeypatch.setattr(d, "_reload_config", _blocking_reload)
+
+    d.request_reload()
+    task1 = d._reload_task
+    assert task1 is not None
+    assert not task1.done()
+
+    d.request_reload()  # reentrant call while task1 is still pending
+    assert d._reload_task is task1  # no duplicate task spawned
+
+    release.set()
+    await task1
+    assert task1.done()

@@ -38,6 +38,7 @@ class Daemon:
         self._context: DaemonContext | None = None
         self._stop_event = asyncio.Event()
         self._scheduler: AsyncIOScheduler | None = None
+        self._reload_task: asyncio.Task[None] | None = None
 
     def install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Wire SIGTERM and SIGINT to request_stop() so Ctrl-C / systemd-stop
@@ -99,10 +100,17 @@ class Daemon:
         self._stop_event.set()
 
     def request_reload(self) -> None:
-        """Schedule an async config reload (wired to SIGHUP). No-op pre-start."""
+        """Schedule an async config reload (wired to SIGHUP). No-op pre-start.
+
+        Retains a strong reference to the task (asyncio only holds a weak one,
+        so a fire-and-forget task can be GC'd mid-flight), and skips if a reload
+        is already running so two SIGHUPs in quick succession don't overlap.
+        """
         if self._context is None or self._scheduler is None:
             return
-        asyncio.create_task(self._reload_config())
+        if self._reload_task is not None and not self._reload_task.done():
+            return
+        self._reload_task = asyncio.create_task(self._reload_config())
 
     async def _reload_config(self) -> None:
         """Re-read settings and apply them live: telegram client, context
