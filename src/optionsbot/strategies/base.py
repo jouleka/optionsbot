@@ -12,11 +12,42 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import date, datetime
 from typing import ClassVar, Literal
 
 from optionsbot.analysis.types import Direction, IVRegime, MarketView
 from optionsbot.ibkr.types import OptionChainLeg, OptionRight, PositionRecord
+
+# Risk-tier thresholds (probability of profit). Module constants for now; if these
+# ever need to be user-tunable, thread them from settings the way risk_pct is.
+_RISK_TIER_CONSERVATIVE_PROB = 0.65
+_RISK_TIER_AGGRESSIVE_PROB = 0.40
+
+
+def _expected_value(
+    prob_profit: float | None,
+    max_profit: float | None,
+    max_loss: float | None,
+    *,
+    defined_risk: bool,
+) -> float | None:
+    """Heuristic expectancy in dollars: prob*max_profit - (1-prob)*max_loss.
+
+    Only defined for defined-risk strategies with a bounded max_profit and a
+    known prob_profit + max_loss. Returns None otherwise (NOT a claim of edge).
+    """
+    if not defined_risk or prob_profit is None or max_profit is None or max_loss is None:
+        return None
+    return prob_profit * max_profit - (1.0 - prob_profit) * max_loss
+
+
+def _risk_tier(*, defined_risk: bool, prob_profit: float | None) -> str:
+    """conservative / balanced / aggressive from defined-risk + prob_profit."""
+    if not defined_risk or (prob_profit is not None and prob_profit < _RISK_TIER_AGGRESSIVE_PROB):
+        return "aggressive"
+    if prob_profit is not None and prob_profit >= _RISK_TIER_CONSERVATIVE_PROB:
+        return "conservative"
+    return "balanced"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +96,8 @@ class StrategySuggestion:
     defined_risk: bool
     rationale: str
     reward_risk: float | None = None  # max_profit / max_loss; None if either is None
+    expected_value: float | None = None  # heuristic expectancy in dollars; None if not computable
+    risk_tier: str = "balanced"  # conservative | balanced | aggressive
 
 
 class Strategy(ABC):
@@ -126,9 +159,7 @@ class Strategy(ABC):
             return None
         expiry = legs[0].expiry
         assert expiry is not None  # guaranteed by is_terminal_modelable
-        dte_days = (
-            datetime.strptime(expiry, "%Y%m%d").replace(tzinfo=UTC) - datetime.now(UTC)
-        ).days
+        dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
         credit = self.estimate_credit(legs, snapshot)
         return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, float(dte_days))
 
@@ -172,6 +203,10 @@ class Strategy(ABC):
             else None
         )
         prob_profit = self.estimate_prob_profit(legs, snapshot)
+        expected_value = _expected_value(
+            prob_profit, max_profit, max_loss, defined_risk=self.defined_risk
+        )
+        risk_tier = _risk_tier(defined_risk=self.defined_risk, prob_profit=prob_profit)
         size = (
             self.suggest_size(account_value, max_loss, risk_pct)
             if account_value is not None
@@ -188,6 +223,8 @@ class Strategy(ABC):
             defined_risk=self.defined_risk,
             rationale=self._build_rationale(snapshot, legs, credit, max_loss),
             reward_risk=reward_risk,
+            expected_value=expected_value,
+            risk_tier=risk_tier,
         )
 
     def _build_rationale(
