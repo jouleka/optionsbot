@@ -22,6 +22,9 @@ from optionsbot.validation.types import (
 
 _TRADING_DAYS_PER_YEAR = 252
 _CAL_DAYS_PER_YEAR = 365
+_LEG_FIELDS = frozenset(
+    {"symbol", "side", "sec_type", "expiry", "strike", "right", "quantity"}
+)
 
 
 def horizon_trading_days(dte_days: int) -> int:
@@ -38,9 +41,9 @@ def historical_win_rate(
 ) -> tuple[float, float, int] | None:
     """(raw_win_rate, dedrift_win_rate, n) over all overlapping DTE-forward returns.
 
-    raw applies the realized log-returns as-is; dedrift subtracts the mean
-    log-return (zero-drift, same vol/tails) to isolate the drift the zero-drift
-    model ignores. Returns None if there are too few samples.
+    raw applies the realized log-returns as-is; dedrift renormalizes them to a
+    martingale (mean simple return = 1, matching the model's risk-neutral spot)
+    so it isolates realized vol/tails from drift. Returns None if too few samples.
     """
     legs = tuple(legs)
     px = [float(c) for c in closes]
@@ -54,14 +57,17 @@ def historical_win_rate(
     ]
     if not log_rets:
         return None
-    mean_lr = sum(log_rets) / len(log_rets)
+    # Martingale renormalization: shift log-returns by `adj` so the mean SIMPLE
+    # return is 1 (E[S_T] = entry_spot), matching the model's risk-neutral spot;
+    # a plain mean-log-return shift would leave a +0.5*var convexity drift.
+    adj = math.log(sum(math.exp(lr) for lr in log_rets) / len(log_rets))
     raw_wins = 0
     dedrift_wins = 0
     for lr in log_rets:
         if terminal_pnl_dollars(legs, credit_or_debit, entry_spot * math.exp(lr)) > 0.0:
             raw_wins += 1
         if terminal_pnl_dollars(
-            legs, credit_or_debit, entry_spot * math.exp(lr - mean_lr)
+            legs, credit_or_debit, entry_spot * math.exp(lr - adj)
         ) > 0.0:
             dedrift_wins += 1
     n = len(log_rets)
@@ -85,16 +91,15 @@ def _bucket(rows: Sequence[BacktestRow], lo: float, hi: float) -> CalibrationBuc
 def calibrate(rows: Sequence[BacktestRow], n_buckets: int = 10) -> BacktestReport:
     """Bucket rows by predicted prob_profit; aggregate overall + per strategy."""
     width = 1.0 / n_buckets
-    buckets: list[CalibrationBucket] = []
-    for i in range(n_buckets):
-        lo, hi = i * width, (i + 1) * width
-        # Last bucket is inclusive of 1.0.
-        last = i == n_buckets - 1
-        in_bucket = [
-            r for r in rows
-            if r.predicted >= lo and (r.predicted < hi or (last and r.predicted <= hi))
-        ]
-        buckets.append(_bucket(in_bucket, lo, hi))
+    # Bucket by integer index with a tiny epsilon -- both a float lo=i*width and
+    # a bare int(pred*n) mis-place exact deciles (0.7*10 == 6.9999... in float).
+    bucketed: list[list[BacktestRow]] = [[] for _ in range(n_buckets)]
+    for r in rows:
+        idx = min(n_buckets - 1, max(0, int(r.predicted * n_buckets + 1e-9)))
+        bucketed[idx].append(r)
+    buckets: list[CalibrationBucket] = [
+        _bucket(bucketed[i], i * width, (i + 1) * width) for i in range(n_buckets)
+    ]
     strategies = sorted({r.strategy for r in rows})
     by_strategy = {
         s: _bucket([r for r in rows if r.strategy == s], 0.0, 1.0) for s in strategies
@@ -157,7 +162,10 @@ def load_pick_records(engine: Engine) -> list[PickRecord]:
             legs_data = row.legs_json or []
             if isinstance(legs_data, str):
                 legs_data = json.loads(legs_data)
-            legs = tuple(Leg(**le) for le in legs_data)
+            legs = tuple(
+                Leg(**{k: v for k, v in le.items() if k in _LEG_FIELDS})
+                for le in legs_data
+            )
             if not is_terminal_modelable(legs):
                 continue
             expiry = legs[0].expiry

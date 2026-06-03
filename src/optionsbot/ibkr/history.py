@@ -42,6 +42,7 @@ class HistoryClient:
         symbol: str,
         days: int = 252,
         end_date: date | None = None,
+        duration_str: str | None = None,
     ) -> pd.DataFrame:
         end_date = end_date if end_date is not None else date.today()
         cache_path = self._cache_path(symbol, end_date)
@@ -55,7 +56,7 @@ class HistoryClient:
         bars = await self._client.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
-            durationStr=f"{days} D",
+            durationStr=duration_str if duration_str is not None else f"{days} D",
             barSizeSetting="1 day",
             whatToShow="TRADES",
             useRTH=True,

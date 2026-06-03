@@ -727,13 +727,17 @@ async def _run_validate_backtest(years: int) -> int:
         return 0
 
     client = IBKRClient(role="cli", settings=settings)
-    days = years * 252
+    # IB rejects day-bar durations beyond ~1 year ("756 D" -> 0 bars), so drive
+    # the request in years. Under-request rows slightly (250/yr vs ~252 actual)
+    # so the parquet cache satisfies on re-run instead of always re-fetching.
+    duration = f"{years} Y"
+    days = years * 250
     try:
         await client.connect()
         history = HistoryClient(client)
 
         async def fetch_closes(symbol: str) -> list[float]:
-            df = await history.get_history(symbol, days=days)
+            df = await history.get_history(symbol, days=days, duration_str=duration)
             return [float(c) for c in df["close"].tolist()]
 
         report = await run_backtest(picks, fetch_closes)
@@ -742,28 +746,31 @@ async def _run_validate_backtest(years: int) -> int:
 
     typer.secho(
         f"Calibration over {report.overall_count} picks "
-        f"(pred {report.overall_mean_pred:.2f} | raw {report.overall_mean_raw:.2f} | "
-        f"dedrift {report.overall_mean_dedrift:.2f}):",
+        f"(pred {report.overall_mean_pred:.2f} | dedrift {report.overall_mean_dedrift:.2f} | "
+        f"raw {report.overall_mean_raw:.2f}):",
         fg=typer.colors.GREEN,
     )
-    typer.echo(f"  {'pred_PoP':>10} {'raw_win':>8} {'dedrift':>8} {'n_picks':>8}")
+    typer.echo(f"  {'pred_PoP':>10} {'dedrift':>8} {'raw_win':>8} {'n_picks':>8}")
     for b in report.buckets:
         if b.count == 0:
             continue
         typer.echo(
-            f"  [{b.lo:.1f},{b.hi:.1f}) {b.mean_pred:>9.2f} {b.mean_raw:>8.2f} "
-            f"{b.mean_dedrift:>8.2f} {b.count:>8}"
+            f"  [{b.lo:.1f},{b.hi:.1f}) {b.mean_pred:>9.2f} {b.mean_dedrift:>8.2f} "
+            f"{b.mean_raw:>8.2f} {b.count:>8}"
         )
     typer.echo("by strategy:")
     for name, b in report.by_strategy.items():
         typer.echo(
-            f"  {name:24} pred={b.mean_pred:.2f} raw={b.mean_raw:.2f} "
-            f"dedrift={b.mean_dedrift:.2f} n={b.count}"
+            f"  {name:24} pred={b.mean_pred:.2f} dedrift={b.mean_dedrift:.2f} "
+            f"raw={b.mean_raw:.2f} n={b.count}"
         )
     typer.echo(
-        "note: raw uses realized returns incl. drift; dedrift removes mean drift "
-        "(model assumes zero drift). raw>dedrift = drift tailwind; dedrift vs pred "
-        "= vol/tail calibration (model uses IV, history uses realized vol)."
+        "note: judge calibration on pred-vs-dedrift (dedrift renormalizes realized "
+        "returns to zero drift, matching the model); raw includes drift and is "
+        "regime-specific (raw>dedrift = the bull/bear tailwind the model ignores). "
+        "Win-rates use OVERLAPPING windows over a single ~Ny path, so effective "
+        "independent samples are far fewer than n_picks -- read as directional, "
+        "not a confidence interval."
     )
     return 0
 

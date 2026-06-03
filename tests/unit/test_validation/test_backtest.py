@@ -100,3 +100,71 @@ async def test_run_backtest_uses_injected_fetch_and_builds_report() -> None:
     assert calls == ["AAA", "BBB"]
     assert report.overall_count == 2
     # Symbol fetch is cached per symbol (each fetched once).
+
+
+def test_calibrate_bucket_boundaries() -> None:
+    """Exact deciles land in the right bucket (0.70 -> [0.7,0.8), 1.0 -> last)."""
+    rows = [
+        BacktestRow(symbol="A", strategy="s", predicted=0.70, raw=0.7, dedrift=0.7, n=10),
+        BacktestRow(symbol="B", strategy="s", predicted=0.30, raw=0.3, dedrift=0.3, n=10),
+        BacktestRow(symbol="C", strategy="s", predicted=1.0, raw=1.0, dedrift=1.0, n=10),
+        BacktestRow(symbol="D", strategy="s", predicted=0.0, raw=0.0, dedrift=0.0, n=10),
+    ]
+    report = calibrate(rows, n_buckets=10)
+    by_lo = {round(b.lo, 1): b for b in report.buckets}
+    assert by_lo[0.7].count == 1  # would be 0 with naive int(0.7*10)==6
+    assert by_lo[0.3].count == 1
+    assert by_lo[0.9].count == 1  # 1.0 pinned to the last bucket, not dropped
+    assert by_lo[0.0].count == 1
+    assert report.overall_count == 4
+
+
+def test_load_pick_records_filters_non_modelable(tmp_path) -> None:
+    """load_pick_records keeps single-expiry picks with a prob_profit; skips
+    multi-expiry (calendar) and null-prob rows."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from alembic.config import Config
+    from sqlalchemy import insert
+
+    from alembic import command
+    from optionsbot.storage.db import create_engine_for_path
+    from optionsbot.storage.schema import snapshots as snaps
+    from optionsbot.storage.schema import strategy_scores as scores
+    from optionsbot.validation.backtest import load_pick_records
+
+    db_path = tmp_path / "v.db"
+    root = Path(__file__).resolve().parents[3]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, "head")
+    engine = create_engine_for_path(db_path)
+
+    def _leg(side: str, strike: float, expiry: str) -> dict[str, object]:
+        return {"symbol": "SPY", "side": side, "sec_type": "OPT",
+                "expiry": expiry, "strike": strike, "right": "C", "quantity": 1}
+
+    with engine.begin() as conn:
+        sid = conn.execute(
+            insert(snaps).values(
+                symbol="SPY", ts=datetime(2026, 1, 1, tzinfo=UTC), spot=100.0
+            )
+        ).inserted_primary_key[0]
+        conn.execute(insert(scores).values(
+            snapshot_id=sid, strategy="bull_call_spread", score=60.0,
+            legs_json=[_leg("buy", 100.0, "20260201"), _leg("sell", 110.0, "20260201")],
+            suggestion_json={"prob_profit": 0.5, "credit_or_debit": -200.0}))
+        conn.execute(insert(scores).values(  # multi-expiry -> not modelable
+            snapshot_id=sid, strategy="calendar", score=55.0,
+            legs_json=[_leg("sell", 100.0, "20260201"), _leg("buy", 100.0, "20260301")],
+            suggestion_json={"prob_profit": None, "credit_or_debit": -150.0}))
+        conn.execute(insert(scores).values(  # null prob_profit -> skipped
+            snapshot_id=sid, strategy="long_call", score=50.0,
+            legs_json=[_leg("buy", 100.0, "20260201")],
+            suggestion_json={"prob_profit": None, "credit_or_debit": -300.0}))
+
+    picks = load_pick_records(engine)
+    assert len(picks) == 1
+    assert picks[0].strategy == "bull_call_spread"
+    assert picks[0].dte_days == 31
