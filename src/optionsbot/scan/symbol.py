@@ -112,7 +112,7 @@ async def scan_symbol(
     stock = await market_client.get_stock_snapshot(symbol)
     spot = stock.mid or stock.last or 0.0
     bars, chain, positions, account = await asyncio.gather(
-        history_client.get_history(symbol, days=120),
+        history_client.get_history(symbol, days=252),
         chain_client.get_chain(
             symbol,
             underlying_price=spot,
