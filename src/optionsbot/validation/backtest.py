@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from datetime import datetime
 
-from optionsbot.scoring.payoff import terminal_pnl_dollars
+from sqlalchemy import Engine, select
+
+from optionsbot.scoring.payoff import is_terminal_modelable, terminal_pnl_dollars
+from optionsbot.storage.schema import snapshots as snapshots_t
+from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies.base import Leg
 from optionsbot.validation.types import (
     BacktestReport,
     BacktestRow,
     CalibrationBucket,
+    PickRecord,
 )
 
 _TRADING_DAYS_PER_YEAR = 252
@@ -100,3 +107,68 @@ def calibrate(rows: Sequence[BacktestRow], n_buckets: int = 10) -> BacktestRepor
         overall_mean_raw=overall.mean_raw,
         overall_mean_dedrift=overall.mean_dedrift,
     )
+
+
+async def run_backtest(
+    picks: Sequence[PickRecord],
+    fetch_closes: Callable[[str], Awaitable[Sequence[float]]],
+) -> BacktestReport:
+    """Fetch each symbol's closes (once, cached), compute per-pick win-rates, calibrate."""
+    closes_cache: dict[str, Sequence[float]] = {}
+    rows: list[BacktestRow] = []
+    for pick in picks:
+        if pick.symbol not in closes_cache:
+            closes_cache[pick.symbol] = await fetch_closes(pick.symbol)
+        out = historical_win_rate(
+            pick.legs, pick.credit_or_debit, pick.entry_spot,
+            closes_cache[pick.symbol], pick.dte_days,
+        )
+        if out is None:
+            continue
+        raw, dedrift, n = out
+        rows.append(BacktestRow(
+            symbol=pick.symbol, strategy=pick.strategy, predicted=pick.prob_profit,
+            raw=raw, dedrift=dedrift, n=n,
+        ))
+    return calibrate(rows)
+
+
+def load_pick_records(engine: Engine) -> list[PickRecord]:
+    """Read terminal-modelable picks from strategy_scores joined to snapshots."""
+    stmt = (
+        select(
+            snapshots_t.c.symbol, snapshots_t.c.spot, snapshots_t.c.ts,
+            scores_t.c.strategy, scores_t.c.score, scores_t.c.legs_json,
+            scores_t.c.suggestion_json,
+        )
+        .select_from(scores_t.join(snapshots_t, scores_t.c.snapshot_id == snapshots_t.c.id))
+    )
+    out: list[PickRecord] = []
+    with engine.connect() as conn:
+        for row in conn.execute(stmt).fetchall():
+            sug = row.suggestion_json or {}
+            if isinstance(sug, str):
+                sug = json.loads(sug)
+            pop = sug.get("prob_profit")
+            spot = row.spot
+            if pop is None or spot is None:
+                continue
+            legs_data = row.legs_json or []
+            if isinstance(legs_data, str):
+                legs_data = json.loads(legs_data)
+            legs = tuple(Leg(**le) for le in legs_data)
+            if not is_terminal_modelable(legs):
+                continue
+            expiry = legs[0].expiry
+            assert expiry is not None
+            entry_date = row.ts.date()
+            dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - entry_date).days
+            if dte_days <= 0:
+                continue
+            out.append(PickRecord(
+                symbol=row.symbol, entry_spot=float(spot), entry_date=entry_date,
+                expiry=expiry, dte_days=dte_days, legs=legs,
+                credit_or_debit=float(sug.get("credit_or_debit", 0.0)),
+                prob_profit=float(pop), score=float(row.score), strategy=row.strategy,
+            ))
+    return out

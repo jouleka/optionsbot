@@ -70,3 +70,37 @@ def test_calibrate_buckets_by_predicted_pop() -> None:
     assert report.overall_count == 3
     assert "bull_call_spread" in report.by_strategy
     assert report.by_strategy["bull_call_spread"].count == 2
+
+
+import datetime as _dt
+
+import pytest
+
+from optionsbot.validation.backtest import run_backtest
+from optionsbot.validation.types import PickRecord
+
+
+def _pick(symbol: str, pop: float, strike: float) -> PickRecord:
+    return PickRecord(
+        symbol=symbol, entry_spot=100.0, entry_date=_dt.date(2026, 1, 1),
+        expiry="20260201", dte_days=31,
+        legs=(Leg(symbol=symbol, side="buy", sec_type="OPT", expiry="20260201",
+                  strike=strike, right="C", quantity=1),),
+        credit_or_debit=-50.0, prob_profit=pop, score=60.0, strategy="long_call",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backtest_uses_injected_fetch_and_builds_report() -> None:
+    picks = [_pick("AAA", 0.72, 90.0), _pick("BBB", 0.25, 130.0)]
+    calls: list[str] = []
+
+    async def fake_fetch(symbol: str) -> list[float]:
+        calls.append(symbol)
+        # Gently rising series -> long call struck at 90 wins, at 130 loses.
+        return [100.0 + i * 0.5 for i in range(60)]
+
+    report = await run_backtest(picks, fake_fetch)
+    assert calls == ["AAA", "BBB"]
+    assert report.overall_count == 2
+    # Symbol fetch is cached per symbol (each fetched once).
