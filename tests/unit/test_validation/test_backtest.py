@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import math
+
+import pytest
 
 from optionsbot.strategies.base import Leg
 from optionsbot.validation.backtest import (
     calibrate,
     historical_win_rate,
     horizon_trading_days,
+    run_backtest,
 )
-from optionsbot.validation.types import BacktestRow
+from optionsbot.validation.types import BacktestRow, PickRecord
 
 
 def test_horizon_trading_days_scales_calendar_to_trading() -> None:
@@ -70,14 +74,6 @@ def test_calibrate_buckets_by_predicted_pop() -> None:
     assert report.overall_count == 3
     assert "bull_call_spread" in report.by_strategy
     assert report.by_strategy["bull_call_spread"].count == 2
-
-
-import datetime as _dt
-
-import pytest
-
-from optionsbot.validation.backtest import run_backtest
-from optionsbot.validation.types import PickRecord
 
 
 def _pick(symbol: str, pop: float, strike: float) -> PickRecord:

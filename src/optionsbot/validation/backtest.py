@@ -89,9 +89,10 @@ def calibrate(rows: Sequence[BacktestRow], n_buckets: int = 10) -> BacktestRepor
     for i in range(n_buckets):
         lo, hi = i * width, (i + 1) * width
         # Last bucket is inclusive of 1.0.
+        last = i == n_buckets - 1
         in_bucket = [
             r for r in rows
-            if r.predicted >= lo and (r.predicted < hi or (i == n_buckets - 1 and r.predicted <= hi))
+            if r.predicted >= lo and (r.predicted < hi or (last and r.predicted <= hi))
         ]
         buckets.append(_bucket(in_bucket, lo, hi))
     strategies = sorted({r.strategy for r in rows})
