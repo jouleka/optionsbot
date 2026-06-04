@@ -5,20 +5,35 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
 
 from optionsbot.config import Settings, get_settings, load_settings
 from optionsbot.daemon.context import DaemonContext
+from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.daemon.scheduler import build_scheduler
 from optionsbot.daemon.telegram_client import TelegramClient
 from optionsbot.daemon.telegram_poller import poll_commands
 from optionsbot.ibkr import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.storage.db import create_engine_for_path
+from optionsbot.storage.schema import scan_runs
 
 log = logging.getLogger(__name__)
+
+
+def format_heartbeat(
+    scanned: int | None, alerts: int | None, finished: datetime | None
+) -> str:
+    if finished is None:
+        return "✅ optionsbot alive — no scan ticks yet"
+    return (
+        f"✅ optionsbot alive — last tick {finished:%H:%M}Z: "
+        f"scanned {scanned}, {alerts} alerts"
+    )
 
 
 def _config_summary(settings: Settings) -> str:
@@ -77,6 +92,13 @@ class Daemon:
             self._scheduler = build_scheduler(self._context, self._scan_tick)
             self._scheduler.start()
             self._poller_task = asyncio.create_task(poll_commands(self._context))
+            hb = self._settings.telegram.heartbeat_minutes
+            if hb > 0:
+                self._scheduler.add_job(
+                    self._heartbeat_tick,
+                    trigger=IntervalTrigger(minutes=hb),
+                    id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
+                )
         except Exception:
             log.exception("Failed to start scheduler; daemon will exit")
             await self._shutdown_context()
@@ -186,3 +208,20 @@ class Daemon:
             )
         except Exception:
             log.exception("scan tick failed catastrophically")
+
+    async def _heartbeat_tick(self) -> None:
+        assert self._context is not None
+        if not is_market_open(datetime.now(UTC)):
+            return
+        with self._context.engine.connect() as conn:
+            last = conn.execute(
+                select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)
+            ).first()
+        if last is None:
+            msg = format_heartbeat(None, None, None)
+        else:
+            msg = format_heartbeat(last.tickers_scanned, last.alerts_fired, last.finished)
+        try:
+            await self._context.telegram.send_message(msg, parse_mode=None)
+        except Exception:  # noqa: BLE001 -- heartbeat failure must not crash the daemon
+            log.exception("heartbeat send failed")
