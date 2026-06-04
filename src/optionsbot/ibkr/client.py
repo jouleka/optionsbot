@@ -71,6 +71,11 @@ class IBKRClient:
         """Read-only access to the Settings instance this client was bound to."""
         return self._settings
 
+    @property
+    def is_connected(self) -> bool:
+        """True if the underlying ib_async client has a live connection."""
+        return bool(self._ib.isConnected())
+
     def _client_id(self) -> int:
         if self._role == "daemon":
             return self._settings.ibkr.client_id_daemon
