@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select
 
 from optionsbot.alerts.formatter import format_alert_markdown
 from optionsbot.daemon.context import DaemonContext
@@ -145,6 +145,45 @@ async def _cmd_screen(context: DaemonContext, args: list[str]) -> list[CommandRe
     return [CommandReply("\n".join(lines))]
 
 
+async def _cmd_watchlist(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    sub = args[0].lower() if args else "list"
+    if sub == "list":
+        with context.engine.connect() as conn:
+            rows = conn.execute(
+                select(watchlist.c.symbol).order_by(watchlist.c.symbol)
+            ).fetchall()
+        if not rows:
+            return [CommandReply("watchlist is empty — /watchlist add SYM")]
+        return [CommandReply("watchlist:\n" + "\n".join(r.symbol for r in rows))]
+    if sub == "add":
+        if len(args) < 2:
+            return [CommandReply("usage: /watchlist add SYMBOL")]
+        symbol = args[1].upper()
+        try:
+            async with context.ibkr_lock:
+                await context.resolver.stock(symbol)  # validate; raises if unknown
+        except Exception:  # noqa: BLE001
+            return [CommandReply(f"could not validate {symbol} against IBKR")]
+        with context.engine.begin() as conn:
+            exists = conn.execute(
+                select(watchlist.c.symbol).where(watchlist.c.symbol == symbol)
+            ).first()
+            if exists:
+                return [CommandReply(f"{symbol} is already in the watchlist")]
+            conn.execute(insert(watchlist).values(symbol=symbol, added_at=datetime.now(UTC)))
+        return [CommandReply(f"added {symbol} to the watchlist")]
+    if sub == "remove":
+        if len(args) < 2:
+            return [CommandReply("usage: /watchlist remove SYMBOL")]
+        symbol = args[1].upper()
+        with context.engine.begin() as conn:
+            res = conn.execute(delete(watchlist).where(watchlist.c.symbol == symbol))
+        if res.rowcount:
+            return [CommandReply(f"removed {symbol} from the watchlist")]
+        return [CommandReply(f"{symbol} is not in the watchlist")]
+    return [CommandReply("usage: /watchlist list|add SYM|remove SYM")]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -153,6 +192,7 @@ _REGISTRY: dict[str, Handler] = {
     "resume": _cmd_resume,
     "scan": _cmd_scan,
     "screen": _cmd_screen,
+    "watchlist": _cmd_watchlist,
 }
 
 

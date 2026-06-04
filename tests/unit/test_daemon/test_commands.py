@@ -96,3 +96,25 @@ async def test_screen_lists_candidates(daemon_context: DaemonContext) -> None:
     with patch("optionsbot.daemon.commands.screen_universe", new=AsyncMock(return_value=cands)):
         [reply] = await dispatch(daemon_context, "/screen 2")
     assert "NVDA" in reply.text and "AMD" in reply.text
+
+
+async def test_watchlist_list_and_add_and_remove(daemon_context: DaemonContext) -> None:
+    [empty] = await dispatch(daemon_context, "/watchlist list")
+    assert "empty" in empty.text.lower()
+
+    # add validates via the resolver (mock it so no IBKR needed)
+    daemon_context.resolver.stock = AsyncMock(return_value=MagicMock())
+    [added] = await dispatch(daemon_context, "/watchlist add aapl")
+    assert "AAPL" in added.text
+    [listed] = await dispatch(daemon_context, "/watchlist list")
+    assert "AAPL" in listed.text
+
+    [removed] = await dispatch(daemon_context, "/watchlist remove AAPL")
+    assert "AAPL" in removed.text
+    [empty2] = await dispatch(daemon_context, "/watchlist list")
+    assert "empty" in empty2.text.lower()
+
+
+async def test_watchlist_add_requires_symbol(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/watchlist add")
+    assert "usage" in reply.text.lower()
