@@ -2,19 +2,7 @@
 
 from __future__ import annotations
 
-from optionsbot.strategies.base import _expected_value, _risk_tier
-
-
-def test_expected_value_defined_risk() -> None:
-    # 60% win of +300, 40% loss of -200 => 0.6*300 - 0.4*200 = 100.0
-    assert _expected_value(0.6, 300.0, 200.0, defined_risk=True) == 100.0
-
-
-def test_expected_value_none_when_unbounded_or_missing() -> None:
-    assert _expected_value(0.6, None, 200.0, defined_risk=True) is None  # unbounded profit
-    assert _expected_value(None, 300.0, 200.0, defined_risk=True) is None  # no prob
-    assert _expected_value(0.6, 300.0, None, defined_risk=True) is None  # no max loss
-    assert _expected_value(0.6, 300.0, 200.0, defined_risk=False) is None  # undefined risk
+from optionsbot.strategies.base import _risk_tier
 
 
 def test_risk_tier_conservative() -> None:

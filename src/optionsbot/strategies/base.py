@@ -24,23 +24,6 @@ _RISK_TIER_CONSERVATIVE_PROB = 0.65
 _RISK_TIER_AGGRESSIVE_PROB = 0.40
 
 
-def _expected_value(
-    prob_profit: float | None,
-    max_profit: float | None,
-    max_loss: float | None,
-    *,
-    defined_risk: bool,
-) -> float | None:
-    """Heuristic expectancy in dollars: prob*max_profit - (1-prob)*max_loss.
-
-    Only defined for defined-risk strategies with a bounded max_profit and a
-    known prob_profit + max_loss. Returns None otherwise (NOT a claim of edge).
-    """
-    if not defined_risk or prob_profit is None or max_profit is None or max_loss is None:
-        return None
-    return prob_profit * max_profit - (1.0 - prob_profit) * max_loss
-
-
 def _risk_tier(*, defined_risk: bool, prob_profit: float | None) -> str:
     """conservative / balanced / aggressive from defined-risk + prob_profit."""
     if not defined_risk or (prob_profit is not None and prob_profit < _RISK_TIER_AGGRESSIVE_PROB):
@@ -163,6 +146,23 @@ class Strategy(ABC):
         credit = self.estimate_credit(legs, snapshot)
         return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, float(dte_days))
 
+    def estimate_expected_value(
+        self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
+    ) -> float | None:
+        """E[P&L] at expiry under a realized-vol (snapshot.hv20), zero-drift
+        lognormal. None for non-modelable positions or when hv20 is unavailable."""
+        from optionsbot.scoring.payoff import expected_value_dollars, is_terminal_modelable
+
+        if not is_terminal_modelable(legs):
+            return None
+        expiry = legs[0].expiry
+        assert expiry is not None  # guaranteed by is_terminal_modelable
+        dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
+        credit = self.estimate_credit(legs, snapshot)
+        return expected_value_dollars(
+            legs, credit, snapshot.spot, snapshot.hv20, float(dte_days)
+        )
+
     def suggest_size(
         self,
         account_value: float,
@@ -203,9 +203,7 @@ class Strategy(ABC):
             else None
         )
         prob_profit = self.estimate_prob_profit(legs, snapshot)
-        expected_value = _expected_value(
-            prob_profit, max_profit, max_loss, defined_risk=self.defined_risk
-        )
+        expected_value = self.estimate_expected_value(legs, snapshot)
         risk_tier = _risk_tier(defined_risk=self.defined_risk, prob_profit=prob_profit)
         size = (
             self.suggest_size(account_value, max_loss, risk_pct)
