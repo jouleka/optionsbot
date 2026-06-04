@@ -170,3 +170,11 @@ async def test_run_scan_tick_enqueues_alert_for_each_top_k_hit(
 
     assert mock_enqueue.await_count == 3
     assert summary.alerts_enqueued == 3
+
+
+def test_scan_settings_alert_calibration_defaults() -> None:
+    from optionsbot.config import ScanSettings
+
+    s = ScanSettings()
+    assert s.alert_top_n == 3
+    assert s.score_threshold == 55  # repurposed as the alert quality floor

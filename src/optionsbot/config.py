@@ -43,7 +43,13 @@ class TelegramSettings(BaseModel):
 
 class ScanSettings(BaseModel):
     interval_minutes: int = Field(default=15, ge=1)
-    score_threshold: int = Field(default=70, ge=0, le=100)
+    # Daemon alert quality FLOOR (IBK-100): a pick must score >= this to be
+    # alert-worthy. Repurposed from the old absolute threshold (was 70). scan-once
+    # and the MCP analyze path use scoring.DEFAULT_THRESHOLD, not this field.
+    score_threshold: int = Field(default=55, ge=0, le=100)
+    # Daemon alerts the top-N highest-scored floor-passing picks per tick, ranked
+    # across all scanned symbols (not per-symbol).
+    alert_top_n: int = Field(default=3, ge=1)
     alert_cooldown_hours: int = Field(default=4, ge=0)  # 0 disables the cooldown
     alert_rescore_delta: int = Field(default=10, ge=0, le=100)
     # Chain fetch: bound the strike set to a near-ATM window so a scan doesn't
