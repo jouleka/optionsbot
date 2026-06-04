@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from sqlalchemy import Engine
 
@@ -26,3 +28,10 @@ class DaemonContext:
     ibkr: IBKRClient
     resolver: ContractResolver
     telegram: TelegramClient
+    # IBK-102: serialize all IBKR market-data work (scheduled tick + on-demand
+    # /scan, /screen) so the single market-data line is never used concurrently.
+    ibkr_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # In-memory alerting pause (/pause, /resume). Resets to on at restart.
+    alerting_paused: bool = False
+    # For /status uptime.
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
