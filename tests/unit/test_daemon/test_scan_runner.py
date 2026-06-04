@@ -321,3 +321,39 @@ async def test_resolve_scan_symbols_falls_back_to_watchlist_when_screen_raises(
         resolved = await _resolve_scan_symbols(daemon_context)
 
     assert resolved == [("AAPL", None)]
+
+
+async def test_run_scan_tick_scans_screened_and_watchlist_symbols(
+    daemon_context: DaemonContext,
+) -> None:
+    """auto_screen on: run_scan_tick scans the watchlist union the screened
+    top-K, and scans screened-only names with view_override=None."""
+    from optionsbot.screener.screen import ScreenCandidate
+
+    daemon_context.settings.scan.auto_screen = True
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
+
+    candidates = (
+        ScreenCandidate(symbol="NVDA", hv_rank=0.9, dollar_volume=2e9),
+        ScreenCandidate(symbol="AMD", hv_rank=0.7, dollar_volume=5e8),
+    )
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch(
+            "optionsbot.daemon.scan_runner.screen_universe",
+            new=AsyncMock(return_value=candidates),
+         ), \
+         patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(side_effect=lambda s, *a, **kw: _fake_scan_result(s)),
+         ) as mock_scan:
+        summary = await run_scan_tick(daemon_context)
+
+    scanned = {call.args[0] for call in mock_scan.await_args_list}
+    assert scanned == {"SPY", "NVDA", "AMD"}
+    assert summary.tickers_scanned == 3
+    overrides = {
+        call.args[0]: call.kwargs["view_override"] for call in mock_scan.await_args_list
+    }
+    assert overrides["NVDA"] is None
+    assert overrides["AMD"] is None

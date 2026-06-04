@@ -73,7 +73,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             )
 
         retries_dispatched = await sweep_retries(context)
-        symbols = _load_watchlist(context)
+        symbols = await _resolve_scan_symbols(context)
         tickers_scanned = 0
         errors: list[str] = []
         all_picks: list[tuple[str, ScoredStrategy, int]] = []

@@ -41,6 +41,12 @@ def daemon_settings(tmp_path: Path) -> Settings:
     s.storage.db_path = tmp_path / "daemon.db"
     s.telegram.bot_token = "test-token"
     s.telegram.chat_id = "test-chat"
+    # Default off in unit tests: auto-screen would otherwise drive the real
+    # screen_universe over the mock IBKR client (reading the dev machine's
+    # parquet history cache), making these tests slow + environment-dependent.
+    # The production default stays True (pinned by test_config.py); tests that
+    # exercise auto-screen flip this back on explicitly and patch screen_universe.
+    s.scan.auto_screen = False
     return s
 
 
