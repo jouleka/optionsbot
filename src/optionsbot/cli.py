@@ -59,6 +59,9 @@ score_threshold = 55
 alert_top_n = 3
 alert_cooldown_hours = 4
 alert_rescore_delta = 10
+# auto_screen: each tick, also scan the top screened universe candidates (in
+# addition to the watchlist). Set false for watchlist-only ticks.
+auto_screen = true
 
 [telegram]
 # bot_token = "123456:ABC-..."
