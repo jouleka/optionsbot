@@ -73,26 +73,27 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             )
 
         retries_dispatched = await sweep_retries(context)
-        symbols = await _resolve_scan_symbols(context)
-        tickers_scanned = 0
-        errors: list[str] = []
-        all_picks: list[tuple[str, ScoredStrategy, int]] = []
+        async with context.ibkr_lock:
+            symbols = await _resolve_scan_symbols(context)
+            tickers_scanned = 0
+            errors: list[str] = []
+            all_picks: list[tuple[str, ScoredStrategy, int]] = []
 
-        for sym, override in symbols:
-            with bind_log_context(symbol=sym):
-                try:
-                    result = await scan_symbol(
-                        sym, context.ibkr, context.engine, context.settings,
-                        resolver=context.resolver,
-                        view_override=override,
-                    )
-                except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
-                    log.exception("scan_symbol failed for %s", sym)
-                    errors.append(f"{sym}: {type(e).__name__}: {e}")
-                    continue
-                tickers_scanned += 1
-                for scored in result.scored:
-                    all_picks.append((sym, scored, result.snapshot_id))
+            for sym, override in symbols:
+                with bind_log_context(symbol=sym):
+                    try:
+                        result = await scan_symbol(
+                            sym, context.ibkr, context.engine, context.settings,
+                            resolver=context.resolver,
+                            view_override=override,
+                        )
+                    except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
+                        log.exception("scan_symbol failed for %s", sym)
+                        errors.append(f"{sym}: {type(e).__name__}: {e}")
+                        continue
+                    tickers_scanned += 1
+                    for scored in result.scored:
+                        all_picks.append((sym, scored, result.snapshot_id))
 
         # Alert the day's best: floor by score, rank desc, enqueue the top N that
         # pass dedup. Counting only successful (dedup-passed) enqueues means a

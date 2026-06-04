@@ -357,3 +357,25 @@ async def test_run_scan_tick_scans_screened_and_watchlist_symbols(
     }
     assert overrides["NVDA"] is None
     assert overrides["AMD"] is None
+
+
+async def test_run_scan_tick_holds_ibkr_lock_during_scan(
+    daemon_context: DaemonContext,
+) -> None:
+    """The scan section runs under context.ibkr_lock (so on-demand /scan can't
+    race a scheduled tick for the market-data line)."""
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    held = {"during": None}
+
+    async def fake_scan(symbol, *a, **kw):
+        held["during"] = daemon_context.ibkr_lock.locked()
+        return _fake_scan_result(symbol)
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch("optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(side_effect=fake_scan)):
+        await run_scan_tick(daemon_context)
+
+    assert held["during"] is True  # the lock was held while scanning
+    assert daemon_context.ibkr_lock.locked() is False  # released afterward
