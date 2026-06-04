@@ -13,8 +13,13 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 
+from optionsbot.alerts.formatter import format_alert_markdown
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.ibkr.history import HistoryClient
+from optionsbot.scan import scan_symbol
+from optionsbot.screener.screen import screen_universe
+from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import alerts, scan_runs, watchlist
 
 
@@ -100,12 +105,54 @@ async def _cmd_resume(context: DaemonContext, args: list[str]) -> list[CommandRe
     return [CommandReply("▶ alerting resumed.")]
 
 
+async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    if not args:
+        return [CommandReply("usage: /scan SYMBOL")]
+    symbol = args[0].upper()
+    async with context.ibkr_lock:
+        result = await scan_symbol(
+            symbol, context.ibkr, context.engine, context.settings,
+            resolver=context.resolver,
+        )
+    top = result.scored[:3]
+    if not top:
+        return [CommandReply(f"{symbol}: no qualifying strategies right now")]
+    return [
+        CommandReply(
+            format_alert_markdown(result.symbol, result.view, s, result.snapshot_ts),
+            parse_mode="MarkdownV2",
+        )
+        for s in top
+    ]
+
+
+async def _cmd_screen(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    n = int(args[0]) if args and args[0].isdigit() else context.settings.screener.top_n
+    n = max(1, min(n, 30))
+    history = HistoryClient(context.ibkr, context.resolver)
+    universe = context.settings.screener.universe or DEFAULT_UNIVERSE
+    async with context.ibkr_lock:
+        cands = await screen_universe(
+            history, universe, context.settings.screener.min_dollar_volume
+        )
+    if not cands:
+        return [CommandReply("screen: no candidates passed the liquidity gate")]
+    lines = ["top screened:"]
+    lines += [
+        f"{c.symbol}: hv_rank {c.hv_rank:.2f}, $vol {c.dollar_volume / 1e6:.0f}M"
+        for c in cands[:n]
+    ]
+    return [CommandReply("\n".join(lines))]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
     "last": _cmd_last,
     "pause": _cmd_pause,
     "resume": _cmd_resume,
+    "scan": _cmd_scan,
+    "screen": _cmd_screen,
 }
 
 
