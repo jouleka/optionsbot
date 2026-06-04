@@ -14,9 +14,12 @@ from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.ibkr.history import HistoryClient
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
+from optionsbot.screener.screen import screen_universe
+from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import scan_runs, watchlist
 
 log = logging.getLogger(__name__)
@@ -147,6 +150,40 @@ def _load_watchlist(
                 )
             out.append((row.symbol, override))
     return out
+
+
+async def _resolve_scan_symbols(
+    context: DaemonContext,
+) -> list[tuple[str, tuple[Direction | None, IVRegime | None] | None]]:
+    """Symbols to scan this tick: the watchlist, augmented (when
+    ``scan.auto_screen`` is on) with the top screened universe candidates.
+
+    Watchlist entries keep their view_override; screened-only names get
+    override None; on overlap the watchlist override wins (so nothing the user
+    configured is lost). If screening raises, log and fall back to the watchlist
+    alone -- screening must never abort a tick.
+    """
+    watchlist_symbols = _load_watchlist(context)
+    if not context.settings.scan.auto_screen:
+        return watchlist_symbols
+
+    try:
+        history = HistoryClient(context.ibkr, context.resolver)
+        universe = context.settings.screener.universe or DEFAULT_UNIVERSE
+        candidates = await screen_universe(
+            history, universe, context.settings.screener.min_dollar_volume
+        )
+    except Exception:  # noqa: BLE001 -- screening must never abort the tick
+        log.exception("auto-screen failed; falling back to watchlist only")
+        return watchlist_symbols
+
+    seen = {sym for sym, _ in watchlist_symbols}
+    resolved = list(watchlist_symbols)
+    for cand in candidates[: context.settings.screener.scan_top_n]:
+        if cand.symbol not in seen:
+            resolved.append((cand.symbol, None))
+            seen.add(cand.symbol)
+    return resolved
 
 
 def _persist_scan_run(

@@ -9,7 +9,7 @@ from sqlalchemy import insert, select
 
 from optionsbot.analysis.types import MarketView
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.scan_runner import run_scan_tick
+from optionsbot.daemon.scan_runner import _resolve_scan_symbols, run_scan_tick
 from optionsbot.scan.types import ScanResult
 from optionsbot.storage.schema import scan_runs, watchlist
 
@@ -246,3 +246,78 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
     assert summary.alerts_enqueued == 2
     enqueued = sorted(call.args[2].score for call in mock_enqueue.await_args_list)
     assert enqueued == [75.0, 88.0]  # the 2 best across BOTH symbols (not 60/55)
+
+
+async def test_resolve_scan_symbols_watchlist_only_when_auto_screen_off(
+    daemon_context: DaemonContext,
+) -> None:
+    """auto_screen off -> exactly the watchlist; screen_universe is never called."""
+    daemon_context.settings.scan.auto_screen = False
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(
+            symbol="AAPL", added_at=datetime.now(UTC),
+            view_override_dir="bull", view_override_iv="high",
+        ))
+
+    boom = AsyncMock(side_effect=AssertionError("screen_universe must not be called"))
+    with patch("optionsbot.daemon.scan_runner.screen_universe", new=boom):
+        resolved = await _resolve_scan_symbols(daemon_context)
+
+    assert resolved == [("AAPL", ("bull", "high"))]
+    boom.assert_not_awaited()
+
+
+async def test_resolve_scan_symbols_unions_screened_with_watchlist(
+    daemon_context: DaemonContext,
+) -> None:
+    """auto_screen on -> watchlist union top screened, deduped by symbol;
+    watchlist override wins on overlap; screened-only names get override None."""
+    from optionsbot.screener.screen import ScreenCandidate
+
+    daemon_context.settings.scan.auto_screen = True
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(
+            symbol="SPY", added_at=datetime.now(UTC),
+            view_override_dir="bull", view_override_iv="high",
+        ))
+        conn.execute(insert(watchlist).values(
+            symbol="AAPL", added_at=datetime.now(UTC),
+            view_override_dir="bear", view_override_iv="low",
+        ))
+
+    candidates = (
+        ScreenCandidate(symbol="NVDA", hv_rank=0.9, dollar_volume=2e9),
+        ScreenCandidate(symbol="AAPL", hv_rank=0.8, dollar_volume=1e9),  # dup of watchlist
+        ScreenCandidate(symbol="AMD", hv_rank=0.7, dollar_volume=5e8),
+    )
+    with patch(
+        "optionsbot.daemon.scan_runner.screen_universe",
+        new=AsyncMock(return_value=candidates),
+    ):
+        resolved = await _resolve_scan_symbols(daemon_context)
+
+    # Robust to watchlist row ordering: check membership/dedup via a dict + length.
+    assert len(resolved) == 4  # SPY, AAPL, NVDA, AMD -- AAPL appears once
+    assert dict(resolved) == {
+        "SPY": ("bull", "high"),   # watchlist override preserved
+        "AAPL": ("bear", "low"),   # watchlist override wins over the screened dup
+        "NVDA": None,              # screened-only
+        "AMD": None,               # screened-only
+    }
+
+
+async def test_resolve_scan_symbols_falls_back_to_watchlist_when_screen_raises(
+    daemon_context: DaemonContext,
+) -> None:
+    """If screening raises, fall back to the watchlist alone (never abort)."""
+    daemon_context.settings.scan.auto_screen = True
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    with patch(
+        "optionsbot.daemon.scan_runner.screen_universe",
+        new=AsyncMock(side_effect=RuntimeError("ibkr down")),
+    ):
+        resolved = await _resolve_scan_symbols(daemon_context)
+
+    assert resolved == [("AAPL", None)]
