@@ -91,7 +91,6 @@ class Daemon:
         try:
             self._scheduler = build_scheduler(self._context, self._scan_tick)
             self._scheduler.start()
-            self._poller_task = asyncio.create_task(poll_commands(self._context))
             hb = self._settings.telegram.heartbeat_minutes
             if hb > 0:
                 self._scheduler.add_job(
@@ -99,6 +98,9 @@ class Daemon:
                     trigger=IntervalTrigger(minutes=hb),
                     id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
                 )
+            # Created last so a failure registering the heartbeat job above can't
+            # orphan the poller task (it wouldn't be cancelled in the except path).
+            self._poller_task = asyncio.create_task(poll_commands(self._context))
         except Exception:
             log.exception("Failed to start scheduler; daemon will exit")
             await self._shutdown_context()

@@ -58,3 +58,16 @@ async def test_poll_once_handler_error_is_swallowed_and_replied(
     assert new_offset == 11
     sent = daemon_context.telegram.send_message.await_args.args[0]
     assert "failed" in sent.lower()
+
+
+async def test_poll_once_bare_scan_skips_ack(daemon_context: DaemonContext) -> None:
+    """Bare /scan (no symbol) must NOT get the 'scanning…' ack before the usage hint."""
+    daemon_context.settings.telegram.chat_id = "5356256463"
+    daemon_context.telegram.get_updates = AsyncMock(
+        return_value=[_update(10, "5356256463", "/scan")]
+    )
+    daemon_context.telegram.send_message = AsyncMock()
+    await poll_once(daemon_context, offset=0)
+    sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
+    assert not any("scanning" in s for s in sent)  # no misleading ack for a bare /scan
+    assert any("usage" in s.lower() for s in sent)  # only the usage hint

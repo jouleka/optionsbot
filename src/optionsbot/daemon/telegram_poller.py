@@ -50,8 +50,11 @@ async def poll_once(context: DaemonContext, offset: int | None) -> int | None:
         text = (message.get("text") or "").strip()
         if not text:
             continue
-        cmd = text.split()[0].lstrip("/").lower() if text.startswith("/") else ""
-        if cmd in _ACK:
+        parts = text.split()
+        cmd = parts[0].lstrip("/").lower() if text.startswith("/") else ""
+        # Only ack a slow command that will actually do work (e.g. "/scan SPY",
+        # not bare "/scan", which just returns a usage hint).
+        if cmd in _ACK and len(parts) > 1:
             await context.telegram.send_message(_ACK[cmd], parse_mode=None)
         try:
             replies = await dispatch(context, text)
