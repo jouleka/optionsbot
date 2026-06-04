@@ -98,7 +98,7 @@ def format_alert_markdown(
     if sug.reward_risk is not None:
         lines.append(f"reward:risk `{sug.reward_risk:.2f}`")
     if sug.expected_value is not None:
-        lines.append(f"exp value `${sug.expected_value:.2f}` \\(heuristic\\)")
+        lines.append(f"exp value `${sug.expected_value:.2f}` \\(est\\)")
     lines.append(f"risk tier `{sug.risk_tier}`")
     if sug.suggested_quantity > 0:
         lines.append(f"size `{sug.suggested_quantity}` contracts")
