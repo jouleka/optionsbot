@@ -63,6 +63,10 @@ class ScanSettings(BaseModel):
     # Per-trade position sizing: fraction of account net-liquidation used as the
     # risk budget (budget = net_liq * risk_pct; contracts = budget // max_loss).
     risk_pct: float = Field(default=0.02, gt=0.0, le=1.0)
+    # Auto-screen the universe each tick and scan the top screened candidates
+    # in addition to the watchlist (IBK-101). False = watchlist-only tick (the
+    # pre-IBK-101 behavior).
+    auto_screen: bool = True
 
 
 class StorageSettings(BaseModel):

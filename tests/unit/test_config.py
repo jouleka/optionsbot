@@ -50,6 +50,11 @@ def test_scan_interval_default_is_15_minutes() -> None:
     assert Settings().scan.interval_minutes == 15
 
 
+def test_scan_auto_screen_default_is_on() -> None:
+    # IBK-101: the daemon screens the universe each tick by default.
+    assert Settings().scan.auto_screen is True
+
+
 def test_scan_risk_pct_default_is_2_percent() -> None:
     assert Settings().scan.risk_pct == 0.02
 
