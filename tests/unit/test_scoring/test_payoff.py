@@ -97,8 +97,9 @@ def test_expected_value_none_when_inputs_missing_or_not_modelable() -> None:
     assert expected_value_dollars(legs, -500.0, spot=100.0, vol=0.2, dte_days=0) is None
     stock = Leg(symbol="SPY", side="buy", sec_type="STK")
     assert expected_value_dollars((stock,), -100.0, spot=100.0, vol=0.2, dte_days=30) is None
+    # multi-expiry (calendar) -> not modelable
     cal = (_opt("sell", "C", 100.0), _opt("buy", "C", 100.0, expiry="20260821"))
-    assert expected_value_dollars(cal, 50.0, spot=100.0, vol=0.2, dte_days=30) is None  # multi-expiry  # noqa: E501
+    assert expected_value_dollars(cal, 50.0, spot=100.0, vol=0.2, dte_days=30) is None
 
 
 def test_expected_value_defined_debit_spread_within_bounds() -> None:
