@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from optionsbot.scoring.payoff import (
+    expected_value_dollars,
     is_terminal_modelable,
     prob_of_profit,
     terminal_pnl_dollars,
@@ -86,3 +87,44 @@ def test_prob_of_profit_is_a_probability() -> None:
     p = prob_of_profit(legs, -500.0, spot=100.0, atm_iv=0.25, dte_days=45)
     assert p is not None and 0.0 <= p <= 1.0
     assert not math.isnan(p)
+
+
+def test_expected_value_none_when_inputs_missing_or_not_modelable() -> None:
+    legs = (_opt("buy", "C", 100.0),)
+    assert expected_value_dollars(legs, -500.0, spot=100.0, vol=None, dte_days=30) is None
+    assert expected_value_dollars(legs, -500.0, spot=100.0, vol=0.0, dte_days=30) is None
+    assert expected_value_dollars(legs, -500.0, spot=0.0, vol=0.2, dte_days=30) is None
+    assert expected_value_dollars(legs, -500.0, spot=100.0, vol=0.2, dte_days=0) is None
+    stock = Leg(symbol="SPY", side="buy", sec_type="STK")
+    assert expected_value_dollars((stock,), -100.0, spot=100.0, vol=0.2, dte_days=30) is None
+    cal = (_opt("sell", "C", 100.0), _opt("buy", "C", 100.0, expiry="20260821"))
+    assert expected_value_dollars(cal, 50.0, spot=100.0, vol=0.2, dte_days=30) is None  # multi-expiry  # noqa: E501
+
+
+def test_expected_value_defined_debit_spread_within_bounds() -> None:
+    # Bull call spread: buy 100C / sell 105C, $2.00 debit (credit_or_debit=-200).
+    # max_loss = 200 (the debit), max_profit = 500 - 200 = 300. EV must lie within.
+    legs = (_opt("buy", "C", 100.0), _opt("sell", "C", 105.0))
+    ev = expected_value_dollars(legs, -200.0, spot=100.0, vol=0.20, dte_days=30)
+    assert ev is not None
+    assert -200.0 <= ev <= 300.0
+
+
+def test_expected_value_short_otm_put_is_not_catastrophic() -> None:
+    # Sell 80P (deep OTM) for $1.00 credit (credit_or_debit=+100), spot 100, modest HV.
+    # The OLD binary EV assumed full max_loss (~$7,900, stock->0) -> deeply negative.
+    # The distribution EV keeps almost all the credit -> positive, nowhere near -max_loss.
+    legs = (_opt("sell", "P", 80.0),)
+    ev = expected_value_dollars(legs, 100.0, spot=100.0, vol=0.20, dte_days=30)
+    assert ev is not None
+    assert ev > 0.0
+    assert ev > -100.0
+
+
+def test_expected_value_short_put_falls_as_vol_rises() -> None:
+    # Higher realized vol -> fatter tail -> the short put's EV decreases.
+    legs = (_opt("sell", "P", 80.0),)
+    lo = expected_value_dollars(legs, 100.0, spot=100.0, vol=0.10, dte_days=30)
+    hi = expected_value_dollars(legs, 100.0, spot=100.0, vol=0.50, dte_days=30)
+    assert lo is not None and hi is not None
+    assert hi < lo

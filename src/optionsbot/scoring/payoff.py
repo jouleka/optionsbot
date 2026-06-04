@@ -104,3 +104,43 @@ def prob_of_profit(
     if w_total <= 0.0:
         return None
     return w_profit / w_total
+
+
+def expected_value_dollars(
+    legs: Iterable[Leg],
+    credit_or_debit: float,
+    spot: float,
+    vol: float | None,
+    dte_days: float,
+) -> float | None:
+    """E[P&L at expiry] in dollars (per single contract set) under a zero-drift
+    lognormal terminal-price distribution sized by ``vol`` (realized vol).
+
+    Returns None when not modelable (stock/multi-expiry legs) or inputs are
+    missing/degenerate (no vol, non-positive spot/DTE).
+
+    Using REALIZED vol for the distribution while the entry premium
+    (``credit_or_debit``) is implied-vol priced captures the volatility-risk
+    premium: when IV > realized vol, premium sellers show a small positive EV.
+    Mirrors ``prob_of_profit``'s grid but accumulates expected P&L.
+    """
+    legs = tuple(legs)
+    if vol is None or vol <= 0.0 or spot <= 0.0 or dte_days <= 0.0:
+        return None
+    if not is_terminal_modelable(legs):
+        return None
+    sigma = vol * math.sqrt(dte_days / 365.0)
+    if sigma <= 0.0:
+        return None
+    step = (2.0 * _Z) / _STEPS
+    w_total = 0.0
+    w_pnl = 0.0
+    for i in range(_STEPS + 1):
+        z = -_Z + i * step
+        phi = math.exp(-0.5 * z * z)
+        s_t = spot * math.exp(-0.5 * sigma * sigma + sigma * z)
+        w_total += phi
+        w_pnl += phi * terminal_pnl_dollars(legs, credit_or_debit, s_t)
+    if w_total <= 0.0:
+        return None
+    return w_pnl / w_total
