@@ -52,7 +52,11 @@ paper = true
 
 [scan]
 interval_minutes = 15
-score_threshold = 70
+# score_threshold is the alert quality FLOOR -- a pick must score >= this to be
+# alert-worthy. The daemon alerts the best `alert_top_n` floor-passing picks per
+# tick, ranked across all scanned symbols.
+score_threshold = 55
+alert_top_n = 3
 alert_cooldown_hours = 4
 alert_rescore_delta = 10
 
