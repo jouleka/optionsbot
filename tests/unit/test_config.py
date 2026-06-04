@@ -41,8 +41,9 @@ def test_ibkr_max_market_data_lines_rejects_below_one() -> None:
         IBKRSettings(max_market_data_lines=0)
 
 
-def test_scan_threshold_default_is_70() -> None:
-    assert Settings().scan.score_threshold == 70
+def test_scan_threshold_default_is_55() -> None:
+    # IBK-100: repurposed as the alert quality floor (was 70)
+    assert Settings().scan.score_threshold == 55
 
 
 def test_scan_interval_default_is_15_minutes() -> None:
