@@ -86,3 +86,35 @@ async def test_aclose_closes_underlying_client() -> None:
     with patch.object(client._client, "aclose", new=AsyncMock()) as mock_close:
         await client.aclose()
     mock_close.assert_awaited_once()
+
+
+# --- IBK-102: get_updates + parse_mode ---
+
+def _client_with_response(json_body: dict) -> tuple[TelegramClient, MagicMock]:
+    resp = MagicMock()
+    resp.json.return_value = json_body
+    resp.raise_for_status = MagicMock()
+    http = MagicMock()
+    http.post = AsyncMock(return_value=resp)
+    return TelegramClient("tok", "123", client=http), http
+
+
+async def test_get_updates_returns_result_list_and_passes_offset() -> None:
+    tc, http = _client_with_response({"ok": True, "result": [{"update_id": 5}]})
+    out = await tc.get_updates(offset=5, timeout=30)
+    assert out == [{"update_id": 5}]
+    args, kwargs = http.post.await_args
+    assert kwargs["json"]["offset"] == 5
+    assert kwargs["json"]["timeout"] == 30
+
+
+async def test_send_message_plain_text_omits_parse_mode() -> None:
+    tc, http = _client_with_response({"ok": True, "result": {"message_id": 9}})
+    await tc.send_message("hi", parse_mode=None)
+    assert "parse_mode" not in http.post.await_args.kwargs["json"]
+
+
+async def test_send_message_defaults_to_markdownv2() -> None:
+    tc, http = _client_with_response({"ok": True, "result": {"message_id": 9}})
+    await tc.send_message("hi")
+    assert http.post.await_args.kwargs["json"]["parse_mode"] == "MarkdownV2"

@@ -29,8 +29,11 @@ class TelegramClient:
         self._chat_id = chat_id
         self._client = client if client is not None else httpx.AsyncClient(timeout=timeout)
 
-    async def send_message(self, text: str) -> int:
-        """Send a Markdown message to the configured chat. Returns Telegram message_id."""
+    async def send_message(self, text: str, parse_mode: str | None = "MarkdownV2") -> int:
+        """Send a message to the configured chat. Returns Telegram message_id.
+
+        ``parse_mode`` defaults to ``"MarkdownV2"``; pass ``None`` for plain text.
+        """
         if not self._bot_token:
             raise RuntimeError("TelegramClient: bot_token is not configured")
         if not self._chat_id:
@@ -39,13 +42,31 @@ class TelegramClient:
         payload: dict[str, Any] = {
             "chat_id": self._chat_id,
             "text": text,
-            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": True,
         }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         response = await self._client.post(url, json=payload)
         response.raise_for_status()
         body = response.json()
         return cast(int, body["result"]["message_id"])
+
+    async def get_updates(
+        self, offset: int | None = None, timeout: int = 30
+    ) -> list[dict[str, Any]]:
+        """Long-poll getUpdates. Returns the raw ``result`` list (possibly empty)."""
+        if not self._bot_token:
+            raise RuntimeError("TelegramClient: bot_token is not configured")
+        url = f"{_API_BASE}/bot{self._bot_token}/getUpdates"
+        params: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        # The per-request read timeout MUST exceed the long-poll timeout, or httpx
+        # would cancel the request mid-poll. The client's default 10s is too short.
+        response = await self._client.post(url, json=params, timeout=timeout + 10)
+        response.raise_for_status()
+        body = response.json()
+        return cast("list[dict[str, Any]]", body.get("result", []))
 
     async def aclose(self) -> None:
         await self._client.aclose()
