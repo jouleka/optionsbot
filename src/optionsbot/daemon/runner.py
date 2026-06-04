@@ -13,6 +13,7 @@ from optionsbot.config import Settings, get_settings, load_settings
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.scheduler import build_scheduler
 from optionsbot.daemon.telegram_client import TelegramClient
+from optionsbot.daemon.telegram_poller import poll_commands
 from optionsbot.ibkr import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.storage.db import create_engine_for_path
@@ -39,6 +40,7 @@ class Daemon:
         self._stop_event = asyncio.Event()
         self._scheduler: AsyncIOScheduler | None = None
         self._reload_task: asyncio.Task[None] | None = None
+        self._poller_task: asyncio.Task[None] | None = None
 
     def install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Wire SIGTERM and SIGINT to request_stop() so Ctrl-C / systemd-stop
@@ -74,6 +76,7 @@ class Daemon:
         try:
             self._scheduler = build_scheduler(self._context, self._scan_tick)
             self._scheduler.start()
+            self._poller_task = asyncio.create_task(poll_commands(self._context))
         except Exception:
             log.exception("Failed to start scheduler; daemon will exit")
             await self._shutdown_context()
@@ -92,6 +95,12 @@ class Daemon:
                 # IBKR disconnect + engine dispose; we always want a clean
                 # process exit even if the scheduler self-terminated.
                 log.exception("Scheduler shutdown failed")
+            if self._poller_task is not None:
+                self._poller_task.cancel()
+                try:
+                    await self._poller_task
+                except asyncio.CancelledError:
+                    pass
             await self._shutdown_context()
         return 0
 
