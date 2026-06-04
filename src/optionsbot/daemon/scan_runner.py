@@ -99,17 +99,18 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
         # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
         alerts_enqueued = 0
-        for sym, scored, snap_id in rank_alert_candidates(
-            all_picks, context.settings.scan.score_threshold
-        ):
-            if alerts_enqueued >= context.settings.scan.alert_top_n:
-                break
-            try:
-                if await enqueue_alert(context, sym, scored, snap_id):
-                    alerts_enqueued += 1
-            except Exception as e:  # noqa: BLE001
-                log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
-                errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
+        if not context.alerting_paused:
+            for sym, scored, snap_id in rank_alert_candidates(
+                all_picks, context.settings.scan.score_threshold
+            ):
+                if alerts_enqueued >= context.settings.scan.alert_top_n:
+                    break
+                try:
+                    if await enqueue_alert(context, sym, scored, snap_id):
+                        alerts_enqueued += 1
+                except Exception as e:  # noqa: BLE001
+                    log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
+                    errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
 
         finished_at = datetime.now(UTC)
         _persist_scan_run(

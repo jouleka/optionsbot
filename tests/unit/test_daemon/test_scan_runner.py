@@ -379,3 +379,29 @@ async def test_run_scan_tick_holds_ibkr_lock_during_scan(
 
     assert held["during"] is True  # the lock was held while scanning
     assert daemon_context.ibkr_lock.locked() is False  # released afterward
+
+
+async def test_run_scan_tick_suppresses_alerts_when_paused(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    sug = MagicMock()
+    sug.legs = ()
+    sug.prob_profit = 0.6
+    scored = (ScoredStrategy("a", 90.0, FactorBreakdown(.5,.5,.5,.5,.5,.5), sug, "x"),)
+    daemon_context.alerting_paused = True
+    daemon_context.settings.scan.score_threshold = 50
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch("optionsbot.daemon.scan_runner.scan_symbol",
+               new=AsyncMock(return_value=_scan_result_for("SPY", scored))), \
+         patch("optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock()) as mock_enq:
+        summary = await run_scan_tick(daemon_context)
+
+    mock_enq.assert_not_awaited()       # paused → no enqueue
+    assert summary.alerts_enqueued == 0
+    assert summary.tickers_scanned == 1  # but scanning still happened
