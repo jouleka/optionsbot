@@ -116,6 +116,20 @@ def test_telegram_token_optional_in_defaults() -> None:
     assert s.telegram.chat_id is None
 
 
+def test_telegram_heartbeat_minutes_default_is_60() -> None:
+    assert Settings().telegram.heartbeat_minutes == 60
+
+
+def test_telegram_heartbeat_minutes_rejects_negative() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from optionsbot.config import TelegramSettings
+
+    with pytest.raises(ValidationError):
+        TelegramSettings(heartbeat_minutes=-1)
+
+
 def test_get_settings_cache_can_be_cleared(monkeypatch: pytest.MonkeyPatch) -> None:
     from optionsbot.config import get_settings
 

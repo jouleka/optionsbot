@@ -66,6 +66,8 @@ auto_screen = true
 [telegram]
 # bot_token = "123456:ABC-..."
 # chat_id = "123456789"
+# heartbeat_minutes: periodic "alive" summary during market hours (0 disables).
+heartbeat_minutes = 60
 
 [storage]
 # db_path = "~/.local/share/optionsbot/optionsbot.db"

@@ -39,6 +39,9 @@ class IBKRSettings(BaseModel):
 class TelegramSettings(BaseModel):
     bot_token: str | None = None
     chat_id: str | None = None
+    # IBK-102: post a periodic "alive + last tick" summary to Telegram during
+    # market hours. 0 disables.
+    heartbeat_minutes: int = Field(default=60, ge=0)
 
 
 class ScanSettings(BaseModel):
