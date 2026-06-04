@@ -16,10 +16,20 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
-from optionsbot.scoring import DEFAULT_TOP_K, top_k
+from optionsbot.scoring import ScoredStrategy
 from optionsbot.storage.schema import scan_runs, watchlist
 
 log = logging.getLogger(__name__)
+
+
+def rank_alert_candidates(
+    picks: list[tuple[str, ScoredStrategy, int]],
+    score_floor: float,
+) -> list[tuple[str, ScoredStrategy, int]]:
+    """Picks scoring >= ``score_floor``, sorted by score descending (best first)."""
+    above = [p for p in picks if p[1].score >= score_floor]
+    above.sort(key=lambda p: p[1].score, reverse=True)
+    return above
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +72,8 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         retries_dispatched = await sweep_retries(context)
         symbols = _load_watchlist(context)
         tickers_scanned = 0
-        alerts_enqueued = 0
         errors: list[str] = []
+        all_picks: list[tuple[str, ScoredStrategy, int]] = []
 
         for sym, override in symbols:
             with bind_log_context(symbol=sym):
@@ -78,21 +88,24 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                     errors.append(f"{sym}: {type(e).__name__}: {e}")
                     continue
                 tickers_scanned += 1
-                selected = top_k(
-                    result.scored,
-                    k=DEFAULT_TOP_K,
-                    threshold=context.settings.scan.score_threshold,
-                )
-                for scored in selected:
-                    try:
-                        # enqueue_alert returns True when a row was actually inserted,
-                        # False when the dedup gate suppressed it. Increment only on
-                        # True so scan_runs.alerts_fired matches reality.
-                        if await enqueue_alert(context, sym, scored, result.snapshot_id):
-                            alerts_enqueued += 1
-                    except Exception as e:  # noqa: BLE001
-                        log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
-                        errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
+                for scored in result.scored:
+                    all_picks.append((sym, scored, result.snapshot_id))
+
+        # Alert the day's best: floor by score, rank desc, enqueue the top N that
+        # pass dedup. Counting only successful (dedup-passed) enqueues means a
+        # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
+        alerts_enqueued = 0
+        for sym, scored, snap_id in rank_alert_candidates(
+            all_picks, context.settings.scan.score_threshold
+        ):
+            if alerts_enqueued >= context.settings.scan.alert_top_n:
+                break
+            try:
+                if await enqueue_alert(context, sym, scored, snap_id):
+                    alerts_enqueued += 1
+            except Exception as e:  # noqa: BLE001
+                log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
+                errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
 
         finished_at = datetime.now(UTC)
         _persist_scan_run(

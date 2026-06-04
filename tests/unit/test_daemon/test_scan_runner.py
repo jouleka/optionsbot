@@ -26,6 +26,18 @@ def _fake_scan_result(symbol: str = "SPY") -> ScanResult:
     )
 
 
+def _scan_result_for(symbol, scored) -> ScanResult:
+    view = MarketView(
+        direction="neutral", direction_strength="weak", iv_regime="high",
+        iv_rank_value=0.7, earnings_in_window=False, warming_up=False,
+    )
+    return ScanResult(
+        symbol=symbol, snapshot_id=7,
+        snapshot_ts=datetime(2026, 6, 2, 15, 30, tzinfo=UTC),
+        view=view, scored=scored,
+    )
+
+
 async def test_run_scan_tick_short_circuits_when_market_closed(
     daemon_context: DaemonContext,
 ) -> None:
@@ -120,10 +132,11 @@ async def test_run_scan_tick_records_per_symbol_errors_without_aborting_tick(
     assert "BORK" in summary.errors[0]
 
 
-async def test_run_scan_tick_enqueues_alert_for_each_top_k_hit(
+async def test_run_scan_tick_enqueues_top_n_above_floor(
     daemon_context: DaemonContext,
 ) -> None:
-    """Each ScoredStrategy in top-K should call enqueue_alert once."""
+    """The top alert_top_n (default 3) floor-passing picks are enqueued; lower
+    ones are dropped by the top-N cap."""
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
 
@@ -146,7 +159,7 @@ async def test_run_scan_tick_enqueues_alert_for_each_top_k_hit(
         _make_scored("iron_condor", 90.0),
         _make_scored("iron_butterfly", 85.0),
         _make_scored("bull_put_spread", 72.0),
-        _make_scored("calendar_spread", 65.0),  # below threshold
+        _make_scored("calendar_spread", 65.0),  # 4th-best -> dropped by the top-3 cap
     )
     result = _fake_scan_result("SPY")
     result = ScanResult(
@@ -178,3 +191,58 @@ def test_scan_settings_alert_calibration_defaults() -> None:
     s = ScanSettings()
     assert s.alert_top_n == 3
     assert s.score_threshold == 55  # repurposed as the alert quality floor
+
+
+def test_rank_alert_candidates_floors_and_sorts() -> None:
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    picks = [
+        ("SPY", MagicMock(score=60.0), 1),
+        ("AAPL", MagicMock(score=80.0), 2),
+        ("XYZ", MagicMock(score=40.0), 3),  # below floor -> dropped
+    ]
+    out = rank_alert_candidates(picks, score_floor=50.0)
+    assert [(sym, p.score) for sym, p, _ in out] == [("AAPL", 80.0), ("SPY", 60.0)]
+
+
+async def test_run_scan_tick_alerts_top_n_across_all_symbols(
+    daemon_context: DaemonContext,
+) -> None:
+    """top_n is applied across the WHOLE tick, not per symbol: the 2 highest of
+    4 floor-passing picks (across 2 symbols) are enqueued."""
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def _mk(name: str, score: float) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.prob_profit = 0.6
+        return ScoredStrategy(
+            strategy_name=name, score=score,
+            factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+            suggestion=sug, rationale="...",
+        )
+
+    daemon_context.settings.scan.alert_top_n = 2
+    daemon_context.settings.scan.score_threshold = 50
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    spy = _scan_result_for("SPY", (_mk("a", 88.0), _mk("b", 60.0)))
+    aapl = _scan_result_for("AAPL", (_mk("c", 75.0), _mk("d", 55.0)))
+
+    async def fake_scan(symbol, *a, **kw):
+        return spy if symbol == "SPY" else aapl
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
+        "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(side_effect=fake_scan)
+    ), patch(
+        "optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock(return_value=True)
+    ) as mock_enqueue:
+        summary = await run_scan_tick(daemon_context)
+
+    assert mock_enqueue.await_count == 2
+    assert summary.alerts_enqueued == 2
+    enqueued = sorted(call.args[2].score for call in mock_enqueue.await_args_list)
+    assert enqueued == [75.0, 88.0]  # the 2 best across BOTH symbols (not 60/55)
