@@ -636,7 +636,10 @@ async def _run_scan_once() -> int:
                 errors.append(f"{sym}: {type(e).__name__}: {e}")
                 continue
             scanned += 1
-            selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+            selected = top_k(
+                result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD,
+                rank_by="expectancy",
+            )
             if selected:
                 typer.secho(f"{sym}: {len(result.scored)} scored", fg=typer.colors.GREEN)
                 for s in selected:
@@ -774,7 +777,10 @@ async def _run_screen_scan(scan_top: int | None) -> int:
         header = (
             f"{cand.symbol:6} hv_rank={cand.hv_rank:.2f}  $vol={cand.dollar_volume:,.0f}"
         )
-        selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+        selected = top_k(
+            result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD,
+            rank_by="expectancy",
+        )
         if selected:
             typer.secho(f"{header}  ({len(result.scored)} scored)", fg=typer.colors.GREEN)
             for s in selected:

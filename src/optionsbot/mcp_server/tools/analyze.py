@@ -51,7 +51,10 @@ async def _analyze_fresh(symbol: str, lifespan: ServerContext) -> dict[str, Any]
         lifespan.settings,
         view_override=override,
     )
-    selected = top_k(result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD)
+    selected = top_k(
+        result.scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD,
+        rank_by="expectancy",
+    )
     return {
         "ok": True,
         "symbol": result.symbol,
@@ -94,6 +97,9 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
         "earnings_in_window": None,
         "warming_up": row.raw_json.get("warming_up") if row.raw_json else None,
     }
+    # NOTE (IBK-104): this cached path stays SCORE-ranked. strategy_scores rows
+    # don't persist expected_value/max_loss, so risk-normalized edge ranking
+    # isn't computable here without a schema migration; the fresh path edge-ranks.
     # Mirrors top_k(scored, k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD) but
     # operates on DB rows instead of ScoredStrategy objects. The score_rows
     # query above already orders by `desc(score)`, so filtering then slicing

@@ -149,6 +149,7 @@ async def test_analyze_returns_top_k_only(
         sug.prob_profit = 0.5
         sug.suggested_quantity = 1
         sug.defined_risk = True
+        sug.risk_normalized_expectancy = score / 1000.0
         return ScoredStrategy(
             strategy_name=name,
             score=score,
