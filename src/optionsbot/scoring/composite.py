@@ -45,6 +45,12 @@ DEFAULT_TOP_K = 3
 DEFAULT_THRESHOLD = 70.0
 
 
+def edge_sort_key(suggestion: StrategySuggestion) -> float:
+    """Sort key for edge-aware ranking: risk-normalized expectancy, None last."""
+    edge = suggestion.risk_normalized_expectancy
+    return edge if edge is not None else float("-inf")
+
+
 def compute_factor_breakdown(
     snapshot: StrategySnapshot,
     suggestion: StrategySuggestion,
@@ -139,18 +145,11 @@ def top_k(
 
     Always filters on the quality ``score`` threshold first (the quality gate).
     ``rank_by`` then orders the survivors: by ``score`` (default) or by
-    ``expectancy`` (the suggestion's ``expected_value``; None sorts last).
+    ``expectancy`` (risk-normalized expectancy (``expected_value / max_loss``; None sorts last)).
     """
     filtered = [s for s in scored if s.score >= threshold]
     if rank_by == "expectancy":
-        filtered.sort(
-            key=lambda s: (
-                s.suggestion.expected_value
-                if s.suggestion.expected_value is not None
-                else float("-inf")
-            ),
-            reverse=True,
-        )
+        filtered.sort(key=lambda s: edge_sort_key(s.suggestion), reverse=True)
     else:
         filtered.sort(key=lambda s: s.score, reverse=True)
     return tuple(filtered[:k])

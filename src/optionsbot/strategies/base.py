@@ -82,6 +82,18 @@ class StrategySuggestion:
     expected_value: float | None = None  # heuristic expectancy in dollars; None if not computable
     risk_tier: str = "balanced"  # conservative | balanced | aggressive
 
+    @property
+    def risk_normalized_expectancy(self) -> float | None:
+        """Expected value per dollar of capital-at-risk (expected_value / max_loss).
+
+        None when EV is unknown (non-modelable) or max_loss is undefined/zero
+        (undefined-risk naked premium). Used for edge-aware ranking (IBK-104);
+        None sorts last there.
+        """
+        if self.expected_value is None or self.max_loss is None or self.max_loss <= 0:
+            return None
+        return self.expected_value / self.max_loss
+
 
 class Strategy(ABC):
     """Stateless strategy.
