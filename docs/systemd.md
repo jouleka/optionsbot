@@ -5,7 +5,39 @@ The daemon is a long-running async process. systemd --user gives you:
 - journalctl-based logs
 - start/stop via `systemctl --user`
 
-## One-time setup
+## WSL2: prefer the SYSTEM service (recommended)
+
+On WSL2, `systemctl --user` is **unreliable**: after a WSL distro restart the
+linger/boot-started user manager (`user@UID.service`) comes up "active" but
+never creates its runtime D-Bus / control sockets (`$XDG_RUNTIME_DIR/bus`,
+`.../systemd/private`), so every shell — login or not — gets
+`Failed to connect to bus`, and the daemon can't be managed or redeployed
+(observed 2026-06-05). Run it as a **system service** (as your user) instead;
+the system manager is always up under `[boot] systemd=true`:
+
+```bash
+# If migrating from the --user service, stop + disable it first:
+sudo loginctl disable-linger $USER
+sudo systemctl stop user@$(id -u).service          # stops the old --user daemon
+rm -f ~/.config/systemd/user/default.target.wants/optionsbot-daemon.service \
+      ~/.config/systemd/user/optionsbot-daemon.service
+
+# Install + enable the system unit (runs as User=<you>):
+sudo cp packaging/systemd/optionsbot-daemon.system.service \
+        /etc/systemd/system/optionsbot-daemon.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now optionsbot-daemon
+
+# Manage / redeploy:
+sudo systemctl status optionsbot-daemon
+journalctl -u optionsbot-daemon -f
+cd ~/projects/optionsbot && git pull && sudo systemctl restart optionsbot-daemon
+```
+
+The `systemctl --user` instructions below are retained for non-WSL hosts where
+the user bus is reliable.
+
+## One-time setup (systemd --user — non-WSL)
 
 ```bash
 # 1. Install the unit file into your user systemd directory
