@@ -149,6 +149,7 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
         sug.prob_profit = 0.5
         sug.suggested_quantity = 1
         sug.defined_risk = True
+        sug.risk_normalized_expectancy = score / 1000.0
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -196,13 +197,19 @@ def test_scan_settings_alert_calibration_defaults() -> None:
 def test_rank_alert_candidates_floors_and_sorts() -> None:
     from optionsbot.daemon.scan_runner import rank_alert_candidates
 
+    def _pick(sym, score, rne):
+        scored = MagicMock(score=score)
+        scored.suggestion.risk_normalized_expectancy = rne
+        return (sym, scored, 1)
+
     picks = [
-        ("SPY", MagicMock(score=60.0), 1),
-        ("AAPL", MagicMock(score=80.0), 2),
-        ("XYZ", MagicMock(score=40.0), 3),  # below floor -> dropped
+        _pick("SPY", 60.0, 0.02),
+        _pick("AAPL", 80.0, 0.10),
+        _pick("XYZ", 40.0, 0.99),   # below floor -> dropped despite high edge
     ]
     out = rank_alert_candidates(picks, score_floor=50.0)
-    assert [(sym, p.score) for sym, p, _ in out] == [("AAPL", 80.0), ("SPY", 60.0)]
+    # Survivors (score>=50) ordered by edge desc: AAPL(0.10) then SPY(0.02).
+    assert [sym for sym, _, _ in out] == ["AAPL", "SPY"]
 
 
 async def test_run_scan_tick_alerts_top_n_across_all_symbols(
@@ -217,6 +224,7 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
         sug = MagicMock()
         sug.legs = ()
         sug.prob_profit = 0.6
+        sug.risk_normalized_expectancy = score / 1000.0
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),

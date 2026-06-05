@@ -18,6 +18,7 @@ from optionsbot.ibkr.history import HistoryClient
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
+from optionsbot.scoring.composite import edge_sort_key
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import scan_runs, watchlist
@@ -29,9 +30,12 @@ def rank_alert_candidates(
     picks: list[tuple[str, ScoredStrategy, int]],
     score_floor: float,
 ) -> list[tuple[str, ScoredStrategy, int]]:
-    """Picks scoring >= ``score_floor``, sorted by score descending (best first)."""
+    """Picks scoring >= ``score_floor``, sorted by risk-normalized expectancy descending.
+
+    Best edge first; None edge last.
+    """
     above = [p for p in picks if p[1].score >= score_floor]
-    above.sort(key=lambda p: p[1].score, reverse=True)
+    above.sort(key=lambda p: edge_sort_key(p[1].suggestion), reverse=True)
     return above
 
 
