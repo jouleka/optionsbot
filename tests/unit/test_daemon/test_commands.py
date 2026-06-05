@@ -118,3 +118,35 @@ async def test_watchlist_list_and_add_and_remove(daemon_context: DaemonContext) 
 async def test_watchlist_add_requires_symbol(daemon_context: DaemonContext) -> None:
     [reply] = await dispatch(daemon_context, "/watchlist add")
     assert "usage" in reply.text.lower()
+
+
+async def test_scan_orders_picks_by_edge(daemon_context: DaemonContext) -> None:
+    """/scan leads with the highest risk-normalized-edge pick, not chain order."""
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scan.types import ScanResult
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def _mk(name: str, rne: float) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.defined_risk = True
+        sug.credit_or_debit = 1.0
+        sug.max_loss = 2.0
+        sug.prob_profit = 0.6
+        sug.reward_risk = 1.0
+        sug.expected_value = 5.0
+        sug.risk_tier = "balanced"
+        sug.suggested_quantity = 1
+        sug.risk_normalized_expectancy = rne
+        return ScoredStrategy(name, 80.0, FactorBreakdown(.5,.5,.5,.5,.5,.5), sug, "ok")
+
+    view = MarketView("neutral", "weak", "high", 0.7, False, False)
+    # Chain order puts the LOW-edge pick first; edge ranking must reorder.
+    scored = (_mk("low_edge", 0.01), _mk("high_edge", 0.40), _mk("mid_edge", 0.10))
+    result = ScanResult("SPY", 1, datetime(2026, 6, 5, 15, 30, tzinfo=UTC), view, scored)
+
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+        replies = await dispatch(daemon_context, "/scan spy")
+    # First reply (top pick) is the highest-edge strategy.
+    assert "high_edge" in replies[0].text

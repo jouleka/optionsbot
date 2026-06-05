@@ -18,6 +18,7 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.scan import scan_symbol
+from optionsbot.scoring.composite import edge_sort_key
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import alerts, scan_runs, watchlist
@@ -114,7 +115,8 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
             symbol, context.ibkr, context.engine, context.settings,
             resolver=context.resolver,
         )
-    top = result.scored[:3]
+    ranked = sorted(result.scored, key=lambda s: edge_sort_key(s.suggestion), reverse=True)
+    top = ranked[:3]
     if not top:
         return [CommandReply(f"{symbol}: no qualifying strategies right now")]
     return [
