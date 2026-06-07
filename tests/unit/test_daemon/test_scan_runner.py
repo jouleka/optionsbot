@@ -150,6 +150,7 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
         sug.suggested_quantity = 1
         sug.defined_risk = True
         sug.risk_normalized_expectancy = score / 1000.0
+        sug.expected_value = score        # positive -> has_positive_edge True
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -200,6 +201,7 @@ def test_rank_alert_candidates_floors_and_sorts() -> None:
     def _pick(sym, score, rne):
         scored = MagicMock(score=score)
         scored.suggestion.risk_normalized_expectancy = rne
+        scored.suggestion.expected_value = rne * 100.0   # same sign as rne
         return (sym, scored, 1)
 
     picks = [
@@ -225,6 +227,7 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
         sug.legs = ()
         sug.prob_profit = 0.6
         sug.risk_normalized_expectancy = score / 1000.0
+        sug.expected_value = score        # positive -> has_positive_edge True
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -413,3 +416,35 @@ async def test_run_scan_tick_suppresses_alerts_when_paused(
     mock_enq.assert_not_awaited()       # paused → no enqueue
     assert summary.alerts_enqueued == 0
     assert summary.tickers_scanned == 1  # but scanning still happened
+
+
+def test_rank_alert_candidates_suppresses_all_negative_edge() -> None:
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    def _pick(sym, score, ev, max_loss):
+        scored = MagicMock(score=score)
+        scored.suggestion.expected_value = ev
+        scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        return (sym, scored, 1)
+
+    # Above floor, but every pick is negative-EV -> nothing alert-worthy.
+    picks = [
+        _pick("NVDA", 80.0, -83.0, 19397.0),
+        _pick("NVDA", 75.0, -49.0, 737.0),
+    ]
+    assert rank_alert_candidates(picks, score_floor=50.0) == []
+
+
+def test_rank_alert_candidates_keeps_only_positive_edge() -> None:
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    def _pick(sym, score, ev, max_loss):
+        scored = MagicMock(score=score)
+        scored.suggestion.expected_value = ev
+        scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        return (sym, scored, 1)
+
+    pos = _pick("AAPL", 80.0, 12.0, 600.0)      # +EV -> kept
+    neg = _pick("NVDA", 85.0, -49.0, 737.0)     # -EV -> dropped despite higher score
+    out = rank_alert_candidates([neg, pos], score_floor=50.0)
+    assert [sym for sym, _, _ in out] == ["AAPL"]

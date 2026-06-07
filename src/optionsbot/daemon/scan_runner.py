@@ -18,7 +18,7 @@ from optionsbot.ibkr.history import HistoryClient
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
-from optionsbot.scoring.composite import edge_sort_key
+from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import scan_runs, watchlist
@@ -30,11 +30,19 @@ def rank_alert_candidates(
     picks: list[tuple[str, ScoredStrategy, int]],
     score_floor: float,
 ) -> list[tuple[str, ScoredStrategy, int]]:
-    """Picks scoring >= ``score_floor``, sorted by risk-normalized expectancy descending.
+    """Alert-worthy picks: ``score >= score_floor`` AND positive edge (EV>0),
+    sorted by sign-aware edge descending (best edge first).
 
-    Best edge first; None edge last.
+    The positive-edge filter (IBK-106) means the daemon auto-alerts only genuine
+    vol-premium edge; on a no-edge tick this returns ``[]`` and nothing is
+    enqueued. On-demand /scan + CLI still SHOW no-edge picks (with a banner);
+    only auto-alerting is suppressed.
     """
-    above = [p for p in picks if p[1].score >= score_floor]
+    above = [
+        p
+        for p in picks
+        if p[1].score >= score_floor and has_positive_edge(p[1].suggestion)
+    ]
     above.sort(key=lambda p: edge_sort_key(p[1].suggestion), reverse=True)
     return above
 
