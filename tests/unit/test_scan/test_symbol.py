@@ -184,7 +184,8 @@ async def test_scan_symbol_survives_relative_strength_failure(
 ) -> None:
     import optionsbot.scan.symbol as symbol_mod
 
-    scan_settings.scan.benchmark_symbol = "QQQ"  # != SPY -> compute path runs  # type: ignore[attr-defined]
+    # benchmark != the scanned symbol -> the compute path runs (not the 0.0 short-circuit)
+    scan_settings.scan.benchmark_symbol = "QQQ"  # type: ignore[attr-defined]
 
     def _boom(*a: object, **k: object) -> None:
         raise RuntimeError("benchmark down")
