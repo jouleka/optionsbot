@@ -150,3 +150,44 @@ async def test_scan_orders_picks_by_edge(daemon_context: DaemonContext) -> None:
         replies = await dispatch(daemon_context, "/scan spy")
     # First reply (top pick) is the highest-edge strategy.
     assert "high_edge" in replies[0].text
+
+
+async def test_scan_warns_and_orders_when_no_positive_edge(
+    daemon_context: DaemonContext,
+) -> None:
+    """All picks negative-EV: /scan prepends the no-edge banner and orders the
+    losers by raw EV (least loss first), NOT by EV/max_loss."""
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scan.types import ScanResult
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def _mk(name: str, ev: float, max_loss: float) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.defined_risk = True
+        sug.credit_or_debit = 1.0
+        sug.max_loss = max_loss
+        sug.prob_profit = 0.6
+        sug.reward_risk = 1.0
+        sug.expected_value = ev
+        sug.risk_tier = "balanced"
+        sug.suggested_quantity = 1
+        sug.risk_normalized_expectancy = ev / max_loss
+        return ScoredStrategy(name, 80.0, FactorBreakdown(.5, .5, .5, .5, .5, .5), sug, "ok")
+
+    view = MarketView("neutral", "weak", "high", 0.7, False, False)
+    csp = _mk("cash_secured_put", ev=-83.0, max_loss=19397.0)   # wins under EV/max_loss
+    spread = _mk("bull_put_spread", ev=-49.0, max_loss=737.0)   # wins under raw EV
+    result = ScanResult("NVDA", 1, datetime(2026, 6, 6, 15, 30, tzinfo=UTC), view, (csp, spread))
+
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+        replies = await dispatch(daemon_context, "/scan nvda")
+
+    # First reply is the plain-text no-edge banner.
+    assert replies[0].parse_mode is None
+    assert "No positive-edge" in replies[0].text
+    # The spread (less-negative EV) is the first PICK, ahead of the CSP.
+    picks = [r.text for r in replies if r.parse_mode == "MarkdownV2"]
+    assert "bull_put_spread" in picks[0]
+    assert "cash_secured_put" in picks[1]

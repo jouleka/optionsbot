@@ -13,12 +13,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, insert, select
 
-from optionsbot.alerts.formatter import format_alert_markdown
+from optionsbot.alerts.formatter import format_alert_markdown, no_edge_note
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.scan import scan_symbol
-from optionsbot.scoring.composite import edge_sort_key
+from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import alerts, scan_runs, watchlist
@@ -119,13 +119,16 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     top = ranked[:3]
     if not top:
         return [CommandReply(f"{symbol}: no qualifying strategies right now")]
-    return [
+    replies = [
         CommandReply(
             format_alert_markdown(result.symbol, result.view, s, result.snapshot_ts),
             parse_mode="MarkdownV2",
         )
         for s in top
     ]
+    if not any(has_positive_edge(s.suggestion) for s in top):
+        replies.insert(0, CommandReply(no_edge_note(result.symbol)))
+    return replies
 
 
 async def _cmd_screen(context: DaemonContext, args: list[str]) -> list[CommandReply]:

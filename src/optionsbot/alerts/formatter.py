@@ -113,3 +113,17 @@ def format_alert_markdown(
     lines.append(f"_snapshot {_md_escape(snapshot_ts.isoformat())}_")
 
     return "\n".join(lines)
+
+
+def no_edge_note(symbol: str) -> str:
+    """Plain-text banner shown when no surfaced pick has positive expected value.
+
+    Plain text (no MarkdownV2): callers send it as a ``parse_mode=None`` reply or
+    a CLI echo. The ``⚠`` glyph is safe in both (used the same way for the
+    UNDEFINED RISK warning above).
+    """
+    return (
+        f"⚠ No positive-edge trade on {symbol} right now — option premium looks "
+        f"fairly priced vs how much {symbol} actually moves. "
+        f"Shown for reference, not a recommendation."
+    )
