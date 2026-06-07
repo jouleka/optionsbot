@@ -38,7 +38,8 @@ def _parse_published(value: Any) -> datetime | None:
         if isinstance(value, (int, float)):
             return datetime.fromtimestamp(value, tz=UTC)
         if isinstance(value, str):
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
     except (ValueError, OSError, OverflowError):
         return None
     return None

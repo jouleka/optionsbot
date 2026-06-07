@@ -118,3 +118,14 @@ def test_refresh_graceful_when_recent_news_raises(news_engine) -> None:  # type:
             select(symbol_news).where(symbol_news.c.symbol == "NVDA")
         ).first()
     assert row is None  # nothing upserted on failure
+
+
+def test_recent_news_handles_tz_naive_pubdate() -> None:
+    # yfinance sometimes returns an ISO date with NO offset -> naive datetime.
+    # It must not crash the recency comparison (which uses a tz-aware cutoff).
+    naive_iso = (datetime.now(UTC) - timedelta(days=1)).replace(tzinfo=None).isoformat()
+    payload = [{"content": {"title": "Naive date", "pubDate": naive_iso}}]
+    with patch("optionsbot.analysis.news.yf") as mock_yf:
+        mock_yf.Ticker.return_value = MagicMock(news=payload)
+        out = recent_news("NVDA")
+    assert [h.title for h in out] == ["Naive date"]  # kept, not crashed
