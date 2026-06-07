@@ -19,7 +19,7 @@ from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.scoring import DEFAULT_TOP_K
 from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
-from optionsbot.storage.schema import snapshots, strategy_scores, watchlist
+from optionsbot.storage.schema import snapshots, strategy_scores, symbol_news, watchlist
 from optionsbot.strategies.base import StrategySuggestion
 
 _TIER_NAMES = {2: "positive", 1: "negative", 0: "undefined"}
@@ -33,8 +33,9 @@ RUBRIC = (
     "entry whose top setup has edge_tier 'positive' -- and state its symbol, strategy, "
     "expected_value, prob_profit, max_loss, and why.\n"
     "3. Offer one higher-reward alternative ONLY if it also has edge_tier 'positive'.\n"
-    "4. Flag any stale snapshot_ts. Earnings proximity is NOT in this packet -- remind "
-    "the user to check the earnings calendar before trading.\n"
+    "4. Flag any stale snapshot_ts. If earnings_in_window is true, lead with an "
+    "earnings caution (a report is near). Read the headlines: call out any fresh, "
+    "material catalyst (downgrade, guidance, litigation, M&A) and factor it in.\n"
     "5. Reason ONLY over the numbers in this packet; never invent expected_value, "
     "prob_profit, or edge."
 )
@@ -119,6 +120,11 @@ def _assemble_brief(symbols: list[str], lifespan: ServerContext) -> dict[str, An
             rows = conn.execute(
                 select(strategy_scores).where(strategy_scores.c.snapshot_id == snap.id)
             ).fetchall()
+            news_row = conn.execute(
+                select(symbol_news.c.headlines_json).where(symbol_news.c.symbol == symbol)
+            ).first()
+            headlines = news_row.headlines_json if news_row else []
+            earnings = (snap.raw_json or {}).get("earnings_in_window")
             # (row, reconstructed suggestion) pairs, sign-aware best-edge first.
             pairs = sorted(
                 (
@@ -142,6 +148,8 @@ def _assemble_brief(symbols: list[str], lifespan: ServerContext) -> dict[str, An
                     "iv_rank_value": snap.iv_rank,
                 },
                 "no_positive_edge": not symbol_positive,
+                "earnings_in_window": earnings,
+                "headlines": headlines or [],
                 "top_setups": [_setup_dict(r, s) for r, s in pairs[:DEFAULT_TOP_K]],
             }
             scored_entries.append((best_key, entry))

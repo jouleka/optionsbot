@@ -12,7 +12,7 @@ from optionsbot.mcp_server.tools.daily_brief import (
     _reconstruct_suggestion,
     register,
 )
-from optionsbot.storage.schema import snapshots, strategy_scores, watchlist
+from optionsbot.storage.schema import snapshots, strategy_scores, symbol_news, watchlist
 from tests.unit.test_mcp.conftest import FakeCtx, get_tools
 
 
@@ -124,3 +124,50 @@ async def test_daily_brief_dedupes_case_variant_symbols(
 
     assert result["generated_for"] == ["AAPL"]   # upper-cased + de-duplicated
     assert len(result["ranked"]) == 1
+
+
+async def test_daily_brief_surfaces_headlines_and_earnings(
+    server_context: ServerContext,
+) -> None:
+    with server_context.engine.begin() as conn:
+        snap_id = conn.execute(insert(snapshots).values(
+            symbol="NVDA", ts=datetime(2026, 6, 5, 20, 0, tzinfo=UTC),
+            regime_dir="bull", regime_iv="high", iv_rank=0.76,
+            raw_json={"earnings_in_window": True},
+        )).inserted_primary_key[0]
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="bull_put_spread", score=72.0,
+            rationale="ok", legs_json=[],
+            suggestion_json={"expected_value": 10.0, "max_loss": 600.0}))
+        conn.execute(insert(symbol_news).values(
+            symbol="NVDA", fetched_at=datetime.now(UTC),
+            headlines_json=[{"title": "NVDA upgraded", "publisher": "Reuters",
+                             "published_ts": None, "link": "https://r/1"}]))
+    brief = get_tools(register)["daily_brief"]
+
+    result = await brief(symbols=["NVDA"], ctx=FakeCtx(server_context))
+
+    entry = result["ranked"][0]
+    assert entry["earnings_in_window"] is True
+    assert entry["headlines"][0]["title"] == "NVDA upgraded"
+
+
+async def test_daily_brief_headlines_empty_when_no_news(
+    server_context: ServerContext,
+) -> None:
+    with server_context.engine.begin() as conn:
+        snap_id = conn.execute(insert(snapshots).values(
+            symbol="AAPL", ts=datetime(2026, 6, 5, 20, 0, tzinfo=UTC),
+            regime_dir="neutral", regime_iv="high", iv_rank=0.5, raw_json={},
+        )).inserted_primary_key[0]
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="bull_put_spread", score=72.0,
+            rationale="ok", legs_json=[],
+            suggestion_json={"expected_value": 10.0, "max_loss": 600.0}))
+    brief = get_tools(register)["daily_brief"]
+
+    result = await brief(symbols=["AAPL"], ctx=FakeCtx(server_context))
+
+    entry = result["ranked"][0]
+    assert entry["headlines"] == []
+    assert entry["earnings_in_window"] is None  # not persisted on this snapshot
