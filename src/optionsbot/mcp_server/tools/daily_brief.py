@@ -73,9 +73,13 @@ def _edge_tier(suggestion: StrategySuggestion) -> str:
 
 
 def _resolve_symbols(symbols: list[str] | None, lifespan: ServerContext) -> list[str]:
-    """The given symbols (upper-cased), or the watchlist when ``symbols`` is None."""
+    """The given symbols (upper-cased + de-duplicated, order-preserving), or the
+    watchlist when ``symbols`` is None."""
     if symbols:
-        return [s.upper().strip() for s in symbols]
+        seen: dict[str, None] = {}
+        for s in symbols:
+            seen.setdefault(s.upper().strip(), None)
+        return list(seen)
     with lifespan.engine.connect() as conn:
         rows = conn.execute(
             select(watchlist.c.symbol).order_by(watchlist.c.symbol)

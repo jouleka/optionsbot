@@ -109,3 +109,18 @@ async def test_daily_brief_defaults_to_watchlist_and_notes_unscanned(
     assert result["generated_for"] == ["SPY"]
     assert result["ranked"] == []
     assert any("no data for SPY" in n for n in result["notes"])
+
+
+async def test_daily_brief_dedupes_case_variant_symbols(
+    server_context: ServerContext,
+) -> None:
+    with server_context.engine.begin() as conn:
+        _seed_symbol(conn, "AAPL", setups=[
+            ("bull_put_spread", 72.0, {"expected_value": 12.0, "max_loss": 600.0}),
+        ])
+    brief = get_tools(register)["daily_brief"]
+
+    result = await brief(symbols=["AAPL", "aapl", "AAPL"], ctx=FakeCtx(server_context))
+
+    assert result["generated_for"] == ["AAPL"]   # upper-cased + de-duplicated
+    assert len(result["ranked"]) == 1
