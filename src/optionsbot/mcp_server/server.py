@@ -15,8 +15,9 @@ def build_server() -> FastMCP:
 
 
 def _register_tools(server: FastMCP) -> None:
-    from optionsbot.mcp_server.tools import analyze, snapshots, watchlist
+    from optionsbot.mcp_server.tools import analyze, daily_brief, snapshots, watchlist
 
     watchlist.register(server)
     analyze.register(server)
     snapshots.register(server)
+    daily_brief.register(server)
