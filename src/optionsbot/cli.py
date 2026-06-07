@@ -601,10 +601,12 @@ def scan_once() -> None:
 async def _run_scan_once() -> int:
     from sqlalchemy import insert, select
 
+    from optionsbot.alerts.formatter import no_edge_note
     from optionsbot.ibkr import IBKRClient
     from optionsbot.ibkr.contracts import ContractResolver
     from optionsbot.scan import scan_symbol
     from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+    from optionsbot.scoring.composite import has_positive_edge
     from optionsbot.storage.schema import scan_runs, watchlist
 
     settings, engine = _load_settings_and_engine()
@@ -642,6 +644,8 @@ async def _run_scan_once() -> int:
             )
             if selected:
                 typer.secho(f"{sym}: {len(result.scored)} scored", fg=typer.colors.GREEN)
+                if not any(has_positive_edge(s.suggestion) for s in selected):
+                    typer.secho(f"   {no_edge_note(sym)}", fg=typer.colors.YELLOW)
                 for s in selected:
                     typer.echo(f"   {s.strategy_name}: {s.score:.0f}")
             else:
@@ -725,6 +729,7 @@ async def _run_screen_scan(scan_top: int | None) -> int:
 
     from sqlalchemy import insert
 
+    from optionsbot.alerts.formatter import no_edge_note
     from optionsbot.config import get_settings, load_settings
     from optionsbot.ibkr import IBKRClient
     from optionsbot.ibkr.contracts import ContractResolver
@@ -732,6 +737,7 @@ async def _run_screen_scan(scan_top: int | None) -> int:
     from optionsbot.scan import scan_symbol
     from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+    from optionsbot.scoring.composite import has_positive_edge
     from optionsbot.screener.screen import ScreenCandidate, screen_and_scan
     from optionsbot.screener.universe import DEFAULT_UNIVERSE
     from optionsbot.storage.db import create_engine_for_path
@@ -783,6 +789,8 @@ async def _run_screen_scan(scan_top: int | None) -> int:
         )
         if selected:
             typer.secho(f"{header}  ({len(result.scored)} scored)", fg=typer.colors.GREEN)
+            if not any(has_positive_edge(s.suggestion) for s in selected):
+                typer.secho(f"   {no_edge_note(cand.symbol)}", fg=typer.colors.YELLOW)
             for s in selected:
                 typer.echo(f"   {s.strategy_name}: {s.score:.0f}")
         else:

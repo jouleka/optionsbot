@@ -75,3 +75,33 @@ def test_scan_once_scans_watchlist_and_records_run(
         ).fetchall()
     assert len(rows) == 1
     assert rows[0].tickers_scanned == 1
+
+
+def test_scan_once_warns_when_no_positive_edge(runner: CliRunner, db: Path) -> None:
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    engine = create_engine_for_path(db)
+    with engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="NVDA", added_at=datetime.now(UTC)))
+
+    sug = MagicMock()
+    sug.expected_value = -50.0
+    sug.max_loss = 1000.0
+    sug.risk_normalized_expectancy = -0.05
+    scored = (ScoredStrategy("bull_put_spread", 85.0, FactorBreakdown(.5, .5, .5, .5, .5, .5), sug, "ok"),)
+    fake_result = MagicMock(scored=scored, symbol="NVDA")
+
+    fake_client = MagicMock()
+    fake_client.connect = AsyncMock()
+    fake_client.disconnect = AsyncMock()
+
+    with (
+        patch("optionsbot.ibkr.IBKRClient", return_value=fake_client),
+        patch("optionsbot.scan.scan_symbol", AsyncMock(return_value=fake_result)),
+    ):
+        result = runner.invoke(app, ["scan-once"])
+
+    assert result.exit_code == 0, result.output
+    assert "No positive-edge" in result.output       # banner shown
+    assert "bull_put_spread: 85" in result.output     # pick still printed (>= threshold)

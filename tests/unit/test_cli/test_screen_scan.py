@@ -76,7 +76,10 @@ def test_screen_scan_renders_picks_and_records_errors(runner: CliRunner, db: Pat
     async def fake_screen_universe(hc, uni, mdv):
         return (cand_spy, cand_aapl)
 
-    spy_result = MagicMock(scored=(MagicMock(strategy_name="bull_put_spread", score=85.0),))
+    pick = MagicMock(strategy_name="bull_put_spread", score=85.0)
+    pick.suggestion.expected_value = 50.0   # positive edge -> no banner
+    pick.suggestion.risk_normalized_expectancy = 0.05
+    spy_result = MagicMock(scored=(pick,))
 
     async def fake_scan_symbol(symbol, *args, **kwargs):
         if symbol == "AAPL":
@@ -133,3 +136,36 @@ def test_plain_screen_writes_no_scan_runs(runner: CliRunner, db: Path) -> None:
     with engine.connect() as conn:
         rows = conn.execute(select(scan_runs.c.id)).fetchall()
     assert rows == []  # plain screen writes no scan_runs heartbeat
+
+
+def test_screen_scan_warns_when_no_positive_edge(runner: CliRunner, db: Path) -> None:
+    from optionsbot.screener.screen import ScreenCandidate
+
+    cand_spy = ScreenCandidate(symbol="SPY", hv_rank=0.82, dollar_volume=1e9)
+
+    async def fake_screen_universe(hc, uni, mdv):
+        return (cand_spy,)
+
+    pick = MagicMock(strategy_name="bull_put_spread", score=85.0)
+    pick.suggestion.expected_value = -50.0
+    pick.suggestion.max_loss = 1000.0
+    pick.suggestion.risk_normalized_expectancy = -0.05
+    spy_result = MagicMock(scored=(pick,))
+
+    async def fake_scan_symbol(symbol, *args, **kwargs):
+        return spy_result
+
+    fake_client = MagicMock()
+    fake_client.connect = AsyncMock()
+    fake_client.disconnect = AsyncMock()
+
+    with (
+        patch("optionsbot.ibkr.IBKRClient", return_value=fake_client),
+        patch("optionsbot.screener.screen.screen_universe", fake_screen_universe),
+        patch("optionsbot.scan.scan_symbol", fake_scan_symbol),
+    ):
+        result = runner.invoke(app, ["screen", "--scan", "--scan-top", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "No positive-edge" in result.output
+    assert "bull_put_spread: 85" in result.output
