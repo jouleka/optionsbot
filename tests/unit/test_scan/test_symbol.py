@@ -143,6 +143,30 @@ async def test_scan_symbol_passes_spot_and_strike_window_to_get_chain(
     assert kwargs["max_strikes_per_side"] == scan_settings.scan.max_strikes_per_side  # type: ignore[attr-defined]
 
 
+async def test_scan_symbol_persists_earnings_in_window(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(select(snapshots)).fetchone()
+    assert "earnings_in_window" in row.raw_json
+    assert isinstance(row.raw_json["earnings_in_window"], bool)
+
+
+async def test_scan_symbol_survives_news_failure(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    import optionsbot.scan.symbol as symbol_mod
+
+    def _boom(*a: object, **k: object) -> None:
+        raise RuntimeError("news down")
+
+    monkeypatch.setattr(symbol_mod, "refresh_news_if_stale", _boom, raising=False)
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    assert result.snapshot_id > 0  # scan completed despite the news failure
+
+
 async def test_scan_symbol_skips_scoring_when_chain_has_no_option_data(
     monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
 ) -> None:

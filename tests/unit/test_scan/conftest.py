@@ -149,3 +149,13 @@ def mock_ibkr_for_scan(
     monkeypatch.setattr(symbol_mod, "PositionsClient", MagicMock(return_value=positions_mock))
 
     return ibkr
+
+
+@pytest.fixture(autouse=True)
+def _stub_news_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """scan_symbol calls refresh_news_if_stale (yfinance) -- stub it offline."""
+    import optionsbot.scan.symbol as symbol_mod
+
+    monkeypatch.setattr(
+        symbol_mod, "refresh_news_if_stale", lambda *a, **k: None, raising=False
+    )

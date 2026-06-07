@@ -12,6 +12,7 @@ from typing import cast
 import pandas as pd
 from sqlalchemy import Engine, insert
 
+from optionsbot.analysis.news import refresh_news_if_stale
 from optionsbot.analysis.types import Direction, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
 from optionsbot.analysis.volatility import historical_volatility, iv_hv_ratio
@@ -196,6 +197,7 @@ async def scan_symbol(
         "delayed": stock.delayed,
         "n_chain_legs": len(chain),
         "warming_up": view.warming_up,
+        "earnings_in_window": view.earnings_in_window,
     }
     with engine.begin() as conn:
         result = conn.execute(
@@ -244,6 +246,13 @@ async def scan_symbol(
                     for s in scored
                 ],
             )
+
+    # Best-effort catalyst refresh (throttled inside). A news failure must never
+    # break a scan, so wrap it defensively on top of its own graceful handling.
+    try:
+        refresh_news_if_stale(symbol, engine)
+    except Exception:  # noqa: BLE001 -- news is best-effort
+        log.exception("news refresh failed for %s", symbol)
 
     return ScanResult(
         symbol=symbol,
