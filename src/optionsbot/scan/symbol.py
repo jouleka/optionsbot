@@ -13,6 +13,7 @@ import pandas as pd
 from sqlalchemy import Engine, insert
 
 from optionsbot.analysis.news import refresh_news_if_stale
+from optionsbot.analysis.relative_strength import relative_strength
 from optionsbot.analysis.types import Direction, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
 from optionsbot.analysis.volatility import historical_volatility, iv_hv_ratio
@@ -193,11 +194,26 @@ async def scan_symbol(
         scored = ()
 
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
+    relative_strength_value: float | None = None
+    try:
+        if symbol == settings.scan.benchmark_symbol:
+            relative_strength_value = 0.0
+        else:
+            benchmark_bars = await history_client.get_history(
+                settings.scan.benchmark_symbol, days=252
+            )
+            relative_strength_value = relative_strength(
+                bars, benchmark_bars, settings.scan.relative_strength_window
+            )
+    except Exception:  # noqa: BLE001 -- benchmark data is best-effort
+        log.exception("relative strength failed for %s", symbol)
+
     raw_extra: dict[str, object] = {
         "delayed": stock.delayed,
         "n_chain_legs": len(chain),
         "warming_up": view.warming_up,
         "earnings_in_window": view.earnings_in_window,
+        "relative_strength": relative_strength_value,
     }
     with engine.begin() as conn:
         result = conn.execute(

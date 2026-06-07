@@ -46,6 +46,10 @@ class TelegramSettings(BaseModel):
 
 class ScanSettings(BaseModel):
     interval_minutes: int = Field(default=15, ge=1)
+    # Relative strength (IBK-109): each symbol's return minus this benchmark's over
+    # relative_strength_window trading days, surfaced in daily_brief as context.
+    benchmark_symbol: str = Field(default="SPY")
+    relative_strength_window: int = Field(default=20, ge=2)
     # Daemon alert quality FLOOR (IBK-100): a pick must score >= this to be
     # alert-worthy. Repurposed from the old absolute threshold (was 70). scan-once
     # and the MCP analyze path use scoring.DEFAULT_THRESHOLD, not this field.

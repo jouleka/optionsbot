@@ -167,6 +167,38 @@ async def test_scan_symbol_survives_news_failure(
     assert result.snapshot_id > 0  # scan completed despite the news failure
 
 
+async def test_scan_symbol_persists_relative_strength(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    # benchmark_symbol defaults to "SPY"; scanning SPY short-circuits to 0.0.
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(select(snapshots)).fetchone()
+    assert "relative_strength" in row.raw_json
+    assert row.raw_json["relative_strength"] == 0.0
+
+
+async def test_scan_symbol_survives_relative_strength_failure(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    import optionsbot.scan.symbol as symbol_mod
+
+    scan_settings.scan.benchmark_symbol = "QQQ"  # != SPY -> compute path runs  # type: ignore[attr-defined]
+
+    def _boom(*a: object, **k: object) -> None:
+        raise RuntimeError("benchmark down")
+
+    monkeypatch.setattr(symbol_mod, "relative_strength", _boom)
+    result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+    assert result.snapshot_id > 0
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(
+            select(snapshots).where(snapshots.c.id == result.snapshot_id)
+        ).fetchone()
+    assert row.raw_json["relative_strength"] is None
+
+
 async def test_scan_symbol_skips_scoring_when_chain_has_no_option_data(
     monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
 ) -> None:
