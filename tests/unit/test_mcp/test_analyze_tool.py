@@ -150,6 +150,7 @@ async def test_analyze_returns_top_k_only(
         sug.suggested_quantity = 1
         sug.defined_risk = True
         sug.risk_normalized_expectancy = score / 1000.0
+        sug.expected_value = score        # positive -> tier 2, has positive edge
         return ScoredStrategy(
             strategy_name=name,
             score=score,
@@ -184,3 +185,40 @@ async def test_analyze_returns_top_k_only(
 
     names = [s["strategy_name"] for s in result["top_strategies"]]
     assert names == ["iron_condor", "iron_butterfly", "bull_put_spread"]
+
+
+async def test_analyze_fresh_flags_no_positive_edge(
+    server_context: ServerContext, mock_ibkr_client: MagicMock
+) -> None:
+    server_context._ibkr = mock_ibkr_client
+
+    def _mk(name: str, ev: float, max_loss: float) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.credit_or_debit = 0.0
+        sug.max_loss = max_loss
+        sug.max_profit = 0.0
+        sug.prob_profit = 0.5
+        sug.suggested_quantity = 1
+        sug.defined_risk = True
+        sug.expected_value = ev
+        sug.risk_normalized_expectancy = ev / max_loss
+        return ScoredStrategy(name, 85.0, FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5), sug, "...")
+
+    base = _fake_scan_result()
+    # Above threshold but all negative-EV -> no_positive_edge True.
+    losers = ScanResult(
+        "NVDA", 99, base.snapshot_ts, base.view,
+        (_mk("bull_put_spread", -49.0, 737.0), _mk("cash_secured_put", -83.0, 19397.0)),
+    )
+    tools = get_tools(register)
+    analyze = tools["analyze"]
+    with patch(
+        "optionsbot.mcp_server.tools.analyze.scan_symbol",
+        new=AsyncMock(return_value=losers),
+    ):
+        result = await analyze(symbol="NVDA", fresh=True, ctx=FakeCtx(server_context))
+
+    assert result["no_positive_edge"] is True
+    # bull_put_spread (less-negative EV) leads under sign-aware ranking.
+    assert result["top_strategies"][0]["strategy_name"] == "bull_put_spread"

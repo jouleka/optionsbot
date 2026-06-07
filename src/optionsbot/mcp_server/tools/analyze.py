@@ -18,6 +18,7 @@ from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.serialization import dump_scored, dump_view, iso_utc
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
+from optionsbot.scoring.composite import has_positive_edge
 from optionsbot.storage.schema import snapshots, strategy_scores, watchlist
 
 
@@ -61,6 +62,7 @@ async def _analyze_fresh(symbol: str, lifespan: ServerContext) -> dict[str, Any]
         "snapshot_id": result.snapshot_id,
         "snapshot_ts": iso_utc(result.snapshot_ts),
         "view": dump_view(result.view),
+        "no_positive_edge": not any(has_positive_edge(s.suggestion) for s in selected),
         "top_strategies": [dump_scored(s) for s in selected],
     }
 
