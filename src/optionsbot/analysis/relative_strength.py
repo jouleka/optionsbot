@@ -16,7 +16,7 @@ def _window_return(bars: pd.DataFrame, window: int) -> float | None:
     closes = bars["close"]
     start = closes.iloc[-(window + 1)]
     end = closes.iloc[-1]
-    if pd.isna(start) or pd.isna(end) or start == 0:
+    if pd.isna(start) or pd.isna(end) or start <= 0:
         return None
     return float(end / start - 1.0)
 

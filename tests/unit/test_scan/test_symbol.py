@@ -200,6 +200,46 @@ async def test_scan_symbol_survives_relative_strength_failure(
     assert row.raw_json["relative_strength"] is None
 
 
+async def test_scan_symbol_persists_real_relative_strength(
+    mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:
+    """Scan a NON-benchmark symbol so the REAL relative_strength compute runs
+    (not the 0.0 short-circuit) -- guards arg order + window plumbing."""
+    from unittest.mock import AsyncMock
+
+    import optionsbot.scan.symbol as symbol_mod
+
+    scan_settings.scan.relative_strength_window = 5  # type: ignore[attr-defined]
+
+    def _frame(closes: list[float]) -> pd.DataFrame:
+        return pd.DataFrame({
+            "open": closes,
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1_000_000] * len(closes),
+        })
+
+    flat = [400.0] * 114
+    sym_frame = _frame(flat + [400, 404, 408, 412, 416, 440])    # +10% over last 5
+    bench_frame = _frame(flat + [400, 400, 404, 404, 408, 408])  # +2%
+
+    async def _get_history(sym: str, *a: object, **k: object) -> pd.DataFrame:
+        return bench_frame if sym == "SPY" else sym_frame
+
+    symbol_mod.HistoryClient.return_value.get_history = AsyncMock(side_effect=_get_history)  # type: ignore[attr-defined]
+
+    result = await scan_symbol("AAPL", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(
+            select(snapshots).where(snapshots.c.id == result.snapshot_id)
+        ).fetchone()
+    rs = row.raw_json["relative_strength"]
+    assert rs is not None
+    assert round(rs, 4) == round(0.10 - 0.02, 4)  # +8%
+
+
 async def test_scan_symbol_skips_scoring_when_chain_has_no_option_data(
     monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
 ) -> None:

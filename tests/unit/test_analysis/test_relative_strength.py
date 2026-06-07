@@ -32,7 +32,7 @@ def test_relative_strength_none_when_too_few_bars() -> None:
     assert relative_strength(sym, bench, window=5) is None
 
 
-def test_relative_strength_none_on_zero_start() -> None:
-    sym = _bars([0, 1, 2, 3, 4, 5])
+def test_relative_strength_none_on_nonpositive_start() -> None:
     bench = _bars([100, 101, 102, 103, 104, 105])
-    assert relative_strength(sym, bench, window=5) is None
+    assert relative_strength(_bars([0, 1, 2, 3, 4, 5]), bench, window=5) is None
+    assert relative_strength(_bars([-5, 1, 2, 3, 4, 5]), bench, window=5) is None
