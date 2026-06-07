@@ -123,6 +123,30 @@ async def test_analyze_cached_reads_latest_snapshot(
     assert result["top_strategies"][0]["strategy_name"] == "iron_condor"
 
 
+async def test_analyze_cached_surfaces_persisted_earnings(
+    server_context: ServerContext,
+) -> None:
+    """The cached path reads earnings_in_window from raw_json (IBK-110), now that
+    scan persists it -- instead of the old hardcoded None."""
+    with server_context.engine.begin() as conn:
+        result = conn.execute(
+            insert(snapshots).values(
+                symbol="SPY", ts=datetime(2026, 5, 27, tzinfo=UTC), spot=401.0,
+                regime_dir="bull", regime_iv="high",
+                raw_json={"earnings_in_window": True},
+            )
+        )
+        snap_id = result.inserted_primary_key[0]
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="iron_condor", score=82.0,
+            rationale="...", legs_json=[]))
+    analyze = get_tools(register)["analyze"]
+
+    result = await analyze(symbol="SPY", fresh=False, ctx=FakeCtx(server_context))
+
+    assert result["view"]["earnings_in_window"] is True
+
+
 async def test_analyze_cached_empty_returns_no_snapshot_error(
     server_context: ServerContext,
 ) -> None:

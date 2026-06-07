@@ -88,15 +88,15 @@ def _analyze_cached(symbol: str, lifespan: ServerContext) -> dict[str, Any]:
             .where(strategy_scores.c.snapshot_id == row.id)
             .order_by(desc(strategy_scores.c.score))
         ).fetchall()
-    # direction_strength and earnings_in_window are not persisted on the
-    # snapshots table -- both are derivable on the next fresh scan. The fresh
-    # path returns concrete values for both via dump_view(MarketView).
+    # direction_strength is not persisted on the snapshots table (derivable on the
+    # next fresh scan via dump_view(MarketView)); earnings_in_window IS persisted in
+    # raw_json as of IBK-108, so the cached path now surfaces it (IBK-110).
     view = {
         "direction": row.regime_dir,
         "direction_strength": None,
         "iv_regime": row.regime_iv,
         "iv_rank_value": row.iv_rank,
-        "earnings_in_window": None,
+        "earnings_in_window": row.raw_json.get("earnings_in_window") if row.raw_json else None,
         "warming_up": row.raw_json.get("warming_up") if row.raw_json else None,
     }
     # NOTE (IBK-104): this cached path stays SCORE-ranked. strategy_scores rows
