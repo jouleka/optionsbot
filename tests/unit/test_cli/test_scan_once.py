@@ -89,7 +89,11 @@ def test_scan_once_warns_when_no_positive_edge(runner: CliRunner, db: Path) -> N
     sug.expected_value = -50.0
     sug.max_loss = 1000.0
     sug.risk_normalized_expectancy = -0.05
-    scored = (ScoredStrategy("bull_put_spread", 85.0, FactorBreakdown(.5, .5, .5, .5, .5, .5), sug, "ok"),)
+    scored = (
+        ScoredStrategy(
+            "bull_put_spread", 85.0, FactorBreakdown(.5, .5, .5, .5, .5, .5), sug, "ok"
+        ),
+    )
     fake_result = MagicMock(scored=scored, symbol="NVDA")
 
     fake_client = MagicMock()
