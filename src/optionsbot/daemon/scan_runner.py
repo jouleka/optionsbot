@@ -112,9 +112,18 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
         alerts_enqueued = 0
         if not context.alerting_paused:
-            for sym, scored, snap_id in rank_alert_candidates(
+            candidates = rank_alert_candidates(
                 all_picks, context.settings.scan.score_threshold
+            )
+            if not candidates and any(
+                scored.score >= context.settings.scan.score_threshold
+                for _, scored, _ in all_picks
             ):
+                log.info(
+                    "no-edge tick: pick(s) passed the score floor but none had "
+                    "positive edge; suppressing alerts"
+                )
+            for sym, scored, snap_id in candidates:
                 if alerts_enqueued >= context.settings.scan.alert_top_n:
                     break
                 try:

@@ -448,3 +448,43 @@ def test_rank_alert_candidates_keeps_only_positive_edge() -> None:
     neg = _pick("NVDA", 85.0, -49.0, 737.0)     # -EV -> dropped despite higher score
     out = rank_alert_candidates([neg, pos], score_floor=50.0)
     assert [sym for sym, _, _ in out] == ["AAPL"]
+
+
+async def test_run_scan_tick_logs_no_edge_suppression(
+    daemon_context: DaemonContext,
+) -> None:
+    """A tick whose floor-passing picks all lack positive edge logs the
+    suppression, so a silent no-alert tick is distinguishable from 'nothing
+    scored above the floor'."""
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def _mk(name: str, score: float, ev: float, max_loss: float) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.prob_profit = 0.6
+        sug.expected_value = ev
+        sug.risk_normalized_expectancy = ev / max_loss
+        return ScoredStrategy(
+            strategy_name=name, score=score,
+            factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+            suggestion=sug, rationale="...",
+        )
+
+    daemon_context.settings.scan.score_threshold = 50
+    # Both pass the score floor; both are negative-EV -> suppressed.
+    scored = (_mk("csp", 80.0, -83.0, 19397.0), _mk("spread", 75.0, -49.0, 737.0))
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="NVDA", added_at=datetime.now(UTC)))
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch("optionsbot.daemon.scan_runner.scan_symbol",
+               new=AsyncMock(return_value=_scan_result_for("NVDA", scored))), \
+         patch("optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock()) as mock_enq, \
+         patch("optionsbot.daemon.scan_runner.log") as mock_log:
+        summary = await run_scan_tick(daemon_context)
+
+    mock_enq.assert_not_awaited()                # all -EV -> nothing enqueued
+    assert summary.alerts_enqueued == 0
+    logged = " ".join(str(call.args[0]) for call in mock_log.info.call_args_list)
+    assert "no-edge" in logged
