@@ -8,8 +8,10 @@ from optionsbot.scoring.composite import top_k
 from optionsbot.scoring.types import FactorBreakdown, ScoredStrategy
 
 
-def _scored(name: str, score: float, rne: float | None) -> ScoredStrategy:
-    sug = SimpleNamespace(risk_normalized_expectancy=rne)
+def _scored(
+    name: str, score: float, rne: float | None, ev: float | None = 1.0
+) -> ScoredStrategy:
+    sug = SimpleNamespace(risk_normalized_expectancy=rne, expected_value=ev)
     return ScoredStrategy(
         strategy_name=name, score=score,
         factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),

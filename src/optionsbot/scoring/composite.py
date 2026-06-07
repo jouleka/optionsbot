@@ -45,10 +45,43 @@ DEFAULT_TOP_K = 3
 DEFAULT_THRESHOLD = 70.0
 
 
-def edge_sort_key(suggestion: StrategySuggestion) -> float:
-    """Sort key for edge-aware ranking: risk-normalized expectancy, None last."""
+def edge_sort_key(suggestion: StrategySuggestion) -> tuple[int, float]:
+    """Sign-aware edge ranking key. Use with ``sorted(..., reverse=True)``.
+
+    Returns ``(tier, within_tier)``; the tier dominates the comparison so the
+    within-tier value is only ever compared against the same metric:
+
+    - tier 2 (best): positive edge (``EV > 0``) -> ordered by ``EV/max_loss`` desc
+      (IBK-104 capital efficiency, valid only where EV is positive).
+    - tier 1: break-even / negative (``EV <= 0``) -> ordered by RAW ``EV`` desc
+      (least dollars lost first). Avoids the ``EV/max_loss`` sign-inversion, where
+      dividing a small negative EV by a huge ``max_loss`` flatters it toward zero
+      and floats a capital-hungry loser to the top.
+    - tier 0 (last): edge ``None`` -- undefined-risk naked premium or
+      non-modelable EV.
+    """
     edge = suggestion.risk_normalized_expectancy
-    return edge if edge is not None else float("-inf")
+    ev = suggestion.expected_value
+    if edge is None or ev is None:
+        return (0, float("-inf"))
+    if ev > 0:
+        return (2, edge)
+    return (1, ev)
+
+
+def has_positive_edge(suggestion: StrategySuggestion) -> bool:
+    """True when the pick has a computable positive expected value.
+
+    Mirrors the tier-2 condition in :func:`edge_sort_key`: ``EV > 0`` with a
+    defined ``max_loss`` (so ``risk_normalized_expectancy`` is not None). Used by
+    the surfaces to decide the "no positive edge" state (IBK-106).
+    """
+    ev = suggestion.expected_value
+    return (
+        suggestion.risk_normalized_expectancy is not None
+        and ev is not None
+        and ev > 0
+    )
 
 
 def compute_factor_breakdown(
@@ -145,7 +178,8 @@ def top_k(
 
     Always filters on the quality ``score`` threshold first (the quality gate).
     ``rank_by`` then orders the survivors: by ``score`` (default) or by
-    ``expectancy`` (risk-normalized expectancy (``expected_value / max_loss``; None sorts last)).
+    ``expectancy`` (sign-aware edge: positive-EV picks by EV/max_loss, then
+    negative-EV by raw EV, then None -- see :func:`edge_sort_key`).
     """
     filtered = [s for s in scored if s.score >= threshold]
     if rank_by == "expectancy":
