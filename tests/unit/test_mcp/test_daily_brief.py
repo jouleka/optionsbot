@@ -171,3 +171,42 @@ async def test_daily_brief_headlines_empty_when_no_news(
     entry = result["ranked"][0]
     assert entry["headlines"] == []
     assert entry["earnings_in_window"] is None  # not persisted on this snapshot
+
+
+async def test_daily_brief_surfaces_relative_strength(
+    server_context: ServerContext,
+) -> None:
+    with server_context.engine.begin() as conn:
+        snap_id = conn.execute(insert(snapshots).values(
+            symbol="NVDA", ts=datetime(2026, 6, 5, 20, 0, tzinfo=UTC),
+            regime_dir="bull", regime_iv="high", iv_rank=0.76,
+            raw_json={"relative_strength": 0.08},
+        )).inserted_primary_key[0]
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="bull_put_spread", score=72.0,
+            rationale="ok", legs_json=[],
+            suggestion_json={"expected_value": 10.0, "max_loss": 600.0}))
+    brief = get_tools(register)["daily_brief"]
+
+    result = await brief(symbols=["NVDA"], ctx=FakeCtx(server_context))
+
+    assert result["ranked"][0]["relative_strength"] == 0.08
+
+
+async def test_daily_brief_relative_strength_none_when_absent(
+    server_context: ServerContext,
+) -> None:
+    with server_context.engine.begin() as conn:
+        snap_id = conn.execute(insert(snapshots).values(
+            symbol="AAPL", ts=datetime(2026, 6, 5, 20, 0, tzinfo=UTC),
+            regime_dir="neutral", regime_iv="high", iv_rank=0.5, raw_json={},
+        )).inserted_primary_key[0]
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="bull_put_spread", score=72.0,
+            rationale="ok", legs_json=[],
+            suggestion_json={"expected_value": 10.0, "max_loss": 600.0}))
+    brief = get_tools(register)["daily_brief"]
+
+    result = await brief(symbols=["AAPL"], ctx=FakeCtx(server_context))
+
+    assert result["ranked"][0]["relative_strength"] is None

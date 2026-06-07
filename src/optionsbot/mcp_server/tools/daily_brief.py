@@ -35,7 +35,9 @@ RUBRIC = (
     "3. Offer one higher-reward alternative ONLY if it also has edge_tier 'positive'.\n"
     "4. Flag any stale snapshot_ts. If earnings_in_window is true, lead with an "
     "earnings caution (a report is near). Read the headlines: call out any fresh, "
-    "material catalyst (downgrade, guidance, litigation, M&A) and factor it in.\n"
+    "material catalyst (downgrade, guidance, litigation, M&A) and factor it in. Use "
+    "relative_strength (return vs the market): strongly positive reinforces a bullish "
+    "setup, strongly negative means the name is lagging.\n"
     "5. Reason ONLY over the numbers in this packet; never invent expected_value, "
     "prob_profit, or edge."
 )
@@ -125,6 +127,7 @@ def _assemble_brief(symbols: list[str], lifespan: ServerContext) -> dict[str, An
             ).first()
             headlines = news_row.headlines_json if news_row else []
             earnings = (snap.raw_json or {}).get("earnings_in_window")
+            rel_strength = (snap.raw_json or {}).get("relative_strength")
             # (row, reconstructed suggestion) pairs, sign-aware best-edge first.
             pairs = sorted(
                 (
@@ -149,6 +152,7 @@ def _assemble_brief(symbols: list[str], lifespan: ServerContext) -> dict[str, An
                 },
                 "no_positive_edge": not symbol_positive,
                 "earnings_in_window": earnings,
+                "relative_strength": rel_strength,
                 "headlines": headlines or [],
                 "top_setups": [_setup_dict(r, s) for r, s in pairs[:DEFAULT_TOP_K]],
             }
