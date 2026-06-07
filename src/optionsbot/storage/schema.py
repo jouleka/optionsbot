@@ -157,3 +157,12 @@ pick_outcomes = Table(
     Column("win", Integer, nullable=False),
     Column("evaluated_at", DateTime(timezone=True), nullable=False),
 )
+
+
+symbol_news = Table(
+    "symbol_news",
+    metadata,
+    Column("symbol", Text, primary_key=True),
+    Column("fetched_at", DateTime(timezone=True), nullable=False),
+    Column("headlines_json", JSON),
+)

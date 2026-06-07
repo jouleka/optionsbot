@@ -8,11 +8,17 @@ yields an empty list (news is never load-bearing).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import yfinance as yf  # type: ignore[import-untyped]
+from sqlalchemy import Engine, delete, insert, select
+
+from optionsbot.storage.schema import symbol_news
+
+log = logging.getLogger(__name__)
 
 _MAX_HEADLINES = 5
 _RECENT_DAYS = 7
@@ -79,3 +85,43 @@ def recent_news(symbol: str) -> list[Headline]:
         key=lambda h: h.published_ts or datetime.min.replace(tzinfo=UTC), reverse=True
     )
     return fresh[:_MAX_HEADLINES]
+
+
+def _headline_dict(h: Headline) -> dict[str, Any]:
+    return {
+        "title": h.title,
+        "publisher": h.publisher,
+        "published_ts": h.published_ts.isoformat() if h.published_ts else None,
+        "link": h.link,
+    }
+
+
+def refresh_news_if_stale(symbol: str, engine: Engine, throttle_hours: int = 6) -> None:
+    """Refresh ``symbol``'s cached headlines if missing or older than throttle_hours.
+
+    Self-contained + graceful: NEVER raises (a yfinance/DB hiccup leaves the cache
+    as-is). Called from scan_symbol so news refreshes at most every throttle_hours
+    per symbol regardless of scan cadence.
+    """
+    try:
+        now = datetime.now(UTC)
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(symbol_news.c.fetched_at).where(symbol_news.c.symbol == symbol)
+            ).first()
+        if row is not None and row.fetched_at is not None:
+            fetched_at = row.fetched_at
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=UTC)
+            if now - fetched_at < timedelta(hours=throttle_hours):
+                return
+        payload = [_headline_dict(h) for h in recent_news(symbol)]
+        with engine.begin() as conn:
+            conn.execute(delete(symbol_news).where(symbol_news.c.symbol == symbol))
+            conn.execute(
+                insert(symbol_news).values(
+                    symbol=symbol, fetched_at=now, headlines_json=payload
+                )
+            )
+    except Exception:  # noqa: BLE001 -- news is best-effort; never break the caller
+        log.exception("refresh_news_if_stale failed for %s", symbol)
