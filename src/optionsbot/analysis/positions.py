@@ -72,7 +72,10 @@ def build_positions_view(
 ) -> dict[str, Any]:
     """Group legs by underlying with per-underlying + grand-total net unrealized P&L,
     DTE and Greeks per option leg. Pure. ``as_of`` is a tz-aware timestamp; legs sort
-    DTE-ascending (None last), then strike; groups sort by underlying."""
+    DTE-ascending (None last), then strike; groups sort by underlying.
+
+    Grouping is by ``symbol`` only; if ``positions`` ever spans multiple accounts the
+    same ticker would merge across them (fine for the single-account setup today)."""
     today = as_of.date()
     groups_map: dict[str, list[dict[str, Any]]] = {}
     for p in positions:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -93,6 +94,7 @@ async def test_get_portfolio_maps_option_and_stock(positions_client, mock_ib) ->
     assert opt.sec_type == "OPT" and opt.expiry == "20260717" and opt.strike == 95.0
     assert opt.right == "P" and opt.multiplier == 100 and opt.position == -1.0
     assert opt.unrealized_pnl == 45.0 and opt.market_value == -110.0
+    assert opt.market_price == 1.1 and opt.realized_pnl == 0.0
     stk = next(p for p in out if p.symbol == "AAPL")
     assert stk.sec_type == "STK" and stk.expiry is None and stk.strike is None
     assert stk.right is None and stk.multiplier == 1 and stk.unrealized_pnl == 500.0
@@ -103,6 +105,18 @@ async def test_get_portfolio_caches_within_ttl(positions_client, mock_ib) -> Non
     await positions_client.get_portfolio()
     await positions_client.get_portfolio()
     assert mock_ib.portfolio.call_count == 1
+
+
+async def test_get_portfolio_treats_unset_double_as_none(positions_client, mock_ib) -> None:
+    # IBKR sends sys.float_info.max as the "unset double" sentinel for a not-yet-priced
+    # leg; it must surface as None, not a 309-digit number (IBK-112 review).
+    big = sys.float_info.max
+    mock_ib.portfolio.return_value = [
+        _ib_portfolio_item(market_price=big, market_value=big, upnl=big, rpnl=big),
+    ]
+    (p,) = await positions_client.get_portfolio()
+    assert p.market_price is None and p.market_value is None
+    assert p.unrealized_pnl is None and p.realized_pnl is None
 
 
 async def test_get_account_summary_extracts_tags(positions_client, mock_ib) -> None:

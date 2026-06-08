@@ -40,3 +40,12 @@ async def test_cmd_positions_ibkr_failure() -> None:
     ):
         replies = await dispatch(_ctx(), "/positions")
     assert "couldn't reach IBKR" in replies[0].text
+
+
+async def test_cmd_positions_empty_book() -> None:
+    empty = {"groups": [], "net_unrealized_pnl": 0.0, "group_count": 0}
+    with patch(
+        "optionsbot.daemon.commands.assemble_open_book", new=AsyncMock(return_value=empty)
+    ):
+        replies = await dispatch(_ctx(), "/positions")
+    assert replies[0].text == "no open positions"

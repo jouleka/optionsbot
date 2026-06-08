@@ -131,7 +131,11 @@ def no_edge_note(symbol: str) -> str:
 
 
 def _money(x: float | None) -> str:
-    return f"${x:+,.0f}" if x is not None else "$?"
+    if x is None:
+        return "$?"
+    if round(x) == 0:  # avoid "$-0" for tiny negatives / -0.0
+        return "$0"
+    return f"${x:+,.0f}"
 
 
 def _short_expiry(expiry: str | None) -> str:
