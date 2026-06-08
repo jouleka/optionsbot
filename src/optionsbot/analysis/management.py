@@ -118,6 +118,8 @@ def evaluate_profit_triggers(
         )
         if net_credit <= 0.0 or net_credit < settings.min_credit:
             continue
+        # Unrealized only: realized P&L from any partial close is excluded from BOTH sums,
+        # so profit_pct is "% captured on what's still open" (remaining-position-relative).
         net_pnl = sum(p.unrealized_pnl or 0.0 for p in legs)
         trigger: str | None = None
         if net_pnl >= settings.take_profit_pct * net_credit:

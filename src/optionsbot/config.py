@@ -89,7 +89,9 @@ class ManageSettings(BaseModel):
     profit_alerts: bool = True
     take_profit_pct: float = Field(default=0.5, gt=0.0)  # alert at >= this fraction of credit
     stop_loss_mult: float = Field(default=2.0, gt=0.0)  # alert at <= -this multiple of credit
-    min_credit: float = Field(default=0.0, ge=0.0)  # skip groups below this net credit ($)
+    # Skip groups below this net credit ($). Non-zero by default so a near-zero balanced /
+    # rolled book (net credit ~ a few cents) can't produce nonsense "50000% of $0" alerts.
+    min_credit: float = Field(default=20.0, ge=0.0)
 
 
 class StorageSettings(BaseModel):

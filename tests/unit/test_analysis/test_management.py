@@ -166,3 +166,24 @@ def test_custom_take_profit_threshold() -> None:
     hits = evaluate_profit_triggers(legs, ManageSettings(take_profit_pct=0.25))
     assert hits[0].trigger == "take_profit"
     assert evaluate_profit_triggers(legs, ManageSettings(take_profit_pct=0.5)) == []
+
+
+def test_default_min_credit_suppresses_near_zero() -> None:
+    # A tiny / near-zero net credit (balanced or rolled book) must NOT alert under the
+    # DEFAULT settings -- otherwise it produces a nonsense "X% of $0" alert (IBK-114 review).
+    legs = [_credit_leg(95.0, "P", -1.0, 5.0, 4.0)]  # net_credit $5 < default floor (20)
+    assert evaluate_profit_triggers(legs, ManageSettings()) == []
+
+
+def test_multi_contract_scales_net_credit() -> None:
+    # avg_cost is per-contract; |position| 2 -> net_credit 500. Up $250 -> 50% -> take_profit.
+    out = evaluate_profit_triggers([_credit_leg(95.0, "P", -2.0, 250.0, 250.0)], ManageSettings())
+    assert out[0].net_credit == 500.0 and out[0].trigger == "take_profit"
+
+
+def test_stop_loss_boundary() -> None:
+    s = ManageSettings()  # stop_loss_mult 2.0, net_credit 250 -> stop threshold -500
+    at = [_credit_leg(95.0, "P", -1.0, 250.0, -500.0)]
+    inside = [_credit_leg(95.0, "P", -1.0, 250.0, -499.0)]
+    assert evaluate_profit_triggers(at, s)[0].trigger == "stop_loss"
+    assert evaluate_profit_triggers(inside, s) == []  # just inside the threshold -> no alert
