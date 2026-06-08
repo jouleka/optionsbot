@@ -142,13 +142,15 @@ class Strategy(ABC):
     def estimate_prob_profit(
         self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
     ) -> float | None:
-        """P(profit) at expiry via the lognormal payoff model.
+        """P(profit) at expiry via the payoff model.
 
-        Returns None for non-modelable positions (stock legs, or legs spanning
-        more than one expiry -- calendars/diagonals). Computes the front DTE
-        from the (single) leg expiry.
+        Uses the per-strike IV smile when the chain carries one (skew-aware,
+        IBK-111), else the flat ATM-IV lognormal. Returns None for non-modelable
+        positions (stock legs, or legs spanning more than one expiry --
+        calendars/diagonals). Computes the front DTE from the (single) leg expiry.
         """
         from optionsbot.scoring.payoff import is_terminal_modelable, prob_of_profit
+        from optionsbot.scoring.skew import build_smile, prob_of_profit_smile
 
         if not is_terminal_modelable(legs):
             return None
@@ -156,14 +158,26 @@ class Strategy(ABC):
         assert expiry is not None  # guaranteed by is_terminal_modelable
         dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
         credit = self.estimate_credit(legs, snapshot)
+        smile = build_smile(snapshot.chain, expiry, snapshot.spot)
+        if smile is not None:
+            pop = prob_of_profit_smile(legs, credit, snapshot.spot, smile, float(dte_days))
+            if pop is not None:
+                return pop
         return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, float(dte_days))
 
     def estimate_expected_value(
         self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
     ) -> float | None:
-        """E[P&L] at expiry under a realized-vol (snapshot.hv20), zero-drift
-        lognormal. None for non-modelable positions or when hv20 is unavailable."""
+        """E[P&L] at expiry under a zero-drift lognormal sized by realized vol
+        (snapshot.hv20).
+
+        When the chain carries a per-strike IV smile, the distribution keeps the
+        realized-vol LEVEL but borrows the smile's SHAPE (skew-aware, IBK-111), so
+        the volatility-risk-premium anchor is preserved while the tails stay
+        asymmetric. Falls back to the flat realized-vol lognormal otherwise. None
+        for non-modelable positions or when hv20 is unavailable."""
         from optionsbot.scoring.payoff import expected_value_dollars, is_terminal_modelable
+        from optionsbot.scoring.skew import build_smile, expected_value_smile
 
         if not is_terminal_modelable(legs):
             return None
@@ -171,6 +185,13 @@ class Strategy(ABC):
         assert expiry is not None  # guaranteed by is_terminal_modelable
         dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
         credit = self.estimate_credit(legs, snapshot)
+        smile = build_smile(snapshot.chain, expiry, snapshot.spot)
+        if smile is not None:
+            ev = expected_value_smile(
+                legs, credit, snapshot.spot, smile, snapshot.hv20, float(dte_days)
+            )
+            if ev is not None:
+                return ev
         return expected_value_dollars(
             legs, credit, snapshot.spot, snapshot.hv20, float(dte_days)
         )
