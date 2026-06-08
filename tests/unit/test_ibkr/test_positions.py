@@ -11,13 +11,25 @@ import pytest
 from optionsbot.config import Settings
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.positions import PositionsClient
-from optionsbot.ibkr.types import AccountSummary, PositionRecord
+from optionsbot.ibkr.types import AccountSummary, PortfolioPosition, PositionRecord
 
 
 def _ib_position(symbol="SPY", sec_type="STK", position=100.0, avg_cost=399.5) -> MagicMock:
     c = MagicMock(symbol=symbol, secType=sec_type, exchange="SMART", currency="USD")
     p = MagicMock(account="DU1234567", contract=c, position=position, avgCost=avg_cost)
     return p
+
+
+def _ib_portfolio_item(
+    symbol="SPY", sec_type="OPT", expiry="20260717", strike=95.0, right="P",
+    multiplier="100", position=-1.0, avg_cost=250.0, market_price=1.1,
+    market_value=-110.0, upnl=45.0, rpnl=0.0,
+) -> MagicMock:
+    c = MagicMock(symbol=symbol, secType=sec_type, lastTradeDateOrContractMonth=expiry,
+                  strike=strike, right=right, multiplier=multiplier)
+    return MagicMock(account="DU1234567", contract=c, position=position, averageCost=avg_cost,
+                     marketPrice=market_price, marketValue=market_value,
+                     unrealizedPNL=upnl, realizedPNL=rpnl)
 
 
 def _account_value(tag: str, value: str, currency: str = "USD") -> MagicMock:
@@ -66,6 +78,31 @@ async def test_get_positions_refreshes_after_ttl(mock_ib) -> None:
     time.sleep(0.1)
     await pc.get_positions()
     assert mock_ib.positions.call_count == 2
+
+
+async def test_get_portfolio_maps_option_and_stock(positions_client, mock_ib) -> None:
+    mock_ib.portfolio.return_value = [
+        _ib_portfolio_item(),  # SPY option
+        _ib_portfolio_item(symbol="AAPL", sec_type="STK", expiry="", strike=0.0, right="",
+                           multiplier="", position=100.0, avg_cost=180.0, market_price=185.0,
+                           market_value=18500.0, upnl=500.0),
+    ]
+    out = await positions_client.get_portfolio()
+    assert all(isinstance(p, PortfolioPosition) for p in out)
+    opt = next(p for p in out if p.symbol == "SPY")
+    assert opt.sec_type == "OPT" and opt.expiry == "20260717" and opt.strike == 95.0
+    assert opt.right == "P" and opt.multiplier == 100 and opt.position == -1.0
+    assert opt.unrealized_pnl == 45.0 and opt.market_value == -110.0
+    stk = next(p for p in out if p.symbol == "AAPL")
+    assert stk.sec_type == "STK" and stk.expiry is None and stk.strike is None
+    assert stk.right is None and stk.multiplier == 1 and stk.unrealized_pnl == 500.0
+
+
+async def test_get_portfolio_caches_within_ttl(positions_client, mock_ib) -> None:
+    mock_ib.portfolio.return_value = [_ib_portfolio_item()]
+    await positions_client.get_portfolio()
+    await positions_client.get_portfolio()
+    assert mock_ib.portfolio.call_count == 1
 
 
 async def test_get_account_summary_extracts_tags(positions_client, mock_ib) -> None:

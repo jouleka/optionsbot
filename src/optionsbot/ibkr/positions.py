@@ -22,8 +22,14 @@ import time
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
+from optionsbot.ibkr._util import clean_float
 from optionsbot.ibkr.client import IBKRClient
-from optionsbot.ibkr.types import AccountSummary, PositionRecord
+from optionsbot.ibkr.types import (
+    AccountSummary,
+    OptionRight,
+    PortfolioPosition,
+    PositionRecord,
+)
 
 if TYPE_CHECKING:
     from ib_async import Position
@@ -42,11 +48,51 @@ def _to_decimal(s: str | None) -> Decimal | None:
         return None
 
 
+def _norm_right(right: str | None) -> OptionRight | None:
+    if not right:
+        return None
+    c = right[0].upper()
+    return "C" if c == "C" else "P" if c == "P" else None
+
+
+def _to_portfolio_position(item: object) -> PortfolioPosition:
+    """Map an ``ib_async.PortfolioItem`` to our flat :class:`PortfolioPosition`.
+
+    Option contract fields (expiry/strike/right) are captured only for OPT legs;
+    stock legs leave them None and use a multiplier of 1.
+    """
+    c = item.contract  # type: ignore[attr-defined]
+    sec_type = getattr(c, "secType", "") or ""
+    is_opt = sec_type == "OPT"
+    raw_strike = getattr(c, "strike", 0.0) or 0.0
+    mult_raw = getattr(c, "multiplier", "") or ""
+    try:
+        multiplier = int(float(mult_raw)) if mult_raw else (100 if is_opt else 1)
+    except (TypeError, ValueError):
+        multiplier = 100 if is_opt else 1
+    return PortfolioPosition(
+        account=getattr(item, "account", "") or "",
+        symbol=getattr(c, "symbol", "") or "",
+        sec_type=sec_type,
+        expiry=(getattr(c, "lastTradeDateOrContractMonth", "") or None) if is_opt else None,
+        strike=(float(raw_strike) if raw_strike and raw_strike > 0 else None) if is_opt else None,
+        right=_norm_right(getattr(c, "right", None)) if is_opt else None,
+        multiplier=multiplier,
+        position=float(item.position),  # type: ignore[attr-defined]
+        avg_cost=float(item.averageCost),  # type: ignore[attr-defined]
+        market_price=clean_float(getattr(item, "marketPrice", None)),
+        market_value=clean_float(getattr(item, "marketValue", None)),
+        unrealized_pnl=clean_float(getattr(item, "unrealizedPNL", None)),
+        realized_pnl=clean_float(getattr(item, "realizedPNL", None)),
+    )
+
+
 class PositionsClient:
     def __init__(self, client: IBKRClient, cache_ttl_seconds: float = _DEFAULT_TTL) -> None:
         self._client = client
         self._ttl = cache_ttl_seconds
         self._positions_cache: tuple[float, list[PositionRecord]] | None = None
+        self._portfolio_cache: tuple[float, list[PortfolioPosition]] | None = None
         self._summary_cache: tuple[float, AccountSummary] | None = None
         self._lock = asyncio.Lock()
 
@@ -70,6 +116,23 @@ class PositionsClient:
                 for p in raw
             ]
             self._positions_cache = (now, out)
+            return out
+
+    async def get_portfolio(self) -> list[PortfolioPosition]:
+        """Enriched open positions via ``ib.portfolio()`` (IBKR-computed market value
+        + unrealized P&L, matching TWS). TTL-cached like the other reads.
+
+        Like ``ib.positions()``, ``ib.portfolio()`` is a passive read of already-
+        streamed account-update data -- synchronous, do NOT await it.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            if self._portfolio_cache and now - self._portfolio_cache[0] < self._ttl:
+                return self._portfolio_cache[1]
+            await self._client.ensure_connected()
+            raw = self._client.ib.portfolio()  # sync; do NOT await
+            out = [_to_portfolio_position(item) for item in raw]
+            self._portfolio_cache = (now, out)
             return out
 
     async def get_account_summary(self) -> AccountSummary:

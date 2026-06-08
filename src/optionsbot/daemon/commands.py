@@ -13,10 +13,17 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, insert, select
 
-from optionsbot.alerts.formatter import format_alert_markdown, no_edge_note
+from optionsbot.alerts.formatter import (
+    format_alert_markdown,
+    format_positions_text,
+    no_edge_note,
+)
+from optionsbot.analysis.positions import assemble_open_book
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.ibkr.history import HistoryClient
+from optionsbot.ibkr.market_data import MarketDataClient
+from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
@@ -38,6 +45,7 @@ _HELP = (
     "/last [N] — recent alerts (default 5)\n"
     "/scan SYMBOL — scan one symbol now\n"
     "/screen [N] — screener top N\n"
+    "/positions — your open book (live P&L, DTE, Greeks)\n"
     "/pause — stop alerting\n"
     "/resume — resume alerting\n"
     "/watchlist list|add SYM|remove SYM\n"
@@ -189,6 +197,17 @@ async def _cmd_watchlist(context: DaemonContext, args: list[str]) -> list[Comman
     return [CommandReply("usage: /watchlist list|add SYM|remove SYM")]
 
 
+async def _cmd_positions(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    pos_client = PositionsClient(context.ibkr)
+    md_client = MarketDataClient(context.ibkr, context.resolver)
+    try:
+        async with context.ibkr_lock:
+            view = await assemble_open_book(pos_client, md_client, datetime.now(UTC))
+    except Exception:  # noqa: BLE001 -- surface a plain failure, never crash the poller
+        return [CommandReply("couldn't reach IBKR for positions")]
+    return [CommandReply(format_positions_text(view))]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -198,6 +217,7 @@ _REGISTRY: dict[str, Handler] = {
     "scan": _cmd_scan,
     "screen": _cmd_screen,
     "watchlist": _cmd_watchlist,
+    "positions": _cmd_positions,
 }
 
 

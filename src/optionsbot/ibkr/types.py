@@ -80,6 +80,28 @@ class PositionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PortfolioPosition:
+    """Enriched open position from ``ib.portfolio()``: contract identity plus
+    IBKR-computed market value and unrealized P&L. Used by the open-book read
+    surface (IBK-112). ``PositionRecord`` (above) stays the lean shape used by
+    Covered-Call eligibility; this is the richer view for position tracking."""
+
+    account: str
+    symbol: str
+    sec_type: str  # 'OPT', 'STK', ...
+    expiry: str | None  # YYYYMMDD for options; None for stock
+    strike: float | None
+    right: OptionRight | None  # 'C' / 'P'
+    multiplier: int  # 100 for equity options, 1 for stock
+    position: float  # signed; short = negative
+    avg_cost: float  # IBKR averageCost (per contract, already x multiplier for options)
+    market_price: float | None
+    market_value: float | None
+    unrealized_pnl: float | None
+    realized_pnl: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class AccountSummary:
     net_liquidation: Decimal | None
     buying_power: Decimal | None

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime
+from typing import Any
 
 from optionsbot.analysis.types import MarketView
 from optionsbot.scoring import ScoredStrategy
@@ -127,3 +128,51 @@ def no_edge_note(symbol: str) -> str:
         f"fairly priced vs how much {symbol} actually moves. "
         f"Shown for reference, not a recommendation."
     )
+
+
+def _money(x: float | None) -> str:
+    return f"${x:+,.0f}" if x is not None else "$?"
+
+
+def _short_expiry(expiry: str | None) -> str:
+    """20260717 -> 17Jul; pass through anything not an 8-char YYYYMMDD."""
+    if not expiry or len(expiry) != 8:
+        return expiry or "?"
+    try:
+        d = datetime.strptime(expiry, "%Y%m%d")
+    except ValueError:
+        return expiry
+    return f"{d.day}{d.strftime('%b')}"
+
+
+def _position_leg_line(lg: dict[str, Any]) -> str:
+    if lg.get("sec_type") != "OPT":
+        return f"{lg['quantity']:+g} shares | P&L {_money(lg.get('unrealized_pnl'))}"
+    strike = f"{lg['strike']:g}" if lg.get("strike") is not None else "?"
+    mid = lg.get("market_price")
+    mids = f"{mid:.2f}" if mid is not None else "?"
+    dte = lg.get("dte")
+    delta = lg.get("delta")
+    ds = f"  Δ{delta:+.2f}" if delta is not None else ""
+    return (
+        f"{lg['quantity']:+g} {_short_expiry(lg.get('expiry'))} {strike}{lg.get('right') or '?'} "
+        f"| mid {mids}  P&L {_money(lg.get('unrealized_pnl'))}  "
+        f"DTE {dte if dte is not None else '?'}{ds}"
+    )
+
+
+def format_positions_text(view: dict[str, Any]) -> str:
+    """Plain-text open book for Telegram (parse_mode=None): grouped by underlying,
+    per-leg P&L / DTE / delta, with a header net total. Empty book -> short notice."""
+    groups = view.get("groups", [])
+    if not groups:
+        return "no open positions"
+    n = view.get("group_count", len(groups))
+    lines = [
+        f"open book — net P&L {_money(view.get('net_unrealized_pnl'))} "
+        f"({n} underlying{'s' if n != 1 else ''})"
+    ]
+    for g in groups:
+        lines.append(f"{g['underlying']}  net {_money(g['net_unrealized_pnl'])}")
+        lines += ["  " + _position_leg_line(lg) for lg in g["legs"]]
+    return "\n".join(lines)
