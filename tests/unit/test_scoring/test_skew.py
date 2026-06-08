@@ -189,3 +189,65 @@ def test_ev_smile_none_without_realized_vol() -> None:
     legs = (_opt("sell", "P", 95.0), _opt("buy", "P", 90.0))
     assert expected_value_smile(legs, 80.0, 100.0, s, None, 30.0) is None
     assert expected_value_smile(legs, 80.0, 100.0, s, 0.0, 30.0) is None
+
+
+# --- Two-sided + profit-tail structure coverage (IBK-111 review S2/S3) ------
+
+_CONDOR = (
+    _opt("sell", "C", 110.0), _opt("buy", "C", 115.0),
+    _opt("sell", "P", 90.0), _opt("buy", "P", 85.0),
+)
+
+
+def test_prob_smile_iron_condor_flat_matches_lognormal_and_bounded() -> None:
+    # Two-sided structure: flat smile must still reproduce the flat lognormal, and
+    # PoP must be a valid probability in [0, 1].
+    v = 0.20
+    s = _smile(
+        100.0,
+        puts=[(80.0, v), (90.0, v), (100.0, v)],
+        calls=[(100.0, v), (110.0, v), (120.0, v)],
+    )
+    flat = prob_of_profit(_CONDOR, 120.0, 100.0, v, 30.0)
+    pop = prob_of_profit_smile(_CONDOR, 120.0, 100.0, s, 30.0)
+    assert flat is not None and pop is not None
+    assert 0.0 <= pop <= 1.0
+    assert abs(pop - flat) < 0.02
+
+
+def test_prob_smile_put_skew_lowers_iron_condor_pop() -> None:
+    # Downside put skew raises P(breach the 90 short put) -> lower condor PoP. Exercises
+    # BOTH wings (call wing unchanged, only the put wing carries skew).
+    skewed = _smile(
+        100.0,
+        puts=[(80.0, 0.40), (90.0, 0.30), (100.0, 0.20)],
+        calls=[(100.0, 0.20), (110.0, 0.20), (120.0, 0.20)],
+    )
+    flat = _smile(
+        100.0,
+        puts=[(80.0, 0.20), (100.0, 0.20)],
+        calls=[(100.0, 0.20), (120.0, 0.20)],
+    )
+    pop_skew = prob_of_profit_smile(_CONDOR, 120.0, 100.0, skewed, 30.0)
+    pop_flat = prob_of_profit_smile(_CONDOR, 120.0, 100.0, flat, 30.0)
+    assert pop_skew is not None and pop_flat is not None
+    assert 0.0 <= pop_skew <= 1.0
+    assert pop_skew < pop_flat
+
+
+def test_prob_smile_debit_call_spread_flat_matches_lognormal() -> None:
+    # Long-premium / profit-tail structure (bull call debit spread): flat smile must
+    # reproduce the flat lognormal and stay bounded.
+    v = 0.20
+    s = _smile(
+        100.0,
+        puts=[(80.0, v), (100.0, v)],
+        calls=[(100.0, v), (110.0, v), (120.0, v)],
+    )
+    legs = (_opt("buy", "C", 100.0), _opt("sell", "C", 110.0))
+    debit = -250.0  # net debit (negative credit per convention)
+    flat = prob_of_profit(legs, debit, 100.0, v, 30.0)
+    pop = prob_of_profit_smile(legs, debit, 100.0, s, 30.0)
+    assert flat is not None and pop is not None
+    assert 0.0 <= pop <= 1.0
+    assert abs(pop - flat) < 0.02

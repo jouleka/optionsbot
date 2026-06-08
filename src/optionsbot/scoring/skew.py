@@ -74,6 +74,8 @@ class VolSmile:
     def iv_at(self, price: float) -> float | None:
         """IV at ``price``: put wing below spot, call wing at/above. Falls back to the
         other wing if the chosen one is empty; ``None`` if both are empty."""
+        # Boundary deliberately on the call side: at price == spot, ATM put-IV ~=
+        # ATM call-IV by put-call parity, so the two wings join continuously.
         if price < self.spot:
             primary, secondary = self.put_points, self.call_points
         else:
@@ -86,6 +88,14 @@ class VolSmile:
     def atm_iv(self) -> float | None:
         return self.iv_at(self.spot)
 
+    def max_iv(self) -> float | None:
+        """Largest IV across both wings. Sizes the integration grid so it brackets the
+        fattest wing -- otherwise a high-IV wing's tail mass is truncated and the
+        renormalization redistributes it directionally, biasing PoP/EV (IBK-111 S1)."""
+        ivs = [iv for _, iv in self.put_points]
+        ivs += [iv for _, iv in self.call_points]
+        return max(ivs) if ivs else None
+
 
 def build_smile(
     chain: Iterable[OptionChainLeg], expiry: str, spot: float
@@ -93,7 +103,9 @@ def build_smile(
     """Build a :class:`VolSmile` from the chain legs at ``expiry``.
 
     Returns ``None`` when no usable IV exists (so callers fall back to the flat model)
-    or when the ATM reference IV cannot resolve.
+    or when the ATM reference IV cannot resolve. A one-sided chain (only puts or only
+    calls) is kept: ``iv_at`` flat-extrapolates the present wing across the missing
+    side -- losing skew on that side, but a reasonable scanner-grade degradation.
     """
     puts: list[tuple[float, float]] = []
     calls: list[tuple[float, float]] = []
@@ -118,22 +130,27 @@ def build_smile(
 
 
 def _smile_cells(
-    spot: float, dte_days: float, sigma_at: Callable[[float], float | None]
+    spot: float,
+    dte_days: float,
+    sigma_at: Callable[[float], float | None],
+    sigma_ref: float,
 ) -> list[tuple[float, float]] | None:
     """``[(mid_price, mass), ...]`` over a log-price grid.
 
     Cell mass is the smile-implied risk-neutral probability in that cell:
     ``F(K) = Phi((ln(K/spot) + 0.5 s^2) / s)`` with ``s = sigma(K) * sqrt(T)`` -- i.e.
-    each grid edge is priced with its OWN local vol. Masses are unnormalized (the
-    caller divides by their sum, so any far-tail mass beyond the grid self-corrects).
+    each grid edge is priced with its OWN local vol. Masses are unnormalized; the
+    caller divides by their sum. The grid half-width is set by ``sigma_ref`` -- the
+    smile's MAX vol, passed by the caller -- so the grid brackets the fattest wing;
+    sizing it off ATM instead would truncate a high-IV wing's tail and the
+    renormalization would redistribute that mass directionally, biasing PoP/EV.
     Returns ``None`` on degenerate inputs.
     """
     if spot <= 0.0 or dte_days <= 0.0:
         return None
-    sqrt_t = math.sqrt(dte_days / 365.0)
-    sigma_ref = sigma_at(spot)
-    if sigma_ref is None or sigma_ref <= 0.0:
+    if sigma_ref <= 0.0:
         return None
+    sqrt_t = math.sqrt(dte_days / 365.0)
     span = _Z * sigma_ref * sqrt_t
     log_spot = math.log(spot)
 
@@ -180,7 +197,10 @@ def prob_of_profit_smile(
     legs = tuple(legs)
     if not is_terminal_modelable(legs):
         return None
-    cells = _smile_cells(spot, dte_days, smile.iv_at)
+    sigma_ref = smile.max_iv()
+    if sigma_ref is None:
+        return None
+    cells = _smile_cells(spot, dte_days, smile.iv_at, sigma_ref)
     if cells is None:
         return None
     total = math.fsum(m for _, m in cells)
@@ -217,12 +237,15 @@ def expected_value_smile(
     if atm is None or atm <= 0.0:
         return None
     scale = realized_vol / atm
+    max_iv = smile.max_iv()
+    if max_iv is None:
+        return None
 
     def sigma_at(price: float) -> float | None:
         v = smile.iv_at(price)
         return None if v is None else v * scale
 
-    cells = _smile_cells(spot, dte_days, sigma_at)
+    cells = _smile_cells(spot, dte_days, sigma_at, scale * max_iv)
     if cells is None:
         return None
     total = math.fsum(m for _, m in cells)
