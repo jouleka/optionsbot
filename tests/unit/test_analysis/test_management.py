@@ -88,3 +88,12 @@ def test_stock_leg_ignored() -> None:
     assert evaluate_position_triggers(
         [_pp(sec_type="STK", position=-100.0)], {"SPY": 90.0}, _TODAY, _settings()
     ) == []
+
+
+def test_expired_leg_no_dte_alert_but_assignment_fires() -> None:
+    # Negative DTE (expiry already passed) must NOT fire a DTE alert -- otherwise it
+    # would re-fire dte_urgent every cooldown. Assignment is independent and still fires.
+    out = evaluate_position_triggers(
+        [_pp(strike=95.0, right="P", expiry="20260601")], {"SPY": 90.0}, _TODAY, _settings()
+    )
+    assert [a.trigger for a in out] == ["assignment"]  # dte = -7, no dte_* alert

@@ -43,9 +43,12 @@ def evaluate_position_triggers(
     today: date,
     settings: ManageSettings,
 ) -> list[ManagementAlert]:
-    """Management alerts for SHORT option legs: a DTE bucket (most severe only) and,
-    when the underlying spot is known, an assignment-risk alert if the short leg is
-    ITM. Long legs and non-options are ignored. Pure."""
+    """Management alerts for SHORT option legs: a DTE bucket (most severe only, and
+    only for not-yet-expired legs) and, when the underlying spot is known, an
+    assignment-risk alert if the short leg is ITM. Assignment is intentionally
+    DTE-independent (early assignment can happen anytime, esp. around ex-dividend);
+    near-expiry urgency is conveyed by the co-firing DTE alert. Long legs and
+    non-options are ignored. Pure."""
     out: list[ManagementAlert] = []
     for p in positions:
         if p.sec_type != "OPT" or p.position >= 0:
@@ -55,9 +58,11 @@ def evaluate_position_triggers(
             continue
         dte = position_dte(expiry, today)
         trigger: str | None = None
-        if dte is not None and dte <= settings.urgent_dte:
+        # Lower-bound at 0: an expired-but-still-held short (negative DTE) is not an
+        # "approaching expiry" alert -- without this it would re-fire dte_urgent forever.
+        if dte is not None and 0 <= dte <= settings.urgent_dte:
             trigger = "dte_urgent"
-        elif dte is not None and dte <= settings.manage_dte:
+        elif dte is not None and 0 <= dte <= settings.manage_dte:
             trigger = "dte_manage"
         if trigger is not None:
             out.append(

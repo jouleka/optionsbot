@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select
@@ -13,8 +13,10 @@ from optionsbot.ibkr.types import PortfolioPosition, StockQuote
 from optionsbot.storage.schema import position_alerts
 
 
-def _short_put(strike: float = 95.0, expiry: str = "20260613") -> PortfolioPosition:
-    # ~5 DTE relative to "today" -> dte_urgent.
+def _short_put(strike: float = 95.0, days: int = 5) -> PortfolioPosition:
+    # Expiry is computed relative to the real date.today() (run_manage_tick reads it),
+    # so the DTE bucket is deterministic regardless of when the suite runs: +5d -> urgent.
+    expiry = (date.today() + timedelta(days=days)).strftime("%Y%m%d")
     return PortfolioPosition(
         account="DU1", symbol="SPY", sec_type="OPT", expiry=expiry, strike=strike,
         right="P", multiplier=100, position=-1.0, avg_cost=250.0, market_price=1.0,
@@ -51,7 +53,8 @@ async def test_manage_tick_sends_and_dedups(daemon_engine, daemon_settings) -> N
         assert summary.alerts_sent == 1  # dte_urgent only (OTM -> no assignment)
         ctx.telegram.send_message.assert_awaited_once()
         with daemon_engine.connect() as conn:
-            assert conn.execute(select(position_alerts)).fetchall()
+            rows = conn.execute(select(position_alerts)).fetchall()
+        assert len(rows) == 1 and rows[0].dedup_key.endswith(":dte_urgent")
         # Second tick within cooldown -> deduped, nothing sent.
         ctx.telegram.send_message.reset_mock()
         summary2 = await run_manage_tick(ctx)
