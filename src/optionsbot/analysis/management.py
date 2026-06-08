@@ -83,3 +83,52 @@ def evaluate_position_triggers(
                     )
                 )
     return out
+
+
+@dataclass(frozen=True, slots=True)
+class ProfitAlert:
+    symbol: str
+    trigger: str  # 'take_profit' | 'stop_loss'
+    net_credit: float
+    net_pnl: float
+    profit_pct: float  # net_pnl / net_credit
+    dedup_key: str
+
+
+def evaluate_profit_triggers(
+    positions: list[PortfolioPosition], settings: ManageSettings
+) -> list[ProfitAlert]:
+    """Per-underlying take-profit / stop-loss for NET-CREDIT option positions. Pure.
+
+    ``net_credit = sum(avg_cost * |position| * (+1 short / -1 long))`` over the underlying's
+    option legs (stock legs excluded); ``net_pnl = sum(unrealized_pnl)``. Net-debit / near-zero
+    aggregates are skipped (a debit's '% of max profit' is undefined). Returns ``[]`` when
+    ``profit_alerts`` is disabled."""
+    if not settings.profit_alerts:
+        return []
+    by_symbol: dict[str, list[PortfolioPosition]] = {}
+    for p in positions:
+        if p.sec_type == "OPT" and p.right is not None and p.position != 0:
+            by_symbol.setdefault(p.symbol, []).append(p)
+    out: list[ProfitAlert] = []
+    for symbol in sorted(by_symbol):
+        legs = by_symbol[symbol]
+        net_credit = sum(
+            p.avg_cost * abs(p.position) * (1.0 if p.position < 0 else -1.0) for p in legs
+        )
+        if net_credit <= 0.0 or net_credit < settings.min_credit:
+            continue
+        net_pnl = sum(p.unrealized_pnl or 0.0 for p in legs)
+        trigger: str | None = None
+        if net_pnl >= settings.take_profit_pct * net_credit:
+            trigger = "take_profit"
+        elif net_pnl <= -settings.stop_loss_mult * net_credit:
+            trigger = "stop_loss"
+        if trigger is not None:
+            out.append(
+                ProfitAlert(
+                    symbol=symbol, trigger=trigger, net_credit=net_credit, net_pnl=net_pnl,
+                    profit_pct=net_pnl / net_credit, dedup_key=f"{symbol}:profit:{trigger}",
+                )
+            )
+    return out

@@ -27,6 +27,9 @@ def test_manage_settings_defaults() -> None:
     assert s.manage.enabled is True
     assert s.manage.manage_dte == 21 and s.manage.urgent_dte == 7
     assert s.manage.assignment_alerts is True and s.manage.cooldown_hours == 24
+    assert s.manage.profit_alerts is True
+    assert s.manage.take_profit_pct == 0.5 and s.manage.stop_loss_mult == 2.0
+    assert s.manage.min_credit == 0.0
 
 
 def test_ibkr_paper_defaults_to_true() -> None:

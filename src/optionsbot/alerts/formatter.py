@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from optionsbot.analysis.management import ManagementAlert
+from optionsbot.analysis.management import ManagementAlert, ProfitAlert
 from optionsbot.analysis.types import MarketView
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.strategies import Leg
@@ -197,3 +197,14 @@ def format_management_alert(alert: ManagementAlert) -> str:
         )
     word = "URGENT" if alert.trigger == "dte_urgent" else "manage"
     return f"⚠ {word} {alert.symbol} {leg} — {dte}, short option approaching expiry"
+
+
+def format_profit_alert(alert: ProfitAlert) -> str:
+    """Plain-text take-profit / stop-loss alert for Telegram (parse_mode=None)."""
+    credit = f"${alert.net_credit:,.0f}"
+    pnl = _money(alert.net_pnl)
+    if alert.trigger == "take_profit":
+        pct = round(alert.profit_pct * 100)
+        return f"✅ take profit {alert.symbol} — captured {pct}% of {credit} credit (P&L {pnl})"
+    mult = abs(alert.net_pnl / alert.net_credit)
+    return f"🛑 stop loss {alert.symbol} — {pnl}, {mult:.1f}x the {credit} credit"

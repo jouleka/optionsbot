@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from optionsbot.alerts.formatter import format_management_alert
-from optionsbot.analysis.management import ManagementAlert
+from optionsbot.alerts.formatter import format_management_alert, format_profit_alert
+from optionsbot.analysis.management import ManagementAlert, ProfitAlert
 
 
 def _a(
@@ -34,3 +34,20 @@ def test_format_dte_manage() -> None:
 def test_format_dte_urgent() -> None:
     out = format_management_alert(_a("dte_urgent", dte=5, spot=None))
     assert "URGENT" in out and "5 DTE" in out
+
+
+def _p(trigger: str, net_credit: float = 80.0, net_pnl: float = 50.0) -> ProfitAlert:
+    return ProfitAlert(
+        symbol="SPY", trigger=trigger, net_credit=net_credit, net_pnl=net_pnl,
+        profit_pct=net_pnl / net_credit, dedup_key=f"SPY:profit:{trigger}",
+    )
+
+
+def test_format_take_profit() -> None:
+    out = format_profit_alert(_p("take_profit", 80.0, 50.0))
+    assert "take profit" in out and "SPY" in out and "62%" in out and "$80" in out
+
+
+def test_format_stop_loss() -> None:
+    out = format_profit_alert(_p("stop_loss", 80.0, -170.0))
+    assert "stop loss" in out and "SPY" in out and "2.1x" in out

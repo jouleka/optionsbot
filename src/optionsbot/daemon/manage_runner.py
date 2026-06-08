@@ -13,8 +13,12 @@ from datetime import UTC, date, datetime
 
 from sqlalchemy import insert
 
-from optionsbot.alerts.formatter import format_management_alert
-from optionsbot.analysis.management import evaluate_position_triggers
+from optionsbot.alerts.formatter import format_management_alert, format_profit_alert
+from optionsbot.analysis.management import (
+    evaluate_position_triggers,
+    evaluate_profit_triggers,
+)
+from optionsbot.config import Settings
 from optionsbot.daemon.alert_dedup import should_manage_alert
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
@@ -54,6 +58,29 @@ async def _fetch_spots(
     return spots
 
 
+async def _send_deduped(
+    context: DaemonContext,
+    settings: Settings,
+    dedup_key: str,
+    text: str,
+    now: datetime,
+    errors: list[str],
+) -> bool:
+    """Send a management alert iff it passes the persisted cooldown; record + return True.
+    One bad alert (cooldown read / send / insert) is logged + collected, never propagated."""
+    try:
+        if not should_manage_alert(context.engine, settings, dedup_key, now):
+            return False
+        await context.telegram.send_message(text, parse_mode=None)
+        with context.engine.begin() as conn:
+            conn.execute(insert(position_alerts).values(dedup_key=dedup_key, ts=now))
+        return True
+    except Exception as e:  # noqa: BLE001 -- one bad alert must not drop the rest
+        log.exception("manage alert failed for %s", dedup_key)
+        errors.append(f"{dedup_key}: {type(e).__name__}: {e}")
+        return False
+
+
 async def run_manage_tick(context: DaemonContext) -> ManageRunSummary:
     """Evaluate open positions and send deduped management alerts. No-op when the
     market is closed, management is disabled, or alerting is paused."""
@@ -69,21 +96,13 @@ async def run_manage_tick(context: DaemonContext) -> ManageRunSummary:
             log.exception("manage tick: get_portfolio failed")
             return ManageRunSummary(0, 0, [f"get_portfolio: {type(e).__name__}: {e}"])
         spots = await _fetch_spots(context, positions, errors)
-    alerts = evaluate_position_triggers(positions, spots, date.today(), settings.manage)
+    items: list[tuple[str, str]] = []
+    for ma in evaluate_position_triggers(positions, spots, date.today(), settings.manage):
+        items.append((ma.dedup_key, format_management_alert(ma)))
+    for pa in evaluate_profit_triggers(positions, settings.manage):
+        items.append((pa.dedup_key, format_profit_alert(pa)))
     sent = 0
-    for alert in alerts:
-        try:
-            if not should_manage_alert(context.engine, settings, alert.dedup_key, now):
-                continue
-            await context.telegram.send_message(
-                format_management_alert(alert), parse_mode=None
-            )
-            with context.engine.begin() as conn:
-                conn.execute(
-                    insert(position_alerts).values(dedup_key=alert.dedup_key, ts=now)
-                )
+    for dedup_key, text in items:
+        if await _send_deduped(context, settings, dedup_key, text, now, errors):
             sent += 1
-        except Exception as e:  # noqa: BLE001 -- one bad alert must not drop the rest
-            log.exception("manage alert failed for %s", alert.dedup_key)
-            errors.append(f"{alert.dedup_key}: {type(e).__name__}: {e}")
     return ManageRunSummary(len(positions), sent, errors)

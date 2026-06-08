@@ -96,3 +96,43 @@ async def test_manage_tick_tolerates_spot_failure(daemon_engine, daemon_settings
         summary = await run_manage_tick(ctx)
     # Spot fetch failed -> assignment skipped, but the 5-DTE urgent alert still sends.
     assert summary.alerts_sent == 1
+
+
+def _profit_book() -> list[PortfolioPosition]:
+    # QQQ short put, far OTM vs the mocked spot (99) and far-dated, so the ONLY possible
+    # trigger is profit: avg_cost 250 (net credit), up $200 -> 80% -> take_profit.
+    return [PortfolioPosition(
+        account="DU1", symbol="QQQ", sec_type="OPT", expiry="20260717", strike=80.0,
+        right="P", multiplier=100, position=-1.0, avg_cost=250.0, market_price=0.5,
+        market_value=-50.0, unrealized_pnl=200.0, realized_pnl=0.0,
+    )]
+
+
+async def test_manage_tick_sends_profit_alert(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=_profit_book())
+        MD.return_value.get_stock_snapshot = AsyncMock(return_value=_quote(99.0))
+        summary = await run_manage_tick(ctx)
+        assert summary.alerts_sent == 1
+        with daemon_engine.connect() as conn:
+            rows = conn.execute(select(position_alerts)).fetchall()
+        assert len(rows) == 1 and rows[0].dedup_key == "QQQ:profit:take_profit"
+        # second tick within cooldown -> deduped
+        ctx.telegram.send_message = AsyncMock(return_value=1)
+        assert (await run_manage_tick(ctx)).alerts_sent == 0
+
+
+async def test_profit_alerts_disabled_suppresses(daemon_engine, daemon_settings) -> None:
+    daemon_settings.manage.profit_alerts = False
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=_profit_book())
+        MD.return_value.get_stock_snapshot = AsyncMock(return_value=_quote(99.0))
+        summary = await run_manage_tick(ctx)
+    # OTM + far-dated, profit off -> no trigger at all.
+    assert summary.alerts_sent == 0

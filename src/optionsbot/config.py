@@ -85,6 +85,11 @@ class ManageSettings(BaseModel):
     urgent_dte: int = Field(default=7, ge=0)
     assignment_alerts: bool = True
     cooldown_hours: int = Field(default=24, ge=0)
+    # IBK-114: per-underlying take-profit / stop-loss on net-credit positions.
+    profit_alerts: bool = True
+    take_profit_pct: float = Field(default=0.5, gt=0.0)  # alert at >= this fraction of credit
+    stop_loss_mult: float = Field(default=2.0, gt=0.0)  # alert at <= -this multiple of credit
+    min_credit: float = Field(default=0.0, ge=0.0)  # skip groups below this net credit ($)
 
 
 class StorageSettings(BaseModel):

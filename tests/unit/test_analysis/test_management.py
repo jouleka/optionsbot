@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from datetime import date
 
-from optionsbot.analysis.management import evaluate_position_triggers
+from optionsbot.analysis.management import (
+    evaluate_position_triggers,
+    evaluate_profit_triggers,
+)
 from optionsbot.config import ManageSettings
 from optionsbot.ibkr.types import PortfolioPosition
 
@@ -97,3 +100,69 @@ def test_expired_leg_no_dte_alert_but_assignment_fires() -> None:
         [_pp(strike=95.0, right="P", expiry="20260601")], {"SPY": 90.0}, _TODAY, _settings()
     )
     assert [a.trigger for a in out] == ["assignment"]  # dte = -7, no dte_* alert
+
+
+# --- evaluate_profit_triggers (IBK-114) ------------------------------------
+
+
+def _credit_leg(
+    strike: float, right: str, position: float, avg_cost: float, upnl: float,
+    expiry: str = "20260717",
+) -> PortfolioPosition:
+    return PortfolioPosition(
+        account="DU1", symbol="SPY", sec_type="OPT", expiry=expiry, strike=strike,
+        right=right, multiplier=100, position=position, avg_cost=avg_cost,
+        market_price=1.0, market_value=-100.0, unrealized_pnl=upnl, realized_pnl=0.0,
+    )
+
+
+def test_csp_take_profit_pins_avg_cost_scale() -> None:
+    # CSP: $2.50 credit -> avg_cost 250, short 1. Up $125 -> 50% -> take_profit.
+    out = evaluate_profit_triggers([_credit_leg(95.0, "P", -1.0, 250.0, 125.0)], ManageSettings())
+    assert len(out) == 1
+    a = out[0]
+    assert a.trigger == "take_profit" and a.net_credit == 250.0 and a.net_pnl == 125.0
+    assert round(a.profit_pct, 3) == 0.5 and a.dedup_key == "SPY:profit:take_profit"
+
+
+def test_credit_spread_aggregates_legs() -> None:
+    # short 250 + long -170 = 80 net credit; up 40 -> 50% -> take_profit.
+    legs = [_credit_leg(95.0, "P", -1.0, 250.0, 60.0), _credit_leg(90.0, "P", 1.0, 170.0, -20.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert len(out) == 1 and out[0].trigger == "take_profit"
+    assert out[0].net_credit == 80.0 and out[0].net_pnl == 40.0
+
+
+def test_stop_loss_fires_at_multiple() -> None:
+    out = evaluate_profit_triggers([_credit_leg(95.0, "P", -1.0, 250.0, -500.0)], ManageSettings())
+    assert [a.trigger for a in out] == ["stop_loss"]
+    assert out[0].dedup_key == "SPY:profit:stop_loss"
+
+
+def test_no_alert_between_thresholds() -> None:
+    # +16% (below 50%), and loss not near -200% -> nothing.
+    legs = [_credit_leg(95.0, "P", -1.0, 250.0, 40.0)]
+    assert evaluate_profit_triggers(legs, ManageSettings()) == []
+
+
+def test_net_debit_group_skipped() -> None:
+    # Long-only (net_credit -250 <= 0) -> skipped even if hugely profitable.
+    legs = [_credit_leg(95.0, "P", 1.0, 250.0, 500.0)]
+    assert evaluate_profit_triggers(legs, ManageSettings()) == []
+
+
+def test_min_credit_floor_skips_small() -> None:
+    legs = [_credit_leg(95.0, "P", -1.0, 50.0, 40.0)]  # net_credit 50, would be 80%
+    assert evaluate_profit_triggers(legs, ManageSettings(min_credit=100.0)) == []
+
+
+def test_profit_alerts_disabled() -> None:
+    legs = [_credit_leg(95.0, "P", -1.0, 250.0, 125.0)]
+    assert evaluate_profit_triggers(legs, ManageSettings(profit_alerts=False)) == []
+
+
+def test_custom_take_profit_threshold() -> None:
+    legs = [_credit_leg(95.0, "P", -1.0, 250.0, 70.0)]  # 28%
+    hits = evaluate_profit_triggers(legs, ManageSettings(take_profit_pct=0.25))
+    assert hits[0].trigger == "take_profit"
+    assert evaluate_profit_triggers(legs, ManageSettings(take_profit_pct=0.5)) == []
