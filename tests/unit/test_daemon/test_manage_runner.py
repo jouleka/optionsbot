@@ -1,0 +1,95 @@
+"""Tests for the position-management tick (IBK-113)."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from sqlalchemy import select
+
+from optionsbot.daemon.manage_runner import run_manage_tick
+from optionsbot.ibkr.types import PortfolioPosition, StockQuote
+from optionsbot.storage.schema import position_alerts
+
+
+def _short_put(strike: float = 95.0, expiry: str = "20260613") -> PortfolioPosition:
+    # ~5 DTE relative to "today" -> dte_urgent.
+    return PortfolioPosition(
+        account="DU1", symbol="SPY", sec_type="OPT", expiry=expiry, strike=strike,
+        right="P", multiplier=100, position=-1.0, avg_cost=250.0, market_price=1.0,
+        market_value=-100.0, unrealized_pnl=10.0, realized_pnl=0.0,
+    )
+
+
+def _quote(mid: float = 99.0) -> StockQuote:
+    return StockQuote(symbol="SPY", bid=mid - 0.1, ask=mid + 0.1, last=mid, mid=mid,
+                      ts=datetime.now(UTC), delayed=True)
+
+
+def _ctx(daemon_engine, daemon_settings) -> MagicMock:
+    ctx = MagicMock()
+    ctx.engine = daemon_engine
+    ctx.settings = daemon_settings
+    ctx.ibkr = MagicMock()
+    ctx.resolver = MagicMock()
+    ctx.ibkr_lock = asyncio.Lock()
+    ctx.alerting_paused = False
+    ctx.telegram = MagicMock()
+    ctx.telegram.send_message = AsyncMock(return_value=1)
+    return ctx
+
+
+async def test_manage_tick_sends_and_dedups(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=[_short_put()])
+        MD.return_value.get_stock_snapshot = AsyncMock(return_value=_quote(99.0))  # OTM put
+        summary = await run_manage_tick(ctx)
+        assert summary.alerts_sent == 1  # dte_urgent only (OTM -> no assignment)
+        ctx.telegram.send_message.assert_awaited_once()
+        with daemon_engine.connect() as conn:
+            assert conn.execute(select(position_alerts)).fetchall()
+        # Second tick within cooldown -> deduped, nothing sent.
+        ctx.telegram.send_message.reset_mock()
+        summary2 = await run_manage_tick(ctx)
+        assert summary2.alerts_sent == 0
+        ctx.telegram.send_message.assert_not_awaited()
+
+
+async def test_manage_tick_noop_when_market_closed(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.is_market_open", return_value=False):
+        summary = await run_manage_tick(ctx)
+    assert summary.alerts_sent == 0
+    ctx.telegram.send_message.assert_not_awaited()
+
+
+async def test_manage_tick_noop_when_paused(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    ctx.alerting_paused = True
+    with patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        summary = await run_manage_tick(ctx)
+    assert summary.alerts_sent == 0
+
+
+async def test_manage_tick_noop_when_disabled(daemon_engine, daemon_settings) -> None:
+    daemon_settings.manage.enabled = False
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        summary = await run_manage_tick(ctx)
+    assert summary.alerts_sent == 0
+
+
+async def test_manage_tick_tolerates_spot_failure(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=[_short_put()])
+        MD.return_value.get_stock_snapshot = AsyncMock(side_effect=RuntimeError("no data"))
+        summary = await run_manage_tick(ctx)
+    # Spot fetch failed -> assignment skipped, but the 5-DTE urgent alert still sends.
+    assert summary.alerts_sent == 1

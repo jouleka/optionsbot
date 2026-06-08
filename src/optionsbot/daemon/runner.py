@@ -197,6 +197,7 @@ class Daemon:
         self._context.engine.dispose()
 
     async def _scan_tick(self) -> None:
+        from optionsbot.daemon.manage_runner import run_manage_tick
         from optionsbot.daemon.scan_runner import run_scan_tick
 
         assert self._context is not None
@@ -210,6 +211,18 @@ class Daemon:
             )
         except Exception:
             log.exception("scan tick failed catastrophically")
+        # Position-management pass runs as a sibling of the scan; its own try/except
+        # so a management failure can't poison the scan (and vice-versa).
+        try:
+            ms = await run_manage_tick(self._context)
+            log.info(
+                "manage tick: positions=%d alerts=%d errors=%d",
+                ms.positions_seen,
+                ms.alerts_sent,
+                len(ms.errors),
+            )
+        except Exception:
+            log.exception("manage tick failed catastrophically")
 
     async def _heartbeat_tick(self) -> None:
         assert self._context is not None

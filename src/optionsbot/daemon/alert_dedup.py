@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import Engine, desc, select
 
 from optionsbot.config import Settings
-from optionsbot.storage.schema import alerts
+from optionsbot.storage.schema import alerts, position_alerts
 
 
 def should_alert(
@@ -54,3 +54,28 @@ def should_alert(
         return True
     last_score = float(row.score)
     return (score - last_score) > settings.scan.alert_rescore_delta
+
+
+def should_manage_alert(
+    engine: Engine,
+    settings: Settings,
+    dedup_key: str,
+    now: datetime | None = None,
+) -> bool:
+    """True iff there is no ``position_alerts`` row for ``dedup_key`` newer than the
+    manage cooldown window. The management analogue of :func:`should_alert`: each
+    (leg, trigger) re-fires at most once per ``settings.manage.cooldown_hours``."""
+    now = now if now is not None else datetime.now(UTC)
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(position_alerts.c.ts)
+            .where(position_alerts.c.dedup_key == dedup_key)
+            .order_by(desc(position_alerts.c.ts))
+            .limit(1)
+        ).first()
+    if row is None:
+        return True
+    last_ts: datetime = row.ts
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=UTC)
+    return (now - last_ts) >= timedelta(hours=settings.manage.cooldown_hours)

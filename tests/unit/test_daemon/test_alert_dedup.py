@@ -7,8 +7,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import insert
 
 from optionsbot.config import Settings
-from optionsbot.daemon.alert_dedup import should_alert
-from optionsbot.storage.schema import alerts
+from optionsbot.daemon.alert_dedup import should_alert, should_manage_alert
+from optionsbot.storage.schema import alerts, position_alerts
 
 
 def _insert_sent_alert(
@@ -115,3 +115,38 @@ def test_cooldown_zero_disables_cooldown(daemon_engine, daemon_settings) -> None
     )
     # Cooldown=0 → past cooldown immediately → fires.
     assert should_alert(daemon_engine, daemon_settings, "AAPL", "iron_condor", 80.0)
+
+
+# --- should_manage_alert (IBK-113) -----------------------------------------
+
+
+def _insert_manage_alert(engine, dedup_key: str, *, ts: datetime) -> None:
+    with engine.begin() as conn:
+        conn.execute(insert(position_alerts).values(dedup_key=dedup_key, ts=ts))
+
+
+def test_manage_first_alert_fires(daemon_engine, daemon_settings) -> None:
+    assert should_manage_alert(daemon_engine, daemon_settings, "SPY:20260717:95:P:dte_manage")
+
+
+def test_manage_within_cooldown_suppressed(daemon_engine, daemon_settings) -> None:
+    daemon_settings.manage.cooldown_hours = 24
+    key = "SPY:20260717:95:P:dte_manage"
+    _insert_manage_alert(daemon_engine, key, ts=datetime.now(UTC) - timedelta(hours=2))
+    assert not should_manage_alert(daemon_engine, daemon_settings, key)
+
+
+def test_manage_past_cooldown_fires(daemon_engine, daemon_settings) -> None:
+    daemon_settings.manage.cooldown_hours = 24
+    key = "SPY:20260717:95:P:dte_manage"
+    _insert_manage_alert(daemon_engine, key, ts=datetime.now(UTC) - timedelta(hours=25))
+    assert should_manage_alert(daemon_engine, daemon_settings, key)
+
+
+def test_manage_dedup_is_per_key(daemon_engine, daemon_settings) -> None:
+    daemon_settings.manage.cooldown_hours = 24
+    _insert_manage_alert(
+        daemon_engine, "SPY:20260717:95:P:dte_manage", ts=datetime.now(UTC) - timedelta(hours=1)
+    )
+    # A different trigger bucket on the same leg is a distinct key -> still fires.
+    assert should_manage_alert(daemon_engine, daemon_settings, "SPY:20260717:95:P:dte_urgent")

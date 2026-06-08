@@ -76,6 +76,17 @@ class ScanSettings(BaseModel):
     auto_screen: bool = True
 
 
+class ManageSettings(BaseModel):
+    # IBK-113: proactive position-management alerts. enabled=False disables the whole
+    # management pass; thresholds are calendar DTE; cooldown_hours bounds re-alerts for
+    # the same (leg, trigger) -- persisted in position_alerts so it survives restarts.
+    enabled: bool = True
+    manage_dte: int = Field(default=21, ge=0)
+    urgent_dte: int = Field(default=7, ge=0)
+    assignment_alerts: bool = True
+    cooldown_hours: int = Field(default=24, ge=0)
+
+
 class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -105,6 +116,7 @@ class Settings(BaseSettings):
     scan: ScanSettings = ScanSettings()
     screener: ScreenerSettings = ScreenerSettings()
     storage: StorageSettings = StorageSettings()
+    manage: ManageSettings = ManageSettings()
 
     log_level: str = "INFO"
 

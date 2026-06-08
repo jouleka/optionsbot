@@ -166,3 +166,15 @@ symbol_news = Table(
     Column("fetched_at", DateTime(timezone=True), nullable=False),
     Column("headlines_json", JSON),
 )
+
+
+# IBK-113: one row per management alert sent, keyed by dedup_key
+# (symbol:expiry:strike:right:trigger), so should_manage_alert suppresses re-fires
+# within the cooldown window across daemon restarts.
+position_alerts = Table(
+    "position_alerts",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("dedup_key", Text, nullable=False, index=True),
+    Column("ts", DateTime(timezone=True), nullable=False),
+)

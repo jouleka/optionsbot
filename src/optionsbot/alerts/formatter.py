@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
+from optionsbot.analysis.management import ManagementAlert
 from optionsbot.analysis.types import MarketView
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.strategies import Leg
@@ -180,3 +181,19 @@ def format_positions_text(view: dict[str, Any]) -> str:
         lines.append(f"{g['underlying']}  net {_money(g['net_unrealized_pnl'])}")
         lines += ["  " + _position_leg_line(lg) for lg in g["legs"]]
     return "\n".join(lines)
+
+
+def format_management_alert(alert: ManagementAlert) -> str:
+    """Plain-text management alert for Telegram (parse_mode=None)."""
+    leg = f"{alert.quantity:+g} {_short_expiry(alert.expiry)} {alert.strike:g}{alert.right}"
+    dte = f"{alert.dte} DTE" if alert.dte is not None else "expiry ?"
+    if alert.trigger == "assignment":
+        side = "put" if alert.right == "P" else "call"
+        rel = "<" if alert.right == "P" else ">"
+        spot = f"{alert.spot:.2f}" if alert.spot is not None else "?"
+        return (
+            f"⚠ assignment risk {alert.symbol} {leg} — short {side} ITM "
+            f"(spot {spot} {rel} {alert.strike:g}), {dte}"
+        )
+    word = "URGENT" if alert.trigger == "dte_urgent" else "manage"
+    return f"⚠ {word} {alert.symbol} {leg} — {dte}, short option approaching expiry"

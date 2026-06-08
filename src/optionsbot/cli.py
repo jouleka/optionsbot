@@ -280,6 +280,16 @@ def init(
     asyncio.run(_run_init(non_interactive, skip_telegram, skip_test, config_dir))
 
 
+@app.command()
+def migrate() -> None:
+    """Apply pending DB migrations (alembic upgrade head) against the configured DB.
+
+    The daemon does not auto-migrate; run this after a `git pull` that adds a
+    migration, then restart the daemon.
+    """
+    _run_migrations()
+
+
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------

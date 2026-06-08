@@ -22,6 +22,13 @@ def test_default_settings_are_valid() -> None:
     assert isinstance(s.storage, StorageSettings)
 
 
+def test_manage_settings_defaults() -> None:
+    s = Settings()
+    assert s.manage.enabled is True
+    assert s.manage.manage_dte == 21 and s.manage.urgent_dte == 7
+    assert s.manage.assignment_alerts is True and s.manage.cooldown_hours == 24
+
+
 def test_ibkr_paper_defaults_to_true() -> None:
     assert Settings().ibkr.paper is True
 
