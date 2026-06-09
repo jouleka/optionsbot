@@ -54,3 +54,76 @@ def test_three_leg_is_custom() -> None:
 def test_zero_position_legs_ignored() -> None:
     legs = [_opt(95.0, "C", 1.0), _opt(90.0, "C", 0.0)]
     assert identify_structure(legs) == "Long Call"
+
+
+def test_bull_put_spread() -> None:
+    # sell higher-strike put, buy lower-strike put (credit).
+    legs = [_opt(95.0, "P", -1.0), _opt(90.0, "P", 1.0)]
+    assert identify_structure(legs) == "Bull Put Spread"
+
+
+def test_bear_put_spread() -> None:
+    # buy higher-strike put, sell lower-strike put (debit).
+    legs = [_opt(95.0, "P", 1.0), _opt(90.0, "P", -1.0)]
+    assert identify_structure(legs) == "Bear Put Spread"
+
+
+def test_bear_call_spread() -> None:
+    # sell lower-strike call, buy higher-strike call (credit).
+    legs = [_opt(100.0, "C", -1.0), _opt(105.0, "C", 1.0)]
+    assert identify_structure(legs) == "Bear Call Spread"
+
+
+def test_bull_call_spread() -> None:
+    # buy lower-strike call, sell higher-strike call (debit).
+    legs = [_opt(100.0, "C", 1.0), _opt(105.0, "C", -1.0)]
+    assert identify_structure(legs) == "Bull Call Spread"
+
+
+def test_vertical_multiple() -> None:
+    legs = [_opt(95.0, "P", -2.0), _opt(90.0, "P", 2.0)]
+    assert identify_structure(legs) == "Bull Put Spread ×2"
+
+
+def test_same_strike_two_leg_same_right_is_custom() -> None:
+    legs = [_opt(95.0, "P", -1.0), _opt(95.0, "P", 1.0)]  # not a vertical
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_same_sign_two_leg_same_right_is_custom() -> None:
+    legs = [_opt(95.0, "P", 1.0), _opt(90.0, "P", 1.0)]  # two longs -> custom
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_long_straddle_and_strangle() -> None:
+    straddle = [_opt(100.0, "C", 1.0), _opt(100.0, "P", 1.0)]
+    strangle = [_opt(105.0, "C", 1.0), _opt(95.0, "P", 1.0)]
+    assert identify_structure(straddle) == "Long Straddle"
+    assert identify_structure(strangle) == "Long Strangle"
+
+
+def test_short_straddle_and_strangle() -> None:
+    straddle = [_opt(100.0, "C", -1.0), _opt(100.0, "P", -1.0)]
+    strangle = [_opt(105.0, "C", -1.0), _opt(95.0, "P", -1.0)]
+    assert identify_structure(straddle) == "Short Straddle"
+    assert identify_structure(strangle) == "Short Strangle"
+
+
+def test_synthetic_opposite_sign_opposite_right_is_custom() -> None:
+    legs = [_opt(100.0, "C", 1.0), _opt(100.0, "P", -1.0)]  # long call + short put
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_calendar_and_diagonal() -> None:
+    cal = [_opt(100.0, "C", -1.0, expiry="20260717"),
+           _opt(100.0, "C", 1.0, expiry="20260821")]
+    diag = [_opt(100.0, "C", -1.0, expiry="20260717"),
+            _opt(105.0, "C", 1.0, expiry="20260821")]
+    assert identify_structure(cal) == "Calendar Spread"
+    assert identify_structure(diag) == "Diagonal Spread"
+
+
+def test_diff_expiry_same_sign_is_custom() -> None:
+    legs = [_opt(100.0, "C", 1.0, expiry="20260717"),
+            _opt(100.0, "C", 1.0, expiry="20260821")]
+    assert identify_structure(legs) == "custom (2 legs)"

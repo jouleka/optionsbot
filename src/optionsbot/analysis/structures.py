@@ -38,6 +38,32 @@ def _match_with_stock(
     return custom
 
 
+def _match_two(a: _OptLeg, b: _OptLeg) -> str | None:
+    ea, ka, ra, sa = a
+    eb, kb, rb, sb = b
+    same_expiry = ea == eb
+    if same_expiry and ra == rb:  # vertical
+        if sa == sb or ka == kb:  # need opposite signs + different strikes
+            return None
+        short = a if sa < 0 else b
+        long_ = b if sa < 0 else a
+        if ra == "P":
+            return "Bull Put Spread" if short[1] > long_[1] else "Bear Put Spread"
+        return "Bear Call Spread" if short[1] < long_[1] else "Bull Call Spread"
+    if same_expiry and ra != rb:  # straddle / strangle
+        if sa != sb:  # need equal signs
+            return None
+        same_strike = ka == kb
+        if sa > 0:
+            return "Long Straddle" if same_strike else "Long Strangle"
+        return "Short Straddle" if same_strike else "Short Strangle"
+    if not same_expiry and ra == rb:  # calendar / diagonal
+        if sa == sb:  # need opposite signs
+            return None
+        return "Calendar Spread" if ka == kb else "Diagonal Spread"
+    return None
+
+
 def _match_options(opts: list[PortfolioPosition], custom: str) -> str:
     qmags = {abs(int(p.position)) for p in opts}
     if len(qmags) != 1:  # uneven copies / ratio -> not a clean structure
@@ -50,6 +76,8 @@ def _match_options(opts: list[PortfolioPosition], custom: str) -> str:
     label: str | None
     if len(reduced) == 1:
         label = _match_single(reduced[0])
+    elif len(reduced) == 2:
+        label = _match_two(reduced[0], reduced[1])
     else:
         label = None
     return _with_mult(label, m) if label is not None else custom
