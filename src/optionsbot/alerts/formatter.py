@@ -221,19 +221,36 @@ def format_positions_text(view: dict[str, Any]) -> str:
 
 
 def format_management_alert(alert: ManagementAlert) -> str:
-    """Plain-text management alert for Telegram (parse_mode=None)."""
+    """Plain-text management alert for Telegram (parse_mode=None). One message per leg,
+    rendering the full set of firing triggers (IBK-119)."""
     leg = f"{alert.quantity:+g} {_short_expiry(alert.expiry)} {alert.strike:g}{alert.right}"
     dte = f"{alert.dte} DTE" if alert.dte is not None else "expiry ?"
-    if alert.trigger == "assignment":
-        side = "put" if alert.right == "P" else "call"
-        rel = "<" if alert.right == "P" else ">"
-        spot = f"{alert.spot:.2f}" if alert.spot is not None else "?"
-        return (
-            f"⚠ assignment risk {alert.symbol} {leg} — short {side} ITM "
-            f"(spot {spot} {rel} {alert.strike:g}), {dte}"
-        )
-    word = "URGENT" if alert.trigger == "dte_urgent" else "manage"
-    return f"⚠ {word} {alert.symbol} {leg} — {dte}, short option approaching expiry"
+    if "dte_urgent" in alert.triggers:
+        word = "URGENT"
+    elif "dte_manage" in alert.triggers:
+        word = "manage"
+    else:
+        word = "assignment risk"
+    has_dte = "dte_urgent" in alert.triggers or "dte_manage" in alert.triggers
+    side = "put" if alert.right == "P" else "call"
+    rel = "<" if alert.right == "P" else ">"
+    spot_s = f"{alert.spot:.2f}" if alert.spot is not None else "?"
+    clauses: list[str] = []
+    if alert.quantity < 0:  # short
+        if "assignment" in alert.triggers:
+            clauses.append(f"short {side} ITM (spot {spot_s} {rel} {alert.strike:g})")
+            if has_dte:
+                clauses.append("approaching expiry")
+        else:
+            clauses.append("short option approaching expiry")
+    else:  # long -- always has a DTE trigger; ITM only changes the wording
+        if alert.itm is True:
+            clauses.append(f"long {side} ITM — auto-exercises at expiry; close if unwanted")
+        elif alert.itm is False:
+            clauses.append("long option approaching expiry — premium decaying; close/roll")
+        else:
+            clauses.append("long option approaching expiry — close/roll")
+    return f"⚠ {word} {alert.symbol} {leg} — {dte}, {', '.join(clauses)}"
 
 
 def format_profit_alert(alert: ProfitAlert) -> str:

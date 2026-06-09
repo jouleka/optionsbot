@@ -34,12 +34,12 @@ def _settings() -> ManageSettings:
 
 def test_dte_manage_bucket() -> None:
     out = evaluate_position_triggers([_pp(expiry="20260626")], {}, _TODAY, _settings())  # 18 DTE
-    assert len(out) == 1 and out[0].trigger == "dte_manage" and out[0].dte == 18
+    assert len(out) == 1 and out[0].triggers == ("dte_manage",) and out[0].dte == 18
 
 
 def test_dte_urgent_bucket_only() -> None:
     out = evaluate_position_triggers([_pp(expiry="20260613")], {}, _TODAY, _settings())  # 5 DTE
-    assert [a.trigger for a in out] == ["dte_urgent"]
+    assert [a.triggers for a in out] == [("dte_urgent",)]
 
 
 def test_no_alert_when_far_dated() -> None:
@@ -50,15 +50,16 @@ def test_assignment_short_put_itm() -> None:
     out = evaluate_position_triggers(
         [_pp(strike=95.0, right="P", expiry="20260717")], {"SPY": 93.2}, _TODAY, _settings()
     )
-    assert [a.trigger for a in out] == ["assignment"]
-    assert out[0].spot == 93.2 and out[0].dedup_key == "SPY:20260717:95:P:assignment"
+    assert [a.triggers for a in out] == [("assignment",)]
+    assert out[0].spot == 93.2 and out[0].itm is True
+    assert out[0].dedup_key == "SPY:20260717:95:P:assignment"
 
 
 def test_assignment_short_call_itm() -> None:
     out = evaluate_position_triggers(
         [_pp(strike=95.0, right="C", expiry="20260717")], {"SPY": 97.0}, _TODAY, _settings()
     )
-    assert [a.trigger for a in out] == ["assignment"]
+    assert [a.triggers for a in out] == [("assignment",)]
 
 
 def test_otm_short_no_assignment() -> None:
@@ -67,17 +68,20 @@ def test_otm_short_no_assignment() -> None:
     ) == []
 
 
-def test_long_leg_ignored() -> None:
-    assert evaluate_position_triggers(
-        [_pp(position=1.0, expiry="20260613")], {"SPY": 90.0}, _TODAY, _settings()
-    ) == []
+def test_short_itm_near_expiry_merges_into_one_alert() -> None:
+    out = evaluate_position_triggers(
+        [_pp(strike=95.0, right="P", expiry="20260613")], {"SPY": 92.0}, _TODAY, _settings()
+    )  # 5 DTE + ITM put
+    assert len(out) == 1
+    assert out[0].triggers == ("assignment", "dte_urgent")  # sorted
+    assert out[0].dedup_key == "SPY:20260613:95:P:assignment+dte_urgent"
 
 
 def test_missing_spot_skips_assignment_keeps_dte() -> None:
     out = evaluate_position_triggers(
         [_pp(strike=95.0, right="P", expiry="20260613")], {}, _TODAY, _settings()
     )
-    assert [a.trigger for a in out] == ["dte_urgent"]
+    assert [a.triggers for a in out] == [("dte_urgent",)] and out[0].itm is None
 
 
 def test_assignment_disabled_by_settings() -> None:
@@ -99,7 +103,45 @@ def test_expired_leg_no_dte_alert_but_assignment_fires() -> None:
     out = evaluate_position_triggers(
         [_pp(strike=95.0, right="P", expiry="20260601")], {"SPY": 90.0}, _TODAY, _settings()
     )
-    assert [a.trigger for a in out] == ["assignment"]  # dte = -7, no dte_* alert
+    assert [a.triggers for a in out] == [("assignment",)]  # dte = -7, no dte_* alert
+
+
+def test_long_leg_near_expiry_itm() -> None:
+    out = evaluate_position_triggers(
+        [_pp(position=1.0, strike=95.0, right="P", expiry="20260613")], {"SPY": 92.0},
+        _TODAY, _settings(),
+    )  # long put, 5 DTE, ITM (spot < strike)
+    assert len(out) == 1
+    assert out[0].triggers == ("dte_urgent",)  # never assignment for a long
+    assert out[0].itm is True
+
+
+def test_long_leg_near_expiry_otm() -> None:
+    out = evaluate_position_triggers(
+        [_pp(position=1.0, strike=95.0, right="P", expiry="20260626")], {"SPY": 99.0},
+        _TODAY, _settings(),
+    )  # long put, 18 DTE, OTM
+    assert out[0].triggers == ("dte_manage",) and out[0].itm is False
+
+
+def test_long_leg_near_expiry_spot_unknown() -> None:
+    out = evaluate_position_triggers(
+        [_pp(position=1.0, strike=95.0, right="P", expiry="20260613")], {}, _TODAY, _settings()
+    )
+    assert out[0].triggers == ("dte_urgent",) and out[0].itm is None
+
+
+def test_long_leg_far_dated_no_alert() -> None:
+    assert evaluate_position_triggers(
+        [_pp(position=1.0, expiry="20260717")], {"SPY": 90.0}, _TODAY, _settings()
+    ) == []
+
+
+def test_long_leg_alerts_disabled() -> None:
+    s = ManageSettings(long_leg_expiry_alerts=False)
+    assert evaluate_position_triggers(
+        [_pp(position=1.0, strike=95.0, right="P", expiry="20260613")], {"SPY": 92.0}, _TODAY, s
+    ) == []
 
 
 # --- evaluate_profit_triggers (IBK-114) ------------------------------------

@@ -22,15 +22,18 @@ class ManagementAlert:
     expiry: str
     strike: float
     right: str  # 'C' / 'P'
-    quantity: float  # signed; short -> negative
-    trigger: str  # 'dte_manage' | 'dte_urgent' | 'assignment'
+    quantity: float  # signed; short < 0, long > 0
+    triggers: tuple[str, ...]  # sorted, non-empty subset of: dte_manage, dte_urgent, assignment
     dte: int | None
     spot: float | None
+    itm: bool | None  # moneyness when spot known (drives wording); None if spot unknown
     dedup_key: str
 
 
-def _dedup_key(symbol: str, expiry: str, strike: float, right: str, trigger: str) -> str:
-    return f"{symbol}:{expiry}:{strike:g}:{right}:{trigger}"
+def _dedup_key(
+    symbol: str, expiry: str, strike: float, right: str, triggers: tuple[str, ...]
+) -> str:
+    return f"{symbol}:{expiry}:{strike:g}:{right}:{'+'.join(triggers)}"
 
 
 def _is_itm(right: str, spot: float, strike: float) -> bool:
@@ -43,45 +46,46 @@ def evaluate_position_triggers(
     today: date,
     settings: ManageSettings,
 ) -> list[ManagementAlert]:
-    """Management alerts for SHORT option legs: a DTE bucket (most severe only, and
-    only for not-yet-expired legs) and, when the underlying spot is known, an
-    assignment-risk alert if the short leg is ITM. Assignment is intentionally
-    DTE-independent (early assignment can happen anytime, esp. around ex-dividend);
-    near-expiry urgency is conveyed by the co-firing DTE alert. Long legs and
-    non-options are ignored. Pure."""
+    """One management alert per option leg, carrying the SET of firing triggers (IBK-119).
+
+    DTE bucket (most-severe only, lower-bounded at 0 so an expired-but-held leg doesn't
+    re-fire forever) applies to SHORT and LONG legs. Assignment (SHORT ITM, DTE-independent --
+    early assignment can happen anytime, esp. around ex-dividend) is short-only. Long legs are
+    gated by ``long_leg_expiry_alerts``; ITM never adds a trigger for a long, it only sets
+    ``itm`` for wording. Non-options and zero-quantity legs are ignored. Pure."""
     out: list[ManagementAlert] = []
     for p in positions:
-        if p.sec_type != "OPT" or p.position >= 0:
+        if p.sec_type != "OPT":
             continue
         expiry, strike, right = p.expiry, p.strike, p.right
         if expiry is None or strike is None or right is None:
             continue
+        is_short = p.position < 0
+        is_long = p.position > 0
+        if not (is_short or is_long):
+            continue
+        if is_long and not settings.long_leg_expiry_alerts:
+            continue
         dte = position_dte(expiry, today)
-        trigger: str | None = None
-        # Lower-bound at 0: an expired-but-still-held short (negative DTE) is not an
-        # "approaching expiry" alert -- without this it would re-fire dte_urgent forever.
+        spot = spots.get(p.symbol)
+        itm = _is_itm(right, spot, strike) if spot is not None else None
+        triggers: list[str] = []
         if dte is not None and 0 <= dte <= settings.urgent_dte:
-            trigger = "dte_urgent"
+            triggers.append("dte_urgent")
         elif dte is not None and 0 <= dte <= settings.manage_dte:
-            trigger = "dte_manage"
-        if trigger is not None:
-            out.append(
-                ManagementAlert(
-                    symbol=p.symbol, expiry=expiry, strike=strike, right=right,
-                    quantity=p.position, trigger=trigger, dte=dte, spot=None,
-                    dedup_key=_dedup_key(p.symbol, expiry, strike, right, trigger),
-                )
+            triggers.append("dte_manage")
+        if is_short and settings.assignment_alerts and itm:
+            triggers.append("assignment")
+        if not triggers:
+            continue
+        t = tuple(sorted(triggers))
+        out.append(
+            ManagementAlert(
+                symbol=p.symbol, expiry=expiry, strike=strike, right=right,
+                quantity=p.position, triggers=t, dte=dte, spot=spot, itm=itm,
+                dedup_key=_dedup_key(p.symbol, expiry, strike, right, t),
             )
-        if settings.assignment_alerts:
-            spot = spots.get(p.symbol)
-            if spot is not None and _is_itm(right, spot, strike):
-                out.append(
-                    ManagementAlert(
-                        symbol=p.symbol, expiry=expiry, strike=strike, right=right,
-                        quantity=p.position, trigger="assignment", dte=dte, spot=spot,
-                        dedup_key=_dedup_key(p.symbol, expiry, strike, right, "assignment"),
-                    )
-                )
+        )
     return out
 
 

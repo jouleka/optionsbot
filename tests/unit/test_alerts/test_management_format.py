@@ -7,33 +7,61 @@ from optionsbot.analysis.management import ManagementAlert, ProfitAlert
 
 
 def _a(
-    trigger: str, dte: int | None = 7, spot: float | None = 93.2, right: str = "P"
+    triggers: tuple[str, ...], dte: int | None = 7, spot: float | None = 93.2,
+    right: str = "P", quantity: float = -1.0, itm: bool | None = None,
 ) -> ManagementAlert:
     return ManagementAlert(
-        symbol="SPY", expiry="20260717", strike=95.0, right=right, quantity=-1.0,
-        trigger=trigger, dte=dte, spot=spot, dedup_key=f"SPY:20260717:95:{right}:{trigger}",
+        symbol="SPY", expiry="20260717", strike=95.0, right=right, quantity=quantity,
+        triggers=triggers, dte=dte, spot=spot, itm=itm,
+        dedup_key="SPY:20260717:95:" + right + ":" + "+".join(triggers),
     )
 
 
-def test_format_assignment_put() -> None:
-    out = format_management_alert(_a("assignment"))
-    assert "assignment risk" in out and "SPY" in out and "95P" in out and "93.20" in out
-    assert "short put ITM" in out
+def test_format_assignment_only_put() -> None:
+    out = format_management_alert(_a(("assignment",), dte=40, spot=93.2, itm=True))
+    assert "assignment risk" in out and "95P" in out and "93.20" in out
+    assert "short put ITM" in out and "40 DTE" in out
 
 
-def test_format_assignment_call() -> None:
-    out = format_management_alert(_a("assignment", spot=97.0, right="C"))
+def test_format_assignment_only_call() -> None:
+    out = format_management_alert(_a(("assignment",), dte=40, spot=97.0, right="C", itm=True))
     assert "short call ITM" in out and "97.00 > 95" in out
 
 
-def test_format_dte_manage() -> None:
-    out = format_management_alert(_a("dte_manage", dte=18, spot=None))
-    assert "manage" in out and "18 DTE" in out
+def test_format_dte_manage_short() -> None:
+    out = format_management_alert(_a(("dte_manage",), dte=18, spot=None))
+    assert "manage" in out and "18 DTE" in out and "short option approaching expiry" in out
 
 
-def test_format_dte_urgent() -> None:
-    out = format_management_alert(_a("dte_urgent", dte=5, spot=None))
+def test_format_dte_urgent_short() -> None:
+    out = format_management_alert(_a(("dte_urgent",), dte=5, spot=None))
     assert "URGENT" in out and "5 DTE" in out
+
+
+def test_format_short_merged_one_message() -> None:
+    out = format_management_alert(_a(("assignment", "dte_urgent"), dte=3, spot=92.0, itm=True))
+    assert "URGENT" in out and "short put ITM" in out and "92.00 < 95" in out
+    assert "approaching expiry" in out
+    assert out.count("\n") == 0  # a single line / message
+
+
+def test_format_long_itm() -> None:
+    out = format_management_alert(
+        _a(("dte_urgent",), dte=3, spot=155.0, right="C", quantity=2.0, itm=True)
+    )
+    assert "long call ITM" in out and "auto-exercises" in out
+
+
+def test_format_long_otm() -> None:
+    out = format_management_alert(
+        _a(("dte_manage",), dte=18, spot=99.0, quantity=1.0, itm=False)
+    )
+    assert "long option approaching expiry" in out and "premium decaying" in out
+
+
+def test_format_long_spot_unknown() -> None:
+    out = format_management_alert(_a(("dte_urgent",), dte=3, spot=None, quantity=1.0, itm=None))
+    assert "long option approaching expiry" in out and "ITM" not in out
 
 
 def _p(
