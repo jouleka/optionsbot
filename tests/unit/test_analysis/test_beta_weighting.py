@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from optionsbot.analysis.beta_weighting import beta
+from optionsbot.analysis.beta_weighting import beta, beta_weighted_delta
 
 
 def _closes(returns: list[float], start: float = 100.0) -> pd.DataFrame:
@@ -56,3 +56,52 @@ def test_beta_aligns_on_common_dates() -> None:
     sym.index = pd.date_range("2026-01-02", periods=37, freq="D")  # shifted by one day
     b = beta(sym, bench, window=36, min_obs=5)
     assert b is not None  # the date overlap still yields a finite beta
+
+
+def test_beta_weighted_delta_basic_sum() -> None:
+    rows = [
+        {"symbol": "SPY", "share_delta": 30.0, "spot": 600.0, "beta": 1.0},  # 18000
+        {"symbol": "AAPL", "share_delta": 100.0, "spot": 200.0, "beta": 1.5},  # 30000
+    ]
+    out = beta_weighted_delta(rows, benchmark_spot=600.0)
+    assert out["beta_weighted_dollar_delta"] == 48000.0
+    assert out["dollar_per_1pct_spy"] == 480.0
+    assert out["spy_equiv_shares"] == 80.0  # 48000 / 600
+    assert out["underlyings_total"] == 2 and out["underlyings_covered"] == 2
+    assert out["complete"] is True
+
+
+def test_beta_weighted_delta_missing_beta_dings_coverage() -> None:
+    rows = [
+        {"symbol": "SPY", "share_delta": 30.0, "spot": 600.0, "beta": 1.0},
+        {"symbol": "XYZ", "share_delta": 50.0, "spot": 20.0, "beta": None},  # no beta
+    ]
+    out = beta_weighted_delta(rows, benchmark_spot=600.0)
+    assert out["underlyings_total"] == 2 and out["underlyings_covered"] == 1
+    assert out["complete"] is False
+    assert out["beta_weighted_dollar_delta"] == 18000.0  # only covered row
+
+
+def test_beta_weighted_delta_no_benchmark_spot_drops_shares() -> None:
+    rows = [{"symbol": "SPY", "share_delta": 30.0, "spot": 600.0, "beta": 1.0}]
+    out = beta_weighted_delta(rows, benchmark_spot=None)
+    assert out["spy_equiv_shares"] is None
+    assert out["dollar_per_1pct_spy"] == 180.0
+
+
+def test_beta_weighted_delta_neutral_row_not_weightable() -> None:
+    rows = [
+        {"symbol": "SPY", "share_delta": 0.0, "spot": 600.0, "beta": 1.0},  # neutral
+        {"symbol": "AAPL", "share_delta": 100.0, "spot": 200.0, "beta": 1.5},
+    ]
+    out = beta_weighted_delta(rows, benchmark_spot=600.0)
+    assert out["underlyings_total"] == 1 and out["underlyings_covered"] == 1
+    assert out["complete"] is True
+
+
+def test_beta_weighted_delta_all_missing_zero_coverage() -> None:
+    rows = [{"symbol": "XYZ", "share_delta": 50.0, "spot": None, "beta": None}]
+    out = beta_weighted_delta(rows, benchmark_spot=600.0)
+    assert out["underlyings_total"] == 1 and out["underlyings_covered"] == 0
+    assert out["complete"] is False
+    assert out["beta_weighted_dollar_delta"] == 0.0

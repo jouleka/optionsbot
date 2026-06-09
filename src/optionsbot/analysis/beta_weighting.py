@@ -45,3 +45,38 @@ def beta(
     if var_b == 0.0 or pd.isna(var_b):
         return None
     return float(rets["s"].cov(rets["b"]) / var_b)
+
+
+def beta_weighted_delta(
+    per_underlying: list[dict[str, Any]], benchmark_spot: float | None
+) -> dict[str, Any]:
+    """Aggregate per-underlying share-deltas into one benchmark-comparable number.
+
+    ``per_underlying`` rows: ``{"symbol", "share_delta", "spot", "beta"}`` (spot/beta may
+    be None). A row is *weightable* iff its ``share_delta`` is non-zero (a delta-neutral
+    group contributes 0 regardless of beta and must not ding coverage); *covered* iff it
+    is weightable and has both beta and spot. ``S = sum(beta * share_delta * spot)`` over
+    covered rows. Pure.
+    """
+    s = 0.0
+    total = 0
+    covered = 0
+    for row in per_underlying:
+        share_delta = row.get("share_delta")
+        if not share_delta:  # None or 0.0 -> not weightable
+            continue
+        total += 1
+        b = row.get("beta")
+        spot = row.get("spot")
+        if b is None or spot is None:
+            continue
+        covered += 1
+        s += b * share_delta * spot
+    return {
+        "beta_weighted_dollar_delta": s,
+        "dollar_per_1pct_spy": s * 0.01,
+        "spy_equiv_shares": (s / benchmark_spot) if benchmark_spot else None,
+        "underlyings_total": total,
+        "underlyings_covered": covered,
+        "complete": covered == total,
+    }
