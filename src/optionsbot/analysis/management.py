@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from optionsbot.analysis.positions import position_dte
+from optionsbot.analysis.structures import identify_structure_detail
 from optionsbot.config import ManageSettings
 from optionsbot.ibkr.types import PortfolioPosition
 
@@ -98,6 +99,7 @@ class ProfitAlert:
     net_pnl: float
     profit_pct: float  # net_pnl / base_amount
     dedup_key: str
+    max_profit: float | None = None  # defined-risk debit-vertical max profit ($); None otherwise
 
 
 def evaluate_profit_triggers(
@@ -115,8 +117,12 @@ def evaluate_profit_triggers(
     if not settings.profit_alerts:
         return []
     by_symbol: dict[str, list[PortfolioPosition]] = {}
+    all_by_symbol: dict[str, list[PortfolioPosition]] = {}
     for p in positions:
-        if p.sec_type == "OPT" and p.right is not None and p.position != 0:
+        if p.position == 0:
+            continue
+        all_by_symbol.setdefault(p.symbol, []).append(p)
+        if p.sec_type == "OPT" and p.right is not None:
             by_symbol.setdefault(p.symbol, []).append(p)
     out: list[ProfitAlert] = []
     for symbol in sorted(by_symbol):
@@ -145,10 +151,17 @@ def evaluate_profit_triggers(
         elif net_pnl <= -stop:
             trigger = "stop_loss"
         if trigger is not None:
+            max_profit: float | None = None
+            if trigger == "take_profit" and basis == "debit":
+                info = identify_structure_detail(all_by_symbol[symbol])
+                if info.width is not None:  # a recognized defined-risk debit vertical
+                    mp = info.width * 100 - base  # base == debit paid ($)
+                    if mp > 0:  # guard a debit >= the spread width (bad fill / stale data)
+                        max_profit = mp
             out.append(
                 ProfitAlert(
                     symbol=symbol, trigger=trigger, basis=basis, base_amount=base,
-                    net_pnl=net_pnl, profit_pct=net_pnl / base,
+                    net_pnl=net_pnl, profit_pct=net_pnl / base, max_profit=max_profit,
                     dedup_key=f"{symbol}:profit:{trigger}",
                 )
             )

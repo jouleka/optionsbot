@@ -287,3 +287,43 @@ def test_debit_stop_boundary() -> None:
     inside = [_long_call(100.0, 250.0, -124.0)]
     assert evaluate_profit_triggers(at, s)[0].trigger == "stop_loss"
     assert evaluate_profit_triggers(inside, s) == []  # just inside -> no alert
+
+
+# --- %-of-max-profit for defined-risk debit verticals (IBK-121) ------------
+
+
+def test_debit_vertical_take_profit_sets_max_profit() -> None:
+    # bull call: long 100C avg 300 (+1) + short 110C avg 100 (-1) -> net debit 200.
+    # width 10 -> max_profit = 10*100 - 200 = 800. up 120 -> +60% on debit -> take_profit.
+    legs = [_long_call(100.0, 300.0, 120.0, position=1.0),
+            _credit_leg(110.0, "C", -1.0, 100.0, 0.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert len(out) == 1 and out[0].trigger == "take_profit" and out[0].basis == "debit"
+    assert out[0].max_profit == 800.0
+
+
+def test_long_single_take_profit_no_max_profit() -> None:
+    # a long call alone has unbounded max profit -> no %-of-max.
+    out = evaluate_profit_triggers([_long_call(100.0, 250.0, 125.0)], ManageSettings())
+    assert out[0].trigger == "take_profit" and out[0].max_profit is None
+
+
+def test_credit_take_profit_no_max_profit() -> None:
+    out = evaluate_profit_triggers([_credit_leg(95.0, "P", -1.0, 250.0, 125.0)], ManageSettings())
+    assert out[0].basis == "credit" and out[0].max_profit is None
+
+
+def test_debit_vertical_stop_no_max_profit() -> None:
+    # stop only computes %-of-max for take-profits; a debit-vertical stop leaves it None.
+    legs = [_long_call(100.0, 300.0, -200.0, position=1.0),
+            _credit_leg(110.0, "C", -1.0, 100.0, 0.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert out[0].trigger == "stop_loss" and out[0].max_profit is None
+
+
+def test_debit_vertical_max_profit_nonpositive_omitted() -> None:
+    # width 1 (100/101) but debit 150 -> max_profit = 100 - 150 = -50 <= 0 -> omitted.
+    legs = [_long_call(100.0, 200.0, 120.0, position=1.0),
+            _credit_leg(101.0, "C", -1.0, 50.0, 0.0)]  # net debit 150
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert out[0].trigger == "take_profit" and out[0].max_profit is None
