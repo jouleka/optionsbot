@@ -38,6 +38,16 @@ def test_validation_settings_default() -> None:
     assert Settings().validation.outcomes_eval_hours == 24
 
 
+def test_manage_long_leg_expiry_alerts_default_on() -> None:
+    assert Settings().manage.long_leg_expiry_alerts is True
+
+
+def test_manage_long_leg_expiry_alerts_overridable() -> None:
+    from optionsbot.config import ManageSettings
+
+    assert ManageSettings(long_leg_expiry_alerts=False).long_leg_expiry_alerts is False
+
+
 def test_portfolio_settings_defaults() -> None:
     s = Settings()
     assert s.portfolio.enabled is True

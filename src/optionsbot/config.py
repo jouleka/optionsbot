@@ -84,6 +84,9 @@ class ManageSettings(BaseModel):
     manage_dte: int = Field(default=21, ge=0)
     urgent_dte: int = Field(default=7, ge=0)
     assignment_alerts: bool = True
+    # IBK-119: also alert on LONG option legs approaching expiry (DTE buckets, ITM-aware
+    # wording). Assignment stays short-only. False = short-leg-only management (pre-IBK-119).
+    long_leg_expiry_alerts: bool = True
     cooldown_hours: int = Field(default=24, ge=0)
     # IBK-114: per-underlying take-profit / stop-loss on net-credit positions.
     profit_alerts: bool = True
