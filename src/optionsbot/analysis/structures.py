@@ -64,6 +64,24 @@ def _match_two(a: _OptLeg, b: _OptLeg) -> str | None:
     return None
 
 
+def _match_four(legs: list[_OptLeg]) -> str | None:
+    if len({lg[0] for lg in legs}) != 1:  # all same expiry
+        return None
+    puts = [lg for lg in legs if lg[2] == "P"]
+    calls = [lg for lg in legs if lg[2] == "C"]
+    if len(puts) != 2 or len(calls) != 2:
+        return None
+    sp = next((lg for lg in puts if lg[3] < 0), None)
+    lp = next((lg for lg in puts if lg[3] > 0), None)
+    sc = next((lg for lg in calls if lg[3] < 0), None)
+    lc = next((lg for lg in calls if lg[3] > 0), None)
+    if not (sp and lp and sc and lc):
+        return None
+    if not (lp[1] < sp[1] and sc[1] < lc[1] and sp[1] <= sc[1]):
+        return None
+    return "Iron Butterfly" if sp[1] == sc[1] else "Iron Condor"
+
+
 def _match_options(opts: list[PortfolioPosition], custom: str) -> str:
     qmags = {abs(int(p.position)) for p in opts}
     if len(qmags) != 1:  # uneven copies / ratio -> not a clean structure
@@ -78,6 +96,8 @@ def _match_options(opts: list[PortfolioPosition], custom: str) -> str:
         label = _match_single(reduced[0])
     elif len(reduced) == 2:
         label = _match_two(reduced[0], reduced[1])
+    elif len(reduced) == 4:
+        label = _match_four(reduced)
     else:
         label = None
     return _with_mult(label, m) if label is not None else custom

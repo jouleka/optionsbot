@@ -127,3 +127,58 @@ def test_diff_expiry_same_sign_is_custom() -> None:
     legs = [_opt(100.0, "C", 1.0, expiry="20260717"),
             _opt(100.0, "C", 1.0, expiry="20260821")]
     assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_iron_condor() -> None:
+    legs = [
+        _opt(85.0, "P", 1.0),    # long put (lower wing)
+        _opt(90.0, "P", -1.0),   # short put
+        _opt(110.0, "C", -1.0),  # short call
+        _opt(115.0, "C", 1.0),   # long call (upper wing)
+    ]
+    assert identify_structure(legs) == "Iron Condor"
+
+
+def test_iron_butterfly() -> None:
+    legs = [
+        _opt(90.0, "P", 1.0),
+        _opt(100.0, "P", -1.0),  # short put at 100
+        _opt(100.0, "C", -1.0),  # short call at 100 (same strike -> butterfly)
+        _opt(110.0, "C", 1.0),
+    ]
+    assert identify_structure(legs) == "Iron Butterfly"
+
+
+def test_iron_condor_multiple() -> None:
+    legs = [
+        _opt(85.0, "P", 2.0), _opt(90.0, "P", -2.0),
+        _opt(110.0, "C", -2.0), _opt(115.0, "C", 2.0),
+    ]
+    assert identify_structure(legs) == "Iron Condor ×2"
+
+
+def test_reverse_iron_condor_is_custom() -> None:
+    # long the body / short the wings -> sign pattern fails -> custom.
+    legs = [
+        _opt(85.0, "P", -1.0), _opt(90.0, "P", 1.0),
+        _opt(110.0, "C", 1.0), _opt(115.0, "C", -1.0),
+    ]
+    assert identify_structure(legs) == "custom (4 legs)"
+
+
+def test_four_legs_three_puts_is_custom() -> None:
+    legs = [
+        _opt(85.0, "P", 1.0), _opt(90.0, "P", -1.0),
+        _opt(95.0, "P", 1.0), _opt(110.0, "C", -1.0),
+    ]
+    assert identify_structure(legs) == "custom (4 legs)"
+
+
+def test_iron_condor_mixed_expiry_is_custom() -> None:
+    legs = [
+        _opt(85.0, "P", 1.0, expiry="20260717"),
+        _opt(90.0, "P", -1.0, expiry="20260717"),
+        _opt(110.0, "C", -1.0, expiry="20260821"),
+        _opt(115.0, "C", 1.0, expiry="20260821"),
+    ]
+    assert identify_structure(legs) == "custom (4 legs)"
