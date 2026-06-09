@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from optionsbot.analysis.positions import (
     assemble_open_book,
     build_positions_view,
+    portfolio_greeks,
     position_dte,
 )
 from optionsbot.ibkr.types import OptionQuote, PortfolioPosition
@@ -88,3 +89,71 @@ async def test_assemble_open_book_tolerates_greeks_failure() -> None:
     leg90 = next(lg for lg in spy["legs"] if lg["strike"] == 90.0)
     assert leg95["delta"] == -0.28
     assert leg90["delta"] is None and leg90["unrealized_pnl"] == -15.0
+
+
+# --- portfolio_greeks (IBK-115) --------------------------------------------
+
+
+def _oq(
+    delta: float | None = None, gamma: float | None = None,
+    theta: float | None = None, vega: float | None = None,
+    strike: float = 95.0, right: str = "P",
+) -> OptionQuote:
+    return OptionQuote(
+        symbol="SPY", expiry="20260717", strike=strike, right=right, bid=1.0, ask=1.2,
+        last=1.1, mid=1.1, iv=0.22, delta=delta, gamma=gamma, theta=theta, vega=vega,
+        open_interest=10, volume=5, ts=_TODAY, delayed=True,
+    )
+
+
+def test_portfolio_greeks_sign_conventions() -> None:
+    # short put: delta -0.30, pos -1 -> +30 delta; +theta, -vega, -gamma.
+    sp = _pp("SPY", strike=95.0, right="P", position=-1.0)
+    greeks = {
+        ("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30, gamma=0.01, theta=-0.05, vega=0.10),
+    }
+    g = portfolio_greeks([sp], greeks)
+    assert g["net_delta"] == 30.0          # -0.30 * -1 * 100
+    assert g["net_theta"] == 5.0           # -0.05 * -1 * 100 -> collect theta
+    assert g["net_vega"] == -10.0          # 0.10 * -1 * 100 -> short vega
+    assert round(g["net_gamma"], 4) == -1.0
+    assert g["option_legs_total"] == 1 and g["option_legs_with_greeks"] == 1
+    assert g["complete"] is True
+
+
+def test_portfolio_greeks_short_call_negative_delta() -> None:
+    sc = _pp("SPY", strike=105.0, right="C", position=-1.0)
+    greeks = {("SPY", "20260717", 105.0, "C"): _oq(delta=0.30, strike=105.0, right="C")}
+    assert portfolio_greeks([sc], greeks)["net_delta"] == -30.0
+
+
+def test_portfolio_greeks_includes_stock_delta_and_multiplier() -> None:
+    stock = _pp("SPY", sec_type="STK", position=100.0)            # +100 delta (1/share)
+    longput2 = _pp("SPY", strike=95.0, right="P", position=2.0)   # long 2 -> x2 scaling
+    greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
+    g = portfolio_greeks([stock, longput2], greeks)
+    assert g["net_delta"] == 100.0 + (-0.30 * 2 * 100)           # 100 - 60 = 40
+    assert g["option_legs_total"] == 1 and g["option_legs_with_greeks"] == 1
+
+
+def test_portfolio_greeks_partial_coverage() -> None:
+    a = _pp("SPY", strike=95.0, right="P", position=-1.0)
+    b = _pp("SPY", strike=90.0, right="P", position=1.0)         # no greeks entry
+    greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
+    g = portfolio_greeks([a, b], greeks)
+    assert g["option_legs_total"] == 2 and g["option_legs_with_greeks"] == 1
+    assert g["complete"] is False
+    assert g["net_delta"] == 30.0                                # only the covered leg
+
+
+def test_portfolio_greeks_empty() -> None:
+    g = portfolio_greeks([], {})
+    assert g["net_delta"] == 0.0 and g["complete"] is True
+    assert g["option_legs_total"] == 0 and g["option_legs_with_greeks"] == 0
+
+
+def test_build_positions_view_includes_portfolio_greeks() -> None:
+    sp = _pp("SPY", strike=95.0, right="P", position=-1.0)
+    greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
+    view = build_positions_view([sp], greeks, _TODAY)
+    assert "portfolio_greeks" in view and view["portfolio_greeks"]["net_delta"] == 30.0

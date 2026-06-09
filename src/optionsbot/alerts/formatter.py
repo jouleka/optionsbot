@@ -139,6 +139,18 @@ def _money(x: float | None) -> str:
     return f"${x:+,.0f}"
 
 
+def _greeks_footer(g: dict[str, Any]) -> str:
+    cov = (
+        ""
+        if g.get("complete", True)
+        else f"  ({g['option_legs_with_greeks']}/{g['option_legs_total']} legs)"
+    )
+    return (
+        f"book greeks: Δ {round(g['net_delta']):+}  Θ {_money(g['net_theta'])}/day  "
+        f"vega {_money(g['net_vega'])}  Γ {g['net_gamma']:+.1f}{cov}"
+    )
+
+
 def _short_expiry(expiry: str | None) -> str:
     """20260717 -> 17Jul; pass through anything not an 8-char YYYYMMDD."""
     if not expiry or len(expiry) != 8:
@@ -180,6 +192,9 @@ def format_positions_text(view: dict[str, Any]) -> str:
     for g in groups:
         lines.append(f"{g['underlying']}  net {_money(g['net_unrealized_pnl'])}")
         lines += ["  " + _position_leg_line(lg) for lg in g["legs"]]
+    pg = view.get("portfolio_greeks")
+    if pg is not None:
+        lines.append(_greeks_footer(pg))
     return "\n".join(lines)
 
 

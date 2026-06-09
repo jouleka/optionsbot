@@ -44,4 +44,30 @@ def test_format_positions_text_option_leg_missing_greeks() -> None:
     }
     out = format_positions_text(view)
     assert "mid ?" in out and "DTE ?" in out and "P&L $?" in out
-    assert "Δ" not in out  # no delta rendered when missing
+    assert "Δ" not in out  # no delta rendered when missing (this leg has no Greeks footer)
+
+
+def _view_with_greeks(complete: bool = True) -> dict[str, Any]:
+    return {
+        "net_unrealized_pnl": 30.0, "group_count": 1, "position_count": 1,
+        "groups": [{"underlying": "SPY", "net_unrealized_pnl": 30.0, "legs": [
+            {"sec_type": "OPT", "quantity": -1.0, "expiry": "20260717", "strike": 95.0,
+             "right": "P", "market_price": 1.1, "unrealized_pnl": 30.0, "dte": 39, "delta": -0.3},
+        ]}],
+        "portfolio_greeks": {
+            "net_delta": -250.0, "net_gamma": -3.2, "net_theta": 45.0, "net_vega": -120.0,
+            "option_legs_total": 5, "option_legs_with_greeks": 5 if complete else 4,
+            "complete": complete,
+        },
+    }
+
+
+def test_format_positions_text_has_greeks_footer() -> None:
+    out = format_positions_text(_view_with_greeks())
+    assert "book greeks" in out and "-250" in out and "/day" in out
+    assert "legs)" not in out  # complete -> no coverage note
+
+
+def test_format_positions_text_greeks_partial_note() -> None:
+    out = format_positions_text(_view_with_greeks(complete=False))
+    assert "(4/5 legs)" in out

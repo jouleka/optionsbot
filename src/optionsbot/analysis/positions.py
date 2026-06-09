@@ -65,6 +65,49 @@ def _leg_dict(
     return leg
 
 
+def portfolio_greeks(
+    positions: list[PortfolioPosition], greeks: dict[GreeksKey, OptionQuote]
+) -> dict[str, Any]:
+    """Book-wide net Greeks by position-weighting (``greek * position * multiplier``).
+
+    Delta includes stock legs (1 delta/share); gamma/theta/vega are option-only. An option
+    leg whose Greeks didn't fetch (absent, or ``delta is None``) is excluded from the sums
+    and counted as missing. ``net_delta``/``net_gamma`` are share-equivalents (meaningful per
+    underlying; unit-mixed across different underlyings -- see spec); ``net_theta`` is $/day
+    and ``net_vega`` $/vol-point, which sum cleanly book-wide. Pure."""
+    net_delta = net_gamma = net_theta = net_vega = 0.0
+    option_total = 0
+    option_with = 0
+    for p in positions:
+        if p.sec_type == "OPT":
+            if p.expiry is None or p.strike is None or p.right is None:
+                continue
+            option_total += 1
+            q = greeks.get((p.symbol, p.expiry, p.strike, p.right))
+            if q is None or q.delta is None:
+                continue
+            option_with += 1
+            scale = p.position * p.multiplier
+            net_delta += q.delta * scale
+            if q.gamma is not None:
+                net_gamma += q.gamma * scale
+            if q.theta is not None:
+                net_theta += q.theta * scale
+            if q.vega is not None:
+                net_vega += q.vega * scale
+        elif p.sec_type == "STK":
+            net_delta += p.position  # 1 delta per share
+    return {
+        "net_delta": net_delta,
+        "net_gamma": net_gamma,
+        "net_theta": net_theta,
+        "net_vega": net_vega,
+        "option_legs_total": option_total,
+        "option_legs_with_greeks": option_with,
+        "complete": option_with == option_total,
+    }
+
+
 def build_positions_view(
     positions: list[PortfolioPosition],
     greeks: dict[GreeksKey, OptionQuote],
@@ -94,6 +137,7 @@ def build_positions_view(
         "group_count": len(groups),
         "position_count": len(positions),
         "groups": groups,
+        "portfolio_greeks": portfolio_greeks(positions, greeks),
     }
 
 
