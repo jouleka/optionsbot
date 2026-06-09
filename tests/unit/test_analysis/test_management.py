@@ -121,7 +121,8 @@ def test_csp_take_profit_pins_avg_cost_scale() -> None:
     out = evaluate_profit_triggers([_credit_leg(95.0, "P", -1.0, 250.0, 125.0)], ManageSettings())
     assert len(out) == 1
     a = out[0]
-    assert a.trigger == "take_profit" and a.net_credit == 250.0 and a.net_pnl == 125.0
+    assert a.trigger == "take_profit" and a.basis == "credit" and a.base_amount == 250.0
+    assert a.net_pnl == 125.0
     assert round(a.profit_pct, 3) == 0.5 and a.dedup_key == "SPY:profit:take_profit"
 
 
@@ -130,7 +131,7 @@ def test_credit_spread_aggregates_legs() -> None:
     legs = [_credit_leg(95.0, "P", -1.0, 250.0, 60.0), _credit_leg(90.0, "P", 1.0, 170.0, -20.0)]
     out = evaluate_profit_triggers(legs, ManageSettings())
     assert len(out) == 1 and out[0].trigger == "take_profit"
-    assert out[0].net_credit == 80.0 and out[0].net_pnl == 40.0
+    assert out[0].basis == "credit" and out[0].base_amount == 80.0 and out[0].net_pnl == 40.0
 
 
 def test_stop_loss_fires_at_multiple() -> None:
@@ -142,12 +143,6 @@ def test_stop_loss_fires_at_multiple() -> None:
 def test_no_alert_between_thresholds() -> None:
     # +16% (below 50%), and loss not near -200% -> nothing.
     legs = [_credit_leg(95.0, "P", -1.0, 250.0, 40.0)]
-    assert evaluate_profit_triggers(legs, ManageSettings()) == []
-
-
-def test_net_debit_group_skipped() -> None:
-    # Long-only (net_credit -250 <= 0) -> skipped even if hugely profitable.
-    legs = [_credit_leg(95.0, "P", 1.0, 250.0, 500.0)]
     assert evaluate_profit_triggers(legs, ManageSettings()) == []
 
 
@@ -178,7 +173,7 @@ def test_default_min_credit_suppresses_near_zero() -> None:
 def test_multi_contract_scales_net_credit() -> None:
     # avg_cost is per-contract; |position| 2 -> net_credit 500. Up $250 -> 50% -> take_profit.
     out = evaluate_profit_triggers([_credit_leg(95.0, "P", -2.0, 250.0, 250.0)], ManageSettings())
-    assert out[0].net_credit == 500.0 and out[0].trigger == "take_profit"
+    assert out[0].base_amount == 500.0 and out[0].trigger == "take_profit"
 
 
 def test_stop_loss_boundary() -> None:
@@ -187,3 +182,50 @@ def test_stop_loss_boundary() -> None:
     inside = [_credit_leg(95.0, "P", -1.0, 250.0, -499.0)]
     assert evaluate_profit_triggers(at, s)[0].trigger == "stop_loss"
     assert evaluate_profit_triggers(inside, s) == []  # just inside the threshold -> no alert
+
+
+# --- debit branch (IBK-116) ------------------------------------------------
+
+
+def _long_call(
+    strike: float, avg_cost: float, upnl: float, position: float = 1.0,
+) -> PortfolioPosition:
+    return PortfolioPosition(
+        account="DU1", symbol="SPY", sec_type="OPT", expiry="20260717", strike=strike,
+        right="C", multiplier=100, position=position, avg_cost=avg_cost,
+        market_price=1.0, market_value=100.0, unrealized_pnl=upnl, realized_pnl=0.0,
+    )
+
+
+def test_long_call_debit_take_profit_pins_scale() -> None:
+    # $2.50 debit -> avg_cost 250, long 1 -> net -250 -> debit base 250. Up $125 -> +50%.
+    out = evaluate_profit_triggers([_long_call(100.0, 250.0, 125.0)], ManageSettings())
+    assert len(out) == 1
+    a = out[0]
+    assert a.trigger == "take_profit" and a.basis == "debit" and a.base_amount == 250.0
+    assert round(a.profit_pct, 3) == 0.5 and a.dedup_key == "SPY:profit:take_profit"
+
+
+def test_long_call_debit_stop() -> None:
+    out = evaluate_profit_triggers([_long_call(100.0, 250.0, -125.0)], ManageSettings())
+    assert [a.trigger for a in out] == ["stop_loss"] and out[0].basis == "debit"
+
+
+def test_debit_spread_aggregates_to_net_debit() -> None:
+    # long 100C (avg 300, +1) + short 110C (avg 100, -1) -> net -300 + 100 = -200 debit.
+    legs = [_long_call(100.0, 300.0, 60.0, position=1.0),
+            _credit_leg(110.0, "C", -1.0, 100.0, 40.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert len(out) == 1 and out[0].basis == "debit" and out[0].base_amount == 200.0
+    assert out[0].trigger == "take_profit"  # net_pnl 100 >= 0.5 * 200
+
+
+def test_min_debit_floor_skips_small() -> None:
+    out = evaluate_profit_triggers([_long_call(100.0, 10.0, 8.0)], ManageSettings(min_debit=20.0))
+    assert out == []
+
+
+def test_balanced_zero_net_skipped() -> None:
+    # short 100P (avg 100, -1) + long 100C (avg 100, +1) -> net 0 -> skipped.
+    legs = [_credit_leg(95.0, "P", -1.0, 100.0, 50.0), _long_call(95.0, 100.0, 50.0)]
+    assert evaluate_profit_triggers(legs, ManageSettings()) == []

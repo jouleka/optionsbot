@@ -89,21 +89,25 @@ def evaluate_position_triggers(
 class ProfitAlert:
     symbol: str
     trigger: str  # 'take_profit' | 'stop_loss'
-    net_credit: float
+    basis: str  # 'credit' | 'debit'
+    base_amount: float  # net credit received / net debit paid (positive $)
     net_pnl: float
-    profit_pct: float  # net_pnl / net_credit
+    profit_pct: float  # net_pnl / base_amount
     dedup_key: str
 
 
 def evaluate_profit_triggers(
     positions: list[PortfolioPosition], settings: ManageSettings
 ) -> list[ProfitAlert]:
-    """Per-underlying take-profit / stop-loss for NET-CREDIT option positions. Pure.
+    """Per-underlying take-profit / stop-loss. Pure.
 
-    ``net_credit = sum(avg_cost * |position| * (+1 short / -1 long))`` over the underlying's
-    option legs (stock legs excluded); ``net_pnl = sum(unrealized_pnl)``. Net-debit / near-zero
-    aggregates are skipped (a debit's '% of max profit' is undefined). Returns ``[]`` when
-    ``profit_alerts`` is disabled."""
+    ``net_signed = sum(avg_cost * |position| * (+1 short / -1 long))`` over the underlying's
+    option legs (stock excluded): > 0 is a net credit (base = credit; take/stop scale off
+    ``take_profit_pct`` / ``stop_loss_mult``), < 0 is a net debit (base = debit paid; scale off
+    ``debit_take_profit_pct`` / ``debit_stop_pct``). ``net_pnl = sum(unrealized_pnl)``; realized
+    P&L from a partial close is excluded, so profit_pct is remaining-position-relative. Groups
+    below the relevant floor (``min_credit`` / ``min_debit``) and exactly-balanced (net 0)
+    groups are skipped. Returns ``[]`` when ``profit_alerts`` is disabled."""
     if not settings.profit_alerts:
         return []
     by_symbol: dict[str, list[PortfolioPosition]] = {}
@@ -113,24 +117,35 @@ def evaluate_profit_triggers(
     out: list[ProfitAlert] = []
     for symbol in sorted(by_symbol):
         legs = by_symbol[symbol]
-        net_credit = sum(
+        net_signed = sum(
             p.avg_cost * abs(p.position) * (1.0 if p.position < 0 else -1.0) for p in legs
         )
-        if net_credit <= 0.0 or net_credit < settings.min_credit:
+        if net_signed > 0.0:
+            basis, base = "credit", net_signed
+            take, stop = settings.take_profit_pct * base, settings.stop_loss_mult * base
+            floor = settings.min_credit
+        elif net_signed < 0.0:
+            basis, base = "debit", -net_signed
+            take, stop = settings.debit_take_profit_pct * base, settings.debit_stop_pct * base
+            floor = settings.min_debit
+        else:
             continue
-        # Unrealized only: realized P&L from any partial close is excluded from BOTH sums,
-        # so profit_pct is "% captured on what's still open" (remaining-position-relative).
+        if base < floor:
+            continue
+        # Unrealized only: realized P&L from any partial close is excluded, so profit_pct is
+        # "% captured on what's still open" (remaining-position-relative).
         net_pnl = sum(p.unrealized_pnl or 0.0 for p in legs)
         trigger: str | None = None
-        if net_pnl >= settings.take_profit_pct * net_credit:
+        if net_pnl >= take:
             trigger = "take_profit"
-        elif net_pnl <= -settings.stop_loss_mult * net_credit:
+        elif net_pnl <= -stop:
             trigger = "stop_loss"
         if trigger is not None:
             out.append(
                 ProfitAlert(
-                    symbol=symbol, trigger=trigger, net_credit=net_credit, net_pnl=net_pnl,
-                    profit_pct=net_pnl / net_credit, dedup_key=f"{symbol}:profit:{trigger}",
+                    symbol=symbol, trigger=trigger, basis=basis, base_amount=base,
+                    net_pnl=net_pnl, profit_pct=net_pnl / base,
+                    dedup_key=f"{symbol}:profit:{trigger}",
                 )
             )
     return out

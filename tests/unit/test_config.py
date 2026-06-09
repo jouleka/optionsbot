@@ -30,6 +30,8 @@ def test_manage_settings_defaults() -> None:
     assert s.manage.profit_alerts is True
     assert s.manage.take_profit_pct == 0.5 and s.manage.stop_loss_mult == 2.0
     assert s.manage.min_credit == 20.0
+    assert s.manage.debit_take_profit_pct == 0.5 and s.manage.debit_stop_pct == 0.5
+    assert s.manage.min_debit == 20.0
 
 
 def test_ibkr_paper_defaults_to_true() -> None:

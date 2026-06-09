@@ -92,6 +92,10 @@ class ManageSettings(BaseModel):
     # Skip groups below this net credit ($). Non-zero by default so a near-zero balanced /
     # rolled book (net credit ~ a few cents) can't produce nonsense "50000% of $0" alerts.
     min_credit: float = Field(default=20.0, ge=0.0)
+    # IBK-116: net-DEBIT positions (long calls/puts, debit spreads) -- % return on debit paid.
+    debit_take_profit_pct: float = Field(default=0.5, gt=0.0)  # +X% on the debit paid
+    debit_stop_pct: float = Field(default=0.5, gt=0.0)  # -X% of the debit paid
+    min_debit: float = Field(default=20.0, ge=0.0)  # skip groups below this net debit ($)
 
 
 class StorageSettings(BaseModel):

@@ -216,10 +216,14 @@ def format_management_alert(alert: ManagementAlert) -> str:
 
 def format_profit_alert(alert: ProfitAlert) -> str:
     """Plain-text take-profit / stop-loss alert for Telegram (parse_mode=None)."""
-    credit = f"${alert.net_credit:,.0f}"
+    amt = f"${alert.base_amount:,.0f}"
     pnl = _money(alert.net_pnl)
+    pct = round(alert.profit_pct * 100)
+    if alert.basis == "credit":
+        if alert.trigger == "take_profit":
+            return f"✅ take profit {alert.symbol} — captured {pct}% of {amt} credit (P&L {pnl})"
+        mult = abs(alert.net_pnl / alert.base_amount)
+        return f"🛑 stop loss {alert.symbol} — {pnl}, {mult:.1f}x the {amt} credit"
     if alert.trigger == "take_profit":
-        pct = round(alert.profit_pct * 100)
-        return f"✅ take profit {alert.symbol} — captured {pct}% of {credit} credit (P&L {pnl})"
-    mult = abs(alert.net_pnl / alert.net_credit)
-    return f"🛑 stop loss {alert.symbol} — {pnl}, {mult:.1f}x the {credit} credit"
+        return f"✅ take profit {alert.symbol} — {pct:+}% on {amt} debit (P&L {pnl})"
+    return f"🛑 stop loss {alert.symbol} — {pct:+}% of the {amt} debit (P&L {pnl})"
