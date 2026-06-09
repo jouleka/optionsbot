@@ -12,9 +12,13 @@ import logging
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
+from optionsbot.analysis.beta_weighting import beta, beta_weighted_delta
 from optionsbot.ibkr.types import OptionQuote, PortfolioPosition
 
 if TYPE_CHECKING:
+    import pandas as pd
+
+    from optionsbot.ibkr.history import HistoryClient
     from optionsbot.ibkr.market_data import MarketDataClient
     from optionsbot.ibkr.positions import PositionsClient
 
@@ -167,16 +171,80 @@ def build_positions_view(
     }
 
 
+async def _safe_spot(market_data_client: MarketDataClient, symbol: str) -> float | None:
+    try:
+        q = await market_data_client.get_stock_snapshot(symbol)
+    except Exception:  # noqa: BLE001 -- best-effort; underlying excluded from weighting
+        log.exception("beta-weight: spot fetch failed for %s", symbol)
+        return None
+    return q.last if q.last is not None else q.mid
+
+
+async def _safe_beta(
+    history_client: HistoryClient, symbol: str, benchmark_bars: pd.DataFrame, window: int
+) -> float | None:
+    try:
+        bars = await history_client.get_history(symbol, days=window + 1)
+    except Exception:  # noqa: BLE001 -- best-effort
+        log.exception("beta-weight: history fetch failed for %s", symbol)
+        return None
+    return beta(bars, benchmark_bars, window)
+
+
+async def _beta_weight_book(
+    positions: list[PortfolioPosition],
+    greeks: dict[GreeksKey, OptionQuote],
+    market_data_client: MarketDataClient,
+    history_client: HistoryClient,
+    benchmark_symbol: str,
+    beta_window: int,
+) -> dict[str, Any] | None:
+    """Best-effort beta-weighted book delta. None if benchmark history can't be fetched
+    (nothing can be weighted then). Per-underlying spot/history failures exclude that
+    underlying and ding coverage -- never crash, never fake beta. ``symbol == benchmark``
+    short-circuits to beta=1.0 (no extra fetch)."""
+    try:
+        benchmark_bars = await history_client.get_history(
+            benchmark_symbol, days=beta_window + 1
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("beta-weight: benchmark history fetch failed for %s", benchmark_symbol)
+        return None
+    benchmark_spot = await _safe_spot(market_data_client, benchmark_symbol)
+    rows: list[dict[str, Any]] = []
+    for symbol, share_delta in per_underlying_share_delta(positions, greeks).items():
+        if not share_delta:  # delta-neutral / unknown -> not weightable; skip the I/O
+            continue
+        if symbol == benchmark_symbol:
+            b: float | None = 1.0
+            spot = benchmark_spot
+        else:
+            b = await _safe_beta(history_client, symbol, benchmark_bars, beta_window)
+            spot = await _safe_spot(market_data_client, symbol)
+        rows.append({"symbol": symbol, "share_delta": share_delta, "spot": spot, "beta": b})
+    result = beta_weighted_delta(rows, benchmark_spot)
+    result["benchmark"] = benchmark_symbol
+    return result
+
+
 async def assemble_open_book(
     positions_client: PositionsClient,
     market_data_client: MarketDataClient,
     as_of: datetime,
+    *,
+    history_client: HistoryClient | None = None,
+    benchmark_symbol: str = "SPY",
+    beta_window: int = 252,
 ) -> dict[str, Any]:
     """Fetch the enriched portfolio + best-effort per-option Greeks, build the view.
 
     A Greeks-fetch failure for one leg is swallowed (that leg shows P&L, no Greeks);
     the portfolio fetch itself is allowed to propagate (callers map it to a structured
-    'IBKR unavailable' response)."""
+    'IBKR unavailable' response).
+
+    When ``history_client`` is provided, a best-effort beta-weighted delta (IBK-118) is
+    attached as ``view["beta_weighted"]`` (None if the benchmark history can't be fetched).
+    Omitting it leaves the view unchanged -- the pre-IBK-118 behavior."""
     positions = await positions_client.get_portfolio()
     greeks: dict[GreeksKey, OptionQuote] = {}
     for p in positions:
@@ -192,4 +260,9 @@ async def assemble_open_book(
             )
             continue
         greeks[(p.symbol, p.expiry, p.strike, p.right)] = q
-    return build_positions_view(positions, greeks, as_of)
+    view = build_positions_view(positions, greeks, as_of)
+    if history_client is not None:
+        view["beta_weighted"] = await _beta_weight_book(
+            positions, greeks, market_data_client, history_client, benchmark_symbol, beta_window
+        )
+    return view

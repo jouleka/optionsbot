@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
+import pandas as pd
+
 from optionsbot.analysis.positions import (
     assemble_open_book,
     build_positions_view,
@@ -12,7 +14,7 @@ from optionsbot.analysis.positions import (
     portfolio_greeks,
     position_dte,
 )
-from optionsbot.ibkr.types import OptionQuote, PortfolioPosition
+from optionsbot.ibkr.types import OptionQuote, PortfolioPosition, StockQuote
 
 _TODAY = datetime(2026, 6, 8, tzinfo=UTC)
 
@@ -202,3 +204,112 @@ def test_per_underlying_share_delta_excludes_missing_greeks() -> None:
     greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
     out = per_underlying_share_delta([a, b], greeks)
     assert out["SPY"] == 30.0  # only the leg with greeks contributes
+
+
+# --- assemble_open_book beta-weighting enrichment (IBK-118) ----------------
+
+_BENCH_RETS_OB = [0.01, -0.012, 0.008, -0.005, 0.015, -0.009] * 10  # 60 returns
+
+
+def _closes_ob(returns: list[float], start: float = 100.0) -> pd.DataFrame:
+    closes = [start]
+    for r in returns:
+        closes.append(closes[-1] * (1.0 + r))
+    return pd.DataFrame({"close": closes})
+
+
+def _sq(last: float) -> StockQuote:
+    return StockQuote(
+        symbol="X", bid=last, ask=last, last=last, mid=last, ts=_TODAY, delayed=True
+    )
+
+
+async def test_assemble_open_book_no_history_client_has_no_beta() -> None:  # regression
+    pos_client = AsyncMock()
+    pos_client.get_portfolio.return_value = [_pp("SPY", strike=95.0, position=-1.0)]
+    md_client = AsyncMock()
+    md_client.get_option_snapshot.return_value = _q(strike=95.0, delta=-0.28)
+    view = await assemble_open_book(pos_client, md_client, _TODAY)
+    assert "beta_weighted" not in view
+
+
+async def test_assemble_open_book_beta_weights_when_history_provided() -> None:
+    spy_put = _pp("SPY", strike=95.0, right="P", position=-1.0)  # +30 share-delta
+    aapl_stock = _pp("AAPL", sec_type="STK", position=100.0)  # +100 share-delta
+    pos_client = AsyncMock()
+    pos_client.get_portfolio.return_value = [spy_put, aapl_stock]
+    md_client = AsyncMock()
+    md_client.get_option_snapshot.return_value = _oq(delta=-0.30)  # SPY 30 share-delta
+    md_client.get_stock_snapshot.side_effect = lambda symbol: _sq(
+        {"SPY": 600.0, "AAPL": 200.0}[symbol]
+    )
+    spy_bars = _closes_ob(_BENCH_RETS_OB)
+    aapl_bars = _closes_ob([1.5 * r for r in _BENCH_RETS_OB])  # beta 1.5 vs SPY
+    history_client = AsyncMock()
+    history_client.get_history.side_effect = lambda symbol, days=0: {
+        "SPY": spy_bars,
+        "AAPL": aapl_bars,
+    }[symbol]
+    view = await assemble_open_book(
+        pos_client,
+        md_client,
+        _TODAY,
+        history_client=history_client,
+        benchmark_symbol="SPY",
+        beta_window=60,
+    )
+    bw = view["beta_weighted"]
+    # S = 1.0*30*600 + 1.5*100*200 = 18000 + 30000 = 48000
+    assert round(bw["beta_weighted_dollar_delta"]) == 48000
+    assert round(bw["spy_equiv_shares"]) == 80  # 48000 / 600
+    assert bw["underlyings_covered"] == 2 and bw["complete"] is True
+    assert bw["benchmark"] == "SPY"
+
+
+async def test_assemble_open_book_benchmark_history_failure_yields_none() -> None:
+    pos_client = AsyncMock()
+    pos_client.get_portfolio.return_value = [_pp("SPY", strike=95.0, position=-1.0)]
+    md_client = AsyncMock()
+    md_client.get_option_snapshot.return_value = _oq(delta=-0.30)
+    history_client = AsyncMock()
+    history_client.get_history.side_effect = RuntimeError("no data")
+    view = await assemble_open_book(
+        pos_client,
+        md_client,
+        _TODAY,
+        history_client=history_client,
+        benchmark_symbol="SPY",
+        beta_window=60,
+    )
+    assert view["beta_weighted"] is None
+
+
+async def test_assemble_open_book_per_underlying_failure_dings_coverage() -> None:
+    spy_put = _pp("SPY", strike=95.0, right="P", position=-1.0)  # benchmark, beta=1
+    aapl_stock = _pp("AAPL", sec_type="STK", position=100.0)
+    pos_client = AsyncMock()
+    pos_client.get_portfolio.return_value = [spy_put, aapl_stock]
+    md_client = AsyncMock()
+    md_client.get_option_snapshot.return_value = _oq(delta=-0.30)
+    md_client.get_stock_snapshot.side_effect = lambda symbol: _sq(600.0)
+    spy_bars = _closes_ob(_BENCH_RETS_OB)
+
+    def _hist(symbol: str, days: int = 0) -> pd.DataFrame:
+        if symbol == "AAPL":
+            raise RuntimeError("no AAPL history")
+        return spy_bars
+
+    history_client = AsyncMock()
+    history_client.get_history.side_effect = _hist
+    view = await assemble_open_book(
+        pos_client,
+        md_client,
+        _TODAY,
+        history_client=history_client,
+        benchmark_symbol="SPY",
+        beta_window=60,
+    )
+    bw = view["beta_weighted"]
+    # SPY covered (beta=1 short-circuit); AAPL history failed -> excluded.
+    assert bw["underlyings_total"] == 2 and bw["underlyings_covered"] == 1
+    assert bw["complete"] is False
