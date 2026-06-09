@@ -25,6 +25,16 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (bid + ask) / 2
 
 
+def _greek(greeks: object, name: str) -> float | None:
+    """A model-Greek value with IBKR's -2.0 'not computed' sentinel mapped to None.
+
+    ib_async nulls delta/gamma on the -2 sentinel but leaks the literal -2.0 for theta/
+    vega, and clean_float keeps it (it's finite). Summing that into portfolio Greeks
+    (IBK-115) would corrupt net theta/vega, so guard every model Greek here at the source."""
+    v = clean_float(getattr(greeks, name, None))
+    return None if v == -2.0 else v
+
+
 def _ticker_ts(ticker: Ticker) -> datetime:
     ts = getattr(ticker, "time", None)
     if isinstance(ts, datetime):
@@ -75,11 +85,11 @@ class MarketDataClient:
         ask = clean_float(getattr(ticker, "ask", None))
         last = clean_float(getattr(ticker, "last", None))
         greeks = getattr(ticker, "modelGreeks", None)
-        iv = clean_float(getattr(greeks, "impliedVol", None)) if greeks is not None else None
-        delta = clean_float(getattr(greeks, "delta", None)) if greeks is not None else None
-        gamma = clean_float(getattr(greeks, "gamma", None)) if greeks is not None else None
-        theta = clean_float(getattr(greeks, "theta", None)) if greeks is not None else None
-        vega = clean_float(getattr(greeks, "vega", None)) if greeks is not None else None
+        iv = _greek(greeks, "impliedVol") if greeks is not None else None
+        delta = _greek(greeks, "delta") if greeks is not None else None
+        gamma = _greek(greeks, "gamma") if greeks is not None else None
+        theta = _greek(greeks, "theta") if greeks is not None else None
+        vega = _greek(greeks, "vega") if greeks is not None else None
         open_interest = clean_int(getattr(ticker, "openInterest", None))
         volume = clean_int(getattr(ticker, "volume", None))
         return OptionQuote(

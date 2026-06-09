@@ -157,3 +157,23 @@ def test_build_positions_view_includes_portfolio_greeks() -> None:
     greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
     view = build_positions_view([sp], greeks, _TODAY)
     assert "portfolio_greeks" in view and view["portfolio_greeks"]["net_delta"] == 30.0
+
+
+def test_portfolio_greeks_delta_present_theta_none() -> None:
+    # A leg with delta but no theta/vega counts as covered for delta, but contributes
+    # nothing to net_theta/net_vega (IBK-115 review S1/S2).
+    sp = _pp("SPY", strike=95.0, right="P", position=-1.0)
+    greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30, theta=None, vega=None)}
+    g = portfolio_greeks([sp], greeks)
+    assert g["net_delta"] == 30.0 and g["net_theta"] == 0.0 and g["net_vega"] == 0.0
+    assert g["option_legs_with_greeks"] == 1 and g["complete"] is True
+
+
+def test_portfolio_greeks_cross_underlying_delta_is_unit_mixed() -> None:
+    # DOCUMENTED LIMITATION: delta sums across underlyings in raw share-equiv, so long 100
+    # SPY shares + a short AAPL call (delta 1.0, pos -1 -> -100) net to 0 even though the
+    # book is not actually market-neutral. Pins the known caveat (IBK-115 review S3).
+    spy = _pp("SPY", sec_type="STK", position=100.0)
+    aapl = _pp("AAPL", strike=150.0, right="C", position=-1.0)
+    greeks = {("AAPL", "20260717", 150.0, "C"): _oq(delta=1.0, strike=150.0, right="C")}
+    assert portfolio_greeks([spy, aapl], greeks)["net_delta"] == 0.0

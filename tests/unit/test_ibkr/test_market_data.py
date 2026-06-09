@@ -100,6 +100,23 @@ async def test_get_snapshot_handles_missing_fields(
     assert quote.mid is None
 
 
+async def test_get_snapshot_maps_unset_greek_sentinel_to_none(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    # IBKR sends -2 for a greek it couldn't compute; ib_async leaks the literal -2.0 for
+    # theta/vega. The adapter must map it to None so portfolio Greeks (IBK-115) aren't
+    # corrupted by a bogus -2.0 (the real delta is preserved).
+    mock_ib.qualifyContractsAsync.return_value = [
+        MagicMock(symbol="SPY", secType="OPT", lastTradeDateOrContractMonth="20260619",
+                  strike=400.0, right="C")
+    ]
+    greeks = MagicMock(impliedVol=0.18, delta=0.5, gamma=0.02, theta=-2.0, vega=-2.0)
+    mock_ib.reqTickersAsync.return_value = [_ticker(modelGreeks=greeks)]
+    quote = await md.get_option_snapshot("SPY", "20260619", 400.0, "C")
+    assert quote.delta == pytest.approx(0.5)
+    assert quote.theta is None and quote.vega is None
+
+
 async def test_get_snapshot_records_live_when_not_paper(mock_ib: MagicMock) -> None:
     s = Settings()
     s.ibkr.paper = False

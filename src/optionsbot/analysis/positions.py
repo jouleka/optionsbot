@@ -72,9 +72,13 @@ def portfolio_greeks(
 
     Delta includes stock legs (1 delta/share); gamma/theta/vega are option-only. An option
     leg whose Greeks didn't fetch (absent, or ``delta is None``) is excluded from the sums
-    and counted as missing. ``net_delta``/``net_gamma`` are share-equivalents (meaningful per
-    underlying; unit-mixed across different underlyings -- see spec); ``net_theta`` is $/day
-    and ``net_vega`` $/vol-point, which sum cleanly book-wide. Pure."""
+    and counted as missing. Coverage (``complete``) is delta-gated: a leg whose delta
+    computed but whose theta/vega did not still counts as covered, so ``net_theta`` /
+    ``net_vega`` may silently omit it (rare -- IBKR model Greeks normally arrive together,
+    and the -2 'not computed' sentinel is mapped to None in market_data). ``net_delta`` /
+    ``net_gamma`` are share-equivalents (meaningful per underlying; unit-mixed across
+    different underlyings -- see spec); ``net_theta`` is $/day and ``net_vega`` $/vol-point,
+    which sum cleanly book-wide. Pure."""
     net_delta = net_gamma = net_theta = net_vega = 0.0
     option_total = 0
     option_with = 0
@@ -96,7 +100,7 @@ def portfolio_greeks(
             if q.vega is not None:
                 net_vega += q.vega * scale
         elif p.sec_type == "STK":
-            net_delta += p.position  # 1 delta per share
+            net_delta += p.position * p.multiplier  # 1 delta/share; equity multiplier is 1
     return {
         "net_delta": net_delta,
         "net_gamma": net_gamma,
