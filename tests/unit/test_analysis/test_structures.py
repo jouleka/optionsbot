@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from optionsbot.analysis.structures import identify_structure
+from optionsbot.analysis.structures import (
+    StructureInfo,
+    identify_structure,
+    identify_structure_detail,
+)
 from optionsbot.ibkr.types import PortfolioPosition
 
 
@@ -224,3 +228,56 @@ def test_fractional_option_quantity_is_custom() -> None:
 def test_fractional_shares_stock_only_still_long_stock() -> None:
     # Fractional shares with no options is still unambiguously long stock (no mislabel risk).
     assert identify_structure([_stk(100.5)]) == "Long Stock"
+
+
+# --- identify_structure_detail (IBK-121) -----------------------------------
+
+
+def test_detail_vertical_has_width() -> None:
+    legs = [_opt(100.0, "C", 1.0), _opt(105.0, "C", -1.0)]  # bull call, 5 wide
+    info = identify_structure_detail(legs)
+    assert isinstance(info, StructureInfo)
+    assert info.name == "Bull Call Spread" and info.defined_risk is True
+    assert info.width == 5.0
+
+
+def test_detail_credit_vertical_also_has_width() -> None:
+    legs = [_opt(95.0, "P", -1.0), _opt(90.0, "P", 1.0)]  # bull put, 5 wide
+    info = identify_structure_detail(legs)
+    assert info.name == "Bull Put Spread" and info.width == 5.0
+
+
+def test_detail_vertical_multiple_has_width() -> None:
+    legs = [_opt(100.0, "C", 2.0), _opt(105.0, "C", -2.0)]
+    info = identify_structure_detail(legs)
+    assert info.name == "Bull Call Spread ×2" and info.width == 5.0
+
+
+def test_detail_single_no_width_defined_risk_true() -> None:
+    info = identify_structure_detail([_opt(100.0, "C", 1.0)])
+    assert info.name == "Long Call" and info.width is None and info.defined_risk is True
+
+
+def test_detail_naked_short_not_defined_risk() -> None:
+    info = identify_structure_detail([_opt(100.0, "C", -1.0)])
+    assert info.name == "Short Call" and info.width is None and info.defined_risk is False
+
+
+def test_detail_iron_condor_defined_risk_no_width() -> None:
+    legs = [
+        _opt(85.0, "P", 1.0), _opt(90.0, "P", -1.0),
+        _opt(110.0, "C", -1.0), _opt(115.0, "C", 1.0),
+    ]
+    info = identify_structure_detail(legs)
+    assert info.name == "Iron Condor" and info.defined_risk is True and info.width is None
+
+
+def test_detail_custom_not_defined_risk_no_width() -> None:
+    legs = [_opt(95.0, "P", -1.0), _opt(90.0, "P", 1.0), _opt(105.0, "C", -1.0)]
+    info = identify_structure_detail(legs)
+    assert info.name.startswith("custom") and info.defined_risk is False and info.width is None
+
+
+def test_detail_name_matches_identify_structure() -> None:
+    legs = [_opt(100.0, "C", 1.0), _opt(105.0, "C", -1.0)]
+    assert identify_structure_detail(legs).name == identify_structure(legs)

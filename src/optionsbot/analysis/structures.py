@@ -9,11 +9,29 @@ annotation only -- NOT an input to scoring, P&L, Greeks, or alerts.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from optionsbot.ibkr.types import PortfolioPosition
 
 # An option leg reduced to what the matcher needs: (expiry, strike, right, sign)
 # with sign +1 long / -1 short.
 _OptLeg = tuple[str, float, str, int]
+
+_VERTICAL_NAMES = frozenset({
+    "Bull Put Spread", "Bear Put Spread", "Bull Call Spread", "Bear Call Spread",
+})
+_DEFINED_RISK_NAMES = frozenset({
+    *_VERTICAL_NAMES, "Iron Condor", "Iron Butterfly", "Covered Call",
+    "Long Call", "Long Put", "Long Straddle", "Long Strangle",
+    "Calendar Spread", "Diagonal Spread",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class StructureInfo:
+    name: str            # same label identify_structure returns (incl. "×N")
+    defined_risk: bool   # verticals/IC/IB/covered-call/long-singles/calendars True; else False
+    width: float | None  # strike width (points) for a 2-leg vertical; None otherwise
 
 
 def _with_mult(label: str, m: int) -> str:
@@ -135,3 +153,23 @@ def identify_structure(legs: list[PortfolioPosition]) -> str:
     if not opts:
         return custom
     return _match_options(opts, custom)
+
+
+def identify_structure_detail(legs: list[PortfolioPosition]) -> StructureInfo:
+    """``identify_structure`` plus geometry: the spread width for a recognized 2-leg
+    vertical (None otherwise) and a defined-risk flag. The string fn stays authoritative
+    for the name; width is purely geometric (no P&L economics here)."""
+    name = identify_structure(legs)
+    base_name = name.split(" ×")[0]  # strip the ×N multiple suffix
+    width: float | None = None
+    if base_name in _VERTICAL_NAMES:
+        strikes = sorted(
+            {
+                p.strike
+                for p in legs
+                if p.sec_type == "OPT" and p.position != 0 and p.strike is not None
+            }
+        )
+        if len(strikes) == 2:
+            width = strikes[1] - strikes[0]
+    return StructureInfo(name=name, defined_risk=base_name in _DEFINED_RISK_NAMES, width=width)
