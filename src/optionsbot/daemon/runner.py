@@ -91,24 +91,8 @@ class Daemon:
         try:
             self._scheduler = build_scheduler(self._context, self._scan_tick)
             self._scheduler.start()
-            hb = self._settings.telegram.heartbeat_minutes
-            if hb > 0:
-                self._scheduler.add_job(
-                    self._heartbeat_tick,
-                    trigger=IntervalTrigger(minutes=hb),
-                    id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
-                )
-            # IBK-117: daily outcome accrual (evaluate newly-expired picks). First run a
-            # couple minutes after start so the ledger updates without waiting a full day.
-            oeh = self._settings.validation.outcomes_eval_hours
-            if oeh > 0:
-                self._scheduler.add_job(
-                    self._outcomes_tick,
-                    trigger=IntervalTrigger(hours=oeh),
-                    id="outcomes", max_instances=1, coalesce=True, replace_existing=True,
-                    next_run_time=datetime.now(UTC) + timedelta(minutes=2),
-                )
-            # Created last so a failure registering the heartbeat job above can't
+            self._register_periodic_jobs()
+            # Created last so a failure registering the periodic jobs above can't
             # orphan the poller task (it wouldn't be cancelled in the except path).
             self._poller_task = asyncio.create_task(poll_commands(self._context))
         except Exception:
@@ -260,3 +244,26 @@ class Daemon:
             log.info("outcomes tick: evaluated %d newly-expired pick(s)", n)
         except Exception:
             log.exception("outcomes tick failed")
+
+    def _register_periodic_jobs(self) -> None:
+        """Add the heartbeat + daily outcome-accrual jobs to the running scheduler. Each is
+        gated by its config (telegram.heartbeat_minutes / validation.outcomes_eval_hours;
+        0 disables)."""
+        assert self._scheduler is not None
+        hb = self._settings.telegram.heartbeat_minutes
+        if hb > 0:
+            self._scheduler.add_job(
+                self._heartbeat_tick,
+                trigger=IntervalTrigger(minutes=hb),
+                id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
+            )
+        # IBK-117: daily outcome accrual (evaluate newly-expired picks). First run a couple
+        # minutes after start so the ledger updates without waiting a full day.
+        oeh = self._settings.validation.outcomes_eval_hours
+        if oeh > 0:
+            self._scheduler.add_job(
+                self._outcomes_tick,
+                trigger=IntervalTrigger(hours=oeh),
+                id="outcomes", max_instances=1, coalesce=True, replace_existing=True,
+                next_run_time=datetime.now(UTC) + timedelta(minutes=2),
+            )
