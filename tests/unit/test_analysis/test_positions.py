@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from optionsbot.analysis.positions import (
     assemble_open_book,
     build_positions_view,
+    per_underlying_share_delta,
     portfolio_greeks,
     position_dte,
 )
@@ -177,3 +178,27 @@ def test_portfolio_greeks_cross_underlying_delta_is_unit_mixed() -> None:
     aapl = _pp("AAPL", strike=150.0, right="C", position=-1.0)
     greeks = {("AAPL", "20260717", 150.0, "C"): _oq(delta=1.0, strike=150.0, right="C")}
     assert portfolio_greeks([spy, aapl], greeks)["net_delta"] == 0.0
+
+
+# --- per_underlying_share_delta (IBK-118) ----------------------------------
+
+
+def test_per_underlying_share_delta_groups_and_scales() -> None:
+    spy_put = _pp("SPY", strike=95.0, right="P", position=-1.0)  # -0.30 * -1 * 100 = +30
+    spy_stock = _pp("SPY", sec_type="STK", position=100.0)  # +100
+    aapl = _pp("AAPL", strike=150.0, right="C", position=-1.0)  # 1.0 * -1 * 100 = -100
+    greeks = {
+        ("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30),
+        ("AAPL", "20260717", 150.0, "C"): _oq(delta=1.0, strike=150.0, right="C"),
+    }
+    out = per_underlying_share_delta([spy_put, spy_stock, aapl], greeks)
+    assert out["SPY"] == 130.0  # 30 + 100
+    assert out["AAPL"] == -100.0
+
+
+def test_per_underlying_share_delta_excludes_missing_greeks() -> None:
+    a = _pp("SPY", strike=95.0, right="P", position=-1.0)
+    b = _pp("SPY", strike=90.0, right="P", position=1.0)  # no greeks entry -> excluded
+    greeks = {("SPY", "20260717", 95.0, "P"): _oq(delta=-0.30)}
+    out = per_underlying_share_delta([a, b], greeks)
+    assert out["SPY"] == 30.0  # only the leg with greeks contributes

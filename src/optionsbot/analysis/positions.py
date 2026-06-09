@@ -112,6 +112,28 @@ def portfolio_greeks(
     }
 
 
+def per_underlying_share_delta(
+    positions: list[PortfolioPosition], greeks: dict[GreeksKey, OptionQuote]
+) -> dict[str, float]:
+    """Net share-delta per underlying (``delta * position * multiplier`` for delta-bearing
+    option legs + ``position`` for stock). Same delta logic as ``portfolio_greeks`` but kept
+    per-symbol for beta-weighting (IBK-118). Every underlying in ``positions`` gets an entry
+    (0.0 if no delta-bearing legs). Pure."""
+    out: dict[str, float] = {}
+    for p in positions:
+        out.setdefault(p.symbol, 0.0)
+        if p.sec_type == "OPT":
+            if p.expiry is None or p.strike is None or p.right is None:
+                continue
+            q = greeks.get((p.symbol, p.expiry, p.strike, p.right))
+            if q is None or q.delta is None:
+                continue
+            out[p.symbol] += q.delta * p.position * p.multiplier
+        elif p.sec_type == "STK":
+            out[p.symbol] += p.position * p.multiplier
+    return out
+
+
 def build_positions_view(
     positions: list[PortfolioPosition],
     greeks: dict[GreeksKey, OptionQuote],
