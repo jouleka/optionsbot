@@ -91,3 +91,22 @@ def test_format_debit_take_profit() -> None:
 def test_format_debit_stop() -> None:
     out = format_profit_alert(_p("stop_loss", -125.0, 250.0, basis="debit"))
     assert "stop loss" in out and "-50%" in out and "$250 debit" in out
+
+
+def _pmax(net_pnl: float, base_amount: float, max_profit: float | None) -> ProfitAlert:
+    return ProfitAlert(
+        symbol="SPY", trigger="take_profit", basis="debit", base_amount=base_amount,
+        net_pnl=net_pnl, profit_pct=net_pnl / base_amount, max_profit=max_profit,
+        dedup_key="SPY:profit:take_profit",
+    )
+
+
+def test_format_debit_take_profit_shows_pct_of_max() -> None:
+    out = format_profit_alert(_pmax(120.0, 200.0, 300.0))
+    assert "+60% on $200 debit" in out
+    assert "40% of $300 max profit" in out  # 120 / 300
+
+
+def test_format_debit_take_profit_without_max_profit_unchanged() -> None:
+    out = format_profit_alert(_pmax(120.0, 200.0, None))
+    assert "+60% on $200 debit" in out and "max profit" not in out
