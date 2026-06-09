@@ -182,3 +182,28 @@ def test_iron_condor_mixed_expiry_is_custom() -> None:
         _opt(115.0, "C", 1.0, expiry="20260821"),
     ]
     assert identify_structure(legs) == "custom (4 legs)"
+
+
+def test_covered_call() -> None:
+    legs = [_stk(100.0), _opt(105.0, "C", -1.0)]
+    assert identify_structure(legs) == "Covered Call"
+
+
+def test_covered_call_multiple() -> None:
+    legs = [_stk(200.0), _opt(105.0, "C", -2.0)]
+    assert identify_structure(legs) == "Covered Call ×2"
+
+
+def test_covered_call_share_mismatch_is_custom() -> None:
+    legs = [_stk(150.0), _opt(105.0, "C", -1.0)]  # 150 != 100*1
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_stock_plus_long_call_is_custom() -> None:
+    legs = [_stk(100.0), _opt(105.0, "C", 1.0)]  # not a covered call
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_collar_is_custom() -> None:
+    legs = [_stk(100.0), _opt(95.0, "P", 1.0), _opt(105.0, "C", -1.0)]
+    assert identify_structure(legs) == "custom (3 legs)"

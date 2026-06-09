@@ -35,7 +35,14 @@ def _match_with_stock(
     shares = int(stock[0].position)
     if not opts:
         return "Long Stock" if shares > 0 else "Short Stock"
-    return custom
+    # Covered Call: long stock + short call(s), shares == 100 * call contracts.
+    if shares > 0 and len(opts) == 1:
+        c = opts[0]
+        if c.right == "C" and c.position < 0:
+            calls = abs(int(c.position))
+            if shares == 100 * calls:
+                return _with_mult("Covered Call", calls)
+    return custom  # collar / covered put / mismatched share count deferred
 
 
 def _match_two(a: _OptLeg, b: _OptLeg) -> str | None:
