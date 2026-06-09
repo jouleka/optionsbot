@@ -32,17 +32,23 @@ def _match_with_stock(
 ) -> str:
     if len(stock) != 1:
         return custom
-    shares = int(stock[0].position)
-    if not opts:
-        return "Long Stock" if shares > 0 else "Short Stock"
-    # Covered Call: long stock + short call(s), shares == 100 * call contracts.
-    if shares > 0 and len(opts) == 1:
+    pos = stock[0].position
+    if not opts:  # fractional shares are still unambiguously long/short stock
+        return "Long Stock" if pos > 0 else "Short Stock"
+    # Covered Call: long stock + short call(s), shares == 100 * call contracts (EXACT --
+    # no int() truncation, so a fractional share count can't masquerade as covered).
+    if len(opts) == 1:
         c = opts[0]
-        if c.right == "C" and c.position < 0:
-            calls = abs(int(c.position))
-            if shares == 100 * calls:
-                return _with_mult("Covered Call", calls)
-    return custom  # collar / covered put / mismatched share count deferred
+        if (
+            pos > 0
+            and pos == int(pos)
+            and c.right == "C"
+            and c.position < 0
+            and c.position == int(c.position)
+            and int(pos) == 100 * abs(int(c.position))
+        ):
+            return _with_mult("Covered Call", abs(int(c.position)))
+    return custom  # collar / covered put / mismatched / fractional share count deferred
 
 
 def _match_two(a: _OptLeg, b: _OptLeg) -> str | None:
@@ -90,6 +96,8 @@ def _match_four(legs: list[_OptLeg]) -> str | None:
 
 
 def _match_options(opts: list[PortfolioPosition], custom: str) -> str:
+    if any(p.position != int(p.position) for p in opts):
+        return custom  # fractional contracts -> not a clean whole-contract structure
     qmags = {abs(int(p.position)) for p in opts}
     if len(qmags) != 1:  # uneven copies / ratio -> not a clean structure
         return custom

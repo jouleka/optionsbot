@@ -207,3 +207,20 @@ def test_stock_plus_long_call_is_custom() -> None:
 def test_collar_is_custom() -> None:
     legs = [_stk(100.0), _opt(95.0, "P", 1.0), _opt(105.0, "C", -1.0)]
     assert identify_structure(legs) == "custom (3 legs)"
+
+
+def test_fractional_shares_covered_call_is_custom() -> None:
+    # 100.4 shares is NOT 100 -- must not truncate into a "Covered Call" (Opus review S1).
+    legs = [_stk(100.4), _opt(105.0, "C", -1.0)]
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_fractional_option_quantity_is_custom() -> None:
+    # A 1.5:1.5 "vertical" isn't a clean whole-contract structure -> custom, not Bull Put.
+    legs = [_opt(95.0, "P", -1.5), _opt(90.0, "P", 1.5)]
+    assert identify_structure(legs) == "custom (2 legs)"
+
+
+def test_fractional_shares_stock_only_still_long_stock() -> None:
+    # Fractional shares with no options is still unambiguously long stock (no mislabel risk).
+    assert identify_structure([_stk(100.5)]) == "Long Stock"
