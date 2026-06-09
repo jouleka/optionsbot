@@ -152,6 +152,22 @@ def _greeks_footer(g: dict[str, Any]) -> str:
     )
 
 
+def _beta_weighted_footer(bw: dict[str, Any]) -> str:
+    bench = bw.get("benchmark", "SPY")
+    if bw["underlyings_total"] > 0 and bw["underlyings_covered"] == 0:
+        return "β-wtd: n/a (no beta available)"
+    cov = (
+        ""
+        if bw.get("complete", True)
+        else f"  ({bw['underlyings_covered']}/{bw['underlyings_total']} underlyings)"
+    )
+    per1 = _money(bw["dollar_per_1pct_spy"])
+    equiv = bw.get("spy_equiv_shares")
+    if equiv is None:
+        return f"β-wtd: {per1}/1% {bench}{cov}"
+    return f"β-wtd: Δ≈ {equiv:+,.0f} {bench}-eq  {per1}/1% {bench}{cov}"
+
+
 def _short_expiry(expiry: str | None) -> str:
     """20260717 -> 17Jul; pass through anything not an 8-char YYYYMMDD."""
     if not expiry or len(expiry) != 8:
@@ -196,6 +212,9 @@ def format_positions_text(view: dict[str, Any]) -> str:
     pg = view.get("portfolio_greeks")
     if pg is not None:
         lines.append(_greeks_footer(pg))
+    bw = view.get("beta_weighted")
+    if bw is not None:
+        lines.append(_beta_weighted_footer(bw))
     return "\n".join(lines)
 
 

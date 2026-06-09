@@ -71,3 +71,47 @@ def test_format_positions_text_has_greeks_footer() -> None:
 def test_format_positions_text_greeks_partial_note() -> None:
     out = format_positions_text(_view_with_greeks(complete=False))
     assert "(4/5 legs)" in out
+
+
+def _view_with_beta(
+    *, complete: bool = True, benchmark_spot: bool = True, covered: int = 2
+) -> dict[str, Any]:
+    v = _view_with_greeks()
+    v["beta_weighted"] = {
+        "beta_weighted_dollar_delta": 48000.0,
+        "dollar_per_1pct_spy": 480.0,
+        "spy_equiv_shares": 80.0 if benchmark_spot else None,
+        "underlyings_total": 2,
+        "underlyings_covered": covered,
+        "complete": complete,
+        "benchmark": "SPY",
+    }
+    return v
+
+
+def test_format_positions_text_beta_footer_complete() -> None:
+    out = format_positions_text(_view_with_beta())
+    assert "β-wtd" in out and "+80 SPY-eq" in out and "/1% SPY" in out
+    assert "underlyings)" not in out
+
+
+def test_format_positions_text_beta_footer_partial_coverage() -> None:
+    out = format_positions_text(_view_with_beta(complete=False, covered=1))
+    assert "(1/2 underlyings)" in out
+
+
+def test_format_positions_text_beta_footer_no_benchmark_spot() -> None:
+    out = format_positions_text(_view_with_beta(benchmark_spot=False))
+    assert "SPY-eq" not in out and "/1% SPY" in out
+
+
+def test_format_positions_text_beta_footer_zero_coverage() -> None:
+    out = format_positions_text(_view_with_beta(complete=False, covered=0))
+    assert "β-wtd: n/a" in out
+
+
+def test_format_positions_text_beta_footer_absent_when_none() -> None:
+    v = _view_with_greeks()
+    v["beta_weighted"] = None
+    out = format_positions_text(v)
+    assert "β-wtd" not in out
