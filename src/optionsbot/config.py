@@ -98,6 +98,11 @@ class ManageSettings(BaseModel):
     min_debit: float = Field(default=20.0, ge=0.0)  # skip groups below this net debit ($)
 
 
+class ValidationSettings(BaseModel):
+    # IBK-117: how often the daemon evaluates newly-expired picks into the outcomes ledger.
+    outcomes_eval_hours: int = Field(default=24, ge=0)  # 0 disables the daily accrual job
+
+
 class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -128,6 +133,7 @@ class Settings(BaseSettings):
     screener: ScreenerSettings = ScreenerSettings()
     storage: StorageSettings = StorageSettings()
     manage: ManageSettings = ManageSettings()
+    validation: ValidationSettings = ValidationSettings()
 
     log_level: str = "INFO"
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -97,6 +97,16 @@ class Daemon:
                     self._heartbeat_tick,
                     trigger=IntervalTrigger(minutes=hb),
                     id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
+                )
+            # IBK-117: daily outcome accrual (evaluate newly-expired picks). First run a
+            # couple minutes after start so the ledger updates without waiting a full day.
+            oeh = self._settings.validation.outcomes_eval_hours
+            if oeh > 0:
+                self._scheduler.add_job(
+                    self._outcomes_tick,
+                    trigger=IntervalTrigger(hours=oeh),
+                    id="outcomes", max_instances=1, coalesce=True, replace_existing=True,
+                    next_run_time=datetime.now(UTC) + timedelta(minutes=2),
                 )
             # Created last so a failure registering the heartbeat job above can't
             # orphan the poller task (it wouldn't be cancelled in the except path).
@@ -240,3 +250,13 @@ class Daemon:
             await self._context.telegram.send_message(msg, parse_mode=None)
         except Exception:  # noqa: BLE001 -- heartbeat failure must not crash the daemon
             log.exception("heartbeat send failed")
+
+    async def _outcomes_tick(self) -> None:
+        from optionsbot.daemon.outcomes_runner import run_outcomes_tick
+
+        assert self._context is not None
+        try:
+            n = await run_outcomes_tick(self._context)
+            log.info("outcomes tick: evaluated %d newly-expired pick(s)", n)
+        except Exception:
+            log.exception("outcomes tick failed")

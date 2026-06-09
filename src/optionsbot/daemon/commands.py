@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, insert, select
 from optionsbot.alerts.formatter import (
     format_alert_markdown,
     format_positions_text,
+    format_track_record,
     no_edge_note,
 )
 from optionsbot.analysis.positions import assemble_open_book
@@ -46,6 +47,7 @@ _HELP = (
     "/scan SYMBOL — scan one symbol now\n"
     "/screen [N] — screener top N\n"
     "/positions — your open book (live P&L, DTE, Greeks)\n"
+    "/record — realized track record (win-rate vs predicted, P&L)\n"
     "/pause — stop alerting\n"
     "/resume — resume alerting\n"
     "/watchlist list|add SYM|remove SYM\n"
@@ -208,6 +210,12 @@ async def _cmd_positions(context: DaemonContext, args: list[str]) -> list[Comman
     return [CommandReply(format_positions_text(view))]
 
 
+async def _cmd_record(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    from optionsbot.validation.outcomes import outcomes_report
+
+    return [CommandReply(format_track_record(outcomes_report(context.engine)))]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -218,6 +226,7 @@ _REGISTRY: dict[str, Handler] = {
     "screen": _cmd_screen,
     "watchlist": _cmd_watchlist,
     "positions": _cmd_positions,
+    "record": _cmd_record,
 }
 
 

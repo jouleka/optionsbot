@@ -893,7 +893,7 @@ def validate_outcomes() -> None:
 
 
 async def _run_validate_outcomes() -> int:
-    from datetime import date, datetime, timedelta
+    from datetime import date
 
     from optionsbot.config import get_settings, load_settings
     from optionsbot.ibkr import IBKRClient
@@ -902,6 +902,7 @@ async def _run_validate_outcomes() -> int:
     from optionsbot.validation.outcomes import (
         evaluate_pending,
         load_unevaluated_expired,
+        make_close_fetcher,
         outcomes_report,
     )
 
@@ -915,20 +916,7 @@ async def _run_validate_outcomes() -> int:
         try:
             await client.connect()
             history = HistoryClient(client)
-
-            async def fetch_close_at(symbol: str, expiry: str) -> float | None:
-                exp = datetime.strptime(expiry, "%Y%m%d").date()
-                df = await history.get_history(symbol, days=400)
-                by_date = {
-                    (d.date() if hasattr(d, "date") else d): float(c)
-                    for d, c in zip(df.index, df["close"].tolist(), strict=False)
-                }
-                for back in range(7):  # nearest trading day on/before expiry
-                    hit = by_date.get(exp - timedelta(days=back))
-                    if hit is not None:
-                        return hit
-                return None
-
+            fetch_close_at = make_close_fetcher(history)
             evaluated = await evaluate_pending(engine, fetch_close_at, today)
         finally:
             await client.disconnect()

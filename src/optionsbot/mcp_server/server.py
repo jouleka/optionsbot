@@ -20,6 +20,7 @@ def _register_tools(server: FastMCP) -> None:
         daily_brief,
         positions,
         snapshots,
+        track_record,
         watchlist,
     )
 
@@ -28,3 +29,4 @@ def _register_tools(server: FastMCP) -> None:
     snapshots.register(server)
     daily_brief.register(server)
     positions.register(server)
+    track_record.register(server)

@@ -34,6 +34,10 @@ def test_manage_settings_defaults() -> None:
     assert s.manage.min_debit == 20.0
 
 
+def test_validation_settings_default() -> None:
+    assert Settings().validation.outcomes_eval_hours == 24
+
+
 def test_ibkr_paper_defaults_to_true() -> None:
     assert Settings().ibkr.paper is True
 

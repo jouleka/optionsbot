@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, date, datetime
-from typing import Any
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Engine, insert, select
 
@@ -15,6 +15,9 @@ from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies.base import Leg
 from optionsbot.validation.types import OutcomeGroup, OutcomesReport, UnevaluatedPick
+
+if TYPE_CHECKING:
+    from optionsbot.ibkr.history import HistoryClient
 
 _LEG_FIELDS = frozenset(
     {"symbol", "side", "sec_type", "expiry", "strike", "right", "quantity"}
@@ -131,3 +134,42 @@ def outcomes_report(engine: Engine) -> OutcomesReport:
         by_strategy={s: _group(s, [r for r in rows if r.strategy == s]) for s in strategies},
         by_risk_tier={t: _group(t, [r for r in rows if r.risk_tier == t]) for t in tiers},
     )
+
+
+def make_close_fetcher(
+    history: HistoryClient,
+) -> Callable[[str, str], Awaitable[float | None]]:
+    """Return ``fetch_close_at(symbol, expiry)`` -> the terminal close on the nearest trading
+    day on/before ``expiry`` (7-day backscan), or None. Shared by the CLI ``validate
+    outcomes`` command and the daemon accrual job (IBK-117)."""
+
+    async def fetch_close_at(symbol: str, expiry: str) -> float | None:
+        exp = datetime.strptime(expiry, "%Y%m%d").date()
+        df = await history.get_history(symbol, days=400)
+        by_date = {
+            (d.date() if hasattr(d, "date") else d): float(c)
+            for d, c in zip(df.index, df["close"].tolist(), strict=False)
+        }
+        for back in range(7):  # nearest trading day on/before expiry
+            hit = by_date.get(exp - timedelta(days=back))
+            if hit is not None:
+                return hit
+        return None
+
+    return fetch_close_at
+
+
+def _group_to_dict(g: OutcomeGroup) -> dict[str, Any]:
+    return {
+        "label": g.label, "count": g.count, "win_rate": g.win_rate,
+        "mean_pred_pop": g.mean_pred_pop, "total_pnl": g.total_pnl, "avg_pnl": g.avg_pnl,
+    }
+
+
+def report_to_dict(report: OutcomesReport) -> dict[str, Any]:
+    """Serialize an OutcomesReport to a plain dict for the MCP track_record tool (IBK-117)."""
+    return {
+        "overall": _group_to_dict(report.overall),
+        "by_strategy": {k: _group_to_dict(v) for k, v in report.by_strategy.items()},
+        "by_risk_tier": {k: _group_to_dict(v) for k, v in report.by_risk_tier.items()},
+    }

@@ -22,6 +22,7 @@ from optionsbot.analysis.management import ManagementAlert, ProfitAlert
 from optionsbot.analysis.types import MarketView
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.strategies import Leg
+from optionsbot.validation.types import OutcomeGroup, OutcomesReport
 
 # MarkdownV2 special chars that need escaping in plain text per Telegram docs.
 # Inside `code` spans and inside *bold*/_italic_ the rules differ, but we
@@ -227,3 +228,28 @@ def format_profit_alert(alert: ProfitAlert) -> str:
     if alert.trigger == "take_profit":
         return f"✅ take profit {alert.symbol} — {pct:+}% on {amt} debit (P&L {pnl})"
     return f"🛑 stop loss {alert.symbol} — {pct:+}% of the {amt} debit (P&L {pnl})"
+
+
+def _track_group_line(name: str, g: OutcomeGroup) -> str:
+    return (
+        f"  {name} n={g.count} win {g.win_rate:.2f} "
+        f"pred {g.mean_pred_pop:.2f} avg {_money(g.avg_pnl)}"
+    )
+
+
+def format_track_record(report: OutcomesReport) -> str:
+    """Plain-text realized track record for Telegram (parse_mode=None)."""
+    o = report.overall
+    if o.count == 0:
+        return "no evaluated outcomes yet (picks resolve at expiry)"
+    lines = [
+        f"track record: {o.count} picks, win {o.win_rate:.2f} vs predicted "
+        f"{o.mean_pred_pop:.2f}, P&L {_money(o.total_pnl)} (avg {_money(o.avg_pnl)})"
+    ]
+    if report.by_strategy:
+        lines.append("by strategy:")
+        lines += [_track_group_line(n, g) for n, g in report.by_strategy.items()]
+    if report.by_risk_tier:
+        lines.append("by risk tier:")
+        lines += [_track_group_line(n, g) for n, g in report.by_risk_tier.items()]
+    return "\n".join(lines)
