@@ -40,3 +40,25 @@ async def test_positions_tool_ibkr_failure(
     ):
         result = await tool(ctx=FakeCtx(server_context))
     assert result["ok"] is False and result["error"] == "ibkr_unavailable"
+
+
+async def test_positions_tool_passes_history_client_and_returns_beta(
+    server_context: ServerContext, mock_ibkr_client: MagicMock
+) -> None:
+    server_context._ibkr = mock_ibkr_client
+    fake_view = {
+        "as_of": "2026-06-08T00:00:00+00:00", "net_unrealized_pnl": 0.0,
+        "group_count": 0, "position_count": 0, "groups": [],
+        "beta_weighted": {"dollar_per_1pct_spy": 480.0, "spy_equiv_shares": 80.0,
+                          "underlyings_total": 2, "underlyings_covered": 2,
+                          "complete": True, "benchmark": "SPY"},
+    }
+    mock = AsyncMock(return_value=fake_view)
+    tool = get_tools(register)["positions"]
+    with patch("optionsbot.mcp_server.tools.positions.assemble_open_book", new=mock):
+        result = await tool(ctx=FakeCtx(server_context))
+    assert result["ok"] is True
+    assert result["beta_weighted"]["spy_equiv_shares"] == 80.0
+    # history_client threaded through (portfolio.enabled defaults True)
+    assert mock.await_args.kwargs["history_client"] is not None
+    assert mock.await_args.kwargs["benchmark_symbol"] == "SPY"
