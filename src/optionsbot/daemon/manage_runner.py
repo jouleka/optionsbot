@@ -40,10 +40,11 @@ class ManageRunSummary:
 async def _fetch_spots(
     context: DaemonContext, positions: list[PortfolioPosition], errors: list[str]
 ) -> dict[str, float]:
-    """Best-effort underlying spot per distinct short-option underlying. A failed
-    fetch just omits that symbol (its assignment check is skipped)."""
+    """Best-effort underlying spot per distinct option underlying (short AND long). A failed
+    fetch just omits that symbol -- a short skips its assignment check, a long falls back to
+    plain (non-ITM-aware) expiry wording (IBK-119)."""
     md = MarketDataClient(context.ibkr, context.resolver)
-    symbols = {p.symbol for p in positions if p.sec_type == "OPT" and p.position < 0}
+    symbols = {p.symbol for p in positions if p.sec_type == "OPT" and p.position != 0}
     spots: dict[str, float] = {}
     for sym in sorted(symbols):
         try:

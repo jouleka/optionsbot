@@ -125,6 +125,46 @@ async def test_manage_tick_sends_profit_alert(daemon_engine, daemon_settings) ->
         assert (await run_manage_tick(ctx)).alerts_sent == 0
 
 
+def _long_put(strike: float = 95.0, days: int = 5) -> PortfolioPosition:
+    expiry = (date.today() + timedelta(days=days)).strftime("%Y%m%d")
+    return PortfolioPosition(
+        account="DU1", symbol="SPY", sec_type="OPT", expiry=expiry, strike=strike,
+        right="P", multiplier=100, position=1.0, avg_cost=250.0, market_price=1.0,
+        market_value=100.0, unrealized_pnl=10.0, realized_pnl=0.0,
+    )
+
+
+async def test_manage_tick_long_leg_itm_uses_itm_wording(daemon_engine, daemon_settings) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=[_long_put()])  # long, 5 DTE
+        MD.return_value.get_stock_snapshot = AsyncMock(return_value=_quote(92.0))  # ITM put
+        summary = await run_manage_tick(ctx)
+    assert summary.alerts_sent == 1
+    # ITM wording requires _fetch_spots to fetch the LONG underlying's spot.
+    sent_text = ctx.telegram.send_message.await_args.args[0]
+    assert "auto-exercises" in sent_text
+
+
+async def test_manage_tick_short_itm_near_expiry_sends_one_merged(
+    daemon_engine, daemon_settings
+) -> None:
+    ctx = _ctx(daemon_engine, daemon_settings)
+    with patch("optionsbot.daemon.manage_runner.PositionsClient") as PC, \
+         patch("optionsbot.daemon.manage_runner.MarketDataClient") as MD, \
+         patch("optionsbot.daemon.manage_runner.is_market_open", return_value=True):
+        PC.return_value.get_portfolio = AsyncMock(return_value=[_short_put()])  # short, 5 DTE
+        MD.return_value.get_stock_snapshot = AsyncMock(return_value=_quote(92.0))  # ITM put
+        summary = await run_manage_tick(ctx)
+        assert summary.alerts_sent == 1  # ONE merged alert, not two
+        ctx.telegram.send_message.assert_awaited_once()
+        with daemon_engine.connect() as conn:
+            rows = conn.execute(select(position_alerts)).fetchall()
+        assert len(rows) == 1 and rows[0].dedup_key.endswith(":assignment+dte_urgent")
+
+
 async def test_profit_alerts_disabled_suppresses(daemon_engine, daemon_settings) -> None:
     daemon_settings.manage.profit_alerts = False
     ctx = _ctx(daemon_engine, daemon_settings)
