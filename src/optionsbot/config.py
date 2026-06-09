@@ -103,6 +103,14 @@ class ValidationSettings(BaseModel):
     outcomes_eval_hours: int = Field(default=24, ge=0)  # 0 disables the daily accrual job
 
 
+class PortfolioSettings(BaseModel):
+    # IBK-118: beta-weighted portfolio delta on the open book. enabled=False skips the
+    # extra per-underlying history/spot I/O (no `beta_weighted` on the view). The benchmark
+    # reuses scan.benchmark_symbol (one benchmark concept across the bot).
+    enabled: bool = True
+    beta_window: int = Field(default=252, ge=2)  # trading days of daily returns for beta
+
+
 class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -134,6 +142,7 @@ class Settings(BaseSettings):
     storage: StorageSettings = StorageSettings()
     manage: ManageSettings = ManageSettings()
     validation: ValidationSettings = ValidationSettings()
+    portfolio: PortfolioSettings = PortfolioSettings()
 
     log_level: str = "INFO"
 

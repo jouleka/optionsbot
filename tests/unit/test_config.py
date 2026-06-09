@@ -38,6 +38,21 @@ def test_validation_settings_default() -> None:
     assert Settings().validation.outcomes_eval_hours == 24
 
 
+def test_portfolio_settings_defaults() -> None:
+    s = Settings()
+    assert s.portfolio.enabled is True
+    assert s.portfolio.beta_window == 252
+
+
+def test_portfolio_beta_window_rejects_below_two() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import PortfolioSettings
+
+    with pytest.raises(ValidationError):
+        PortfolioSettings(beta_window=1)
+
+
 def test_ibkr_paper_defaults_to_true() -> None:
     assert Settings().ibkr.paper is True
 
