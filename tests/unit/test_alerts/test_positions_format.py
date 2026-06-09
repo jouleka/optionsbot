@@ -31,6 +31,19 @@ def test_format_positions_text_empty() -> None:
     assert out == "no open positions"
 
 
+def test_format_positions_text_shows_structure() -> None:
+    v = _view()
+    v["groups"][0]["structure"] = "Bull Put Spread"
+    out = format_positions_text(v)
+    assert "SPY  Bull Put Spread  net" in out
+
+
+def test_format_positions_text_no_structure_key_unchanged() -> None:
+    # Backward-compat: a group without a structure key renders the old header.
+    out = format_positions_text(_view())
+    assert "SPY  net" in out
+
+
 def test_format_positions_text_option_leg_missing_greeks() -> None:
     # The likely live path: best-effort Greeks fetch failed -> OPT leg with None
     # delta/mid/P&L/DTE must render safely (IBK-112 review).

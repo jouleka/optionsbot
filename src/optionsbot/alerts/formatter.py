@@ -209,7 +209,9 @@ def format_positions_text(view: dict[str, Any]) -> str:
         f"({n} underlying{'s' if n != 1 else ''})"
     ]
     for g in groups:
-        lines.append(f"{g['underlying']}  net {_money(g['net_unrealized_pnl'])}")
+        struct = g.get("structure")
+        head = f"{g['underlying']}  {struct}" if struct else f"{g['underlying']}"
+        lines.append(f"{head}  net {_money(g['net_unrealized_pnl'])}")
         lines += ["  " + _position_leg_line(lg) for lg in g["legs"]]
     pg = view.get("portfolio_greeks")
     if pg is not None:
