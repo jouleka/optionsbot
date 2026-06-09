@@ -155,7 +155,11 @@ def evaluate_profit_triggers(
             if trigger == "take_profit" and basis == "debit":
                 info = identify_structure_detail(all_by_symbol[symbol])
                 if info.width is not None:  # a recognized defined-risk debit vertical
-                    mp = info.width * 100 - base  # base == debit paid ($)
+                    # N-scale the width term to match `base` (the N-lot debit): a vertical's
+                    # legs are equal-magnitude (ratios are rejected upstream), so any leg's
+                    # |position| is the contract count.
+                    n = abs(int(legs[0].position))
+                    mp = info.width * 100 * n - base  # both terms now N-scaled ($)
                     if mp > 0:  # guard a debit >= the spread width (bad fill / stale data)
                         max_profit = mp
             out.append(

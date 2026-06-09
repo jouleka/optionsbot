@@ -110,3 +110,9 @@ def test_format_debit_take_profit_shows_pct_of_max() -> None:
 def test_format_debit_take_profit_without_max_profit_unchanged() -> None:
     out = format_profit_alert(_pmax(120.0, 200.0, None))
     assert "+60% on $200 debit" in out and "max profit" not in out
+
+
+def test_format_debit_take_profit_zero_max_profit_no_crash() -> None:
+    # A hand-built max_profit of 0.0 must not divide-by-zero; the clause is skipped (Opus S1).
+    out = format_profit_alert(_pmax(120.0, 200.0, 0.0))
+    assert "+60% on $200 debit" in out and "max profit" not in out

@@ -321,6 +321,15 @@ def test_debit_vertical_stop_no_max_profit() -> None:
     assert out[0].trigger == "stop_loss" and out[0].max_profit is None
 
 
+def test_debit_vertical_multiple_max_profit_scales() -> None:
+    # 2-lot bull call: long 2x100C @300, short 2x110C @100 -> debit 400, width 10.
+    # max profit = (10*100 * 2) - 400 = 1600, NOT 600 (the N-scaling must match) (Opus M1).
+    legs = [_long_call(100.0, 300.0, 240.0, position=2.0),
+            _credit_leg(110.0, "C", -2.0, 100.0, 0.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert out[0].trigger == "take_profit" and out[0].max_profit == 1600.0
+
+
 def test_debit_vertical_max_profit_nonpositive_omitted() -> None:
     # width 1 (100/101) but debit 150 -> max_profit = 100 - 150 = -50 <= 0 -> omitted.
     legs = [_long_call(100.0, 200.0, 120.0, position=1.0),

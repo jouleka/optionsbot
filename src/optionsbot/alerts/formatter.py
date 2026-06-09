@@ -267,7 +267,7 @@ def format_profit_alert(alert: ProfitAlert) -> str:
         return f"🛑 stop loss {alert.symbol} — {pnl}, {mult:.1f}x the {amt} credit"
     if alert.trigger == "take_profit":
         line = f"✅ take profit {alert.symbol} — {pct:+}% on {amt} debit (P&L {pnl})"
-        if alert.max_profit is not None:
+        if alert.max_profit:  # None or 0.0 -> skip (no divide-by-zero, no nonsense)
             pct_max = round(alert.net_pnl / alert.max_profit * 100)
             line += f"; {pct_max}% of ${alert.max_profit:,.0f} max profit"
         return line
