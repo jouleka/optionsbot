@@ -224,6 +224,28 @@ def _sq(last: float) -> StockQuote:
     )
 
 
+def test_build_view_labels_structure() -> None:
+    # A bull put spread on SPY -> group carries the structure label.
+    legs = [
+        _pp("SPY", strike=95.0, right="P", position=-1.0, upnl=20.0),
+        _pp("SPY", strike=90.0, right="P", position=1.0, upnl=-5.0),
+    ]
+    view = build_positions_view(legs, {}, _TODAY)
+    spy = next(g for g in view["groups"] if g["underlying"] == "SPY")
+    assert spy["structure"] == "Bull Put Spread"
+
+
+def test_build_view_custom_structure() -> None:
+    legs = [
+        _pp("SPY", strike=95.0, right="P", position=-1.0),
+        _pp("SPY", strike=90.0, right="P", position=1.0),
+        _pp("SPY", strike=105.0, right="C", position=-1.0),
+    ]
+    view = build_positions_view(legs, {}, _TODAY)
+    spy = next(g for g in view["groups"] if g["underlying"] == "SPY")
+    assert spy["structure"] == "custom (3 legs)"
+
+
 async def test_assemble_open_book_no_history_client_has_no_beta() -> None:  # regression
     pos_client = AsyncMock()
     pos_client.get_portfolio.return_value = [_pp("SPY", strike=95.0, position=-1.0)]

@@ -13,6 +13,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from optionsbot.analysis.beta_weighting import beta, beta_weighted_delta
+from optionsbot.analysis.structures import identify_structure
 from optionsbot.ibkr.types import OptionQuote, PortfolioPosition
 
 if TYPE_CHECKING:
@@ -151,8 +152,10 @@ def build_positions_view(
     same ticker would merge across them (fine for the single-account setup today)."""
     today = as_of.date()
     groups_map: dict[str, list[dict[str, Any]]] = {}
+    raw_by_symbol: dict[str, list[PortfolioPosition]] = {}
     for p in positions:
         groups_map.setdefault(p.symbol, []).append(_leg_dict(p, greeks, today))
+        raw_by_symbol.setdefault(p.symbol, []).append(p)
     groups: list[dict[str, Any]] = []
     grand_total = 0.0
     for underlying in sorted(groups_map):
@@ -160,7 +163,12 @@ def build_positions_view(
         legs.sort(key=lambda lg: (lg["dte"] is None, lg["dte"] or 0, lg["strike"] or 0.0))
         net = sum(lg["unrealized_pnl"] or 0.0 for lg in legs)
         grand_total += net
-        groups.append({"underlying": underlying, "net_unrealized_pnl": net, "legs": legs})
+        groups.append({
+            "underlying": underlying,
+            "structure": identify_structure(raw_by_symbol[underlying]),
+            "net_unrealized_pnl": net,
+            "legs": legs,
+        })
     return {
         "as_of": as_of.isoformat(),
         "net_unrealized_pnl": grand_total,
