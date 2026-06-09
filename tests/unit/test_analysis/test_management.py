@@ -229,3 +229,19 @@ def test_balanced_zero_net_skipped() -> None:
     # short 100P (avg 100, -1) + long 100C (avg 100, +1) -> net 0 -> skipped.
     legs = [_credit_leg(95.0, "P", -1.0, 100.0, 50.0), _long_call(95.0, 100.0, 50.0)]
     assert evaluate_profit_triggers(legs, ManageSettings()) == []
+
+
+def test_multi_contract_debit_scales() -> None:
+    # avg_cost per-contract; long 2 -> debit base 500. Up $250 -> +50% -> take_profit.
+    legs = [_long_call(100.0, 250.0, 250.0, position=2.0)]
+    out = evaluate_profit_triggers(legs, ManageSettings())
+    assert out[0].basis == "debit" and out[0].base_amount == 500.0
+    assert out[0].trigger == "take_profit"
+
+
+def test_debit_stop_boundary() -> None:
+    s = ManageSettings()  # debit_stop_pct 0.5, debit base 250 -> stop threshold -125
+    at = [_long_call(100.0, 250.0, -125.0)]
+    inside = [_long_call(100.0, 250.0, -124.0)]
+    assert evaluate_profit_triggers(at, s)[0].trigger == "stop_loss"
+    assert evaluate_profit_triggers(inside, s) == []  # just inside -> no alert
