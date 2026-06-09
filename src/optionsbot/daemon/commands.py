@@ -202,9 +202,21 @@ async def _cmd_watchlist(context: DaemonContext, args: list[str]) -> list[Comman
 async def _cmd_positions(context: DaemonContext, args: list[str]) -> list[CommandReply]:
     pos_client = PositionsClient(context.ibkr)
     md_client = MarketDataClient(context.ibkr, context.resolver)
+    history_client = (
+        HistoryClient(context.ibkr, context.resolver)
+        if context.settings.portfolio.enabled
+        else None
+    )
     try:
         async with context.ibkr_lock:
-            view = await assemble_open_book(pos_client, md_client, datetime.now(UTC))
+            view = await assemble_open_book(
+                pos_client,
+                md_client,
+                datetime.now(UTC),
+                history_client=history_client,
+                benchmark_symbol=context.settings.scan.benchmark_symbol,
+                beta_window=context.settings.portfolio.beta_window,
+            )
     except Exception:  # noqa: BLE001 -- surface a plain failure, never crash the poller
         return [CommandReply("couldn't reach IBKR for positions")]
     return [CommandReply(format_positions_text(view))]
