@@ -169,8 +169,8 @@ symbol_news = Table(
 
 
 # IBK-113: one row per management alert sent, keyed by dedup_key
-# (symbol:expiry:strike:right:trigger), so should_manage_alert suppresses re-fires
-# within the cooldown window across daemon restarts.
+# (symbol:expiry:strike:right:trigger[+trigger], IBK-119 merges a leg's triggers into one
+# key), so should_manage_alert suppresses re-fires within the cooldown across daemon restarts.
 position_alerts = Table(
     "position_alerts",
     metadata,

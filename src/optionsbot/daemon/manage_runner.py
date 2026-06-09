@@ -49,7 +49,7 @@ async def _fetch_spots(
     for sym in sorted(symbols):
         try:
             q = await md.get_stock_snapshot(sym)
-        except Exception as e:  # noqa: BLE001 -- missing spot just skips assignment for sym
+        except Exception as e:  # noqa: BLE001 -- short skips assignment, long uses plain wording
             log.exception("manage tick: spot fetch failed for %s", sym)
             errors.append(f"spot {sym}: {type(e).__name__}: {e}")
             continue

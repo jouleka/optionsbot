@@ -64,7 +64,8 @@ def should_manage_alert(
 ) -> bool:
     """True iff there is no ``position_alerts`` row for ``dedup_key`` newer than the
     manage cooldown window. The management analogue of :func:`should_alert`: each
-    (leg, trigger) re-fires at most once per ``settings.manage.cooldown_hours``."""
+    (leg, trigger-set) re-fires at most once per ``settings.manage.cooldown_hours``
+    (IBK-119: a change in a leg's firing trigger-set is a new key, so it re-fires)."""
     now = now if now is not None else datetime.now(UTC)
     with engine.connect() as conn:
         row = conn.execute(
