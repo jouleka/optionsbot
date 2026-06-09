@@ -58,6 +58,18 @@ def test_beta_aligns_on_common_dates() -> None:
     assert b is not None  # the date overlap still yields a finite beta
 
 
+def test_beta_sorts_unsorted_input() -> None:
+    # A "pure" helper must not silently miscompute on out-of-order bars: returns are
+    # differenced positionally, so unsorted input would otherwise produce garbage. With a
+    # date index, reversed-row input must yield the same beta as sorted input (here 1.0).
+    idx = pd.date_range("2026-01-01", periods=37, freq="D")
+    bench = _closes(_BENCH_RETS)
+    bench.index = idx
+    reversed_same = bench.iloc[::-1]  # identical data, descending row order
+    b = beta(reversed_same, bench, window=36, min_obs=5)
+    assert b is not None and round(b, 6) == 1.0
+
+
 def test_beta_weighted_delta_basic_sum() -> None:
     rows = [
         {"symbol": "SPY", "share_delta": 30.0, "spot": 600.0, "beta": 1.0},  # 18000

@@ -30,12 +30,13 @@ def beta(
     Returns over each series' own consecutive closes, then aligned on common dates
     (handles halts / unequal listing length). Uses the last ``min(window, available)``
     paired returns. None if fewer than ``min_obs`` paired returns, if a ``close``
-    column is missing, or if benchmark variance is zero.
+    column is missing, or if benchmark variance is zero. Bars are sorted by index before
+    differencing so out-of-order input can't silently miscompute (Opus review S1).
     """
     if "close" not in symbol_bars or "close" not in benchmark_bars:
         return None
-    s_ret = symbol_bars["close"].astype(float).pct_change(fill_method=None)
-    b_ret = benchmark_bars["close"].astype(float).pct_change(fill_method=None)
+    s_ret = symbol_bars["close"].astype(float).sort_index().pct_change(fill_method=None)
+    b_ret = benchmark_bars["close"].astype(float).sort_index().pct_change(fill_method=None)
     rets = pd.DataFrame({"s": s_ret, "b": b_ret}).dropna()
     if len(rets) > window:
         rets = rets.iloc[-window:]

@@ -154,8 +154,10 @@ def _greeks_footer(g: dict[str, Any]) -> str:
 
 def _beta_weighted_footer(bw: dict[str, Any]) -> str:
     bench = bw.get("benchmark", "SPY")
-    if bw["underlyings_total"] > 0 and bw["underlyings_covered"] == 0:
-        return "β-wtd: n/a (no beta available)"
+    if bw["underlyings_total"] == 0:
+        return "β-wtd: n/a (no weightable positions)"  # delta-neutral / flat book
+    if bw["underlyings_covered"] == 0:
+        return "β-wtd: n/a (no beta available)"  # have exposure, no beta for any name
     cov = (
         ""
         if bw.get("complete", True)

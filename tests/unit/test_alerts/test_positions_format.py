@@ -110,6 +110,19 @@ def test_format_positions_text_beta_footer_zero_coverage() -> None:
     assert "β-wtd: n/a" in out
 
 
+def test_format_positions_text_beta_footer_no_weightable_positions() -> None:
+    # Fully delta-neutral book: nothing to weight. Must say so, not print "+0 SPY-eq"
+    # as if it had measured a flat book (honesty wart from Opus review S2).
+    v = _view_with_greeks()
+    v["beta_weighted"] = {
+        "beta_weighted_dollar_delta": 0.0, "dollar_per_1pct_spy": 0.0,
+        "spy_equiv_shares": 0.0, "underlyings_total": 0, "underlyings_covered": 0,
+        "complete": True, "benchmark": "SPY",
+    }
+    out = format_positions_text(v)
+    assert "β-wtd: n/a" in out and "SPY-eq" not in out
+
+
 def test_format_positions_text_beta_footer_absent_when_none() -> None:
     v = _view_with_greeks()
     v["beta_weighted"] = None
