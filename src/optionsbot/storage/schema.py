@@ -191,3 +191,70 @@ execution_state = Table(
     Column("reason", Text),
     Column("ts", DateTime(timezone=True)),
 )
+
+
+# IBK-124: the order ledger. One row per order INTENT (entry or exit), staged
+# before any network call so a crash mid-submit is recoverable (IBK-128
+# resolves `submitting` rows against the broker). order_ref ("obot-{id}") is
+# stamped into IBKR's Order.orderRef so broker-side orders map back to rows
+# unambiguously; limit_price is per combo unit, negative = net credit under
+# the BUY-bag convention.
+orders = Table(
+    "orders",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="SET NULL"),
+        index=True,  # nullable: close orders (IBK-129) won't reference a pick
+    ),
+    Column("intent", Text, nullable=False),
+    Column("symbol", Text, nullable=False, index=True),
+    Column("strategy", Text, nullable=False),
+    # [{symbol, side, sec_type, expiry, strike, right, quantity, conId?}]
+    Column("legs_json", JSON),
+    Column("quantity", Integer, nullable=False),
+    Column("limit_price", Float),
+    Column("ib_order_id", Integer),
+    Column("ib_perm_id", Integer),
+    Column("order_ref", Text, unique=True),
+    Column("status", Text, nullable=False, index=True),
+    Column("staged_ts", DateTime(timezone=True), nullable=False),
+    Column("submitted_ts", DateTime(timezone=True)),
+    Column("terminal_ts", DateTime(timezone=True)),
+    Column("last_error", Text),
+    Column("reprice_count", Integer, nullable=False, server_default="0"),
+    CheckConstraint("intent IN ('open','close')", name="ck_orders_intent"),
+    CheckConstraint(
+        "status IN ('staged','submitting','submitted','partial','filled',"
+        "'cancelled','rejected','abandoned','skipped')",
+        name="ck_orders_status",
+    ),
+)
+
+
+# IBK-124: per-LEG executions (combo orders report one execution per leg, each
+# with its own execId; IBKR re-sends executions on reconnect, hence the UNIQUE
+# ib_exec_id dedupe). commission arrives separately via commissionReport,
+# keyed by the same execId.
+fills = Table(
+    "fills",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("ib_exec_id", Text, nullable=False, unique=True),
+    Column("side", Text, nullable=False),
+    Column("price", Float, nullable=False),
+    Column("qty", Integer, nullable=False),
+    Column("ts", DateTime(timezone=True), nullable=False),
+    Column("commission", Float),
+    Column("leg_con_id", Integer),
+    CheckConstraint("side IN ('BUY','SELL')", name="ck_fills_side"),
+)
