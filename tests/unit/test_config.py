@@ -262,3 +262,45 @@ def test_bare_telegram_env_vars_are_silently_ignored(
     s = Settings()
     assert s.telegram.bot_token is None
     assert s.telegram.chat_id is None
+
+
+def test_execution_settings_defaults() -> None:
+    # IBK-123: execution is OFF by default — without explicit opt-in the bot
+    # stays analysis/alerting-only, exactly as before the execution epic.
+    s = Settings()
+    assert s.execution.enabled is False
+    assert s.execution.mode == "confirm"
+    assert s.execution.paper_only is True
+    assert s.execution.max_open_positions == 6
+    assert s.execution.max_per_symbol == 1
+    assert s.execution.max_daily_loss_pct == 0.02
+    assert s.execution.max_consecutive_losses == 4
+
+
+def test_execution_enabled_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPTIONSBOT_EXECUTION__ENABLED", "true")
+    assert Settings().execution.enabled is True
+
+
+def test_execution_mode_rejects_unknown_value() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(mode="yolo")  # type: ignore[arg-type]
+
+
+def test_execution_bounds_reject_out_of_range() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_daily_loss_pct=0.0)
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_daily_loss_pct=1.5)
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_open_positions=0)
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_consecutive_losses=0)

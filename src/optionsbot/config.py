@@ -11,6 +11,7 @@ from __future__ import annotations
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
@@ -114,6 +115,29 @@ class PortfolioSettings(BaseModel):
     beta_window: int = Field(default=252, ge=2)  # trading days of daily returns for beta
 
 
+class ExecutionSettings(BaseModel):
+    # IBK-123: automated order execution (paper-first). enabled=False means the
+    # bot NEVER places orders regardless of any other setting — exactly the
+    # pre-execution-epic behavior (analysis + alerting only).
+    enabled: bool = False
+    # confirm = orders happen only via an explicit Telegram /execute on an
+    # alerted pick (IBK-126); auto = the scan tick may stage entries itself
+    # (IBK-130). Declared now so config keys stay stable across the epic.
+    mode: Literal["confirm", "auto"] = "confirm"
+    # Hard interlock: while True, can_execute refuses to arm unless
+    # ibkr.paper=True AND ibkr.port is a recognized paper port (4002 Gateway /
+    # 7497 TWS). Flipping this off is a deliberate live-trading decision and
+    # out of scope for the paper epic.
+    paper_only: bool = True
+    # Portfolio caps consumed by the entry gates (IBK-126/130).
+    max_open_positions: int = Field(default=6, ge=1)
+    max_per_symbol: int = Field(default=1, ge=1)
+    # Kill-switch thresholds: auto-trip wiring lands in IBK-130; the persisted
+    # switch + Telegram /kill work from IBK-123.
+    max_daily_loss_pct: float = Field(default=0.02, gt=0.0, le=1.0)
+    max_consecutive_losses: int = Field(default=4, ge=1)
+
+
 class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -146,6 +170,7 @@ class Settings(BaseSettings):
     manage: ManageSettings = ManageSettings()
     validation: ValidationSettings = ValidationSettings()
     portfolio: PortfolioSettings = PortfolioSettings()
+    execution: ExecutionSettings = ExecutionSettings()
 
     log_level: str = "INFO"
 

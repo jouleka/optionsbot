@@ -20,6 +20,7 @@ EXPECTED_TABLES = {
     "pick_outcomes",
     "symbol_news",
     "position_alerts",
+    "execution_state",
 }
 
 
@@ -44,10 +45,36 @@ def test_position_alerts_migration_round_trips(tmp_path: Path) -> None:
 
     command.upgrade(cfg, "head")
     assert "position_alerts" in tables()
-    command.downgrade(cfg, "-1")
+    # Target 0005 explicitly (not "-1"): head keeps moving as migrations land,
+    # but this test pins 0006's own downgrade path.
+    command.downgrade(cfg, "0005")
     assert "position_alerts" not in tables()
     command.upgrade(cfg, "head")
     assert "position_alerts" in tables()
+
+
+def test_execution_state_migration_round_trips(tmp_path: Path) -> None:
+    """0007 upgrade->downgrade->upgrade is reversible (guards a future downgrade edit)."""
+    from alembic.config import Config
+
+    from alembic import command
+
+    project_root = Path(__file__).resolve().parents[2]
+    db = tmp_path / "roundtrip_exec.db"
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+
+    def tables() -> set[str]:
+        with create_engine_for_path(db).connect() as conn:
+            return set(inspect(conn).get_table_names())
+
+    command.upgrade(cfg, "head")
+    assert "execution_state" in tables()
+    # Target 0006 explicitly (not "-1") so the test survives future heads.
+    command.downgrade(cfg, "0006")
+    assert "execution_state" not in tables()
+    command.upgrade(cfg, "head")
+    assert "execution_state" in tables()
 
 
 def test_alerts_table_has_retry_queue_columns() -> None:

@@ -178,3 +178,16 @@ position_alerts = Table(
     Column("dedup_key", Text, nullable=False, index=True),
     Column("ts", DateTime(timezone=True), nullable=False),
 )
+
+
+# IBK-123: singleton-row (id=1) execution kill switch. Persisted (unlike
+# DaemonContext.alerting_paused) so a tripped switch survives daemon restarts;
+# cleared only by an explicit /arm.
+execution_state = Table(
+    "execution_state",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("killed", Integer, nullable=False, server_default="0"),
+    Column("reason", Text),
+    Column("ts", DateTime(timezone=True)),
+)
