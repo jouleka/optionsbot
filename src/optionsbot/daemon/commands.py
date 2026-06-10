@@ -247,7 +247,13 @@ async def _cmd_kill(context: DaemonContext, args: list[str]) -> list[CommandRepl
 async def _cmd_arm(context: DaemonContext, args: list[str]) -> list[CommandReply]:
     state = clear_kill(context.engine)
     verdict = can_execute(context.settings, state)
-    status = "✅ armed" if verdict.allowed else f"not armed — {verdict.reason}"
+    # Distinguish the two switches: /arm clears the kill switch, but execution
+    # may still be off via config — say so instead of a bare "not armed".
+    status = (
+        "execution: ✅ armed"
+        if verdict.allowed
+        else f"execution still off — {verdict.reason}"
+    )
     return [CommandReply(f"kill switch cleared.\n{status}")]
 
 

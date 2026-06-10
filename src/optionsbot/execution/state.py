@@ -33,7 +33,12 @@ def load_state(engine: Engine) -> ExecutionState:
         ).first()
     if row is None:
         return ExecutionState(killed=False, reason=None, ts=None)
-    return ExecutionState(killed=bool(row.killed), reason=row.reason, ts=row.ts)
+    ts = row.ts
+    if ts is not None and ts.tzinfo is None:
+        # SQLite DateTime(timezone=True) drops tzinfo on read; values are
+        # written as UTC, so re-attach it (same defense as alert_dedup).
+        ts = ts.replace(tzinfo=UTC)
+    return ExecutionState(killed=bool(row.killed), reason=row.reason, ts=ts)
 
 
 def trip_kill(

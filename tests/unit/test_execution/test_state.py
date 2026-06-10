@@ -23,6 +23,9 @@ def test_trip_kill_round_trips(tmp_db: Engine) -> None:
     assert state.killed is True
     assert state.reason == "max daily loss breached"
     assert state.ts is not None
+    # SQLite drops tzinfo on round-trip; load_state must re-attach UTC (same
+    # defense as alert_dedup) so later phases can do aware-datetime arithmetic.
+    assert state.ts.tzinfo is not None
 
 
 def test_kill_survives_engine_restart(tmp_path: Path) -> None:
