@@ -22,6 +22,8 @@ from optionsbot.alerts.formatter import (
 from optionsbot.analysis.positions import assemble_open_book
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.execution.gate import can_execute
+from optionsbot.execution.state import clear_kill, load_state, trip_kill
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
@@ -50,6 +52,9 @@ _HELP = (
     "/record — realized track record (win-rate vs predicted, P&L)\n"
     "/pause — stop alerting\n"
     "/resume — resume alerting\n"
+    "/exec — execution status (auto-trading)\n"
+    "/kill [reason] — trip the execution kill switch (no orders until /arm)\n"
+    "/arm — clear the execution kill switch\n"
     "/watchlist list|add SYM|remove SYM\n"
     "/help — this message"
 )
@@ -228,6 +233,43 @@ async def _cmd_record(context: DaemonContext, args: list[str]) -> list[CommandRe
     return [CommandReply(format_track_record(outcomes_report(context.engine)))]
 
 
+async def _cmd_kill(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    reason = " ".join(args).strip() or "manual /kill via Telegram"
+    trip_kill(context.engine, reason)
+    return [
+        CommandReply(
+            f"🛑 execution kill switch TRIPPED\nreason: {reason}\n"
+            "No orders will be placed until /arm."
+        )
+    ]
+
+
+async def _cmd_arm(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    state = clear_kill(context.engine)
+    verdict = can_execute(context.settings, state)
+    status = "✅ armed" if verdict.allowed else f"not armed — {verdict.reason}"
+    return [CommandReply(f"kill switch cleared.\n{status}")]
+
+
+async def _cmd_exec(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    ex = context.settings.execution
+    state = load_state(context.engine)
+    verdict = can_execute(context.settings, state)
+    kill_line = f"TRIPPED ({state.reason})" if state.killed else "clear"
+    verdict_line = ("✅ " if verdict.allowed else "❌ ") + verdict.reason
+    lines = [
+        "execution status:",
+        f"enabled: {str(ex.enabled).lower()}",
+        f"mode: {ex.mode}",
+        f"paper_only: {str(ex.paper_only).lower()} "
+        f"(ibkr.paper={str(context.settings.ibkr.paper).lower()}, "
+        f"port={context.settings.ibkr.port})",
+        f"kill switch: {kill_line}",
+        f"verdict: {verdict_line}",
+    ]
+    return [CommandReply("\n".join(lines))]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -239,6 +281,9 @@ _REGISTRY: dict[str, Handler] = {
     "watchlist": _cmd_watchlist,
     "positions": _cmd_positions,
     "record": _cmd_record,
+    "exec": _cmd_exec,
+    "kill": _cmd_kill,
+    "arm": _cmd_arm,
 }
 
 

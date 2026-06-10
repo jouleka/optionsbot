@@ -191,3 +191,54 @@ async def test_scan_warns_and_orders_when_no_positive_edge(
     picks = [r.text for r in replies if r.parse_mode == "MarkdownV2"]
     assert "bull_put_spread" in picks[0]
     assert "cash_secured_put" in picks[1]
+
+
+async def test_kill_trips_persisted_switch(daemon_context: DaemonContext) -> None:
+    from optionsbot.execution.state import load_state
+
+    [reply] = await dispatch(daemon_context, "/kill max pain today")
+    assert "kill" in reply.text.lower()
+    assert "max pain today" in reply.text
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert state.reason == "max pain today"
+
+
+async def test_kill_without_args_uses_default_reason(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.execution.state import load_state
+
+    await dispatch(daemon_context, "/kill")
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert state.reason  # some non-empty default
+
+
+async def test_arm_clears_kill(daemon_context: DaemonContext) -> None:
+    from optionsbot.execution.state import load_state
+
+    await dispatch(daemon_context, "/kill oops")
+    [reply] = await dispatch(daemon_context, "/arm")
+    assert "clear" in reply.text.lower()
+    assert load_state(daemon_context.engine).killed is False
+
+
+async def test_exec_reports_disabled_by_default(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/exec")
+    assert "enabled: false" in reply.text
+    assert "kill switch: clear" in reply.text
+    assert "verdict:" in reply.text
+
+
+async def test_exec_reports_tripped_kill_switch(daemon_context: DaemonContext) -> None:
+    await dispatch(daemon_context, "/kill drawdown")
+    [reply] = await dispatch(daemon_context, "/exec")
+    assert "drawdown" in reply.text
+
+
+async def test_help_lists_execution_commands(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/help")
+    assert "/exec" in reply.text
+    assert "/kill" in reply.text
+    assert "/arm" in reply.text
