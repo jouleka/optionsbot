@@ -242,3 +242,80 @@ async def test_help_lists_execution_commands(daemon_context: DaemonContext) -> N
     assert "/exec" in reply.text
     assert "/kill" in reply.text
     assert "/arm" in reply.text
+    assert "/execute" in reply.text
+    assert "/orders" in reply.text
+    assert "/cancelorder" in reply.text
+
+
+async def test_execute_requires_numeric_id(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/execute")
+    assert "usage" in reply.text.lower()
+    [reply] = await dispatch(daemon_context, "/execute abc")
+    assert "usage" in reply.text.lower()
+
+
+async def test_execute_without_order_client(daemon_context: DaemonContext) -> None:
+    daemon_context.order_client = None
+    [reply] = await dispatch(daemon_context, "/execute 5")
+    assert "not configured" in reply.text.lower()
+
+
+async def test_execute_delegates_to_engine(daemon_context: DaemonContext) -> None:
+    from optionsbot.execution.engine import ExecuteOutcome
+
+    daemon_context.order_client = MagicMock()
+    with patch(
+        "optionsbot.execution.engine.execute_pick",
+        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="✅ submitted #9", order_id=9)),
+    ) as run:
+        [reply] = await dispatch(daemon_context, "/execute 5")
+    assert "submitted #9" in reply.text
+    assert run.await_args.args[1] == 5
+
+
+async def test_orders_lists_recent(daemon_context: DaemonContext) -> None:
+    from optionsbot.storage.schema import orders as orders_table
+
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(orders_table).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread", legs_json=[],
+            quantity=2, status="submitted", staged_ts=datetime.now(UTC),
+            limit_price=-1.2, reprice_count=0,
+        ))
+    [reply] = await dispatch(daemon_context, "/orders")
+    assert "SPY" in reply.text and "submitted" in reply.text
+
+
+async def test_orders_empty(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/orders")
+    assert "no orders" in reply.text.lower()
+
+
+async def test_cancelorder_paths(daemon_context: DaemonContext) -> None:
+    from optionsbot.storage.schema import orders as orders_table
+
+    daemon_context.order_client = MagicMock()
+    daemon_context.order_client.cancel = AsyncMock()
+    [reply] = await dispatch(daemon_context, "/cancelorder 424242")
+    assert "unknown" in reply.text.lower()
+
+    with daemon_context.engine.begin() as conn:
+        row = conn.execute(insert(orders_table).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread", legs_json=[],
+            quantity=1, status="submitted", staged_ts=datetime.now(UTC),
+            ib_order_id=77, reprice_count=0,
+        ))
+        working_id = int(row.inserted_primary_key[0])
+        done = conn.execute(insert(orders_table).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread", legs_json=[],
+            quantity=1, status="filled", staged_ts=datetime.now(UTC),
+            reprice_count=0,
+        ))
+        done_id = int(done.inserted_primary_key[0])
+
+    [reply] = await dispatch(daemon_context, f"/cancelorder {done_id}")
+    assert "filled" in reply.text
+
+    [reply] = await dispatch(daemon_context, f"/cancelorder {working_id}")
+    assert "cancel requested" in reply.text.lower()
+    daemon_context.order_client.cancel.assert_awaited_once_with(77)

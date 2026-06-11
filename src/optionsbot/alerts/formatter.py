@@ -59,6 +59,7 @@ def format_alert_markdown(
     view: MarketView,
     scored: ScoredStrategy,
     snapshot_ts: datetime,
+    execute_hint: str | None = None,
 ) -> str:
     """Return a MarkdownV2-escaped Telegram message for one scored strategy."""
     sug = scored.suggestion
@@ -110,6 +111,12 @@ def format_alert_markdown(
     # Rationale: escape user-supplied text that may contain special chars.
     lines.append(_md_escape(scored.rationale))
     lines.append("")
+    # IBK-126: one-tap execution hint ("➤ /execute 123"). The slash command is
+    # MarkdownV2-safe as long as the hint stays /-letters-digits — escape
+    # defensively anyway since the caller builds the string.
+    if execute_hint:
+        lines.append(f"➤ {_md_escape(execute_hint)}")
+        lines.append("")
     # Snapshot timestamp inside italic: even inside _..._ all special chars
     # except `_` and `\` still need escaping (Telegram MarkdownV2 rule).
     # The isoformat() output has `-`, `:`, `+`, `.` — all of which must be escaped.

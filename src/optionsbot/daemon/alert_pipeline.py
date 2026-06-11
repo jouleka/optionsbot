@@ -55,6 +55,27 @@ async def enqueue_alert(
     return True
 
 
+def execute_hint_for(
+    context: DaemonContext, snapshot_id: int, strategy: str
+) -> str | None:
+    """`/execute <strategy_scores.id>` hint for an alert, or None.
+
+    Only when execution is enabled (IBK-126) — the hint would be noise (and
+    /execute would just reject) while the bot is analysis-only.
+    """
+    if not context.settings.execution.enabled:
+        return None
+    with context.engine.connect() as conn:
+        row = conn.execute(
+            select(strategy_scores.c.id)
+            .where(strategy_scores.c.snapshot_id == snapshot_id)
+            .where(strategy_scores.c.strategy == strategy)
+            .order_by(strategy_scores.c.id.desc())
+            .limit(1)
+        ).first()
+    return f"/execute {row.id}" if row is not None else None
+
+
 async def dispatch_alert(
     context: DaemonContext,
     alert_id: int,
@@ -67,6 +88,7 @@ async def dispatch_alert(
     symbol = _load_symbol_for_alert(context, alert_id)
     text = format_alert_markdown(
         symbol=symbol, view=view, scored=scored, snapshot_ts=snapshot_ts,
+        execute_hint=execute_hint_for(context, snapshot_id, scored.strategy_name),
     )
     try:
         msg_id = await context.telegram.send_message(text)

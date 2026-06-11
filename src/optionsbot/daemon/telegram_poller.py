@@ -18,7 +18,11 @@ log = logging.getLogger(__name__)
 
 _POLL_TIMEOUT = 30
 _ERROR_BACKOFF = 5.0
-_ACK = {"scan": "⏳ scanning, one moment…", "screen": "⏳ screening the universe…"}
+_ACK = {
+    "scan": "⏳ scanning, one moment…",
+    "screen": "⏳ screening the universe…",
+    "execute": "⏳ checking gates and fresh quotes…",
+}
 
 
 async def _drop_backlog(context: DaemonContext) -> int | None:

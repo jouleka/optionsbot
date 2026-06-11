@@ -53,6 +53,9 @@ _HELP = (
     "/pause — stop alerting\n"
     "/resume — resume alerting\n"
     "/exec — execution status (auto-trading)\n"
+    "/execute ID — place the alerted pick with that id (paper)\n"
+    "/orders [N] — recent orders + status\n"
+    "/cancelorder ID — cancel a working order\n"
     "/kill [reason] — trip the execution kill switch (no orders until /arm)\n"
     "/arm — clear the execution kill switch\n"
     "/watchlist list|add SYM|remove SYM\n"
@@ -276,6 +279,78 @@ async def _cmd_exec(context: DaemonContext, args: list[str]) -> list[CommandRepl
     return [CommandReply("\n".join(lines))]
 
 
+async def _cmd_execute(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    if not args or not args[0].isdigit():
+        return [CommandReply("usage: /execute PICK_ID (the id shown on the alert)")]
+    if context.order_client is None:
+        return [CommandReply("execution is not configured in this daemon build")]
+    # Imported here, not at module level: engine -> daemon.market_hours would
+    # otherwise close an import cycle through this module (same lazy pattern
+    # as _cmd_record).
+    from optionsbot.execution import engine as execution_engine
+
+    deps = execution_engine.ExecutionDeps(
+        engine=context.engine,
+        settings=context.settings,
+        order_client=context.order_client,
+        md=MarketDataClient(context.ibkr, context.resolver),
+        positions=PositionsClient(context.ibkr),
+        ibkr_lock=context.ibkr_lock,
+    )
+    outcome = await execution_engine.execute_pick(deps, int(args[0]))
+    return [CommandReply(outcome.message)]
+
+
+async def _cmd_orders(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    from optionsbot.execution.orders import net_premium
+    from optionsbot.storage.schema import orders as orders_table
+
+    n = int(args[0]) if args and args[0].isdigit() else 5
+    n = max(1, min(n, 20))
+    with context.engine.connect() as conn:
+        rows = conn.execute(
+            select(orders_table).order_by(orders_table.c.id.desc()).limit(n)
+        ).fetchall()
+    if not rows:
+        return [CommandReply("no orders yet — /execute an alerted pick to start")]
+    lines = []
+    for r in rows:
+        net = net_premium(context.engine, r.id)
+        net_part = f" net ${net:,.0f}" if net is not None else ""
+        limit_part = f" lmt {r.limit_price:+.2f}" if r.limit_price is not None else ""
+        lines.append(
+            f"#{r.id} {r.symbol} {r.strategy} {r.quantity}x [{r.status}]"
+            f"{limit_part}{net_part}"
+        )
+    return [CommandReply("orders (newest first):\n" + "\n".join(lines))]
+
+
+async def _cmd_cancelorder(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    from optionsbot.execution.orders import WORKING_STATUSES, get_order
+
+    if not args or not args[0].isdigit():
+        return [CommandReply("usage: /cancelorder ORDER_ID")]
+    if context.order_client is None:
+        return [CommandReply("execution is not configured in this daemon build")]
+    order = get_order(context.engine, int(args[0]))
+    if order is None:
+        return [CommandReply(f"unknown order id {args[0]}")]
+    if order.status not in WORKING_STATUSES:
+        return [CommandReply(f"#{order.id} is {order.status} — nothing to cancel")]
+    if order.ib_order_id is None:
+        return [CommandReply(f"#{order.id} has no broker order id — cannot cancel")]
+    try:
+        await context.order_client.cancel(order.ib_order_id)
+    except ValueError:
+        return [
+            CommandReply(
+                f"#{order.id} was placed before a daemon restart — cancel it "
+                "manually in TWS (automatic adoption lands with IBK-128)"
+            )
+        ]
+    return [CommandReply(f"cancel requested for #{order.id} — you'll get a confirmation")]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -290,6 +365,9 @@ _REGISTRY: dict[str, Handler] = {
     "exec": _cmd_exec,
     "kill": _cmd_kill,
     "arm": _cmd_arm,
+    "execute": _cmd_execute,
+    "orders": _cmd_orders,
+    "cancelorder": _cmd_cancelorder,
 }
 
 
