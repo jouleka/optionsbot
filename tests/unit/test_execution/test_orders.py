@@ -153,13 +153,20 @@ EXPECTED_LEGAL: frozenset[tuple[str, str]] = frozenset(
         ("submitting", "submitted"),
         ("submitting", "rejected"),
         ("submitting", "skipped"),
+        # Self-loops on working states: ib_async re-delivers orderStatus with
+        # the same status while fill quantities mutate — must be a no-op, not
+        # an IllegalOrderTransition mid-pipeline.
+        ("submitted", "submitted"),
         ("submitted", "partial"),
         ("submitted", "filled"),
         ("submitted", "cancelled"),
         ("submitted", "rejected"),
         ("submitted", "abandoned"),
+        ("partial", "partial"),
         ("partial", "filled"),
         ("partial", "cancelled"),
+        # IBKR can reject/deactivate the REMAINDER of a partially-filled order.
+        ("partial", "rejected"),
         ("partial", "abandoned"),
     }
 )
@@ -220,6 +227,24 @@ def test_terminal_transition_sets_terminal_ts_and_error(tmp_db: Engine) -> None:
     )
     assert record.terminal_ts is not None and record.terminal_ts.tzinfo is not None
     assert record.last_error == "insufficient buying power"
+
+
+def test_same_status_redelivery_is_a_noop(tmp_db: Engine) -> None:
+    # ib_async fires orderStatus repeatedly with an unchanged status string
+    # while filled/remaining mutate; re-delivery must not rewrite anything.
+    later = datetime(2026, 6, 10, 16, 45, tzinfo=UTC)
+    order_id = _insert_order(
+        tmp_db, "submitted", submitted_ts=NOW, ib_order_id=7, reprice_count=3
+    )
+    record = transition(tmp_db, order_id, "submitted", now=later)
+    assert record.status == "submitted"
+    assert record.submitted_ts == NOW  # NOT rewritten to `later`
+    assert record.reprice_count == 3
+
+    partial_id = _insert_order(tmp_db, "partial")
+    record = transition(tmp_db, partial_id, "partial", now=later)
+    assert record.status == "partial"
+    assert record.terminal_ts is None
 
 
 # --- reprice -----------------------------------------------------------------
@@ -289,6 +314,25 @@ def test_net_premium_signed_per_leg_sum(tmp_db: Engine) -> None:
 def test_net_premium_none_without_fills(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "submitted")
     assert net_premium(tmp_db, order_id) is None
+
+
+def test_net_premium_sums_multiple_fills_per_leg(tmp_db: Engine) -> None:
+    # One leg can fill across several executions (each with its own execId).
+    order_id = _insert_order(tmp_db, "partial", quantity=2)
+    record_fill(tmp_db, order_id, exec_id="m1", side="SELL", price=1.20, qty=1, ts=NOW)
+    record_fill(tmp_db, order_id, exec_id="m2", side="SELL", price=1.10, qty=1, ts=NOW)
+    record_fill(tmp_db, order_id, exec_id="m3", side="BUY", price=0.40, qty=2, ts=NOW)
+    # (1.20 + 1.10 - 0.40*2) * 100 = 150 dollars net credit.
+    assert net_premium(tmp_db, order_id) == pytest.approx(150.0)
+
+
+def test_record_fill_rejects_lowercase_side(tmp_db: Engine) -> None:
+    # legs_json stores side as lowercase 'buy'/'sell'; fills require uppercase
+    # IBKR execution sides. A clear ValueError beats an IntegrityError if
+    # IBK-125 ever wires a leg side straight through.
+    order_id = _insert_order(tmp_db, "submitted")
+    with pytest.raises(ValueError, match="side"):
+        record_fill(tmp_db, order_id, exec_id="x1", side="sell", price=1.0, qty=1, ts=NOW)
 
 
 # --- queries -----------------------------------------------------------------

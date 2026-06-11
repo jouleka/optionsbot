@@ -47,11 +47,17 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
 # Orders resting at IBKR (have an ib_order_id and may still fill).
 WORKING_STATUSES: frozenset[str] = frozenset({"submitted", "partial"})
 
+# Self-loops on the working states are legal NO-OPS: ib_async re-delivers
+# orderStatus with an unchanged status string while filled/remaining mutate,
+# and that must never raise mid-pipeline. partial -> rejected covers IBKR
+# rejecting/deactivating the REMAINDER of a partially-filled order.
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "staged": frozenset({"submitting", "skipped"}),
     "submitting": frozenset({"submitted", "rejected", "skipped"}),
-    "submitted": frozenset({"partial", "filled", "cancelled", "rejected", "abandoned"}),
-    "partial": frozenset({"filled", "cancelled", "abandoned"}),
+    "submitted": frozenset(
+        {"submitted", "partial", "filled", "cancelled", "rejected", "abandoned"}
+    ),
+    "partial": frozenset({"partial", "filled", "cancelled", "rejected", "abandoned"}),
     "filled": frozenset(),
     "cancelled": frozenset(),
     "rejected": frozenset(),
@@ -202,6 +208,9 @@ def transition(
     if new_status not in ORDER_STATUSES:
         raise IllegalOrderTransition(f"unknown status {new_status!r}")
     ts = now if now is not None else datetime.now(UTC)
+    # Read-then-update in one transaction: safe under the single-process
+    # asyncio daemon (SQLite serializes writers); revisit if a second writer
+    # process is ever introduced.
     with engine.begin() as conn:
         row = conn.execute(
             select(orders.c.status).where(orders.c.id == order_id)
@@ -213,18 +222,20 @@ def transition(
             raise IllegalOrderTransition(
                 f"order {order_id}: illegal transition {current!r} -> {new_status!r}"
             )
-        values: dict[str, Any] = {"status": new_status}
-        if ib_order_id is not None:
-            values["ib_order_id"] = ib_order_id
-        if ib_perm_id is not None:
-            values["ib_perm_id"] = ib_perm_id
-        if error is not None:
-            values["last_error"] = error
-        if new_status == "submitted":
-            values["submitted_ts"] = ts
-        if new_status in TERMINAL_STATUSES:
-            values["terminal_ts"] = ts
-        conn.execute(update(orders).where(orders.c.id == order_id).values(**values))
+        if new_status != current:
+            values: dict[str, Any] = {"status": new_status}
+            if ib_order_id is not None:
+                values["ib_order_id"] = ib_order_id
+            if ib_perm_id is not None:
+                values["ib_perm_id"] = ib_perm_id
+            if error is not None:
+                values["last_error"] = error
+            if new_status == "submitted":
+                values["submitted_ts"] = ts
+            if new_status in TERMINAL_STATUSES:
+                values["terminal_ts"] = ts
+            conn.execute(update(orders).where(orders.c.id == order_id).values(**values))
+        # else: same-status re-delivery — idempotent no-op, nothing rewritten.
     record = get_order(engine, order_id)
     assert record is not None
     return record
@@ -270,7 +281,14 @@ def record_fill(
     leg_con_id: int | None = None,
 ) -> bool:
     """Persist one per-leg execution. Returns False on a duplicate execId
-    (IBKR re-sends executions on reconnect — replay must be idempotent)."""
+    (IBKR re-sends executions on reconnect — replay must be idempotent).
+
+    ``side`` is an IBKR execution side, uppercase — NOT a legs_json side
+    (those are lowercase 'buy'/'sell'); the explicit check turns a wiring
+    mistake into a clear error instead of a CHECK-constraint IntegrityError.
+    """
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"fill side must be 'BUY' or 'SELL', got {side!r}")
     with engine.begin() as conn:
         exists = conn.execute(
             select(fills.c.id).where(fills.c.ib_exec_id == exec_id)

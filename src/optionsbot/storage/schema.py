@@ -212,7 +212,9 @@ orders = Table(
     Column("intent", Text, nullable=False),
     Column("symbol", Text, nullable=False, index=True),
     Column("strategy", Text, nullable=False),
-    # [{symbol, side, sec_type, expiry, strike, right, quantity, conId?}]
+    # [{symbol, side('buy'|'sell'), sec_type, expiry, strike, right, quantity}]
+    # copied verbatim from strategy_scores — carries NO conIds; contract
+    # qualification is the submitter's job at order time (IBK-125).
     Column("legs_json", JSON),
     Column("quantity", Integer, nullable=False),
     Column("limit_price", Float),
