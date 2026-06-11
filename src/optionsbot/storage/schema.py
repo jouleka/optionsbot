@@ -240,6 +240,34 @@ orders = Table(
 # with its own execId; IBKR re-sends executions on reconnect, hence the UNIQUE
 # ib_exec_id dedupe). commission arrives separately via commissionReport,
 # keyed by the same execId.
+# IBK-127: decision-quote journal — the implementation-shortfall baseline.
+# One row at decision time plus one per price-walk step, carrying the exact
+# per-leg NBBO the bot acted on, so realized fills can be compared against
+# the quotes that justified them (slippage measurement on paper AND live).
+order_quotes = Table(
+    "order_quotes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("kind", Text, nullable=False),  # decision | step | final
+    Column("step", Integer, nullable=False, server_default="0"),
+    Column("ts", DateTime(timezone=True), nullable=False),
+    Column("combo_bid", Float),
+    Column("combo_ask", Float),
+    Column("combo_mid", Float),
+    Column("target_net", Float),
+    Column("limit_price", Float),
+    Column("legs_json", JSON),  # per-leg {expiry, strike, right, side, bid, ask, mid, delayed}
+    CheckConstraint("kind IN ('decision','step','final')", name="ck_order_quotes_kind"),
+)
+
+
 fills = Table(
     "fills",
     metadata,

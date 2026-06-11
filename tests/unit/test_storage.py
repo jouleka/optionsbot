@@ -23,6 +23,7 @@ EXPECTED_TABLES = {
     "execution_state",
     "orders",
     "fills",
+    "order_quotes",
 }
 
 
@@ -101,6 +102,29 @@ def test_orders_fills_migration_round_trips(tmp_path: Path) -> None:
     assert {"orders", "fills"} & tables() == set()
     command.upgrade(cfg, "head")
     assert {"orders", "fills"} <= tables()
+
+
+def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:
+    """0009 upgrade->downgrade->upgrade is reversible."""
+    from alembic.config import Config
+
+    from alembic import command
+
+    project_root = Path(__file__).resolve().parents[2]
+    db = tmp_path / "roundtrip_quotes.db"
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+
+    def tables() -> set[str]:
+        with create_engine_for_path(db).connect() as conn:
+            return set(inspect(conn).get_table_names())
+
+    command.upgrade(cfg, "head")
+    assert "order_quotes" in tables()
+    command.downgrade(cfg, "0008")
+    assert "order_quotes" not in tables()
+    command.upgrade(cfg, "head")
+    assert "order_quotes" in tables()
 
 
 def test_alerts_table_has_retry_queue_columns() -> None:

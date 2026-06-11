@@ -24,7 +24,13 @@ from typing import Any
 
 from sqlalchemy import Engine, Row, insert, select, update
 
-from optionsbot.storage.schema import fills, orders, snapshots, strategy_scores
+from optionsbot.storage.schema import (
+    fills,
+    order_quotes,
+    orders,
+    snapshots,
+    strategy_scores,
+)
 
 ORDER_STATUSES: frozenset[str] = frozenset(
     {
@@ -316,6 +322,38 @@ def set_fill_commission(engine: Engine, exec_id: str, commission: float) -> bool
             update(fills).where(fills.c.ib_exec_id == exec_id).values(commission=commission)
         )
     return result.rowcount > 0
+
+
+def record_order_quotes(
+    engine: Engine,
+    order_id: int,
+    *,
+    kind: str,
+    step: int,
+    ts: datetime,
+    combo_bid: float | None,
+    combo_ask: float | None,
+    combo_mid: float | None,
+    target_net: float | None,
+    limit_price: float | None,
+    legs: list[dict[str, Any]],
+) -> None:
+    """One decision-journal row (IBK-127): the quotes behind a pricing action."""
+    with engine.begin() as conn:
+        conn.execute(
+            insert(order_quotes).values(
+                order_id=order_id,
+                kind=kind,
+                step=step,
+                ts=ts,
+                combo_bid=combo_bid,
+                combo_ask=combo_ask,
+                combo_mid=combo_mid,
+                target_net=target_net,
+                limit_price=limit_price,
+                legs_json=legs,
+            )
+        )
 
 
 def net_premium(engine: Engine, order_id: int) -> float | None:
