@@ -144,6 +144,14 @@ class ExecutionSettings(BaseModel):
     # switch + Telegram /kill work from IBK-123.
     max_daily_loss_pct: float = Field(default=0.02, gt=0.0, le=1.0)
     max_consecutive_losses: int = Field(default=4, ge=1)
+    # IBK-126 semi-auto execution. A pick older than max_pick_age is the wrong
+    # trade (strikes/credit moved) — rescan instead. v1 pricing places at the
+    # fresh mid and rests until the TTL, then auto-cancels (= trade skipped);
+    # the reprice ladder arrives in IBK-127. credit_drift_warn_pct flags when
+    # the fresh mid drifted from the alerted credit.
+    max_pick_age_minutes: int = Field(default=20, ge=1)
+    order_ttl_minutes: int = Field(default=10, ge=1)
+    credit_drift_warn_pct: float = Field(default=0.25, gt=0.0)
 
 
 class StorageSettings(BaseModel):

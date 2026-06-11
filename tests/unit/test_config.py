@@ -297,6 +297,14 @@ def test_execution_mode_rejects_unknown_value() -> None:
         ExecutionSettings(mode="yolo")  # type: ignore[arg-type]
 
 
+def test_execution_semi_auto_defaults() -> None:
+    # IBK-126
+    s = Settings()
+    assert s.execution.max_pick_age_minutes == 20
+    assert s.execution.order_ttl_minutes == 10
+    assert s.execution.credit_drift_warn_pct == 0.25
+
+
 def test_execution_bounds_reject_out_of_range() -> None:
     from pydantic import ValidationError
 

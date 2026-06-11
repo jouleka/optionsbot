@@ -1,0 +1,259 @@
+"""/execute orchestration (IBK-126): gates → fresh pricing → stage → place.
+
+Every rejection returns a human-readable reason (the Telegram reply IS the
+UX in confirm mode). Pricing is v1: place at the fresh combo mid and let the
+order watcher TTL-cancel if unfilled — the reprice ladder is IBK-127.
+
+NOT re-exported from ``optionsbot.execution.__init__`` (imports ibkr +
+daemon submodules; same import-graph reasoning as tracker.py). Callers
+import it directly inside functions — see daemon/commands.py.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from sqlalchemy import Engine, select
+
+from optionsbot.config import Settings
+from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.execution.gate import can_execute
+from optionsbot.execution.orders import stage_order, transition
+from optionsbot.execution.state import load_state
+from optionsbot.ibkr.market_data import MarketDataClient
+from optionsbot.ibkr.orders import OrderClient
+from optionsbot.ibkr.positions import PositionsClient
+from optionsbot.ibkr.types import OptionQuote
+from optionsbot.storage.schema import orders, snapshots, strategy_scores
+
+log = logging.getLogger(__name__)
+
+# Statuses that count as "this pick already has live exposure": anything not
+# failed-terminal. `filled` stays active until IBK-129 introduces closes.
+_ACTIVE_STATUSES = ("staged", "submitting", "submitted", "partial", "filled")
+
+LegSpec = tuple[str, float, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionDeps:
+    """Everything execute_pick needs; daemon/commands assembles it from context."""
+
+    engine: Engine
+    settings: Settings
+    order_client: OrderClient
+    md: MarketDataClient
+    positions: PositionsClient
+    ibkr_lock: asyncio.Lock
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteOutcome:
+    ok: bool
+    message: str
+    order_id: int | None = None
+
+
+def combo_mid(
+    legs: Sequence[Mapping[str, Any]], quotes: Mapping[LegSpec, OptionQuote]
+) -> float | None:
+    """Signed per-unit net mid from per-leg quotes: positive = net credit.
+
+    STK legs are ignored (never ordered). Returns None unless EVERY option
+    leg has a usable mid — a partial mid is a wrong price, not a fallback.
+    """
+    total = 0.0
+    for leg in legs:
+        if leg.get("sec_type", "OPT") != "OPT":
+            continue
+        spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+        quote = quotes.get(spec)
+        if quote is None or quote.mid is None:
+            return None
+        sign = 1.0 if leg["side"] == "sell" else -1.0
+        total += sign * quote.mid * int(leg.get("quantity", 1))
+    return total
+
+
+def _reject(message: str) -> ExecuteOutcome:
+    return ExecuteOutcome(ok=False, message=f"❌ {message}")
+
+
+async def execute_pick(
+    deps: ExecutionDeps, score_id: int, *, now: datetime | None = None
+) -> ExecuteOutcome:
+    ts_now = now if now is not None else datetime.now(UTC)
+    engine = deps.engine
+    settings = deps.settings
+
+    # 1. Arming gate (enabled + paper interlock + kill switch).
+    verdict = can_execute(settings, load_state(engine))
+    if not verdict.allowed:
+        return _reject(verdict.reason)
+
+    # 2. Load the pick.
+    with engine.connect() as conn:
+        pick = conn.execute(
+            select(
+                strategy_scores.c.id,
+                strategy_scores.c.strategy,
+                strategy_scores.c.legs_json,
+                strategy_scores.c.suggestion_json,
+                snapshots.c.symbol,
+                snapshots.c.ts,
+            )
+            .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+            .where(strategy_scores.c.id == score_id)
+        ).first()
+    if pick is None:
+        return _reject(f"unknown pick id {score_id}")
+    suggestion: dict[str, Any] = pick.suggestion_json or {}
+    legs: list[dict[str, Any]] = list(pick.legs_json or [])
+    symbol: str = pick.symbol
+
+    # 3. Freshness — stale strikes are the wrong trade.
+    pick_ts: datetime = pick.ts
+    if pick_ts.tzinfo is None:
+        pick_ts = pick_ts.replace(tzinfo=UTC)
+    age = ts_now - pick_ts
+    max_age = timedelta(minutes=settings.execution.max_pick_age_minutes)
+    if age > max_age:
+        return _reject(
+            f"stale pick — scanned {int(age.total_seconds() // 60)}m ago "
+            f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
+        )
+
+    # 4. Defined-risk only; sized.
+    if not suggestion.get("defined_risk", False):
+        return _reject("undefined risk strategies are not executable")
+    quantity = int(suggestion.get("suggested_quantity") or 0)
+    if quantity < 1:
+        return _reject("pick has no executable quantity (sizing returned 0)")
+
+    # 5. Market hours.
+    if not is_market_open(ts_now):
+        return _reject("market is closed — orders would rest blind on stale quotes")
+
+    # 6. One active order per pick.
+    with engine.connect() as conn:
+        existing = conn.execute(
+            select(orders.c.id, orders.c.status)
+            .where(orders.c.strategy_score_id == score_id)
+            .where(orders.c.status.in_(_ACTIVE_STATUSES))
+        ).first()
+        if existing is not None:
+            return _reject(
+                f"pick {score_id} already has order #{existing.id} ({existing.status})"
+            )
+        # 7. Ledger-based caps (bot-attributed exposure; portfolio-wide gates
+        # arrive with full-auto IBK-130).
+        active_rows = conn.execute(
+            select(orders.c.id, orders.c.symbol)
+            .where(orders.c.intent == "open")
+            .where(orders.c.status.in_(_ACTIVE_STATUSES))
+        ).fetchall()
+    if len(active_rows) >= settings.execution.max_open_positions:
+        return _reject(
+            f"max_open_positions reached ({settings.execution.max_open_positions}) "
+            "— close something first"
+        )
+    same_symbol = sum(1 for r in active_rows if r.symbol == symbol)
+    if same_symbol >= settings.execution.max_per_symbol:
+        return _reject(
+            f"already {same_symbol} active {symbol} position(s) "
+            f"(max_per_symbol={settings.execution.max_per_symbol})"
+        )
+
+    # 8. Fresh per-leg quotes -> combo mid (the scan-time credit is stale).
+    option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+    quotes: dict[LegSpec, OptionQuote] = {}
+    async with deps.ibkr_lock:
+        for leg in option_legs:
+            spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+            try:
+                quotes[spec] = await deps.md.get_option_snapshot(
+                    symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
+                )
+            except Exception as exc:  # noqa: BLE001 -- per-leg quote failure = reject
+                return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
+    fresh_net = combo_mid(legs, quotes)
+    if fresh_net is None:
+        return _reject("missing quote mid on at least one leg — not pricing this blind")
+
+    scan_net = float(suggestion.get("credit_or_debit") or 0.0) / 100.0  # per unit
+    if scan_net != 0 and (fresh_net == 0 or (fresh_net > 0) != (scan_net > 0)):
+        return _reject(
+            f"edge gone — scan priced {scan_net:+.2f}/unit but fresh mid is "
+            f"{fresh_net:+.2f}/unit"
+        )
+    drift_note = ""
+    if scan_net != 0:
+        drift = abs(fresh_net - scan_net) / abs(scan_net)
+        if drift > settings.execution.credit_drift_warn_pct:
+            drift_note = (
+                f"\n⚠ drift {drift * 100:.0f}% vs scan "
+                f"({scan_net:+.2f} → {fresh_net:+.2f})"
+            )
+
+    limit_price = -fresh_net  # BUY-bag convention: credit = negative limit
+
+    # 9. Margin gate via whatIf + available funds.
+    try:
+        preview = await deps.order_client.whatif_combo(
+            symbol, legs, quantity=quantity, limit_price=limit_price
+        )
+    except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
+        return _reject(f"whatIf margin preview failed: {exc}")
+    async with deps.ibkr_lock:
+        summary = await deps.positions.get_account_summary()
+    available = float(summary.available_funds) if summary.available_funds is not None else None
+    needed = preview.init_margin_change
+    if needed is not None and available is not None and needed > available:
+        return _reject(
+            f"margin Δ ${needed:,.0f} exceeds available funds ${available:,.0f}"
+        )
+    margin_note = f"margin Δ ${needed:,.0f}" if needed is not None else "margin Δ unknown"
+    if preview.warning:
+        margin_note += f" ({preview.warning})"
+
+    # 10. Stage -> submitting -> place -> submitted.
+    record = stage_order(engine, score_id, now=ts_now)
+    transition(engine, record.id, "submitting", now=ts_now)
+    try:
+        placed = await deps.order_client.place_combo_limit(
+            symbol,
+            legs,
+            quantity=quantity,
+            limit_price=limit_price,
+            order_ref=record.order_ref or f"obot-{record.id}",
+        )
+    except Exception as exc:  # noqa: BLE001 -- a failed place must land in the ledger
+        transition(engine, record.id, "skipped", error=str(exc), now=ts_now)
+        return ExecuteOutcome(
+            ok=False,
+            message=f"❌ order #{record.id} not placed: {exc}",
+            order_id=record.id,
+        )
+    transition(
+        engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
+    )
+    log.info(
+        "executed pick %s -> order #%s (%s %sx %s @ %+.2f)",
+        score_id, record.id, pick.strategy, quantity, symbol, fresh_net,
+    )
+    kind = "credit" if fresh_net > 0 else "debit"
+    return ExecuteOutcome(
+        ok=True,
+        message=(
+            f"✅ submitted #{record.id}: {symbol} {pick.strategy} {quantity}x "
+            f"@ net {kind} {abs(fresh_net):.2f}/unit\n{margin_note}\n"
+            f"TTL {settings.execution.order_ttl_minutes}m — /orders to track, "
+            f"/cancelorder {record.id} to pull{drift_note}"
+        ),
+        order_id=record.id,
+    )
