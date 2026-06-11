@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-ProcessRole = Literal["mcp", "daemon", "cli"]
+ProcessRole = Literal["mcp", "daemon", "cli", "exec"]
 
 
 class IBKRClient:
@@ -79,6 +79,9 @@ class IBKRClient:
     def _client_id(self) -> int:
         if self._role == "daemon":
             return self._settings.ibkr.client_id_daemon
+        if self._role == "exec":
+            # IBK-125: order events are only delivered to the placing clientId.
+            return self._settings.ibkr.client_id_exec
         # mcp and cli share an id-space; the cli path is short-lived and unlikely to collide
         return self._settings.ibkr.client_id_mcp
 

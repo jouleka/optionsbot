@@ -264,6 +264,12 @@ def test_bare_telegram_env_vars_are_silently_ignored(
     assert s.telegram.chat_id is None
 
 
+def test_ibkr_client_id_exec_default_is_3() -> None:
+    # IBK-125: dedicated execution clientId — order events are only visible
+    # to the placing clientId, so the OrderClient never shares MCP=1/daemon=2.
+    assert Settings().ibkr.client_id_exec == 3
+
+
 def test_execution_settings_defaults() -> None:
     # IBK-123: execution is OFF by default — without explicit opt-in the bot
     # stays analysis/alerting-only, exactly as before the execution epic.

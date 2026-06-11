@@ -11,12 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from optionsbot.config import PAPER_PORTS
+
 if TYPE_CHECKING:
     from optionsbot.config import Settings
     from optionsbot.execution.state import ExecutionState
 
-# Recognized paper ports: IB Gateway paper / TWS paper (IBK-16 conventions).
-PAPER_PORTS: frozenset[int] = frozenset({4002, 7497})
+__all__ = ["PAPER_PORTS", "GateResult", "can_execute"]
 
 
 @dataclass(frozen=True, slots=True)

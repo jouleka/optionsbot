@@ -24,12 +24,20 @@ from pydantic_settings import (
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "optionsbot" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "optionsbot" / "optionsbot.db"
 
+# Recognized paper ports: IB Gateway paper / TWS paper (IBK-16 conventions).
+# Lives here (zero-dependency module) so both the execution gate and the
+# ibkr-layer order interlock can share it without an import cycle.
+PAPER_PORTS: frozenset[int] = frozenset({4002, 7497})
+
 
 class IBKRSettings(BaseModel):
     host: str = "127.0.0.1"
     port: int = 4002  # IB Gateway paper default (see IBK-16 for port conventions)
     client_id_mcp: int = 1
     client_id_daemon: int = 2
+    # IBK-125: dedicated execution clientId — order status/fill events are
+    # only delivered to the clientId that placed the order.
+    client_id_exec: int = 3
     paper: bool = True
     # Max simultaneous streaming market-data lines to subscribe at once when
     # fetching an option chain. IBKR's default account allowance is 100; a

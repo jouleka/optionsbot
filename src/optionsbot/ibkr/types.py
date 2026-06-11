@@ -107,3 +107,65 @@ class AccountSummary:
     buying_power: Decimal | None
     available_funds: Decimal | None
     currency: str
+
+
+@dataclass(frozen=True, slots=True)
+class MarginPreview:
+    """Parsed ``whatIfOrder`` result (IBK-125). IBKR returns margin figures
+    as strings and uses DBL_MAX sentinels for unset values — both normalized
+    to ``None`` here."""
+
+    init_margin_change: float | None
+    maint_margin_change: float | None
+    equity_with_loan_change: float | None
+    commission: float | None
+    max_commission: float | None
+    warning: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlacedOrder:
+    """Acknowledgement that an order was handed to ib_async (IBK-125)."""
+
+    ib_order_id: int
+    order_ref: str
+    action: str  # 'BUY' | 'SELL'
+    limit_price: float
+    quantity: int
+
+
+@dataclass(frozen=True, slots=True)
+class OrderStatusUpdate:
+    """One orderStatus event, flattened (IBK-125)."""
+
+    ib_order_id: int
+    perm_id: int | None
+    order_ref: str | None
+    status: str  # raw IBKR status string ('Submitted', 'Filled', ...)
+    filled: float
+    remaining: float
+    avg_fill_price: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionFill:
+    """One execution event (IBK-125). Combo orders report one execution per
+    LEG; ``sec_type`` lets consumers skip any BAG-level summary row."""
+
+    ib_order_id: int
+    order_ref: str | None
+    exec_id: str
+    side: str  # normalized 'BUY' | 'SELL' (IBKR reports 'BOT'/'SLD')
+    price: float
+    qty: int
+    ts: datetime
+    con_id: int | None
+    sec_type: str  # 'OPT' leg vs 'BAG' summary
+
+
+@dataclass(frozen=True, slots=True)
+class CommissionUpdate:
+    """commissionReport event, keyed to its fill by execId (IBK-125)."""
+
+    exec_id: str
+    commission: float
