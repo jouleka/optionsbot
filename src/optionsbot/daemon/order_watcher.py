@@ -56,6 +56,22 @@ async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
     now = datetime.now(UTC)
     ttl = timedelta(minutes=context.settings.execution.order_ttl_minutes)
 
+    # IBK-128: periodic broker reconciliation, only while non-terminal orders
+    # exist (free when idle; startup always runs one pass from the runner).
+    rec_min = context.settings.execution.reconcile_minutes
+    if rec_min > 0:
+        last = context.last_reconcile_ts or context.started_at
+        if now - last >= timedelta(minutes=rec_min):
+            from optionsbot.execution.orders import open_orders as open_rows
+            from optionsbot.execution.reconcile import reconcile
+
+            if open_rows(engine):
+                async def _notify(text: str) -> None:
+                    await context.telegram.send_message(text, parse_mode=None)
+
+                await reconcile(engine, context.order_client, notify=_notify, now=now)
+            context.last_reconcile_ts = now
+
     # --- TTL sweep: cancel at the broker FIRST, only then mark abandoned.
     expired = 0
     working = working_orders(engine)

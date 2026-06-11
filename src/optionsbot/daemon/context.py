@@ -51,3 +51,5 @@ class DaemonContext:
     # weak refs; a GC'd walk would strand its order at the decision mid until
     # the TTL watcher cancels it).
     walk_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # IBK-128: watermark for the periodic broker reconciliation pass.
+    last_reconcile_ts: datetime | None = None

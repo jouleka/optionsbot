@@ -100,6 +100,35 @@ class Daemon:
             await self._shutdown_context()
             return 1
 
+        # IBK-128: startup reconciliation — adopt working orders across the
+        # restart, resolve crash-orphaned rows, replay missed fills. Failure
+        # must never block boot (the periodic pass retries).
+        if self._context.order_client is not None:
+            try:
+                from optionsbot.execution.orders import open_orders as _open_rows
+                from optionsbot.execution.reconcile import reconcile
+
+                if _open_rows(self._context.engine):
+                    telegram = self._context.telegram
+
+                    async def _notify(text: str) -> None:
+                        await telegram.send_message(text, parse_mode=None)
+
+                    summary = await reconcile(
+                        self._context.engine,
+                        self._context.order_client,
+                        notify=_notify,
+                    )
+                    log.info(
+                        "startup reconcile: adopted=%d foreign=%d fills=%d "
+                        "resolved=%d mismatches=%d",
+                        summary.adopted, summary.foreign, summary.fills_replayed,
+                        summary.resolved, summary.mismatches,
+                    )
+                    self._context.last_reconcile_ts = datetime.now(UTC)
+            except Exception:
+                log.exception("startup reconciliation failed; periodic pass will retry")
+
         log.info("Daemon started; waiting for stop signal")
         log.info("daemon config: %s", _config_summary(self._settings))
         try:

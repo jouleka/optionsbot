@@ -167,6 +167,10 @@ class ExecutionSettings(BaseModel):
     # to paper (IBK-122).
     max_leg_spread_dollars: float = Field(default=0.50, gt=0.0)
     min_open_interest: int = Field(default=0, ge=0)
+    # IBK-128: periodic broker reconciliation cadence (startup always runs
+    # one pass). 0 disables the periodic pass; it only fires while
+    # non-terminal orders exist, so it is free when idle.
+    reconcile_minutes: int = Field(default=5, ge=0)
 
 
 class StorageSettings(BaseModel):

@@ -305,6 +305,11 @@ def test_execution_semi_auto_defaults() -> None:
     assert s.execution.credit_drift_warn_pct == 0.25
 
 
+def test_execution_reconcile_default() -> None:
+    # IBK-128
+    assert Settings().execution.reconcile_minutes == 5
+
+
 def test_execution_walk_defaults() -> None:
     # IBK-127
     s = Settings()
