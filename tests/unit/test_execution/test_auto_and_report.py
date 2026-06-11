@@ -63,6 +63,48 @@ async def test_confirm_mode_ignores_bp_cap(tmp_db: Engine) -> None:
     assert outcome.ok
 
 
+async def test_closed_round_trip_frees_the_symbol_cap(tmp_db: Engine) -> None:
+    # Opus IBK-130 #1: a fully-closed position is a round-trip, not exposure —
+    # the symbol must be re-enterable afterwards at max_per_symbol=1.
+    _pair(tmp_db)  # SPY entry+close, both filled
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+    assert outcome.ok, outcome.message
+
+
+async def test_entry_walk_stops_on_kill(tmp_db: Engine) -> None:
+    # Opus IBK-130 #3: a kill mid-walk must stop ENTRY walks before they fill.
+    from unittest.mock import AsyncMock, MagicMock
+
+    from optionsbot.config import Settings
+    from optionsbot.execution.orders import get_order
+    from optionsbot.execution.state import trip_kill
+    from optionsbot.execution.walk import run_price_walk
+    from tests.unit.test_execution.test_walk import LEGS as WALK_LEGS
+    from tests.unit.test_execution.test_walk import _md, _walk_order
+
+    order_id = _walk_order(tmp_db)
+    trip_kill(tmp_db, "loss limit")
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = AsyncMock()
+    settings = Settings()
+    settings.execution.walk_step_seconds = 0
+    settings.execution.walk_max_steps = 3
+    settings.execution.walk_final_rest_seconds = 0
+    await run_price_walk(
+        engine=tmp_db, settings=settings, order_client=order_client,
+        md=_md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)}),
+        symbol="SPY", legs=WALK_LEGS, order_id=order_id, ib_order_id=11,
+        decision_mid=1.20, budget=0.09, increment=0.01,
+    )
+    order_client.cancel.assert_awaited_once_with(11)
+    order_client.modify_price.assert_not_awaited()
+    assert get_order(tmp_db, order_id).status == "abandoned"  # type: ignore[union-attr]
+
+
 # --- IBK-131 realized pairs + report --------------------------------------------------
 
 

@@ -7,6 +7,7 @@ surface is unit-testable with a mocked context. The poller sends the replies.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -32,6 +33,8 @@ from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import alerts, scan_runs, watchlist
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +241,11 @@ async def _cmd_record(context: DaemonContext, args: list[str]) -> list[CommandRe
     from optionsbot.validation.outcomes import outcomes_report
 
     hypothetical = format_track_record(outcomes_report(context.engine))
-    executed = format_execution_report(execution_report(context.engine))
+    try:
+        executed = format_execution_report(execution_report(context.engine))
+    except Exception:  # noqa: BLE001 -- never lose the hypothetical half too
+        log.exception("execution report failed")
+        executed = "EXECUTED (real fills): report unavailable (error logged)"
     return [CommandReply(f"{hypothetical}\n\n{executed}")]
 
 

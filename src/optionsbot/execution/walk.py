@@ -192,6 +192,21 @@ async def run_price_walk(
             record = get_order(engine, order_id)
             if record is None or record.status not in WORKING_STATUSES:
                 return  # filled/cancelled/rejected while we slept — done
+            if record.intent == "open":
+                # A kill switch tripped mid-walk must stop ENTRY walks before
+                # they fill (exits keep walking — we still want out).
+                from optionsbot.execution.state import load_state
+
+                if load_state(engine).killed:
+                    try:
+                        await order_client.cancel(ib_order_id)
+                        transition(
+                            engine, order_id, "abandoned",
+                            error="kill switch tripped mid-walk", now=datetime.now(UTC),
+                        )
+                    except Exception:  # noqa: BLE001 -- reconcile is the backstop
+                        log.exception("walk %s: kill-cancel failed", order_id)
+                    return
 
             quotes: dict[LegSpec, OptionQuote] = {}
             current_mid: float | None = None

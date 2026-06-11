@@ -181,12 +181,24 @@ async def execute_pick(
                 f"pick {score_id} already has order #{existing.id} ({existing.status})"
             )
         # 7. Ledger-based caps (bot-attributed exposure; portfolio-wide gates
-        # arrive with full-auto IBK-130).
-        active_rows = conn.execute(
+        # arrive with full-auto IBK-130). Entries whose close has FILLED are
+        # round-trips, not exposure — without this exclusion a cycled symbol
+        # would be permanently barred and the global cap would ratchet down
+        # over the account's lifetime (Opus IBK-130 #1).
+        raw_active = conn.execute(
             select(orders.c.id, orders.c.symbol)
             .where(orders.c.intent == "open")
             .where(orders.c.status.in_(_ACTIVE_STATUSES))
         ).fetchall()
+        closed_entry_ids = {
+            row.closes_order_id
+            for row in conn.execute(
+                select(orders.c.closes_order_id)
+                .where(orders.c.intent == "close")
+                .where(orders.c.status == "filled")
+            ).fetchall()
+        }
+    active_rows = [row for row in raw_active if row.id not in closed_entry_ids]
     if len(active_rows) >= settings.execution.max_open_positions:
         return _reject(
             f"max_open_positions reached ({settings.execution.max_open_positions}) "

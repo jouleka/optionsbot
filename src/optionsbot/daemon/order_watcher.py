@@ -189,7 +189,16 @@ async def _check_loss_kill_triggers(context: DaemonContext, now: datetime) -> No
         return
     net_liq = await _net_liq(context)
     threshold = context.settings.execution.max_daily_loss_pct
-    if net_liq and abs(realized_today) >= threshold * net_liq:
+    if net_liq is None:
+        # Fail-open would silently hide a loss day (Opus IBK-130 #2) — say so.
+        log.warning("daily-loss kill not evaluable: net liquidation unavailable")
+        await _send(
+            context,
+            f"⚠ realized today ${realized_today:,.0f} but net liquidation is "
+            "unavailable — the daily-loss kill switch could NOT be evaluated.",
+        )
+        return
+    if abs(realized_today) >= threshold * net_liq:
         trip_kill(
             engine,
             f"daily realized loss ${abs(realized_today):,.0f} ≥ "
