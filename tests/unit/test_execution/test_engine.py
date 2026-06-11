@@ -304,6 +304,20 @@ async def test_happy_path_stages_places_and_reports(tmp_db: Engine) -> None:
     assert "1.20" in outcome.message
 
 
+async def test_happy_path_debit_places_positive_limit(tmp_db: Engine) -> None:
+    # Debit spread: scan says we PAY (credit_or_debit < 0); fresh quotes net a
+    # debit too. BUY-bag debit = POSITIVE limit — the most error-prone sign in
+    # the codebase, pinned here.
+    score_id = _insert_pick(tmp_db, credit_or_debit=-120.0)
+    deps = _deps(tmp_db, md_mids={(580.0, "P"): 0.40, (575.0, "P"): 1.60})
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok, outcome.message
+    call = deps.order_client.place_combo_limit.call_args
+    assert call.kwargs["limit_price"] == pytest.approx(+1.20)
+    assert "debit" in outcome.message
+
+
 async def test_drift_warning_included(tmp_db: Engine) -> None:
     # Scan credit $1.80/unit, fresh mid $1.20 -> 33% drift > 25% default band.
     score_id = _insert_pick(tmp_db, credit_or_debit=180.0)

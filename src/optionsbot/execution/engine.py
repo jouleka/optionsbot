@@ -202,14 +202,17 @@ async def execute_pick(
 
     limit_price = -fresh_net  # BUY-bag convention: credit = negative limit
 
-    # 9. Margin gate via whatIf + available funds.
-    try:
-        preview = await deps.order_client.whatif_combo(
-            symbol, legs, quantity=quantity, limit_price=limit_price
-        )
-    except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
-        return _reject(f"whatIf margin preview failed: {exc}")
+    # 9. Margin gate via whatIf + available funds. Under ibkr_lock: whatif's
+    # leg qualification can touch the DAEMON connection (resolver), and all
+    # daemon-connection I/O is serialized by discipline — cache hits make this
+    # free in practice, but the invariant must hold by construction.
     async with deps.ibkr_lock:
+        try:
+            preview = await deps.order_client.whatif_combo(
+                symbol, legs, quantity=quantity, limit_price=limit_price
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
+            return _reject(f"whatIf margin preview failed: {exc}")
         summary = await deps.positions.get_account_summary()
     available = float(summary.available_funds) if summary.available_funds is not None else None
     needed = preview.init_margin_change

@@ -65,14 +65,18 @@ def execute_hint_for(
     """
     if not context.settings.execution.enabled:
         return None
-    with context.engine.connect() as conn:
-        row = conn.execute(
-            select(strategy_scores.c.id)
-            .where(strategy_scores.c.snapshot_id == snapshot_id)
-            .where(strategy_scores.c.strategy == strategy)
-            .order_by(strategy_scores.c.id.desc())
-            .limit(1)
-        ).first()
+    try:
+        with context.engine.connect() as conn:
+            row = conn.execute(
+                select(strategy_scores.c.id)
+                .where(strategy_scores.c.snapshot_id == snapshot_id)
+                .where(strategy_scores.c.strategy == strategy)
+                .order_by(strategy_scores.c.id.desc())
+                .limit(1)
+            ).first()
+    except Exception:  # noqa: BLE001 -- a hint must never break alert delivery
+        log.exception("execute-hint lookup failed for snapshot %s", snapshot_id)
+        return None
     return f"/execute {row.id}" if row is not None else None
 
 
