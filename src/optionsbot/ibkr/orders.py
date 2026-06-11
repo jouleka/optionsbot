@@ -287,7 +287,7 @@ class OrderClient:
     def _handle_order_status(self, trade: Trade) -> None:
         update = OrderStatusUpdate(
             ib_order_id=int(trade.order.orderId),
-            perm_id=int(trade.order.permId) or None,
+            perm_id=int(trade.order.permId) if trade.order.permId else None,
             order_ref=trade.order.orderRef or None,
             status=trade.orderStatus.status,
             filled=float(trade.orderStatus.filled),
@@ -308,7 +308,7 @@ class OrderClient:
             exec_id=execution.execId,
             side=_IB_SIDE.get(execution.side, execution.side),
             price=float(execution.price),
-            qty=int(execution.shares),
+            qty=round(execution.shares),  # float in ib_async; int contracts for options
             ts=ts,
             con_id=int(fill.contract.conId) or None,
             sec_type=fill.contract.secType,

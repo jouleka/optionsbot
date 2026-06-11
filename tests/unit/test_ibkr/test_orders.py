@@ -372,6 +372,23 @@ def test_fill_event_translates_and_normalizes_side(
     assert record.ts.tzinfo is not None
 
 
+def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
+    # Order.permId defaults to 0 but the dataclass accepts None; a None must
+    # not blow up the handler (the status update would be silently dropped).
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    seen: list[OrderStatusUpdate] = []
+    order_client.on_status(seen.append)
+    trade = Trade(
+        contract=Contract(secType="BAG", symbol="SPY"),
+        order=Order(orderId=7, permId=None, orderRef="obot-7"),  # type: ignore[arg-type]
+        orderStatus=OrderStatus(orderId=7, status="Submitted", filled=0, remaining=1),
+    )
+    order_client._handle_order_status(trade)  # noqa: SLF001
+    [update] = seen
+    assert update.perm_id is None
+
+
 def test_commission_event_translates(order_client: OrderClient) -> None:
     from ib_async import CommissionReport
 

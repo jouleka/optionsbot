@@ -2,7 +2,7 @@
 
 Wraps ``ib_async.IB`` so the rest of the codebase has a single point of
 contact for connect/disconnect/ensure-connected semantics. Distinct
-``client_id`` per process role (MCP=1, daemon=2) from settings.
+``client_id`` per process role (MCP=1, daemon=2, exec=3) from settings.
 """
 
 from __future__ import annotations
