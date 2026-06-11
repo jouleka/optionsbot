@@ -273,6 +273,31 @@ async def test_walk_exhaustion_cancels_and_abandons(tmp_db: Engine) -> None:
     assert {r.kind for r in journal} == {"step"}
 
 
+async def test_walk_debit_sends_ascending_positive_limits(tmp_db: Engine) -> None:
+    # Debit structure: decision mid −2.00 (we pay). Walking = paying more, so
+    # the BAG limits sent must be POSITIVE and ASCENDING (+2.03, +2.06, +2.09).
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = AsyncMock()
+    md = _md({(580.0, "P"): (1.00, 1.10), (575.0, "P"): (3.00, 3.10)})  # net mid −2.00
+
+    debit_legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260717",
+         "strike": 580.0, "right": "P", "quantity": 1},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260717",
+         "strike": 575.0, "right": "P", "quantity": 1},
+    ]
+    await run_price_walk(
+        engine=tmp_db, settings=_walk_settings(), order_client=order_client,
+        md=md, symbol="SPY", legs=debit_legs, order_id=order_id, ib_order_id=11,
+        decision_mid=-2.00, budget=0.09, increment=0.01,
+    )
+    limits = [c.kwargs["new_limit_price"] for c in order_client.modify_price.call_args_list]
+    assert limits == [pytest.approx(2.03), pytest.approx(2.06), pytest.approx(2.09)]
+    assert limits == sorted(limits)  # strictly toward marketable
+
+
 async def test_walk_stops_when_order_fills_midway(tmp_db: Engine) -> None:
     order_id = _walk_order(tmp_db)
     order_client = MagicMock()
