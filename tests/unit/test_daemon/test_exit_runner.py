@@ -140,6 +140,41 @@ async def test_expiry_guard_forces_close(daemon_context: DaemonContext) -> None:
     order_client.place_combo_limit.assert_awaited_once()
 
 
+async def test_half_closed_position_hands_off_instead_of_reclosing(
+    daemon_context: DaemonContext,
+) -> None:
+    # Opus IBK-129 critical: a close that PARTIALLY filled then died must
+    # never be auto-restaged at full quantity (over-close = wrong-way risk).
+    entry_id = _filled_entry(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        pk = conn.execute(insert(orders).values(
+            intent="close", closes_order_id=entry_id, symbol="SPY",
+            strategy="bull_put_spread", legs_json=_legs(FAR), quantity=1,
+            status="abandoned", staged_ts=NOW, submitted_ts=NOW,
+            terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key
+        assert pk is not None
+        close_id = int(pk[0])
+        conn.execute(update(orders).where(orders.c.id == close_id)
+                     .values(order_ref=f"obot-{close_id}"))
+    record_fill(daemon_context.engine, close_id, exec_id="half1", side="BUY",
+                price=0.80, qty=1, ts=NOW)
+
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner._exec_md",
+               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+        first = await run_exits_tick(daemon_context)
+        second = await run_exits_tick(daemon_context)
+    assert first.closes_submitted == 0
+    assert second.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    warns = [
+        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        if "HALF-CLOSED" in c.args[0]
+    ]
+    assert len(warns) == 1  # escalated exactly once
+
+
 async def test_missing_quote_skips_and_retries_later(
     daemon_context: DaemonContext,
 ) -> None:

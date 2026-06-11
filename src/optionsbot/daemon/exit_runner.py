@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
@@ -22,6 +22,7 @@ from optionsbot.execution.engine import combo_mid
 from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
+    FAILED_TERMINAL_STATUSES,
     OrderRecord,
     get_order,
     net_premium,
@@ -33,7 +34,7 @@ from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import combo_bid_ask, price_increment_for, slippage_budget
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import orders
+from optionsbot.storage.schema import fills, orders
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,26 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
         if record is not None:
             records.append(record)
     return records
+
+
+def _half_closed(engine: Engine, entry_id: int) -> bool:
+    """True when a dead (non-filled terminal) close for this entry recorded
+    any fills — the position is partially flat and must not be re-closed at
+    full quantity (Opus IBK-129 critical)."""
+    with engine.connect() as conn:
+        closes = conn.execute(
+            select(orders.c.id, orders.c.status)
+            .where(orders.c.closes_order_id == entry_id)
+        ).fetchall()
+        for row in closes:
+            if row.status not in FAILED_TERMINAL_STATUSES:
+                continue
+            has_fill = conn.execute(
+                select(fills.c.id).where(fills.c.order_id == row.id).limit(1)
+            ).first()
+            if has_fill is not None:
+                return True
+    return False
 
 
 def _min_dte(legs: list[dict[str, object]], now: datetime) -> int | None:
@@ -136,6 +157,20 @@ async def _manage_entry(
         return 0
     if open_close_for(engine, entry.id) is not None:
         return 0  # a close is already working — never double-exit
+    if _half_closed(engine, entry.id):
+        # A close partially filled and then died (abandoned/cancelled): the
+        # broker position is HALF flat. Re-staging a full-quantity close
+        # would over-close into wrong-way exposure — hand off to the human.
+        if entry.id not in context.exit_handoff_warned:
+            context.exit_handoff_warned.add(entry.id)
+            await _send(
+                context,
+                f"⚠ position #{entry.id} {entry.symbol} {entry.strategy} is "
+                "HALF-CLOSED (a closing order partially filled, then died). "
+                "Auto-exit is halted for this position — flatten the remainder "
+                "manually in TWS.",
+            )
+        return 0
     dte = _min_dte(entry.legs, now)
     if dte is None:
         return 0

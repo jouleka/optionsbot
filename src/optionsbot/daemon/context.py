@@ -53,3 +53,6 @@ class DaemonContext:
     walk_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     # IBK-128: watermark for the periodic broker reconciliation pass.
     last_reconcile_ts: datetime | None = None
+    # IBK-129: entries whose half-closed state was already escalated (a close
+    # partially filled then died — human handoff, never auto-restaged).
+    exit_handoff_warned: set[int] = field(default_factory=set)
