@@ -23,8 +23,15 @@ from sqlalchemy import Engine, select
 from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
-from optionsbot.execution.orders import stage_order, transition
+from optionsbot.execution.orders import record_order_quotes, stage_order, transition
 from optionsbot.execution.state import load_state
+from optionsbot.execution.walk import (
+    combo_bid_ask,
+    liquidity_issues,
+    price_increment_for,
+    run_price_walk,
+    slippage_budget,
+)
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.orders import OrderClient
 from optionsbot.ibkr.positions import PositionsClient
@@ -42,7 +49,13 @@ LegSpec = tuple[str, float, str]
 
 @dataclass(frozen=True, slots=True)
 class ExecutionDeps:
-    """Everything execute_pick needs; daemon/commands assembles it from context."""
+    """Everything execute_pick needs; daemon/commands assembles it from context.
+
+    walk_md is a MarketDataClient bound to the EXEC connection (the walk
+    re-anchors quotes without ibkr_lock); walk_tasks holds strong refs to
+    spawned walk tasks. Either being None disables the walk (v1 behavior:
+    rest at mid until the TTL watcher cancels).
+    """
 
     engine: Engine
     settings: Settings
@@ -50,6 +63,8 @@ class ExecutionDeps:
     md: MarketDataClient
     positions: PositionsClient
     ibkr_lock: asyncio.Lock
+    walk_md: MarketDataClient | None = None
+    walk_tasks: set[asyncio.Task[None]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +196,13 @@ async def execute_pick(
                 )
             except Exception as exc:  # noqa: BLE001 -- per-leg quote failure = reject
                 return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
+    issues = liquidity_issues(
+        legs, quotes,
+        max_leg_spread=settings.execution.max_leg_spread_dollars,
+        min_open_interest=settings.execution.min_open_interest,
+    )
+    if issues:
+        return _reject("liquidity: " + "; ".join(issues))
     fresh_net = combo_mid(legs, quotes)
     if fresh_net is None:
         return _reject("missing quote mid on at least one leg — not pricing this blind")
@@ -224,8 +246,35 @@ async def execute_pick(
     if preview.warning:
         margin_note += f" ({preview.warning})"
 
-    # 10. Stage -> submitting -> place -> submitted.
+    # 10. Stage (+ decision journal) -> submitting -> place -> submitted.
+    nbbo = combo_bid_ask(legs, quotes)
+    increment = price_increment_for(symbol)
+    budget = (
+        slippage_budget(
+            nbbo[0], nbbo[1],
+            frac=settings.execution.max_slippage_spread_frac,
+            abs_cap=settings.execution.max_slippage_abs,
+            increment=increment,
+        )
+        if nbbo is not None
+        else increment
+    )
     record = stage_order(engine, score_id, now=ts_now)
+    record_order_quotes(
+        engine, record.id, kind="decision", step=0, ts=ts_now,
+        combo_bid=nbbo[0] if nbbo else None,
+        combo_ask=nbbo[1] if nbbo else None,
+        combo_mid=fresh_net, target_net=fresh_net, limit_price=limit_price,
+        legs=[
+            {
+                "expiry": leg["expiry"], "strike": leg["strike"],
+                "right": leg["right"], "side": leg["side"],
+                "bid": q.bid, "ask": q.ask, "mid": q.mid, "delayed": q.delayed,
+            }
+            for leg in option_legs
+            if (q := quotes.get((str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))))
+        ],
+    )
     transition(engine, record.id, "submitting", now=ts_now)
     try:
         placed = await deps.order_client.place_combo_limit(
@@ -245,18 +294,43 @@ async def execute_pick(
     transition(
         engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
     )
+
+    # 11. Spawn the price walk (IBK-127). Without walk plumbing the order
+    # simply rests at mid until the TTL watcher cancels (v1 behavior).
+    walking = ""
+    if (
+        deps.walk_md is not None
+        and deps.walk_tasks is not None
+        and settings.execution.walk_max_steps > 0
+    ):
+        task = asyncio.create_task(
+            run_price_walk(
+                engine=engine, settings=settings,
+                order_client=deps.order_client, md=deps.walk_md,
+                symbol=symbol, legs=legs, order_id=record.id,
+                ib_order_id=placed.ib_order_id, decision_mid=fresh_net,
+                budget=budget, increment=increment,
+            )
+        )
+        deps.walk_tasks.add(task)
+        task.add_done_callback(deps.walk_tasks.discard)
+        walking = (
+            f"\nwalking mid→{fresh_net - budget:+.2f} over "
+            f"{settings.execution.walk_max_steps}×{settings.execution.walk_step_seconds}s"
+            f" + {settings.execution.walk_final_rest_seconds}s rest"
+        )
     log.info(
-        "executed pick %s -> order #%s (%s %sx %s @ %+.2f)",
-        score_id, record.id, pick.strategy, quantity, symbol, fresh_net,
+        "executed pick %s -> order #%s (%s %sx %s @ %+.2f, budget %.2f)",
+        score_id, record.id, pick.strategy, quantity, symbol, fresh_net, budget,
     )
     kind = "credit" if fresh_net > 0 else "debit"
     return ExecuteOutcome(
         ok=True,
         message=(
             f"✅ submitted #{record.id}: {symbol} {pick.strategy} {quantity}x "
-            f"@ net {kind} {abs(fresh_net):.2f}/unit\n{margin_note}\n"
-            f"TTL {settings.execution.order_ttl_minutes}m — /orders to track, "
-            f"/cancelorder {record.id} to pull{drift_note}"
+            f"@ net {kind} {abs(fresh_net):.2f}/unit\n{margin_note}{walking}\n"
+            f"TTL {settings.execution.order_ttl_minutes}m backstop — /orders to "
+            f"track, /cancelorder {record.id} to pull{drift_note}"
         ),
         order_id=record.id,
     )

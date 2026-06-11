@@ -47,3 +47,7 @@ class DaemonContext:
     # restarts don't replay history); registry-miss cancel warnings fire once.
     orders_notified_through: datetime | None = None
     orders_cancel_warned: set[int] = field(default_factory=set)
+    # IBK-127: strong refs to in-flight price-walk tasks (asyncio only holds
+    # weak refs; a GC'd walk would strand its order at the decision mid until
+    # the TTL watcher cancels it).
+    walk_tasks: set[asyncio.Task[None]] = field(default_factory=set)

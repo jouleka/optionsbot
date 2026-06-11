@@ -305,6 +305,18 @@ def test_execution_semi_auto_defaults() -> None:
     assert s.execution.credit_drift_warn_pct == 0.25
 
 
+def test_execution_walk_defaults() -> None:
+    # IBK-127
+    s = Settings()
+    assert s.execution.walk_step_seconds == 10
+    assert s.execution.walk_max_steps == 4
+    assert s.execution.walk_final_rest_seconds == 120
+    assert s.execution.max_slippage_spread_frac == 0.25
+    assert s.execution.max_slippage_abs == 0.10
+    assert s.execution.max_leg_spread_dollars == 0.50
+    assert s.execution.min_open_interest == 0
+
+
 def test_execution_bounds_reject_out_of_range() -> None:
     from pydantic import ValidationError
 

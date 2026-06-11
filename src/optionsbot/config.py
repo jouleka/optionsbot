@@ -152,6 +152,21 @@ class ExecutionSettings(BaseModel):
     max_pick_age_minutes: int = Field(default=20, ge=1)
     order_ttl_minutes: int = Field(default=10, ge=1)
     credit_drift_warn_pct: float = Field(default=0.25, gt=0.0)
+    # IBK-127 price walk: submit at mid, reprice toward marketable every
+    # walk_step_seconds for walk_max_steps (0 disables walking), final price
+    # rests walk_final_rest_seconds, then cancel = trade skipped. The hard
+    # slippage budget is min(frac × combo spread, abs cap), at least one
+    # price increment, anchored to the DECISION mid.
+    walk_step_seconds: int = Field(default=10, ge=0)
+    walk_max_steps: int = Field(default=4, ge=0)
+    walk_final_rest_seconds: int = Field(default=120, ge=0)
+    max_slippage_spread_frac: float = Field(default=0.25, gt=0.0, le=1.0)
+    max_slippage_abs: float = Field(default=0.10, gt=0.0)
+    # IBK-127 liquidity gates. min_open_interest=0 disables the OI check —
+    # delayed snapshots often omit OI; enable once real-time data is shared
+    # to paper (IBK-122).
+    max_leg_spread_dollars: float = Field(default=0.50, gt=0.0)
+    min_open_interest: int = Field(default=0, ge=0)
 
 
 class StorageSettings(BaseModel):

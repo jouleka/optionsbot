@@ -30,9 +30,11 @@ QUOTE_MIDS = {(580.0, "P"): 1.60, (575.0, "P"): 0.40}  # fresh net credit 1.20
 
 
 def _quote(strike: float, right: str, mid: float | None) -> OptionQuote:
+    bid = round(mid - 0.05, 4) if mid is not None else None
+    ask = round(mid + 0.05, 4) if mid is not None else None
     return OptionQuote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
-        bid=None, ask=None, last=None, mid=mid, iv=None, delta=None, gamma=None,
+        bid=bid, ask=ask, last=None, mid=mid, iv=None, delta=None, gamma=None,
         theta=None, vega=None, open_interest=None, volume=None, ts=NOW, delayed=True,
     )
 
@@ -75,6 +77,7 @@ def _deps(
     md_mids: dict[tuple[float, str], float | None] | None = None,
     available_funds: float = 50_000.0,
     margin_change: float | None = 380.0,
+    walk: bool = False,
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
@@ -102,6 +105,9 @@ def _deps(
         )
     )
 
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = AsyncMock()
+
     positions = MagicMock()
     positions.get_account_summary = AsyncMock(
         return_value=AccountSummary(
@@ -112,6 +118,8 @@ def _deps(
     return ExecutionDeps(
         engine=tmp_db, settings=settings, order_client=order_client,
         md=md, positions=positions, ibkr_lock=asyncio.Lock(),
+        walk_md=md if walk else None,
+        walk_tasks=set() if walk else None,
     )
 
 
@@ -326,6 +334,62 @@ async def test_drift_warning_included(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert outcome.ok
     assert "drift" in outcome.message.lower()
+
+
+async def test_rejects_illiquid_wide_spread(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.settings.execution.max_leg_spread_dollars = 0.05  # tighter than the 0.10 stub spread
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "liquidity" in outcome.message.lower()
+
+
+async def test_decision_quotes_journaled(tmp_db: Engine) -> None:
+    from sqlalchemy import select
+
+    from optionsbot.storage.schema import order_quotes
+
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok
+    with tmp_db.connect() as conn:
+        row = conn.execute(select(order_quotes)).one()
+    assert row.kind == "decision"
+    assert row.order_id == outcome.order_id
+    assert row.combo_mid == pytest.approx(1.20)
+    assert row.legs_json and row.legs_json[0]["bid"] is not None
+
+
+async def test_happy_path_spawns_walk_task(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, walk=True)
+    deps.settings.execution.walk_step_seconds = 0
+    deps.settings.execution.walk_max_steps = 2
+    deps.settings.execution.walk_final_rest_seconds = 0
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok
+    assert deps.walk_tasks
+    await asyncio.gather(*list(deps.walk_tasks))
+    # The stubbed order never fills, so the walk repriced and then abandoned.
+    assert deps.order_client.modify_price.await_count == 2
+    deps.order_client.cancel.assert_awaited_once()
+    record = get_order(tmp_db, outcome.order_id)  # type: ignore[arg-type]
+    assert record is not None
+    assert record.status == "abandoned"
+
+
+async def test_no_walk_spawned_without_walk_md(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)  # walk_md None — v1 place-at-mid behavior
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok
+    deps.order_client.modify_price.assert_not_awaited()
 
 
 async def test_place_failure_marks_skipped(tmp_db: Engine) -> None:
