@@ -163,18 +163,31 @@ class Daemon:
         log.info("config reloaded: %s", _config_summary(new))
 
     def _build_context(self) -> DaemonContext:
+        from optionsbot.execution.tracker import OrderTracker
+        from optionsbot.ibkr.orders import OrderClient
+
         engine = create_engine_for_path(self._settings.storage.db_path)
         ibkr = IBKRClient(role="daemon", settings=self._settings)
         resolver = ContractResolver(ibkr)
         telegram = TelegramClient(
             self._settings.telegram.bot_token, self._settings.telegram.chat_id
         )
+        # IBK-126: execution plumbing. Constructed unconditionally (cheap — no
+        # connection until the first order op); the gate keeps it inert while
+        # execution.enabled is false. Dedicated clientId 3 connection because
+        # order events only reach the placing clientId. Shares the resolver so
+        # leg qualification reuses the scan's contract cache.
+        exec_ibkr = IBKRClient(role="exec", settings=self._settings)
+        order_client = OrderClient(exec_ibkr, resolver)
+        OrderTracker(engine).attach(order_client)
         return DaemonContext(
             settings=self._settings,
             engine=engine,
             ibkr=ibkr,
             resolver=resolver,
             telegram=telegram,
+            exec_ibkr=exec_ibkr,
+            order_client=order_client,
         )
 
     async def _shutdown_context(self) -> None:
@@ -184,6 +197,11 @@ class Daemon:
             await self._context.ibkr.disconnect()
         except Exception:
             log.exception("IBKR disconnect failed")
+        if self._context.exec_ibkr is not None:
+            try:
+                await self._context.exec_ibkr.disconnect()
+            except Exception:
+                log.exception("exec IBKR disconnect failed")
         try:
             await self._context.telegram.aclose()
         except Exception:
@@ -245,6 +263,15 @@ class Daemon:
         except Exception:
             log.exception("outcomes tick failed")
 
+    async def _orders_tick(self) -> None:
+        from optionsbot.daemon.order_watcher import run_orders_tick
+
+        assert self._context is not None
+        try:
+            await run_orders_tick(self._context)
+        except Exception:
+            log.exception("orders tick failed")
+
     def _register_periodic_jobs(self) -> None:
         """Add the heartbeat + daily outcome-accrual jobs to the running scheduler. Each is
         gated by its config (telegram.heartbeat_minutes / validation.outcomes_eval_hours;
@@ -267,3 +294,12 @@ class Daemon:
                 id="outcomes", max_instances=1, coalesce=True, replace_existing=True,
                 next_run_time=datetime.now(UTC) + timedelta(minutes=2),
             )
+        # IBK-126: order watcher — TTL sweep on working orders + terminal-state
+        # Telegram notifications. Always registered (no-ops fast when there is
+        # no execution wiring or no orders); NOT gated on execution.enabled
+        # because working orders must still be managed after a /kill.
+        self._scheduler.add_job(
+            self._orders_tick,
+            trigger=IntervalTrigger(minutes=1),
+            id="orders", max_instances=1, coalesce=True, replace_existing=True,
+        )

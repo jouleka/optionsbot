@@ -1,0 +1,127 @@
+"""1-minute order watcher (IBK-126): TTL sweep + terminal notifications.
+
+Runs as an APScheduler job. No-ops fast when the daemon has no execution
+wiring or no orders. Never raises — every order is handled in its own
+try/except so one bad row can't starve the rest.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
+
+from optionsbot.daemon.context import DaemonContext
+from optionsbot.execution.orders import (
+    IllegalOrderTransition,
+    net_premium,
+    transition,
+    working_orders,
+)
+from optionsbot.storage.schema import orders
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class OrdersTickSummary:
+    working: int
+    expired: int
+    notified: int
+
+
+def _terminal_message(row: object, premium: float | None) -> str:
+    status: str = row.status  # type: ignore[attr-defined]
+    head = f"#{row.id} {row.symbol} {row.strategy} {row.quantity}x"  # type: ignore[attr-defined]
+    if status == "filled":
+        net = f" — net ${premium:,.0f}" if premium is not None else ""
+        return f"🟢 filled {head}{net}"
+    if status == "rejected":
+        err = row.last_error or "no reason recorded"  # type: ignore[attr-defined]
+        return f"🔴 rejected {head}: {err}"
+    if status == "abandoned":
+        return f"⏱ abandoned {head} (unfilled at TTL — trade skipped)"
+    if status == "skipped":
+        err = row.last_error or "gates"  # type: ignore[attr-defined]
+        return f"⚪ skipped {head}: {err}"
+    return f"⚪ {status} {head}"
+
+
+async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
+    if context.order_client is None:
+        return OrdersTickSummary(working=0, expired=0, notified=0)
+    engine = context.engine
+    now = datetime.now(UTC)
+    ttl = timedelta(minutes=context.settings.execution.order_ttl_minutes)
+
+    # --- TTL sweep: cancel at the broker FIRST, only then mark abandoned.
+    expired = 0
+    working = working_orders(engine)
+    for order in working:
+        if order.submitted_ts is None or now - order.submitted_ts <= ttl:
+            continue
+        if order.ib_order_id is None:
+            continue  # never acked; reconciliation (IBK-128) owns this case
+        try:
+            await context.order_client.cancel(order.ib_order_id)
+        except ValueError:
+            # Placed before a daemon restart: the in-memory modify/cancel
+            # registry is gone. Don't mark abandoned — the order is still
+            # working at IBKR and pretending otherwise would lie. Warn once.
+            if order.id not in context.orders_cancel_warned:
+                context.orders_cancel_warned.add(order.id)
+                await _send(
+                    context,
+                    f"⚠ order #{order.id} is working at IBKR but was placed "
+                    "before a daemon restart — cancel it manually in TWS "
+                    "(automatic adoption lands with IBK-128)",
+                )
+            continue
+        except Exception:  # noqa: BLE001 -- one bad cancel must not starve the sweep
+            log.exception("TTL cancel failed for order %s", order.id)
+            continue
+        try:
+            transition(
+                engine, order.id, "abandoned",
+                error=f"TTL {context.settings.execution.order_ttl_minutes}m expired unfilled",
+                now=now,
+            )
+        except IllegalOrderTransition:
+            # The tracker's Cancelled event beat us to a terminal state — fine.
+            log.debug("order %s already terminal during TTL sweep", order.id)
+        expired += 1
+
+    # --- Notify newly-terminal orders exactly once (watermark on terminal_ts).
+    since = context.orders_notified_through or context.started_at
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(orders)
+            .where(orders.c.terminal_ts.is_not(None))
+            .where(orders.c.terminal_ts > since)
+            .order_by(orders.c.terminal_ts)
+        ).fetchall()
+    notified = 0
+    watermark = since
+    for row in rows:
+        premium = net_premium(engine, row.id) if row.status == "filled" else None
+        await _send(context, _terminal_message(row, premium))
+        notified += 1
+        row_ts = row.terminal_ts if row.terminal_ts.tzinfo else row.terminal_ts.replace(tzinfo=UTC)
+        watermark = max(watermark, row_ts)
+    context.orders_notified_through = watermark
+
+    if expired or notified:
+        log.info(
+            "orders tick: working=%d expired=%d notified=%d",
+            len(working), expired, notified,
+        )
+    return OrdersTickSummary(working=len(working), expired=expired, notified=notified)
+
+
+async def _send(context: DaemonContext, text: str) -> None:
+    try:
+        await context.telegram.send_message(text, parse_mode=None)
+    except Exception:  # noqa: BLE001 -- notification failure must not kill the sweep
+        log.exception("order notification send failed")
