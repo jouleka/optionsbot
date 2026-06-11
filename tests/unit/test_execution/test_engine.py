@@ -48,10 +48,13 @@ def _insert_pick(
     suggested_quantity: int = 1,
     credit_or_debit: float = 120.0,  # dollars per set; 1.20/unit
     legs: list[dict[str, Any]] | None = None,
+    raw_json: dict[str, Any] | None = None,
 ) -> int:
     with engine.begin() as conn:
         snapshot_id = conn.execute(
-            insert(snapshots).values(symbol=symbol, ts=ts, spot=600.0)
+            insert(snapshots).values(
+                symbol=symbol, ts=ts, spot=600.0, raw_json=raw_json
+            )
         ).inserted_primary_key[0]
         score_id = conn.execute(
             insert(strategy_scores).values(
@@ -76,6 +79,7 @@ def _deps(
     enabled: bool = True,
     md_mids: dict[tuple[float, str], float | None] | None = None,
     available_funds: float = 50_000.0,
+    net_liquidation: float | None = None,
     margin_change: float | None = 380.0,
     walk: bool = False,
 ) -> ExecutionDeps:
@@ -111,7 +115,7 @@ def _deps(
     positions = MagicMock()
     positions.get_account_summary = AsyncMock(
         return_value=AccountSummary(
-            net_liquidation=None, buying_power=None,
+            net_liquidation=net_liquidation, buying_power=None,  # type: ignore[arg-type]
             available_funds=available_funds, currency="USD",  # type: ignore[arg-type]
         )
     )

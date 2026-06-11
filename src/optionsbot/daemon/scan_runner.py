@@ -111,6 +111,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
         # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
         alerts_enqueued = 0
+        alerted = []
         if not context.alerting_paused:
             candidates = rank_alert_candidates(
                 all_picks, context.settings.scan.score_threshold
@@ -129,9 +130,20 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                 try:
                     if await enqueue_alert(context, sym, scored, snap_id):
                         alerts_enqueued += 1
+                        alerted.append((sym, scored, snap_id))
                 except Exception as e:  # noqa: BLE001
                     log.exception("enqueue_alert failed for %s/%s", sym, scored.strategy_name)
                     errors.append(f"{sym}/{scored.strategy_name}: {type(e).__name__}: {e}")
+
+        # IBK-130: full-auto entries — the alerted picks run the same
+        # execute_pick pipeline as /execute (every gate still applies).
+        if alerted and context.settings.execution.mode == "auto":
+            try:
+                from optionsbot.daemon.auto_executor import auto_execute_candidates
+
+                await auto_execute_candidates(context, alerted)
+            except Exception:  # noqa: BLE001 -- auto entries must not poison the scan
+                log.exception("auto-execute pass failed")
 
         finished_at = datetime.now(UTC)
         _persist_scan_run(

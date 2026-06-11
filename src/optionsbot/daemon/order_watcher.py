@@ -120,13 +120,23 @@ async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
         ).fetchall()
     notified = 0
     watermark = since
+    close_filled = False
     for row in rows:
         premium = net_premium(engine, row.id) if row.status == "filled" else None
         await _send(context, _terminal_message(row, premium))
         notified += 1
+        if row.status == "filled" and row.intent == "close":
+            close_filled = True
         row_ts = row.terminal_ts if row.terminal_ts.tzinfo else row.terminal_ts.replace(tzinfo=UTC)
         watermark = max(watermark, row_ts)
     context.orders_notified_through = watermark
+
+    # IBK-130: a realized round-trip just completed — evaluate loss triggers.
+    if close_filled:
+        try:
+            await _check_loss_kill_triggers(context, now)
+        except Exception:  # noqa: BLE001 -- trigger evaluation must not kill the tick
+            log.exception("loss kill-trigger evaluation failed")
 
     if expired or notified:
         log.info(
@@ -134,6 +144,62 @@ async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
             len(working), expired, notified,
         )
     return OrdersTickSummary(working=len(working), expired=expired, notified=notified)
+
+
+async def _net_liq(context: DaemonContext) -> float | None:
+    """Net liquidation for the daily-loss trigger. Patchable seam for tests."""
+    from optionsbot.ibkr.positions import PositionsClient
+
+    async with context.ibkr_lock:
+        summary = await PositionsClient(context.ibkr).get_account_summary()
+    return (
+        float(summary.net_liquidation)
+        if summary.net_liquidation is not None
+        else None
+    )
+
+
+async def _check_loss_kill_triggers(context: DaemonContext, now: datetime) -> None:
+    """IBK-130: consecutive-loss and daily-realized-loss kill switches."""
+    from optionsbot.execution.orders import realized_close_pairs
+    from optionsbot.execution.state import load_state, trip_kill
+
+    engine = context.engine
+    if load_state(engine).killed:
+        return
+    pairs = realized_close_pairs(engine)
+    if not pairs:
+        return
+    limit = context.settings.execution.max_consecutive_losses
+    recent = pairs[-limit:]
+    if len(recent) >= limit and all(p.pnl < 0 for p in recent):
+        trip_kill(engine, f"{limit} consecutive losing trades")
+        await _send(
+            context,
+            f"🛑 KILL SWITCH: {limit} consecutive losing trades "
+            f"(latest {recent[-1].symbol} {recent[-1].pnl:+,.0f}). "
+            "No new orders until /arm.",
+        )
+        return
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    realized_today = sum(
+        p.pnl for p in pairs if p.closed_ts is not None and p.closed_ts >= day_start
+    )
+    if realized_today >= 0:
+        return
+    net_liq = await _net_liq(context)
+    threshold = context.settings.execution.max_daily_loss_pct
+    if net_liq and abs(realized_today) >= threshold * net_liq:
+        trip_kill(
+            engine,
+            f"daily realized loss ${abs(realized_today):,.0f} ≥ "
+            f"{threshold * 100:.0f}% of net liq",
+        )
+        await _send(
+            context,
+            f"🛑 KILL SWITCH: daily loss ${abs(realized_today):,.0f} hit the "
+            f"{threshold * 100:.0f}% cap. No new orders until /arm.",
+        )
 
 
 async def _send(context: DaemonContext, text: str) -> None:

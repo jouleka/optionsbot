@@ -127,6 +127,7 @@ async def execute_pick(
                 snapshots.c.symbol,
                 snapshots.c.ts,
             )
+            .add_columns(snapshots.c.raw_json)
             .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
             .where(strategy_scores.c.id == score_id)
         ).first()
@@ -148,7 +149,16 @@ async def execute_pick(
             f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
         )
 
-    # 4. Defined-risk only; sized.
+    # 4. Defined-risk only; sized. In auto mode, earnings inside the expiry
+    # window are skipped — binary jump risk overwhelms theta edge for neutral
+    # structures (the human can still /execute deliberately in confirm mode).
+    if settings.execution.mode == "auto":
+        snapshot_raw: dict[str, Any] = pick.raw_json or {}
+        if snapshot_raw.get("earnings_in_window"):
+            return _reject(
+                "earnings inside the expiry window — auto mode skips "
+                "(use /execute to override deliberately)"
+            )
     if not suggestion.get("defined_risk", False):
         return _reject("undefined risk strategies are not executable")
     quantity = int(suggestion.get("suggested_quantity") or 0)
@@ -242,6 +252,20 @@ async def execute_pick(
             return _reject(f"whatIf margin preview failed: {exc}")
         summary = await deps.positions.get_account_summary()
     available = float(summary.available_funds) if summary.available_funds is not None else None
+    # IBK-130: portfolio-wide buying-power deployment cap (auto mode only).
+    if settings.execution.mode == "auto":
+        net_liq = (
+            float(summary.net_liquidation)
+            if summary.net_liquidation is not None
+            else None
+        )
+        if net_liq and available is not None and net_liq > 0:
+            deployed = (net_liq - available) / net_liq
+            if deployed >= settings.execution.max_bp_usage_pct:
+                return _reject(
+                    f"buying-power deployment {deployed * 100:.0f}% is at/over the "
+                    f"{settings.execution.max_bp_usage_pct * 100:.0f}% auto-mode cap"
+                )
     needed = preview.init_margin_change
     if needed is not None and available is not None and needed > available:
         return _reject(

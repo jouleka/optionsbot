@@ -177,6 +177,10 @@ class ExecutionSettings(BaseModel):
     # bot position this many days before its NEAREST leg expiry.
     exit_stop_enabled: bool = False
     expiry_guard_dte: int = Field(default=3, ge=0)
+    # IBK-130 full-auto gates: reject new auto entries once this fraction of
+    # net liquidation is already deployed ((net_liq - available)/net_liq).
+    # Confirm-mode /execute is NOT bound by it — the human decides.
+    max_bp_usage_pct: float = Field(default=0.30, gt=0.0, le=1.0)
 
 
 class StorageSettings(BaseModel):

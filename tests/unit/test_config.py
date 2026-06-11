@@ -310,6 +310,11 @@ def test_execution_reconcile_default() -> None:
     assert Settings().execution.reconcile_minutes == 5
 
 
+def test_execution_auto_defaults() -> None:
+    # IBK-130
+    assert Settings().execution.max_bp_usage_pct == 0.30
+
+
 def test_execution_exit_defaults() -> None:
     # IBK-129: soft stop OFF by default (defined-risk width is the stop);
     # expiry guard force-closes 3 days out.
