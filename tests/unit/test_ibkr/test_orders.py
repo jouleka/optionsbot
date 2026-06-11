@@ -438,6 +438,10 @@ async def test_recent_executions_translates_with_commission(
     order_ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
 
     [record] = await order_client.recent_executions()
+    # The filter must carry a lookback time — an empty filter returns TODAY
+    # only and would hide weekend-outage fills from reconciliation.
+    (exec_filter,) = order_ib.reqExecutionsAsync.call_args.args
+    assert exec_filter.time  # non-empty lookback
     assert record.exec_id == "0009.aa.01"
     assert record.side == "SELL"
     assert record.order_ref == "obot-12"

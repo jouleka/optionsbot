@@ -163,6 +163,17 @@ def test_fill_persists_and_skips_bag_rows(tmp_db: Engine) -> None:
     assert rows[0].leg_con_id == 1580
 
 
+def test_live_fill_on_failed_terminal_row_trips_kill(tmp_db: Engine) -> None:
+    from optionsbot.execution.state import load_state
+
+    order_id = _insert_order(tmp_db, "abandoned")
+    tracker = OrderTracker(tmp_db)
+    tracker.handle_fill(_fill(order_id, exec_id="zombie1"))
+    assert load_state(tmp_db).killed is True
+    # Replay of the same execId must not re-trip anything (dedupe path).
+    tracker.handle_fill(_fill(order_id, exec_id="zombie1"))
+
+
 def test_commission_attaches_by_exec_id(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "submitted")
     record_fill(

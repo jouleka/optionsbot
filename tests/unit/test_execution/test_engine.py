@@ -392,6 +392,37 @@ async def test_no_walk_spawned_without_walk_md(tmp_db: Engine) -> None:
     deps.order_client.modify_price.assert_not_awaited()
 
 
+async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
+    # Opus C1 backstop: if a reconcile pass resolves the row terminal while
+    # place is in flight, the just-placed REAL order must be pulled.
+    from sqlalchemy import update as sa_update
+
+    from optionsbot.storage.schema import orders as orders_table
+
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    async def race_place(*args: object, **kwargs: object) -> PlacedOrder:
+        # Simulate reconcile flipping the row to skipped mid-place.
+        with tmp_db.begin() as conn:
+            conn.execute(
+                sa_update(orders_table)
+                .where(orders_table.c.status == "submitting")
+                .values(status="skipped", terminal_ts=NOW)
+            )
+        return PlacedOrder(
+            ib_order_id=77, order_ref=str(kwargs["order_ref"]), action="BUY",
+            limit_price=float(kwargs["limit_price"]), quantity=int(kwargs["quantity"]),
+        )
+
+    deps.order_client.place_combo_limit = AsyncMock(side_effect=race_place)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "race" in outcome.message.lower()
+    deps.order_client.cancel.assert_awaited_once_with(77)
+
+
 async def test_place_failure_marks_skipped(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db)

@@ -50,6 +50,13 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"filled", "cancelled", "rejected", "abandoned", "skipped"}
 )
 
+# Failed terminals: a fill landing on one of these means the broker holds a
+# position the ledger denies — the mismatch that must trip the kill switch
+# (checked both live in the tracker and during reconciliation replay).
+FAILED_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"skipped", "rejected", "cancelled", "abandoned"}
+)
+
 # Orders resting at IBKR (have an ib_order_id and may still fill).
 WORKING_STATUSES: frozenset[str] = frozenset({"submitted", "partial"})
 

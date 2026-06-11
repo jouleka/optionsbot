@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Engine, select
 
 from optionsbot.execution.orders import (
+    FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
     get_order,
     record_fill,
@@ -40,11 +41,14 @@ log = logging.getLogger(__name__)
 
 Notify = Callable[[str], Awaitable[None]]
 
-# Failed terminals: a NEW fill arriving for one of these means the broker
-# holds a position the ledger denies — the dangerous mismatch.
-_FAILED_TERMINALS = frozenset({"skipped", "rejected", "cancelled", "abandoned"})
-
 _STALE_STAGED_AFTER = timedelta(minutes=30)
+
+# An /execute may be suspended between transition(submitting) and the broker
+# ack when this pass snapshots open orders (the place path awaits connect/
+# qualify/rate-limit). A row younger than this grace is treated as in-flight
+# and left for the next pass — resolving it as failed would strand a REAL
+# order at the broker under a terminal ledger row (Opus C1).
+_INFLIGHT_GRACE = timedelta(seconds=60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +125,10 @@ async def reconcile(
         target = map_ib_status(ib_status, 0, 1)  # working ack mapping
         if target is None or record.status == target:
             continue
+        if record.status == "partial" and target == "submitted":
+            # We have no fill counts here; a partially-filled at-broker order
+            # is already correctly "working" — nothing to sync.
+            continue
         try:
             transition(engine, row_id, target, ib_order_id=ib_order_id, now=ts_now)
             resolved += 1
@@ -155,7 +163,7 @@ async def reconcile(
         if not was_new:
             continue
         replayed += 1
-        if record.status in _FAILED_TERMINALS:
+        if record.status in FAILED_TERMINAL_STATUSES:
             # The broker filled an order the ledger recorded as failed: a
             # real position the books deny. Stop everything, human required.
             mismatches += 1
@@ -175,7 +183,7 @@ async def reconcile(
     with engine.connect() as conn:
         rows = conn.execute(
             select(orders.c.id, orders.c.status, orders.c.quantity,
-                   orders.c.legs_json, orders.c.staged_ts)
+                   orders.c.legs_json, orders.c.staged_ts, orders.c.submitted_ts)
             .where(orders.c.status.in_(sorted(set(map(str, (
                 "staged", "submitting", "submitted", "partial"))) )))
         ).fetchall()
@@ -183,28 +191,38 @@ async def reconcile(
         if row.id in at_broker:
             continue
         legs = list(row.legs_json or [])
+        anchor = row.submitted_ts or row.staged_ts
+        if anchor is not None and anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=UTC)
+        in_flight = anchor is None or (ts_now - anchor) < _INFLIGHT_GRACE
         try:
             if row.status in ("submitted", "partial"):
                 if _fills_complete(engine, row.id, row.quantity, legs):
                     transition(engine, row.id, "filled", now=ts_now)
+                    resolved += 1
+                elif in_flight:
+                    continue  # an /execute may still be mid-place — next pass
                 else:
                     transition(
                         engine, row.id, "cancelled",
                         error="not at broker after restart (reconciled)",
                         now=ts_now,
                     )
-                resolved += 1
+                    resolved += 1
             elif row.status == "submitting":
                 if _fills_complete(engine, row.id, row.quantity, legs):
                     transition(engine, row.id, "submitted", now=ts_now)
                     transition(engine, row.id, "filled", now=ts_now)
+                    resolved += 1
+                elif in_flight:
+                    continue
                 else:
                     transition(
                         engine, row.id, "skipped",
                         error="no broker record after crash — never resubmitted (reconciled)",
                         now=ts_now,
                     )
-                resolved += 1
+                    resolved += 1
             elif row.status == "staged":
                 staged_ts = row.staged_ts
                 if staged_ts is not None and staged_ts.tzinfo is None:

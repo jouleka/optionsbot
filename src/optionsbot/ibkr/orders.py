@@ -350,9 +350,16 @@ class OrderClient:
         down; record_fill's execId dedupe makes the replay idempotent.
         """
         await self._client.ensure_connected()
+        from datetime import timedelta
+
         from ib_async import ExecutionFilter
 
-        fills_ = await self._client.ib.reqExecutionsAsync(ExecutionFilter())
+        # 3-day lookback (IBKR serves ~7 days max): an empty filter returns
+        # TODAY only, which would hide weekend-outage fills from
+        # reconciliation's mismatch detection (Opus I1). Timezone slop of a
+        # few hours is irrelevant at this window size.
+        since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y%m%d %H:%M:%S")
+        fills_ = await self._client.ib.reqExecutionsAsync(ExecutionFilter(time=since))
         return [self._to_execution_fill(f) for f in fills_]
 
     def _handle_exec_details(self, trade: Trade, fill: Fill) -> None:

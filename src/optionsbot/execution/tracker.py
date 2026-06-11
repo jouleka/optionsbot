@@ -18,11 +18,14 @@ import logging
 from typing import TYPE_CHECKING
 
 from optionsbot.execution.orders import (
+    FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
+    get_order,
     record_fill,
     set_fill_commission,
     transition,
 )
+from optionsbot.execution.state import trip_kill
 from optionsbot.ibkr.types import CommissionUpdate, ExecutionFill, OrderStatusUpdate
 
 if TYPE_CHECKING:
@@ -128,6 +131,21 @@ class OrderTracker:
             return
         if not recorded:
             log.debug("duplicate execId %s ignored (replay)", fill.exec_id)
+            return
+        # IBK-128: a LIVE fill for an order the ledger already wrote off means
+        # the broker holds a position the books deny (e.g. a cancel raced a
+        # fill) — stop everything, human required.
+        record = get_order(self._engine, row_id)
+        if record is not None and record.status in FAILED_TERMINAL_STATUSES:
+            trip_kill(
+                self._engine,
+                f"live fill {fill.exec_id} for order #{row_id} already in "
+                f"status {record.status} — ledger denies a real position",
+            )
+            log.error(
+                "KILL: live fill %s on failed-terminal order #%s (%s)",
+                fill.exec_id, row_id, record.status,
+            )
 
     def handle_commission(self, update: CommissionUpdate) -> None:
         if not set_fill_commission(self._engine, update.exec_id, update.commission):

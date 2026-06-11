@@ -24,15 +24,19 @@ LEGS: list[dict[str, Any]] = [
 ]
 
 
+OLD = NOW - timedelta(minutes=5)  # past the in-flight grace window
+
+
 def _insert_order(
     engine: Engine, status: str, *, quantity: int = 1,
-    staged_ts: datetime | None = None, ib_order_id: int | None = 11,
+    staged_ts: datetime | None = None, submitted_ts: datetime | None = OLD,
+    ib_order_id: int | None = 11,
 ) -> int:
     with engine.begin() as conn:
         pk = conn.execute(insert(orders).values(
             intent="open", symbol="SPY", strategy="bull_put_spread",
             legs_json=LEGS, quantity=quantity, status=status,
-            staged_ts=staged_ts or NOW, submitted_ts=NOW,
+            staged_ts=staged_ts or OLD, submitted_ts=submitted_ts,
             ib_order_id=ib_order_id, reprice_count=0,
         )).inserted_primary_key
         assert pk is not None
@@ -153,6 +157,30 @@ async def test_fill_for_failed_terminal_row_trips_kill_switch(tmp_db: Engine) ->
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed is True
     assert any("kill" in m.lower() for m in sent)
+
+
+async def test_fresh_working_row_not_at_broker_is_left_alone(tmp_db: Engine) -> None:
+    # Opus C1: an /execute can be suspended between transition(submitting/
+    # submitted) and the broker snapshot — a row inside the grace window must
+    # NOT be resolved as failed.
+    submitted = _insert_order(tmp_db, "submitted", submitted_ts=NOW)
+    submitting = _insert_order(
+        tmp_db, "submitting", staged_ts=NOW, submitted_ts=None, ib_order_id=None,
+    )
+    notify, _ = _notify()
+    summary = await reconcile(tmp_db, _client(), notify=notify, now=NOW)
+    assert summary.resolved == 0
+    assert get_order(tmp_db, submitted).status == "submitted"  # type: ignore[union-attr]
+    assert get_order(tmp_db, submitting).status == "submitting"  # type: ignore[union-attr]
+
+
+async def test_partial_at_broker_is_not_downgraded(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "partial")
+    client = _client(open_orders=[(11, f"obot-{order_id}", "Submitted")])
+    notify, _ = _notify()
+    summary = await reconcile(tmp_db, client, notify=notify, now=NOW)
+    assert summary.resolved == 0
+    assert get_order(tmp_db, order_id).status == "partial"  # type: ignore[union-attr]
 
 
 async def test_stale_staged_row_is_skipped(tmp_db: Engine) -> None:

@@ -23,7 +23,12 @@ from sqlalchemy import Engine, select
 from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
-from optionsbot.execution.orders import record_order_quotes, stage_order, transition
+from optionsbot.execution.orders import (
+    IllegalOrderTransition,
+    record_order_quotes,
+    stage_order,
+    transition,
+)
 from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import (
     combo_bid_ask,
@@ -291,9 +296,29 @@ async def execute_pick(
             message=f"❌ order #{record.id} not placed: {exc}",
             order_id=record.id,
         )
-    transition(
-        engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
-    )
+    try:
+        transition(
+            engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
+        )
+    except IllegalOrderTransition:
+        # A reconcile pass raced the place and resolved this row terminal
+        # while we were awaiting the broker. The order is REAL at IBKR — pull
+        # it immediately rather than leave a position the ledger denies.
+        log.error(
+            "order #%s went terminal during place — cancelling at broker", record.id
+        )
+        try:
+            await deps.order_client.cancel(placed.ib_order_id)
+        except Exception:  # noqa: BLE001 -- reconcile/kill-switch is the backstop
+            log.exception("race-cancel failed for order #%s", record.id)
+        return ExecuteOutcome(
+            ok=False,
+            message=(
+                f"❌ order #{record.id} hit a reconcile race — cancelled at the "
+                "broker; /execute again"
+            ),
+            order_id=record.id,
+        )
 
     # 11. Spawn the price walk (IBK-127). Without walk plumbing the order
     # simply rests at mid until the TTL watcher cancels (v1 behavior).
