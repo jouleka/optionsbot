@@ -434,6 +434,66 @@ def net_premium(engine: Engine, order_id: int) -> float | None:
     return total
 
 
+@dataclass(frozen=True, slots=True)
+class ClosedPair:
+    """One realized round-trip: a filled entry and its filled close (IBK-130/131)."""
+
+    entry_id: int
+    close_id: int
+    symbol: str
+    strategy: str
+    quantity: int
+    pnl: float  # dollars, commissions included
+    closed_ts: datetime | None
+
+
+def total_commissions(engine: Engine, order_id: int) -> float:
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(fills.c.commission).where(fills.c.order_id == order_id)
+        ).fetchall()
+    return sum(float(r.commission) for r in rows if r.commission is not None)
+
+
+def realized_close_pairs(
+    engine: Engine, *, since: datetime | None = None
+) -> list[ClosedPair]:
+    """All realized round-trips, oldest first. pnl = entry premium + close
+    premium − real commissions on both legs (premiums are signed: a credit
+    entry collects, its closing buy-back pays)."""
+    with engine.connect() as conn:
+        query = (
+            select(orders)
+            .where(orders.c.intent == "close")
+            .where(orders.c.status == "filled")
+            .where(orders.c.closes_order_id.is_not(None))
+            .order_by(orders.c.terminal_ts)
+        )
+        closes = conn.execute(query).fetchall()
+    pairs: list[ClosedPair] = []
+    for close in closes:
+        closed_ts = _aware(close.terminal_ts)
+        if since is not None and (closed_ts is None or closed_ts <= since):
+            continue
+        entry_premium = net_premium(engine, close.closes_order_id) or 0.0
+        close_premium = net_premium(engine, close.id) or 0.0
+        commissions = total_commissions(engine, close.closes_order_id) + total_commissions(
+            engine, close.id
+        )
+        pairs.append(
+            ClosedPair(
+                entry_id=close.closes_order_id,
+                close_id=close.id,
+                symbol=close.symbol,
+                strategy=close.strategy,
+                quantity=close.quantity,
+                pnl=entry_premium + close_premium - commissions,
+                closed_ts=closed_ts,
+            )
+        )
+    return pairs
+
+
 def open_orders(engine: Engine) -> list[OrderRecord]:
     """All non-terminal orders (staged/submitting/submitted/partial)."""
     non_terminal = sorted(ORDER_STATUSES - TERMINAL_STATUSES)

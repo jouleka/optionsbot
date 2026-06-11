@@ -231,9 +231,15 @@ async def _cmd_positions(context: DaemonContext, args: list[str]) -> list[Comman
 
 
 async def _cmd_record(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    from optionsbot.validation.execution_report import (
+        execution_report,
+        format_execution_report,
+    )
     from optionsbot.validation.outcomes import outcomes_report
 
-    return [CommandReply(format_track_record(outcomes_report(context.engine)))]
+    hypothetical = format_track_record(outcomes_report(context.engine))
+    executed = format_execution_report(execution_report(context.engine))
+    return [CommandReply(f"{hypothetical}\n\n{executed}")]
 
 
 async def _cmd_kill(context: DaemonContext, args: list[str]) -> list[CommandReply]:
