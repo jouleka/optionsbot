@@ -221,6 +221,10 @@ orders = Table(
     Column("ib_order_id", Integer),
     Column("ib_perm_id", Integer),
     Column("order_ref", Text, unique=True),
+    # IBK-129: a closing order points at the entry it closes (nullable; only
+    # intent='close' rows carry it). Entry "position open" = filled open-intent
+    # order with no filled close.
+    Column("closes_order_id", Integer, ForeignKey("orders.id", ondelete="SET NULL")),
     Column("status", Text, nullable=False, index=True),
     Column("staged_ts", DateTime(timezone=True), nullable=False),
     Column("submitted_ts", DateTime(timezone=True)),

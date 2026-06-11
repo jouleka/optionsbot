@@ -89,6 +89,7 @@ class IllegalOrderTransition(RuntimeError):
 class OrderRecord:
     id: int
     strategy_score_id: int | None
+    closes_order_id: int | None
     intent: str
     symbol: str
     strategy: str
@@ -118,6 +119,7 @@ def _to_record(row: Row[Any]) -> OrderRecord:
     return OrderRecord(
         id=row.id,
         strategy_score_id=row.strategy_score_id,
+        closes_order_id=row.closes_order_id,
         intent=row.intent,
         symbol=row.symbol,
         strategy=row.strategy,
@@ -195,6 +197,54 @@ def stage_order(
     record = get_order(engine, int(order_id))
     assert record is not None  # just inserted in a committed transaction
     return record
+
+
+def stage_close_order(
+    engine: Engine, entry: OrderRecord, *, now: datetime | None = None
+) -> OrderRecord:
+    """Stage the closing order for a filled entry: every leg side flipped,
+    same symbol/strategy/quantity, linked via closes_order_id (IBK-129)."""
+    ts = now if now is not None else datetime.now(UTC)
+    flipped = [
+        {**leg, "side": "buy" if leg.get("side") == "sell" else "sell"}
+        for leg in entry.legs
+    ]
+    with engine.begin() as conn:
+        inserted = conn.execute(
+            insert(orders).values(
+                strategy_score_id=entry.strategy_score_id,
+                closes_order_id=entry.id,
+                intent="close",
+                symbol=entry.symbol,
+                strategy=entry.strategy,
+                legs_json=flipped,
+                quantity=entry.quantity,
+                status="staged",
+                staged_ts=ts,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
+        assert inserted is not None
+        order_id = int(inserted[0])
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(order_ref=f"obot-{order_id}")
+        )
+    record = get_order(engine, order_id)
+    assert record is not None
+    return record
+
+
+def open_close_for(engine: Engine, entry_id: int) -> OrderRecord | None:
+    """The ACTIVE (non-terminal) close working against this entry, if any."""
+    active = sorted(ORDER_STATUSES - TERMINAL_STATUSES)
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(orders)
+            .where(orders.c.closes_order_id == entry_id)
+            .where(orders.c.status.in_(active))
+            .limit(1)
+        ).first()
+    return None if row is None else _to_record(row)
 
 
 def get_order(engine: Engine, order_id: int) -> OrderRecord | None:

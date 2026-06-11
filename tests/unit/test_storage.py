@@ -104,6 +104,16 @@ def test_orders_fills_migration_round_trips(tmp_path: Path) -> None:
     assert {"orders", "fills"} <= tables()
 
 
+def test_orders_closes_column_exists_after_migration(tmp_path: Path) -> None:
+    """0010 adds orders.closes_order_id (IBK-129 close↔entry linkage)."""
+    db_path = tmp_path / "closes.db"
+    apply_migrations(db_path)
+    engine = create_engine_for_path(db_path)
+    with engine.connect() as conn:
+        cols = {c["name"] for c in inspect(conn).get_columns("orders")}
+    assert "closes_order_id" in cols
+
+
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:
     """0009 upgrade->downgrade->upgrade is reversible."""
     from alembic.config import Config
