@@ -264,6 +264,14 @@ class Daemon:
             )
         except Exception:
             log.exception("manage tick failed catastrophically")
+        # IBK-129: automated exits for bot-opened positions — third sibling,
+        # isolated the same way.
+        try:
+            from optionsbot.daemon.exit_runner import run_exits_tick
+
+            await run_exits_tick(self._context)
+        except Exception:
+            log.exception("exits tick failed catastrophically")
 
     async def _heartbeat_tick(self) -> None:
         assert self._context is not None

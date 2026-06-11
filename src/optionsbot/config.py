@@ -171,6 +171,12 @@ class ExecutionSettings(BaseModel):
     # one pass). 0 disables the periodic pass; it only fires while
     # non-terminal orders exist, so it is free when idle.
     reconcile_minutes: int = Field(default=5, ge=0)
+    # IBK-129 exits: soft stop OFF by default — the defined-risk width IS the
+    # stop (gaps blow through soft stops anyway, per the research); profit
+    # targets/DTE come from ManageSettings. The expiry guard force-closes any
+    # bot position this many days before its NEAREST leg expiry.
+    exit_stop_enabled: bool = False
+    expiry_guard_dte: int = Field(default=3, ge=0)
 
 
 class StorageSettings(BaseModel):
