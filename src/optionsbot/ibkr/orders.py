@@ -297,14 +297,22 @@ class OrderClient:
         for callback in self._status_callbacks:
             callback(update)
 
-    def _handle_exec_details(self, trade: Trade, fill: Fill) -> None:
+    def _to_execution_fill(
+        self, fill: Fill, *, fallback_ref: str | None = None
+    ) -> ExecutionFill:
         execution = fill.execution
         ts = execution.time if isinstance(execution.time, datetime) else datetime.now(UTC)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
-        record = ExecutionFill(
+        report = fill.commissionReport
+        commission = (
+            float(report.commission)
+            if report is not None and report.execId
+            else None
+        )
+        return ExecutionFill(
             ib_order_id=int(execution.orderId),
-            order_ref=execution.orderRef or trade.order.orderRef or None,
+            order_ref=execution.orderRef or fallback_ref or None,
             exec_id=execution.execId,
             side=_IB_SIDE.get(execution.side, execution.side),
             price=float(execution.price),
@@ -312,7 +320,43 @@ class OrderClient:
             ts=ts,
             con_id=int(fill.contract.conId) or None,
             sec_type=fill.contract.secType,
+            commission=commission,
         )
+
+    async def adopt_open_orders(self) -> list[tuple[int, str | None, str]]:
+        """Re-register OUR open orders after a restart; report all of them.
+
+        Only orders carrying an "obot-" orderRef enter the modify/cancel
+        registry — manual TWS orders arrive with orderId 0 and must never be
+        modifiable through this client. Returns (orderId, orderRef, status)
+        for every open order so the reconciler can classify foreign ones.
+        """
+        await self._client.ensure_connected()
+        self._ensure_subscribed()
+        trades = await self._client.ib.reqAllOpenOrdersAsync()
+        adopted: list[tuple[int, str | None, str]] = []
+        for trade in trades:
+            ref = trade.order.orderRef or None
+            order_id = int(trade.order.orderId)
+            if ref is not None and ref.startswith("obot-"):
+                self._registry[order_id] = (trade.contract, trade.order)
+            adopted.append((order_id, ref, trade.orderStatus.status))
+        return adopted
+
+    async def recent_executions(self) -> list[ExecutionFill]:
+        """Today's executions for this account (reqExecutions), translated.
+
+        Used by reconciliation to replay fills missed while the daemon was
+        down; record_fill's execId dedupe makes the replay idempotent.
+        """
+        await self._client.ensure_connected()
+        from ib_async import ExecutionFilter
+
+        fills_ = await self._client.ib.reqExecutionsAsync(ExecutionFilter())
+        return [self._to_execution_fill(f) for f in fills_]
+
+    def _handle_exec_details(self, trade: Trade, fill: Fill) -> None:
+        record = self._to_execution_fill(fill, fallback_ref=trade.order.orderRef or None)
         for callback in self._fill_callbacks:
             callback(record)
 

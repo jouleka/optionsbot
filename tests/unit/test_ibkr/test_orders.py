@@ -389,6 +389,62 @@ def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
     assert update.perm_id is None
 
 
+async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    ours = Trade(
+        contract=Contract(secType="BAG", symbol="SPY"),
+        order=Order(orderId=44, permId=99, orderRef="obot-12"),
+        orderStatus=OrderStatus(orderId=44, status="Submitted"),
+    )
+    manual = Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=0, permId=7, orderRef=""),
+        orderStatus=OrderStatus(orderId=0, status="Submitted"),
+    )
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[ours, manual])
+
+    adopted = await order_client.adopt_open_orders()
+    assert (44, "obot-12", "Submitted") in adopted
+    assert (0, None, "Submitted") in adopted  # reported for classification
+    # Registry holds OURS only — modify works again after a restart...
+    await order_client.modify_price(44, new_limit_price=-1.10)
+    order_ib.placeOrder.assert_called_once()
+    # ...but a manual TWS order (orderId 0) must never be modifiable.
+    with pytest.raises(ValueError, match="unknown"):
+        await order_client.modify_price(0, new_limit_price=-1.0)
+
+
+async def test_recent_executions_translates_with_commission(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="0009.aa.01", time=datetime(2026, 6, 11, 15, 0, tzinfo=UTC),
+        side="SLD", shares=1.0, price=1.55, permId=99, orderId=44,
+        orderRef="obot-12",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=CommissionReport(execId="0009.aa.01", commission=0.66),
+        time=execution.time,
+    )
+    order_ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
+
+    [record] = await order_client.recent_executions()
+    assert record.exec_id == "0009.aa.01"
+    assert record.side == "SELL"
+    assert record.order_ref == "obot-12"
+    assert record.commission == pytest.approx(0.66)
+    assert record.sec_type == "OPT"
+
+
 def test_commission_event_translates(order_client: OrderClient) -> None:
     from ib_async import CommissionReport
 

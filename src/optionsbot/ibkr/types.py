@@ -161,6 +161,9 @@ class ExecutionFill:
     ts: datetime
     con_id: int | None
     sec_type: str  # 'OPT' leg vs 'BAG' summary
+    # IBK-128: populated from the bundled commissionReport when translating
+    # reqExecutions results (live events deliver commissions separately).
+    commission: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
