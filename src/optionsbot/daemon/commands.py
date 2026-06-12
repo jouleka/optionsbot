@@ -140,9 +140,18 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     top = ranked[:3]
     if not top:
         return [CommandReply(f"{symbol}: no qualifying strategies right now")]
+    # IBK-126/130: /scan is the on-demand test surface — picks carry the same
+    # ➤ /execute hint as scheduled alerts when execution is armed.
+    from optionsbot.daemon.alert_pipeline import execute_hint_for
+
     replies = [
         CommandReply(
-            format_alert_markdown(result.symbol, result.view, s, result.snapshot_ts),
+            format_alert_markdown(
+                result.symbol, result.view, s, result.snapshot_ts,
+                execute_hint=execute_hint_for(
+                    context, result.snapshot_id, s.strategy_name
+                ),
+            ),
             parse_mode="MarkdownV2",
         )
         for s in top

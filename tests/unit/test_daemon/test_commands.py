@@ -193,6 +193,46 @@ async def test_scan_warns_and_orders_when_no_positive_edge(
     assert "cash_secured_put" in picks[1]
 
 
+async def test_scan_includes_execute_hint_when_armed(
+    daemon_context: DaemonContext,
+) -> None:
+    # /scan must be a self-sufficient test surface: when execution is enabled
+    # the picks carry the same ➤ /execute id as scheduled alerts.
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scan.types import ScanResult
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+    from optionsbot.storage.schema import snapshots, strategy_scores
+
+    daemon_context.settings.execution.enabled = True
+    with daemon_context.engine.begin() as conn:
+        snap_id = int(conn.execute(insert(snapshots).values(
+            symbol="SPY", ts=datetime.now(UTC), spot=600.0,
+        )).inserted_primary_key[0])
+        score_id = int(conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="iron_condor", score=88.0,
+            rationale="t", legs_json=[], suggestion_json={},
+        )).inserted_primary_key[0])
+
+    sug = MagicMock()
+    sug.legs = ()
+    sug.defined_risk = True
+    sug.credit_or_debit = 1.0
+    sug.max_loss = 2.0
+    sug.prob_profit = 0.6
+    sug.reward_risk = 1.0
+    sug.expected_value = 5.0
+    sug.risk_tier = "balanced"
+    sug.suggested_quantity = 1
+    scored = ScoredStrategy("iron_condor", 88.0, FactorBreakdown(.5,.5,.5,.5,.5,.5), sug, "ok")
+    view = MarketView("neutral", "weak", "high", 0.7, False, False)
+    result = ScanResult("SPY", snap_id, datetime.now(UTC), view, (scored,))
+
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+        replies = await dispatch(daemon_context, "/scan spy")
+    assert any(f"/execute {score_id}" in r.text for r in replies)
+
+
 async def test_kill_trips_persisted_switch(daemon_context: DaemonContext) -> None:
     from optionsbot.execution.state import load_state
 
