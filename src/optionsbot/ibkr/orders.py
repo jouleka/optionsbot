@@ -251,7 +251,10 @@ class OrderClient:
         if entry is None:
             raise ValueError(f"unknown order id {ib_order_id} (not placed by this client)")
         contract, order = entry
-        order.lmtPrice = new_limit_price
+        # Same normalization as placement: only BAG combos use signed net
+        # limits; a single-leg option's premium is always positive (a signed
+        # walk target sent raw produced lmtPrice=-6.14 → IBKR Error 201).
+        order.lmtPrice = new_limit_price if contract.secType == "BAG" else abs(new_limit_price)
         await self._client.ensure_connected()
         await self._rate.acquire()
         self._client.ib.placeOrder(contract, order)

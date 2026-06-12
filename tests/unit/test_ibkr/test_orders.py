@@ -234,6 +234,35 @@ async def test_modify_price_reuses_same_order_id(
     assert second_order.lmtPrice == -1.45
 
 
+async def test_modify_single_leg_normalizes_to_positive_premium(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    # Live Error 201: the walk passes signed net targets (credit = negative);
+    # a single-leg option must convert to a positive premium on modify just
+    # like it does at placement.
+    short_put = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260717",
+         "strike": 580.0, "right": "P", "quantity": 1},
+    ]
+    placed = await order_client.place_combo_limit(
+        "SPY", short_put, quantity=1, limit_price=-6.15, order_ref="obot-16",
+    )
+    await order_client.modify_price(placed.ib_order_id, new_limit_price=-6.14)
+    _, modified_order = order_ib.placeOrder.call_args_list[1].args
+    assert modified_order.lmtPrice == pytest.approx(+6.14)  # positive premium
+
+
+async def test_modify_bag_keeps_signed_limit(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    placed = await order_client.place_combo_limit(
+        "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.55, order_ref="obot-17",
+    )
+    await order_client.modify_price(placed.ib_order_id, new_limit_price=-1.45)
+    _, modified_order = order_ib.placeOrder.call_args_list[1].args
+    assert modified_order.lmtPrice == pytest.approx(-1.45)  # signed BAG net
+
+
 async def test_modify_unknown_order_raises(order_client: OrderClient) -> None:
     with pytest.raises(ValueError, match="unknown"):
         await order_client.modify_price(31337, new_limit_price=-1.0)
