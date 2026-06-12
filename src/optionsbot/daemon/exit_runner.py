@@ -31,7 +31,12 @@ from optionsbot.execution.orders import (
     transition,
 )
 from optionsbot.execution.state import load_state
-from optionsbot.execution.walk import combo_bid_ask, price_increment_for, slippage_budget
+from optionsbot.execution.walk import (
+    combo_bid_ask,
+    price_increment_for,
+    round_to_increment,
+    slippage_budget,
+)
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.types import OptionQuote
 from optionsbot.storage.schema import fills, orders
@@ -203,7 +208,11 @@ async def _manage_entry(
     # Price the FLIPPED structure. Closing a credit pays; closing a debit
     # collects. With no usable quote (expiry guard path) fall back to the
     # entry net — the walk re-anchors from live quotes immediately anyway.
-    close_net = -(current_net if current_net is not None else entry_net)
+    # Rounded to the symbol tick: IBKR rejects sub-increment limits (Error 110).
+    increment = price_increment_for(entry.symbol)
+    close_net = round_to_increment(
+        -(current_net if current_net is not None else entry_net), increment
+    )
     limit_price = -close_net  # BAG convention: limit = -net
 
     close = stage_close_order(engine, entry, now=now)
@@ -226,7 +235,6 @@ async def _manage_entry(
     cfg = context.settings.execution
     if cfg.walk_max_steps > 0:
         flipped_nbbo = combo_bid_ask(close.legs, quotes) if quotes else None
-        increment = price_increment_for(entry.symbol)
         budget = (
             slippage_budget(
                 flipped_nbbo[0], flipped_nbbo[1],

@@ -316,6 +316,22 @@ async def test_happy_path_stages_places_and_reports(tmp_db: Engine) -> None:
     assert "1.20" in outcome.message
 
 
+async def test_limit_price_rounds_to_tick(tmp_db: Engine) -> None:
+    # Half-cent mids (bid 9.30/ask 9.33 -> 9.315) must round to the penny —
+    # IBKR rejects sub-increment limits with Error 110 (seen live, pick 686).
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, md_mids={(580.0, "P"): 1.615, (575.0, "P"): 0.40})
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok, outcome.message
+    call = deps.order_client.place_combo_limit.call_args
+    limit = call.kwargs["limit_price"]
+    assert limit == pytest.approx(round(limit, 2))  # on the penny grid
+    # Which side of the half-tick it lands on is float noise; within half a
+    # tick of the true mid is the contract.
+    assert abs(-limit - 1.215) <= 0.005 + 1e-9
+
+
 async def test_happy_path_debit_places_positive_limit(tmp_db: Engine) -> None:
     # Debit spread: scan says we PAY (credit_or_debit < 0); fresh quotes net a
     # debit too. BUY-bag debit = POSITIVE limit — the most error-prone sign in

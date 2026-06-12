@@ -34,6 +34,7 @@ from optionsbot.execution.walk import (
     combo_bid_ask,
     liquidity_issues,
     price_increment_for,
+    round_to_increment,
     run_price_walk,
     slippage_budget,
 )
@@ -233,6 +234,9 @@ async def execute_pick(
     fresh_net = combo_mid(legs, quotes)
     if fresh_net is None:
         return _reject("missing quote mid on at least one leg — not pricing this blind")
+    # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
+    # rejects sub-increment limits with Error 110. Round to the symbol's tick.
+    fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
 
     scan_net = float(suggestion.get("credit_or_debit") or 0.0) / 100.0  # per unit
     if scan_net != 0 and (fresh_net == 0 or (fresh_net > 0) != (scan_net > 0)):
