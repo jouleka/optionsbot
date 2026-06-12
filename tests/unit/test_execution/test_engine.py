@@ -47,6 +47,7 @@ def _insert_pick(
     defined_risk: bool = True,
     suggested_quantity: int = 1,
     credit_or_debit: float = 120.0,  # dollars per set; 1.20/unit
+    max_loss: float = 380.0,
     legs: list[dict[str, Any]] | None = None,
     raw_json: dict[str, Any] | None = None,
 ) -> int:
@@ -63,7 +64,7 @@ def _insert_pick(
                 suggestion_json={
                     "defined_risk": defined_risk,
                     "credit_or_debit": credit_or_debit,
-                    "max_loss": 380.0, "max_profit": 120.0, "prob_profit": 0.7,
+                    "max_loss": max_loss, "max_profit": 120.0, "prob_profit": 0.7,
                     "suggested_quantity": suggested_quantity,
                     "reward_risk": 0.32, "expected_value": 11.0,
                     "risk_tier": "balanced",

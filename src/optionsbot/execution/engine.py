@@ -150,8 +150,8 @@ async def execute_pick(
             f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
         )
 
-    # 4. Defined-risk only; sized. In auto mode, earnings inside the expiry
-    # window are skipped — binary jump risk overwhelms theta edge for neutral
+    # 4. Defined-risk only. In auto mode, earnings inside the expiry window
+    # are skipped — binary jump risk overwhelms theta edge for neutral
     # structures (the human can still /execute deliberately in confirm mode).
     if settings.execution.mode == "auto":
         snapshot_raw: dict[str, Any] = pick.raw_json or {}
@@ -162,9 +162,9 @@ async def execute_pick(
             )
     if not suggestion.get("defined_risk", False):
         return _reject("undefined risk strategies are not executable")
-    quantity = int(suggestion.get("suggested_quantity") or 0)
-    if quantity < 1:
-        return _reject("pick has no executable quantity (sizing returned 0)")
+    max_loss_unit = float(suggestion.get("max_loss") or 0.0)
+    if max_loss_unit <= 0:
+        return _reject("pick carries no defined max loss — not sizeable")
 
     # 5. Market hours.
     if not is_market_open(ts_now):
@@ -230,7 +230,15 @@ async def execute_pick(
         min_open_interest=settings.execution.min_open_interest,
     )
     if issues:
-        return _reject("liquidity: " + "; ".join(issues))
+        message = "liquidity: " + "; ".join(issues)
+        if all("no bid/ask" in issue for issue in issues):
+            # Every leg empty = almost always IBKR's one-session rule, not
+            # illiquidity (Error 10197 — a LIVE login is consuming the feed).
+            message += (
+                "\n(all quotes empty — usually a competing LIVE login: close "
+                "live TWS/Client Portal/mobile and retry)"
+            )
+        return _reject(message)
     fresh_net = combo_mid(legs, quotes)
     if fresh_net is None:
         return _reject("missing quote mid on at least one leg — not pricing this blind")
@@ -255,10 +263,47 @@ async def execute_pick(
 
     limit_price = -fresh_net  # BUY-bag convention: credit = negative limit
 
-    # 9. Margin gate via whatIf + available funds. Under ibkr_lock: whatif's
-    # leg qualification can touch the DAEMON connection (resolver), and all
-    # daemon-connection I/O is serialized by discipline — cache hits make this
-    # free in practice, but the invariant must hold by construction.
+    # 9. Dynamic sizing (IBK-133) from live equity + the bot's own history,
+    # then the margin gate via whatIf. Under ibkr_lock: whatif's leg
+    # qualification can touch the DAEMON connection (resolver), and all
+    # daemon-connection I/O is serialized by discipline.
+    async with deps.ibkr_lock:
+        summary = await deps.positions.get_account_summary()
+    equity = (
+        float(summary.net_liquidation) if summary.net_liquidation is not None else None
+    )
+    if equity is not None and equity > 0:
+        from optionsbot.execution.orders import realized_close_pairs
+        from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
+
+        decision = dynamic_quantity(
+            equity=equity,
+            max_loss_unit=max_loss_unit,
+            max_profit_unit=(
+                float(suggestion["max_profit"]) if suggestion.get("max_profit") else None
+            ),
+            prob_profit=(
+                float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
+            ),
+            open_heat=open_heat_dollars(engine),
+            recent_pnls=[p.pnl for p in realized_close_pairs(engine)[-5:]],
+            base_risk_pct=settings.execution.base_risk_pct,
+            heat_cap_pct=settings.execution.max_portfolio_heat_pct,
+            single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,
+        )
+        if decision.quantity < 1:
+            return _reject(decision.note)
+        quantity = decision.quantity
+        sizing_note = decision.note
+    else:
+        # No live equity figure — fall back to the scan-time indicative size.
+        quantity = int(suggestion.get("suggested_quantity") or 0)
+        if quantity < 1:
+            return _reject(
+                "no live equity figure and the pick has no executable quantity"
+            )
+        sizing_note = f"sized {quantity}x (scan-time indicative; live equity unavailable)"
+
     async with deps.ibkr_lock:
         try:
             preview = await deps.order_client.whatif_combo(
@@ -266,7 +311,6 @@ async def execute_pick(
             )
         except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
             return _reject(f"whatIf margin preview failed: {exc}")
-        summary = await deps.positions.get_account_summary()
     available = float(summary.available_funds) if summary.available_funds is not None else None
     # IBK-130: portfolio-wide buying-power deployment cap (auto mode only).
     if settings.execution.mode == "auto":
@@ -304,7 +348,7 @@ async def execute_pick(
         if nbbo is not None
         else increment
     )
-    record = stage_order(engine, score_id, now=ts_now)
+    record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
     record_order_quotes(
         engine, record.id, kind="decision", step=0, ts=ts_now,
         combo_bid=nbbo[0] if nbbo else None,
@@ -393,7 +437,8 @@ async def execute_pick(
         ok=True,
         message=(
             f"✅ submitted #{record.id}: {symbol} {pick.strategy} {quantity}x "
-            f"@ net {kind} {abs(fresh_net):.2f}/unit\n{margin_note}{walking}\n"
+            f"@ net {kind} {abs(fresh_net):.2f}/unit\n{sizing_note}\n"
+            f"{margin_note}{walking}\n"
             f"TTL {settings.execution.order_ttl_minutes}m backstop — /orders to "
             f"track, /cancelorder {record.id} to pull{drift_note}"
         ),

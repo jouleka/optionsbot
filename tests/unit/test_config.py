@@ -315,6 +315,14 @@ def test_execution_auto_defaults() -> None:
     assert Settings().execution.max_bp_usage_pct == 0.30
 
 
+def test_execution_sizing_defaults() -> None:
+    # IBK-133
+    s = Settings()
+    assert s.execution.base_risk_pct == 0.03
+    assert s.execution.max_portfolio_heat_pct == 0.15
+    assert s.execution.max_single_trade_risk_pct == 0.10
+
+
 def test_execution_exit_defaults() -> None:
     # IBK-129: soft stop OFF by default (defined-risk width is the stop);
     # expiry guard force-closes 3 days out.

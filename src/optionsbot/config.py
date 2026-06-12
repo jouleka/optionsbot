@@ -181,6 +181,13 @@ class ExecutionSettings(BaseModel):
     # net liquidation is already deployed ((net_liq - available)/net_liq).
     # Confirm-mode /execute is NOT bound by it — the human decides.
     max_bp_usage_pct: float = Field(default=0.30, gt=0.0, le=1.0)
+    # IBK-133 dynamic sizing (authoritative at execution; scan.risk_pct only
+    # shapes the alert's indicative size): base risk × quarter-Kelly edge
+    # tilt × anti-martingale drawdown governor, capped by portfolio heat and
+    # a single-trade ceiling. Min 1 lot when within both caps.
+    base_risk_pct: float = Field(default=0.03, gt=0.0, le=1.0)
+    max_portfolio_heat_pct: float = Field(default=0.15, gt=0.0, le=1.0)
+    max_single_trade_risk_pct: float = Field(default=0.10, gt=0.0, le=1.0)
 
 
 class StorageSettings(BaseModel):

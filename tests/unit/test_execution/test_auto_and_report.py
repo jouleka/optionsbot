@@ -108,6 +108,73 @@ async def test_entry_walk_stops_on_kill(tmp_db: Engine) -> None:
     assert "kill switch" in (record.last_error or "")
 
 
+def test_dynamic_sizing_matrix() -> None:
+    # IBK-133 pure math: $5k equity, base 3% = $150.
+    from optionsbot.execution.sizing import dynamic_quantity
+
+    # Spread with $90 max loss: budget $150×0.5 (no-edge tilt) = $75 → min-1.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=90, max_profit_unit=30, prob_profit=0.70,
+        open_heat=0, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 1 and "min-1" in d.note
+
+    # Strong edge (b=2, p=0.6 → kelly 0.4 → tilt capped ×2): budget $300 → 5x.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=60, max_profit_unit=120, prob_profit=0.60,
+        open_heat=0, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 5
+
+    # Anti-martingale: 3 straight losses halve the budget.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=60, max_profit_unit=120, prob_profit=0.60,
+        open_heat=0, recent_pnls=[-10, -20, -5], base_risk_pct=0.03,
+        heat_cap_pct=0.15, single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 2  # 300×0.5 = 150 → 2x
+
+    # $18,885 CSP max loss on $5k: hard single-trade ceiling → 0.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=18_885, max_profit_unit=615, prob_profit=0.72,
+        open_heat=0, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 0 and "single-trade cap" in d.note
+
+    # Heat cap: $700 already open of a $750 cap leaves no room for a $90 trade.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=90, max_profit_unit=30, prob_profit=0.70,
+        open_heat=700, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 0 and "heat" in d.note
+
+
+async def test_engine_uses_dynamic_size_with_live_equity(tmp_db: Engine) -> None:
+    # Pick: max_loss 380/unit, equity 100k → no-edge tilt ×0.5 → $1.5k → 3x.
+    score_id = _insert_pick(tmp_db, suggested_quantity=9)
+    deps = _deps(tmp_db, net_liquidation=100_000.0)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+    assert outcome.ok, outcome.message
+    call = deps.order_client.place_combo_limit.call_args
+    assert call.kwargs["quantity"] == 3  # dynamic, NOT the indicative 9
+    assert "sized 3x" in outcome.message
+
+
+async def test_engine_rejects_oversized_trade_for_small_account(tmp_db: Engine) -> None:
+    # $18,885 max-loss CSP on a $5k account → clear refusal.
+    score_id = _insert_pick(tmp_db, credit_or_debit=615.0, max_loss=18_885.0)
+    deps = _deps(tmp_db, net_liquidation=5_000.0, available_funds=5_000.0)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+    assert not outcome.ok
+    assert "single-trade cap" in outcome.message
+
+
 # --- IBK-131 realized pairs + report --------------------------------------------------
 
 
