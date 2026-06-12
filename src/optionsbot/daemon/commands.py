@@ -141,15 +141,18 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     if not top:
         return [CommandReply(f"{symbol}: no qualifying strategies right now")]
     # IBK-126/130: /scan is the on-demand test surface — picks carry the same
-    # ➤ /execute hint as scheduled alerts when execution is armed.
+    # ➤ /execute hint as scheduled alerts when execution is armed. No hint on
+    # picks the execute gates would refuse anyway (undefined risk / size 0).
     from optionsbot.daemon.alert_pipeline import execute_hint_for
 
     replies = [
         CommandReply(
             format_alert_markdown(
                 result.symbol, result.view, s, result.snapshot_ts,
-                execute_hint=execute_hint_for(
-                    context, result.snapshot_id, s.strategy_name
+                execute_hint=(
+                    execute_hint_for(context, result.snapshot_id, s.strategy_name)
+                    if s.suggestion.defined_risk and s.suggestion.suggested_quantity > 0
+                    else None
                 ),
             ),
             parse_mode="MarkdownV2",

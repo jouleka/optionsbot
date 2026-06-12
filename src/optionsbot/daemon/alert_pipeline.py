@@ -90,9 +90,18 @@ async def dispatch_alert(
     view = _load_view_for_snapshot(context, snapshot_id)
     snapshot_ts = _load_snapshot_ts(context, snapshot_id)
     symbol = _load_symbol_for_alert(context, alert_id)
+    suggestion = scored.suggestion
+    executable = bool(
+        getattr(suggestion, "defined_risk", False)
+        and getattr(suggestion, "suggested_quantity", 0) > 0
+    )
     text = format_alert_markdown(
         symbol=symbol, view=view, scored=scored, snapshot_ts=snapshot_ts,
-        execute_hint=execute_hint_for(context, snapshot_id, scored.strategy_name),
+        execute_hint=(
+            execute_hint_for(context, snapshot_id, scored.strategy_name)
+            if executable
+            else None
+        ),
     )
     try:
         msg_id = await context.telegram.send_message(text)

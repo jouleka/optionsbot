@@ -233,6 +233,46 @@ async def test_scan_includes_execute_hint_when_armed(
     assert any(f"/execute {score_id}" in r.text for r in replies)
 
 
+async def test_scan_hides_hint_for_unexecutable_picks(
+    daemon_context: DaemonContext,
+) -> None:
+    # An undefined-risk or zero-quantity pick can NEVER pass the execute
+    # gates — showing the button just teaches the user that buttons fail.
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scan.types import ScanResult
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+    from optionsbot.storage.schema import snapshots, strategy_scores
+
+    daemon_context.settings.execution.enabled = True
+    with daemon_context.engine.begin() as conn:
+        snap_id = int(conn.execute(insert(snapshots).values(
+            symbol="NVDA", ts=datetime.now(UTC), spot=200.0,
+        )).inserted_primary_key[0])
+        conn.execute(insert(strategy_scores).values(
+            snapshot_id=snap_id, strategy="short_straddle", score=67.0,
+            rationale="t", legs_json=[], suggestion_json={},
+        ))
+
+    sug = MagicMock()
+    sug.legs = ()
+    sug.defined_risk = False  # undefined risk — never executable
+    sug.credit_or_debit = 22.0
+    sug.max_loss = None
+    sug.prob_profit = 0.56
+    sug.reward_risk = None
+    sug.expected_value = -3.0
+    sug.risk_tier = "aggressive"
+    sug.suggested_quantity = 0
+    scored = ScoredStrategy("short_straddle", 67.0, FactorBreakdown(.5,.5,.5,.5,.5,.5), sug, "ok")
+    view = MarketView("neutral", "weak", "high", 0.7, False, False)
+    result = ScanResult("NVDA", snap_id, datetime.now(UTC), view, (scored,))
+
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+        replies = await dispatch(daemon_context, "/scan nvda")
+    assert not any("/execute" in r.text for r in replies)
+
+
 async def test_kill_trips_persisted_switch(daemon_context: DaemonContext) -> None:
     from optionsbot.execution.state import load_state
 
