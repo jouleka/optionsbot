@@ -83,13 +83,13 @@ async def test_entry_walk_stops_on_kill(tmp_db: Engine) -> None:
     from optionsbot.execution.state import trip_kill
     from optionsbot.execution.walk import run_price_walk
     from tests.unit.test_execution.test_walk import LEGS as WALK_LEGS
-    from tests.unit.test_execution.test_walk import _md, _walk_order
+    from tests.unit.test_execution.test_walk import _md, _tracker_confirms_cancel, _walk_order
 
     order_id = _walk_order(tmp_db)
     trip_kill(tmp_db, "loss limit")
     order_client = MagicMock()
     order_client.modify_price = AsyncMock()
-    order_client.cancel = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
     settings = Settings()
     settings.execution.walk_step_seconds = 0
     settings.execution.walk_max_steps = 3
@@ -102,7 +102,10 @@ async def test_entry_walk_stops_on_kill(tmp_db: Engine) -> None:
     )
     order_client.cancel.assert_awaited_once_with(11)
     order_client.modify_price.assert_not_awaited()
-    assert get_order(tmp_db, order_id).status == "abandoned"  # type: ignore[union-attr]
+    record = get_order(tmp_db, order_id)
+    assert record is not None
+    assert record.status == "cancelled"
+    assert "kill switch" in (record.last_error or "")
 
 
 # --- IBK-131 realized pairs + report --------------------------------------------------

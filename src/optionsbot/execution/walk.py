@@ -22,12 +22,12 @@ from sqlalchemy import Engine
 from optionsbot.config import Settings
 from optionsbot.execution.orders import (
     WORKING_STATUSES,
-    IllegalOrderTransition,
     bump_reprice,
     get_order,
     record_order_quotes,
-    transition,
+    set_order_note,
 )
+from optionsbot.execution.state import load_state
 
 if TYPE_CHECKING:
     from optionsbot.ibkr.market_data import MarketDataClient
@@ -192,21 +192,14 @@ async def run_price_walk(
             record = get_order(engine, order_id)
             if record is None or record.status not in WORKING_STATUSES:
                 return  # filled/cancelled/rejected while we slept — done
-            if record.intent == "open":
+            if record.intent == "open" and load_state(engine).killed:
                 # A kill switch tripped mid-walk must stop ENTRY walks before
                 # they fill (exits keep walking — we still want out).
-                from optionsbot.execution.state import load_state
-
-                if load_state(engine).killed:
-                    try:
-                        await order_client.cancel(ib_order_id)
-                        transition(
-                            engine, order_id, "abandoned",
-                            error="kill switch tripped mid-walk", now=datetime.now(UTC),
-                        )
-                    except Exception:  # noqa: BLE001 -- reconcile is the backstop
-                        log.exception("walk %s: kill-cancel failed", order_id)
-                    return
+                await _request_cancel_and_confirm(
+                    engine, order_client, order_id, ib_order_id,
+                    note="kill switch tripped mid-walk — cancel requested",
+                )
+                return
 
             quotes: dict[LegSpec, OptionQuote] = {}
             current_mid: float | None = None
@@ -262,29 +255,58 @@ async def run_price_walk(
                 legs=leg_rows,
             )
 
-        # Final price rests, then the trade is skipped.
+        # Final price rests, then the trade is skipped: request the cancel and
+        # let the TRACKER confirm it. Marking the row terminal ourselves while
+        # the broker could still (partially) fill is exactly how a real
+        # position once hid behind a "trade skipped" message.
         if cfg.walk_final_rest_seconds:
             await asyncio.sleep(cfg.walk_final_rest_seconds)
         record = get_order(engine, order_id)
         if record is None or record.status not in WORKING_STATUSES:
             return
-        try:
-            await order_client.cancel(ib_order_id)
-        except Exception:  # noqa: BLE001 -- TTL watcher is the backstop
-            log.exception("walk %s: final cancel failed", order_id)
-            return
-        try:
-            transition(
-                engine, order_id, "abandoned",
-                error=(
-                    f"price walk exhausted ({cfg.walk_max_steps} steps + "
-                    f"{cfg.walk_final_rest_seconds}s rest) — no fill within budget"
-                ),
-                now=datetime.now(UTC),
-            )
-        except IllegalOrderTransition:
-            log.debug("walk %s: tracker reached terminal first", order_id)
+        await _request_cancel_and_confirm(
+            engine, order_client, order_id, ib_order_id,
+            note=(
+                f"price walk exhausted ({cfg.walk_max_steps} steps + "
+                f"{cfg.walk_final_rest_seconds}s rest) — cancel requested"
+            ),
+        )
     except asyncio.CancelledError:
         raise  # daemon shutdown — let it propagate
     except Exception:  # noqa: BLE001 -- the walk must never crash the daemon
         log.exception("price walk for order %s died", order_id)
+
+
+_CANCEL_CONFIRM_TIMEOUT = 30.0  # seconds; tests may monkeypatch
+_CANCEL_CONFIRM_POLL = 0.5
+
+
+async def _request_cancel_and_confirm(
+    engine: Engine,
+    order_client: OrderClient,
+    order_id: int,
+    ib_order_id: int,
+    *,
+    note: str,
+) -> None:
+    """Annotate intent, request the broker cancel, and wait for the TRACKER to
+    confirm the terminal state (cancelled — or filled, if a fill won the
+    race). Never writes a terminal status itself: the broker owns the order's
+    fate until it says otherwise."""
+    set_order_note(engine, order_id, note)
+    try:
+        await order_client.cancel(ib_order_id)
+    except Exception:  # noqa: BLE001 -- TTL watcher retries the cancel
+        log.exception("order %s: cancel request failed — watcher will retry", order_id)
+        return
+    waited = 0.0
+    while waited <= _CANCEL_CONFIRM_TIMEOUT:
+        record = get_order(engine, order_id)
+        if record is None or record.status not in WORKING_STATUSES:
+            return  # tracker confirmed (cancelled / filled)
+        await asyncio.sleep(_CANCEL_CONFIRM_POLL)
+        waited += _CANCEL_CONFIRM_POLL
+    log.error(
+        "order %s: cancel UNCONFIRMED after %.0fs — order may still be working; "
+        "TTL watcher keeps retrying", order_id, _CANCEL_CONFIRM_TIMEOUT,
+    )

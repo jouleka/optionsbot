@@ -247,11 +247,25 @@ def _md(mids: dict[tuple[float, str], tuple[float, float]]) -> MagicMock:
     return md
 
 
-async def test_walk_exhaustion_cancels_and_abandons(tmp_db: Engine) -> None:
+def _tracker_confirms_cancel(engine: Engine, order_id: int) -> AsyncMock:
+    """Simulate the tracker: the broker's Cancelled event lands right after
+    the cancel request and moves the row terminal."""
+
+    async def _cancel(ib_order_id: int) -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                update(orders).where(orders.c.id == order_id)
+                .values(status="cancelled", terminal_ts=NOW)
+            )
+
+    return AsyncMock(side_effect=_cancel)
+
+
+async def test_walk_exhaustion_requests_cancel_tracker_confirms(tmp_db: Engine) -> None:
     order_id = _walk_order(tmp_db)
     order_client = MagicMock()
     order_client.modify_price = AsyncMock()
-    order_client.cancel = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
     md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
 
     await run_price_walk(
@@ -265,7 +279,9 @@ async def test_walk_exhaustion_cancels_and_abandons(tmp_db: Engine) -> None:
     order_client.cancel.assert_awaited_once_with(11)
     record = get_order(tmp_db, order_id)
     assert record is not None
-    assert record.status == "abandoned"
+    # The TRACKER moved it terminal; the walk only annotated the intent.
+    assert record.status == "cancelled"
+    assert "walk exhausted" in (record.last_error or "")
     assert record.reprice_count == 3
     with tmp_db.connect() as conn:
         journal = conn.execute(select(order_quotes)).fetchall()
@@ -343,13 +359,13 @@ async def test_walk_survives_modify_errors(tmp_db: Engine) -> None:
     order_id = _walk_order(tmp_db)
     order_client = MagicMock()
     order_client.modify_price = AsyncMock(side_effect=RuntimeError("flaky"))
-    order_client.cancel = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
     md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
     await run_price_walk(
         engine=tmp_db, settings=_walk_settings(), order_client=order_client,
         md=md, symbol="SPY", legs=LEGS, order_id=order_id, ib_order_id=11,
         decision_mid=1.20, budget=0.09, increment=0.01,
     )
-    # Errors tolerated per-step; the walk still completes and abandons.
+    # Errors tolerated per-step; the walk still completes and requests cancel.
     order_client.cancel.assert_awaited_once()
-    assert get_order(tmp_db, order_id).status == "abandoned"  # type: ignore[union-attr]
+    assert get_order(tmp_db, order_id).status == "cancelled"  # type: ignore[union-attr]

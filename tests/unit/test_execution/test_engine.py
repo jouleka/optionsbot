@@ -394,13 +394,29 @@ async def test_happy_path_spawns_walk_task(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert outcome.ok
     assert deps.walk_tasks
+
+    from sqlalchemy import update as sa_update
+
+    from optionsbot.storage.schema import orders as orders_table
+
+    async def confirm(ib_order_id: int) -> None:  # the tracker's job
+        with tmp_db.begin() as conn:
+            conn.execute(
+                sa_update(orders_table)
+                .where(orders_table.c.id == outcome.order_id)
+                .values(status="cancelled", terminal_ts=NOW)
+            )
+
+    deps.order_client.cancel = AsyncMock(side_effect=confirm)
     await asyncio.gather(*list(deps.walk_tasks))
-    # The stubbed order never fills, so the walk repriced and then abandoned.
+    # The stubbed order never fills, so the walk repriced then requested
+    # the cancel; the simulated tracker confirmed it.
     assert deps.order_client.modify_price.await_count == 2
     deps.order_client.cancel.assert_awaited_once()
     record = get_order(tmp_db, outcome.order_id)  # type: ignore[arg-type]
     assert record is not None
-    assert record.status == "abandoned"
+    assert record.status == "cancelled"
+    assert "walk exhausted" in (record.last_error or "")
 
 
 async def test_no_walk_spawned_without_walk_md(tmp_db: Engine) -> None:

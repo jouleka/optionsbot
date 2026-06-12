@@ -15,9 +15,8 @@ from sqlalchemy import select
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.orders import (
-    IllegalOrderTransition,
     net_premium,
-    transition,
+    set_order_note,
     working_orders,
 )
 from optionsbot.storage.schema import orders
@@ -35,17 +34,26 @@ class OrdersTickSummary:
 def _terminal_message(row: object, premium: float | None) -> str:
     status: str = row.status  # type: ignore[attr-defined]
     head = f"#{row.id} {row.symbol} {row.strategy} {row.quantity}x"  # type: ignore[attr-defined]
+    err = row.last_error or ""  # type: ignore[attr-defined]
     if status == "filled":
         net = f" — net ${premium:,.0f}" if premium is not None else ""
         return f"🟢 filled {head}{net}"
     if status == "rejected":
-        err = row.last_error or "no reason recorded"  # type: ignore[attr-defined]
-        return f"🔴 rejected {head}: {err}"
-    if status == "abandoned":
-        return f"⏱ abandoned {head} (unfilled at TTL — trade skipped)"
+        return f"🔴 rejected {head}: {err or 'no reason recorded'}"
+    if status in ("cancelled", "abandoned"):
+        if premium is not None:
+            # Fills landed before the cancel: a REAL partial position exists
+            # that the exit engine will not manage — human must flatten/adopt.
+            return (
+                f"⚠ PARTIAL FILL then {status}: {head} — net ${premium:,.0f} "
+                "already executed. This partial position is NOT auto-managed; "
+                "flatten it manually in TWS or ask Claude to adopt it."
+            )
+        if "walk exhausted" in err or "TTL" in err:
+            return f"⏱ no fill {head} — trade skipped ({err})"
+        return f"⚪ {status} {head}"
     if status == "skipped":
-        err = row.last_error or "gates"  # type: ignore[attr-defined]
-        return f"⚪ skipped {head}: {err}"
+        return f"⚪ skipped {head}: {err or 'gates'}"
     return f"⚪ {status} {head}"
 
 
@@ -81,32 +89,30 @@ async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
         if order.ib_order_id is None:
             continue  # never acked; reconciliation (IBK-128) owns this case
         try:
+            set_order_note(
+                engine, order.id,
+                f"TTL {context.settings.execution.order_ttl_minutes}m expired "
+                "unfilled — cancel requested",
+            )
             await context.order_client.cancel(order.ib_order_id)
         except ValueError:
             # Placed before a daemon restart: the in-memory modify/cancel
-            # registry is gone. Don't mark abandoned — the order is still
-            # working at IBKR and pretending otherwise would lie. Warn once.
+            # registry is gone. Reconciliation re-adopts within minutes; warn
+            # once meanwhile.
             if order.id not in context.orders_cancel_warned:
                 context.orders_cancel_warned.add(order.id)
                 await _send(
                     context,
-                    f"⚠ order #{order.id} is working at IBKR but was placed "
-                    "before a daemon restart — cancel it manually in TWS "
-                    "(automatic adoption lands with IBK-128)",
+                    f"⚠ order #{order.id} is working at IBKR but unmanaged "
+                    "after a restart — reconciliation will adopt it shortly",
                 )
             continue
         except Exception:  # noqa: BLE001 -- one bad cancel must not starve the sweep
             log.exception("TTL cancel failed for order %s", order.id)
             continue
-        try:
-            transition(
-                engine, order.id, "abandoned",
-                error=f"TTL {context.settings.execution.order_ttl_minutes}m expired unfilled",
-                now=now,
-            )
-        except IllegalOrderTransition:
-            # The tracker's Cancelled event beat us to a terminal state — fine.
-            log.debug("order %s already terminal during TTL sweep", order.id)
+        # NO terminal transition here: the broker owns the order's fate. The
+        # tracker confirms (cancelled — or filled/partial if a fill raced us),
+        # and this sweep simply retries while the row stays working.
         expired += 1
 
     # --- Notify newly-terminal orders exactly once (watermark on terminal_ts).

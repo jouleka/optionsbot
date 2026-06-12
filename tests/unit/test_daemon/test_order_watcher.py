@@ -55,7 +55,11 @@ async def test_noop_without_order_client(daemon_context: DaemonContext) -> None:
     assert summary.expired == 0 and summary.notified == 0
 
 
-async def test_ttl_expiry_cancels_then_abandons(daemon_context: DaemonContext) -> None:
+async def test_ttl_expiry_requests_cancel_tracker_confirms(
+    daemon_context: DaemonContext,
+) -> None:
+    from sqlalchemy import update as sa_update
+
     order_client = _wire_exec(daemon_context)
     stale = _insert_order(
         daemon_context.engine, "submitted",
@@ -64,11 +68,39 @@ async def test_ttl_expiry_cancels_then_abandons(daemon_context: DaemonContext) -
     fresh = _insert_order(
         daemon_context.engine, "submitted", submitted_ts=datetime.now(UTC),
     )
+
+    async def confirm(ib_order_id: int) -> None:  # the tracker's job
+        with daemon_context.engine.begin() as conn:
+            conn.execute(sa_update(orders).where(orders.c.id == stale)
+                         .values(status="cancelled", terminal_ts=datetime.now(UTC)))
+
+    order_client.cancel = AsyncMock(side_effect=confirm)
     summary = await run_orders_tick(daemon_context)
     assert summary.expired == 1
     order_client.cancel.assert_awaited_once_with(11)
-    assert get_order(daemon_context.engine, stale).status == "abandoned"  # type: ignore[union-attr]
+    record = get_order(daemon_context.engine, stale)
+    assert record is not None
+    assert record.status == "cancelled"  # tracker confirmed, not the sweep
+    assert "TTL" in (record.last_error or "")
     assert get_order(daemon_context.engine, fresh).status == "submitted"  # type: ignore[union-attr]
+
+
+async def test_ttl_unconfirmed_cancel_retries_next_tick(
+    daemon_context: DaemonContext,
+) -> None:
+    # If the broker never confirms (no Cancelled event), the row stays WORKING
+    # and the sweep simply requests the cancel again — it must never mark the
+    # row terminal itself (a fill may still be racing the cancel).
+    order_client = _wire_exec(daemon_context)
+    stale = _insert_order(
+        daemon_context.engine, "submitted",
+        submitted_ts=datetime.now(UTC) - timedelta(minutes=30),
+    )
+    first = await run_orders_tick(daemon_context)
+    second = await run_orders_tick(daemon_context)
+    assert first.expired == 1 and second.expired == 1
+    assert order_client.cancel.await_count == 2
+    assert get_order(daemon_context.engine, stale).status == "submitted"  # type: ignore[union-attr]
 
 
 async def test_ttl_registry_miss_warns_once_and_leaves_row(

@@ -381,6 +381,16 @@ def set_fill_commission(engine: Engine, exec_id: str, commission: float) -> bool
     return result.rowcount > 0
 
 
+def set_order_note(engine: Engine, order_id: int, note: str) -> None:
+    """Annotate a row (last_error) WITHOUT changing status — used to record
+    intent ("cancel requested: walk exhausted") while the broker still owns
+    the order's fate; the tracker performs the actual terminal transition."""
+    with engine.begin() as conn:
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(last_error=note)
+        )
+
+
 def record_order_quotes(
     engine: Engine,
     order_id: int,
