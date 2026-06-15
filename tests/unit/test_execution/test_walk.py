@@ -152,27 +152,37 @@ def test_walk_target_rounds_to_increment() -> None:
 # --- liquidity gates -----------------------------------------------------------------
 
 
+_GATES = {"leg_spread_frac": 0.40, "leg_spread_floor": 0.20}
+
+
 def test_liquidity_ok_on_good_quotes() -> None:
-    assert liquidity_issues(
-        LEGS, GOOD_QUOTES, max_leg_spread=0.50, min_open_interest=100
-    ) == []
+    assert liquidity_issues(LEGS, GOOD_QUOTES, min_open_interest=100, **_GATES) == []
 
 
 def test_liquidity_flags_wide_spread() -> None:
+    # 1.00/1.80 on a 1.40 mid = $0.80 spread = 57% of mid, over the 40% cap.
     quotes = dict(GOOD_QUOTES)
     quotes[("20260717", 580.0, "P")] = _quote(580.0, "P", bid=1.00, ask=1.80)
-    issues = liquidity_issues(LEGS, quotes, max_leg_spread=0.50, min_open_interest=0)
+    issues = liquidity_issues(LEGS, quotes, min_open_interest=0, **_GATES)
     assert issues and "spread" in issues[0]
+
+
+def test_liquidity_proportional_lets_pricey_liquid_leg_through() -> None:
+    # A $0.55 spread on a $14 option = 4% of mid — fine, though it would have
+    # failed the old absolute $0.50 cap. This is the juicy-trade rescue.
+    quotes = dict(GOOD_QUOTES)
+    quotes[("20260717", 580.0, "P")] = _quote(580.0, "P", bid=13.75, ask=14.30)
+    assert liquidity_issues(LEGS, quotes, min_open_interest=0, **_GATES) == []
 
 
 def test_liquidity_flags_missing_and_crossed() -> None:
     quotes = dict(GOOD_QUOTES)
     quotes[("20260717", 575.0, "P")] = _quote(575.0, "P", bid=None, ask=0.45)
-    issues = liquidity_issues(LEGS, quotes, max_leg_spread=0.50, min_open_interest=0)
+    issues = liquidity_issues(LEGS, quotes, min_open_interest=0, **_GATES)
     assert issues and "no bid/ask" in issues[0]
 
     quotes[("20260717", 575.0, "P")] = _quote(575.0, "P", bid=0.50, ask=0.40)
-    issues = liquidity_issues(LEGS, quotes, max_leg_spread=0.50, min_open_interest=0)
+    issues = liquidity_issues(LEGS, quotes, min_open_interest=0, **_GATES)
     assert issues and "crossed" in issues[0]
 
 
@@ -181,10 +191,27 @@ def test_liquidity_oi_gate_only_when_enabled_and_present() -> None:
         ("20260717", 580.0, "P"): _quote(580.0, "P", bid=1.55, ask=1.65, oi=10),
         ("20260717", 575.0, "P"): _quote(575.0, "P", bid=0.35, ask=0.45, oi=None),
     }
-    issues = liquidity_issues(LEGS, quotes, max_leg_spread=0.50, min_open_interest=100)
+    issues = liquidity_issues(LEGS, quotes, min_open_interest=100, **_GATES)
     assert len(issues) == 1  # low OI flagged; None OI tolerated
     assert "open interest" in issues[0]
-    assert liquidity_issues(LEGS, quotes, max_leg_spread=0.50, min_open_interest=0) == []
+    assert liquidity_issues(LEGS, quotes, min_open_interest=0, **_GATES) == []
+
+
+def test_combo_spread_issue_economic_gate() -> None:
+    from optionsbot.execution.walk import combo_spread_issue
+
+    # GOOD_QUOTES combo: bid 1.10 / ask 1.30 -> spread 0.20. Net credit 1.20.
+    # 0.20/1.20 = 17% < 35% cap -> fine.
+    assert combo_spread_issue(LEGS, GOOD_QUOTES, 1.20, max_frac=0.35) is None
+    # Same spread but tiny credit 0.40 -> 50% > cap -> rejected.
+    issue = combo_spread_issue(LEGS, GOOD_QUOTES, 0.40, max_frac=0.35)
+    assert issue is not None and "net premium" in issue
+    # Wide combo (the XLK case): legs 1.00/2.60 + 0.10/2.06 -> combo spread huge.
+    wide = {
+        ("20260717", 580.0, "P"): _quote(580.0, "P", bid=1.00, ask=2.60),
+        ("20260717", 575.0, "P"): _quote(575.0, "P", bid=0.10, ask=2.06),
+    }
+    assert combo_spread_issue(LEGS, wide, 1.20, max_frac=0.35) is not None
 
 
 # --- journal --------------------------------------------------------------------------

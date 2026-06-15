@@ -119,14 +119,18 @@ def liquidity_issues(
     legs: Sequence[Mapping[str, Any]],
     quotes: Mapping[LegSpec, OptionQuote],
     *,
-    max_leg_spread: float,
+    leg_spread_frac: float,
+    leg_spread_floor: float,
     min_open_interest: int,
 ) -> list[str]:
-    """Human-readable reasons a structure is too illiquid to order.
+    """Per-leg SANITY check — catches broken/garbage quotes, not economics.
 
-    OI is checked only when the gate is enabled (>0) AND the snapshot carries
-    a value — delayed snapshots often omit OI, and a missing datum is not
-    evidence of illiquidity (chain-level scans already saw real OI).
+    A leg's bid/ask spread must be within max(frac x leg mid, floor $): the
+    percentage scales the allowance with the option's price (a $0.55 spread is
+    fine on a $14 option, awful on a $0.30 one), and the floor lets cheap,
+    genuinely-tight options through. The combo-vs-credit economic gate
+    (``combo_spread_issue``) does the real work; OI is checked only when
+    enabled AND present (delayed snapshots often omit it).
     """
     issues: list[str] = []
     for leg in legs:
@@ -142,9 +146,12 @@ def liquidity_issues(
             issues.append(f"crossed quote on {label} ({quote.bid}/{quote.ask})")
             continue
         spread = quote.ask - quote.bid
-        if spread > max_leg_spread:
+        mid = (quote.bid + quote.ask) / 2
+        allowed = max(leg_spread_frac * mid, leg_spread_floor)
+        if spread > allowed:
             issues.append(
-                f"spread ${spread:.2f} on {label} exceeds ${max_leg_spread:.2f}"
+                f"spread ${spread:.2f} on {label} exceeds ${allowed:.2f} "
+                f"({leg_spread_frac * 100:.0f}% of mid)"
             )
         if (
             min_open_interest > 0
@@ -155,6 +162,37 @@ def liquidity_issues(
                 f"open interest {quote.open_interest} on {label} below {min_open_interest}"
             )
     return issues
+
+
+def combo_spread_issue(
+    legs: Sequence[Mapping[str, Any]],
+    quotes: Mapping[LegSpec, OptionQuote],
+    net_premium: float,
+    *,
+    max_frac: float,
+) -> str | None:
+    """The ECONOMIC gate: the combo's bid/ask spread (summed per-leg NBBO)
+    must not exceed ``max_frac`` of the net premium being captured — else
+    slippage on entry+exit would eat the edge. Returns a reason or None.
+
+    The summed-leg spread overstates the true package spread (a real combo
+    quotes tighter), so this is intentionally generous and paired with the
+    price-walk, which never pays more than its budget past mid.
+    """
+    nbbo = combo_bid_ask(legs, quotes)
+    if nbbo is None:
+        return None  # missing legs already flagged per-leg
+    spread = nbbo[1] - nbbo[0]
+    juice = abs(net_premium)
+    if juice <= 0:
+        return None  # zero-premium edge handled upstream
+    if spread > max_frac * juice:
+        return (
+            f"combo bid/ask ${spread:.2f} is {spread / juice * 100:.0f}% of the "
+            f"${juice:.2f} net premium (cap {max_frac * 100:.0f}%) — slippage "
+            "would eat the edge"
+        )
+    return None
 
 
 async def run_price_walk(

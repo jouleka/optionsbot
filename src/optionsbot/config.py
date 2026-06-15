@@ -162,10 +162,18 @@ class ExecutionSettings(BaseModel):
     walk_final_rest_seconds: int = Field(default=120, ge=0)
     max_slippage_spread_frac: float = Field(default=0.25, gt=0.0, le=1.0)
     max_slippage_abs: float = Field(default=0.10, gt=0.0)
-    # IBK-127 liquidity gates. min_open_interest=0 disables the OI check —
-    # delayed snapshots often omit OI; enable once real-time data is shared
-    # to paper (IBK-122).
-    max_leg_spread_dollars: float = Field(default=0.50, gt=0.0)
+    # Liquidity gates — proportional, the way a trader actually judges them.
+    # Per-leg is a lenient SANITY check (catch broken/garbage quotes): a leg's
+    # bid/ask spread must be within max(frac x leg mid, floor $), so a pricey
+    # but liquid leg isn't killed by an absolute dollar cap. The real ECONOMIC
+    # gate is combo-level: the combo's bid/ask spread must be <= combo_frac of
+    # the net premium, so slippage can't eat the credit (and we can exit). The
+    # price-walk remains the hard backstop against overpaying on entry.
+    max_leg_spread_frac: float = Field(default=0.40, gt=0.0)
+    max_leg_spread_floor: float = Field(default=0.20, gt=0.0)
+    max_combo_spread_frac: float = Field(default=0.35, gt=0.0)
+    # min_open_interest=0 disables the OI check — delayed snapshots often omit
+    # OI; enable once real-time data is shared to paper (IBK-122).
     min_open_interest: int = Field(default=0, ge=0)
     # IBK-128: periodic broker reconciliation cadence (startup always runs
     # one pass). 0 disables the periodic pass; it only fires while

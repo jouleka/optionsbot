@@ -339,7 +339,9 @@ def test_execution_walk_defaults() -> None:
     assert s.execution.walk_final_rest_seconds == 120
     assert s.execution.max_slippage_spread_frac == 0.25
     assert s.execution.max_slippage_abs == 0.10
-    assert s.execution.max_leg_spread_dollars == 0.50
+    assert s.execution.max_leg_spread_frac == 0.40
+    assert s.execution.max_leg_spread_floor == 0.20
+    assert s.execution.max_combo_spread_frac == 0.35
     assert s.execution.min_open_interest == 0
 
 

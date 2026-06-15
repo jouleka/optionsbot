@@ -32,6 +32,7 @@ from optionsbot.execution.orders import (
 from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import (
     combo_bid_ask,
+    combo_spread_issue,
     liquidity_issues,
     price_increment_for,
     round_to_increment,
@@ -226,7 +227,8 @@ async def execute_pick(
                 return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
     issues = liquidity_issues(
         legs, quotes,
-        max_leg_spread=settings.execution.max_leg_spread_dollars,
+        leg_spread_frac=settings.execution.max_leg_spread_frac,
+        leg_spread_floor=settings.execution.max_leg_spread_floor,
         min_open_interest=settings.execution.min_open_interest,
     )
     if issues:
@@ -245,6 +247,12 @@ async def execute_pick(
     # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
     # rejects sub-increment limits with Error 110. Round to the symbol's tick.
     fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
+    # Economic liquidity gate: combo spread vs the premium we're capturing.
+    combo_issue = combo_spread_issue(
+        legs, quotes, fresh_net, max_frac=settings.execution.max_combo_spread_frac
+    )
+    if combo_issue is not None:
+        return _reject("liquidity: " + combo_issue)
 
     scan_net = float(suggestion.get("credit_or_debit") or 0.0) / 100.0  # per unit
     if scan_net != 0 and (fresh_net == 0 or (fresh_net > 0) != (scan_net > 0)):

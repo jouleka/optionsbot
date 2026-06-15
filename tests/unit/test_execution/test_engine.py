@@ -360,11 +360,25 @@ async def test_drift_warning_included(tmp_db: Engine) -> None:
 async def test_rejects_illiquid_wide_spread(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db)
-    deps.settings.execution.max_leg_spread_dollars = 0.05  # tighter than the 0.10 stub spread
+    # Stub legs quote a $0.10 spread; force a per-leg failure with a tiny cap.
+    deps.settings.execution.max_leg_spread_frac = 0.01
+    deps.settings.execution.max_leg_spread_floor = 0.01
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
     assert "liquidity" in outcome.message.lower()
+
+
+async def test_rejects_when_combo_spread_eats_the_credit(tmp_db: Engine) -> None:
+    # Per-leg spreads pass, but the combo bid/ask is too big a fraction of the
+    # net premium -> economic gate rejects (slippage would eat the edge).
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.settings.execution.max_combo_spread_frac = 0.01  # combo spread > 1% of net
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "liquidity" in outcome.message.lower() and "net premium" in outcome.message
 
 
 async def test_decision_quotes_journaled(tmp_db: Engine) -> None:
