@@ -7,6 +7,8 @@ a subscription open.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -17,6 +19,22 @@ from optionsbot.ibkr.types import OptionQuote, OptionRight, StockQuote
 
 if TYPE_CHECKING:
     from ib_async import Contract, Ticker
+
+log = logging.getLogger(__name__)
+
+# A one-shot snapshot (reqTickersAsync) frequently returns an empty ticker on
+# a DELAYED feed — the bid/ask only arrive a couple seconds later over a
+# streaming subscription. When that happens we briefly stream until the quote
+# populates (the same thing the chain client does for scans), then cancel.
+_STREAM_TIMEOUT_S = 6.0
+_STREAM_POLL_S = 0.4
+
+
+def _has_quote(ticker: object) -> bool:
+    return (
+        clean_float(getattr(ticker, "bid", None)) is not None
+        and clean_float(getattr(ticker, "ask", None)) is not None
+    )
 
 
 def _mid(bid: float | None, ask: float | None) -> float | None:
@@ -115,6 +133,31 @@ class MarketDataClient:
     async def _fetch_ticker(self, contract: Contract) -> Ticker:
         await self._client.ensure_connected()
         tickers = await self._client.ib.reqTickersAsync(contract)
-        if not tickers:
-            raise ValueError(f"No ticker returned for {contract!r}")
-        return tickers[0]
+        ticker = tickers[0] if tickers else None
+        if ticker is not None and _has_quote(ticker):
+            return ticker  # fast path: snapshot had the quote (always for stocks)
+        streamed = await self._stream_until_quote(contract)
+        if streamed is not None:
+            return streamed
+        if ticker is not None:
+            return ticker  # empty, but a real Ticker — caller sees None bid/ask
+        raise ValueError(f"No ticker returned for {contract!r}")
+
+    async def _stream_until_quote(self, contract: Contract) -> Ticker | None:
+        """Open a streaming subscription and wait (bounded) for bid/ask to
+        arrive — the reliable path for delayed feeds. Always cancels."""
+        ib = self._client.ib
+        ticker = ib.reqMktData(contract, "", False, False)
+        try:
+            waited = 0.0
+            while waited < _STREAM_TIMEOUT_S:
+                if _has_quote(ticker):
+                    return ticker
+                await asyncio.sleep(_STREAM_POLL_S)
+                waited += _STREAM_POLL_S
+        finally:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:  # noqa: BLE001 -- cancel best-effort; never mask the quote
+                log.debug("cancelMktData failed for %r", contract, exc_info=True)
+        return ticker if _has_quote(ticker) else None

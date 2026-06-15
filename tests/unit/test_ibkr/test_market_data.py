@@ -86,18 +86,55 @@ async def test_get_snapshot_option_extracts_greeks(
 
 
 async def test_get_snapshot_handles_missing_fields(
-    md: MarketDataClient, mock_ib: MagicMock
+    md: MarketDataClient, mock_ib: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # IBKR returns NaN for missing fields; our adapter converts NaN -> None.
+    # An empty snapshot now triggers the streaming fallback — keep it instant
+    # and have the stream also return NaN (no quote anywhere).
     import math
 
+    from optionsbot.ibkr import market_data
+
+    monkeypatch.setattr(market_data, "_STREAM_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(market_data, "_STREAM_POLL_S", 0.01)
+    nan_ticker = _ticker(bid=math.nan, ask=math.nan, last=math.nan)
     mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="ABC", secType="STK")]
-    mock_ib.reqTickersAsync.return_value = [_ticker(bid=math.nan, ask=math.nan, last=math.nan)]
+    mock_ib.reqTickersAsync.return_value = [nan_ticker]
+    mock_ib.reqMktData = MagicMock(return_value=nan_ticker)
+    mock_ib.cancelMktData = MagicMock()
     quote = await md.get_stock_snapshot("ABC")
     assert quote.bid is None
     assert quote.ask is None
     assert quote.last is None
     assert quote.mid is None
+
+
+async def test_empty_snapshot_falls_back_to_streaming_quote(
+    md: MarketDataClient, mock_ib: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The delayed-data case: the one-shot snapshot is empty, but a streaming
+    # subscription fills the quote a moment later. This is the fix for option
+    # /execute pricing on a delayed feed.
+    import math
+
+    from optionsbot.ibkr import market_data
+
+    monkeypatch.setattr(market_data, "_STREAM_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(market_data, "_STREAM_POLL_S", 0.01)
+    mock_ib.qualifyContractsAsync.return_value = [
+        MagicMock(symbol="SPY", secType="OPT", lastTradeDateOrContractMonth="20260717",
+                  strike=755.0, right="C")
+    ]
+    mock_ib.reqTickersAsync.return_value = [_ticker(bid=math.nan, ask=math.nan, last=math.nan)]
+    # Streaming subscription returns a ticker that already carries the quote
+    # (simulating the delayed tick that arrives shortly after subscribing).
+    mock_ib.reqMktData = MagicMock(return_value=_ticker(bid=13.08, ask=13.12, last=13.10))
+    mock_ib.cancelMktData = MagicMock()
+    quote = await md.get_option_snapshot("SPY", "20260717", 755.0, "C")
+    assert quote.bid == pytest.approx(13.08)
+    assert quote.ask == pytest.approx(13.12)
+    assert quote.mid == pytest.approx(13.10)
+    mock_ib.cancelMktData.assert_called_once()
 
 
 async def test_get_snapshot_maps_unset_greek_sentinel_to_none(
