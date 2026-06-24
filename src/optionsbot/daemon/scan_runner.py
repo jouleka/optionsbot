@@ -15,6 +15,7 @@ from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.ibkr.history import HistoryClient
+from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
@@ -22,6 +23,7 @@ from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import DEFAULT_UNIVERSE
 from optionsbot.storage.schema import scan_runs, watchlist
+from optionsbot.strategies.base import StrategySuggestion
 
 log = logging.getLogger(__name__)
 
@@ -29,19 +31,46 @@ log = logging.getLogger(__name__)
 def rank_alert_candidates(
     picks: list[tuple[str, ScoredStrategy, int]],
     score_floor: float,
+    account_value: float | None = None,
 ) -> list[tuple[str, ScoredStrategy, int]]:
-    """Alert-worthy picks: ``score >= score_floor`` AND positive edge (EV>0),
-    sorted by sign-aware edge descending (best edge first).
+    """Alert-worthy picks: ``score >= score_floor``, positive edge (EV>0), AND
+    affordable, sorted by sign-aware edge descending (best edge first).
 
     The positive-edge filter (IBK-106) means the daemon auto-alerts only genuine
     vol-premium edge; on a no-edge tick this returns ``[]`` and nothing is
     enqueued. On-demand /scan + CLI still SHOW no-edge picks (with a banner);
     only auto-alerting is suppressed.
+
+    Affordability (IBK-134): a pick whose per-contract worst-case ``max_loss``
+    exceeds the account net-liq can't be put on even once -- e.g. a $36k
+    cash-secured put on a $5k account. Surfacing it just eats a top alert slot
+    and crowds out the small defined-risk spreads that DO fit, so it's dropped
+    here. Fail-open: when ``account_value`` is unknown (net-liq fetch failed) or
+    the risk is undefined (``max_loss is None``), the pick is KEPT -- the
+    execute_pick pipeline still gates margin/defined-risk downstream. So this
+    can never suppress every alert; it only trims the genuinely oversized ones.
+
+    Units caveat: ``account_value`` is the account's BASE currency (EUR for this
+    account) while ``max_loss`` is USD, so this is deliberately a LOOSE "can it
+    fit one lot at all" screen, not a precise budget check. At ~1.08 EUR/USD the
+    EUR figure reads ~8% small in USD terms, i.e. the screen errs slightly STRICT
+    (the safe direction) and can only bite a pick whose max_loss sits within ~8%
+    of net-liq -- never the small defined-risk spreads the bot wants. The
+    precise, currency-correct affordability check is the whatIf margin gate in
+    execute_pick (init-margin vs available-funds, both base currency).
     """
+
+    def affordable(sug: StrategySuggestion) -> bool:
+        if account_value is None or sug.max_loss is None:
+            return True
+        return float(sug.max_loss) <= account_value
+
     above = [
         p
         for p in picks
-        if p[1].score >= score_floor and has_positive_edge(p[1].suggestion)
+        if p[1].score >= score_floor
+        and has_positive_edge(p[1].suggestion)
+        and affordable(p[1].suggestion)
     ]
     above.sort(key=lambda p: edge_sort_key(p[1].suggestion), reverse=True)
     return above
@@ -107,6 +136,18 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                     for scored in result.scored:
                         all_picks.append((sym, scored, result.snapshot_id))
 
+            # Live net-liq, fetched once per tick under the same lock, so the
+            # affordability filter can drop picks too big for the account (e.g.
+            # a $36k cash-secured put on a $5k account). Fail-open on error:
+            # account_value stays None and rank_alert_candidates keeps everything.
+            account_value: float | None = None
+            try:
+                _summary = await PositionsClient(context.ibkr).get_account_summary()
+                if _summary.net_liquidation is not None:
+                    account_value = float(_summary.net_liquidation)
+            except Exception:  # noqa: BLE001 -- net-liq is advisory; never abort a tick
+                log.exception("net-liq fetch failed; affordability filter off this tick")
+
         # Alert the day's best: floor by score, rank desc, enqueue the top N that
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
         # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
@@ -114,7 +155,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         alerted = []
         if not context.alerting_paused:
             candidates = rank_alert_candidates(
-                all_picks, context.settings.scan.score_threshold
+                all_picks, context.settings.scan.score_threshold, account_value
             )
             if not candidates and any(
                 scored.score >= context.settings.scan.score_threshold

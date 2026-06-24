@@ -103,6 +103,12 @@ def combo_mid(
 
 
 def _reject(message: str) -> ExecuteOutcome:
+    # Log every rejection reason to the journal. Without this, execute_pick's
+    # gate decisions were only visible in the Telegram outcome message (the
+    # daemon's auto-execute path sends them to chat, not the log), so a pick
+    # that silently failed a gate left no trace in `journalctl` -- which made
+    # "why didn't it trade?" undiagnosable from the logs.
+    log.info("execute_pick reject: %s", message)
     return ExecuteOutcome(ok=False, message=f"❌ {message}")
 
 
