@@ -120,3 +120,12 @@ async def test_async_context_manager_connects_and_disconnects(mock_ib) -> None:
         assert c is client
     mock_ib.connectAsync.assert_awaited_once()
     mock_ib.disconnect.assert_called_once()
+
+
+async def test_connect_uses_configured_market_data_type(mock_ib) -> None:
+    s = _settings_with_paper(paper=True)
+    s.ibkr.market_data_type = 1  # live
+    client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
+    mock_ib.isConnected.return_value = False
+    await client.connect()
+    mock_ib.reqMarketDataType.assert_called_once_with(1)

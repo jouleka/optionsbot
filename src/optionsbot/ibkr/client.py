@@ -105,9 +105,11 @@ class IBKRClient:
                     await asyncio.sleep(delay)
                 try:
                     await self._ib.connectAsync(host=host, port=port, clientId=client_id)
-                    # Set delayed-data default in paper mode (mode 3 = delayed-streaming).
+                    # IBK-122: in paper mode request the configured market-data
+                    # type (default 3 = delayed-streaming; 1 = live once real-time
+                    # data is shared into the paper account).
                     if self._settings.ibkr.paper:
-                        self._ib.reqMarketDataType(3)
+                        self._ib.reqMarketDataType(self._settings.ibkr.market_data_type)
                     log.info("Connected to IB Gateway")
                     return
                 except Exception as e:  # noqa: BLE001 -- connection failures are heterogeneous
