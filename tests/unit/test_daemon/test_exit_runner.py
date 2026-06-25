@@ -240,6 +240,40 @@ async def test_stale_quote_suppresses_take_profit_and_alerts(
     assert len(stale_alerts) == 1  # escalated exactly once
 
 
+async def test_non_atomic_close_fails_safe_and_halts(
+    daemon_context: DaemonContext,
+) -> None:
+    # Phase 0 C2: if the staged close is not the exact inverse of the entry
+    # (here: a leg went missing), the runner must NOT place it. It fails safe:
+    # trips the kill switch, alerts, places nothing.
+    from optionsbot.daemon import exit_runner as er
+    from optionsbot.execution.orders import stage_close_order as real_stage
+    from optionsbot.execution.state import load_state
+
+    _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+
+    def _drop_a_leg(engine, entry, *, now=None):  # type: ignore[no-untyped-def]
+        close = real_stage(engine, entry, now=now)
+        # Simulate a staging defect: only one option leg survives -> a
+        # single-leg route that would strand the other side.
+        object.__setattr__(close, "legs", close.legs[:1])
+        return close
+
+    with (
+        patch("optionsbot.daemon.exit_runner._exec_md",
+              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch.object(er, "stage_close_order", _drop_a_leg),
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    assert load_state(daemon_context.engine).killed is True
+    sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
+    assert any("naked" in m.lower() or "atomic" in m.lower() for m in sent)
+
+
 async def test_stale_quote_still_allows_expiry_guard(
     daemon_context: DaemonContext,
 ) -> None:

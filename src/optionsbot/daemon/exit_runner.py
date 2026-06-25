@@ -18,6 +18,11 @@ from sqlalchemy import Engine, select
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.execution.close_safety import (
+    NonAtomicCloseError,
+    assert_atomic_close_legs,
+    find_naked_short_legs,
+)
 from optionsbot.execution.engine import combo_mid
 from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
@@ -30,7 +35,7 @@ from optionsbot.execution.orders import (
     stage_close_order,
     transition,
 )
-from optionsbot.execution.state import load_state
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
     price_increment_for,
@@ -144,6 +149,16 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
         except Exception:  # noqa: BLE001 -- one bad position must not starve the rest
             errors += 1
             log.exception("exit evaluation failed for entry #%s", entry.id)
+    for entry in entries:
+        try:
+            if open_close_for(context.engine, entry.id) is None and _half_closed(
+                context.engine, entry.id
+            ):
+                # A close for this entry has terminated with partial fills:
+                # confirm the broker isn't sitting on a naked short.
+                await assert_no_naked_short_after_close(context, entry)
+        except Exception:  # noqa: BLE001 -- safety sweep is best-effort
+            log.exception("post-close naked-leg sweep failed for #%s", entry.id)
     if entries:
         log.info(
             "exits tick: positions=%d closes=%d errors=%d",
@@ -255,6 +270,19 @@ async def _manage_entry(
     limit_price = -close_net  # BAG convention: limit = -net
 
     close = stage_close_order(engine, entry, now=now)
+    try:
+        assert_atomic_close_legs(entry_legs=entry.legs, close_legs=close.legs)
+    except NonAtomicCloseError as exc:
+        # Fail safe: a close we cannot guarantee atomic must NOT be legged out.
+        transition(engine, close.id, "skipped", error=str(exc), now=now)
+        trip_kill(engine, f"non-atomic close for #{entry.id}: {exc}")
+        await _send(
+            context,
+            f"🛑 HALT: close for #{entry.id} {entry.symbol} {entry.strategy} is "
+            f"NOT an atomic combo ({exc}). Kill switch tripped — no order placed. "
+            "Flatten manually and /arm after fixing.",
+        )
+        return 0
     transition(engine, close.id, "submitting", now=now)
     try:
         placed = await order_client.place_combo_limit(
@@ -303,6 +331,42 @@ async def _manage_entry(
         f"{entry.quantity}x — {reason} (close order #{close.id})",
     )
     return 1
+
+
+async def assert_no_naked_short_after_close(
+    context: DaemonContext, entry: OrderRecord
+) -> bool:
+    """After a close fills, verify no SHORT leg of this entry is still open at
+    the broker. A residual naked short is a P1 incident: trip the kill switch
+    and alert (once). Returns True when clean, False when a naked short was
+    found. Never raises (a broker read failure is logged, not fatal)."""
+    from optionsbot.ibkr.positions import PositionsClient
+
+    if context.exec_ibkr is None:
+        return True
+    try:
+        positions = await PositionsClient(context.exec_ibkr).get_portfolio()
+    except Exception:  # noqa: BLE001 -- a dead read must not crash the tick
+        log.exception("naked-leg check: get_portfolio failed for #%s", entry.id)
+        return True
+    naked = find_naked_short_legs(entry.legs, positions)
+    if not naked:
+        context.naked_leg_halted.discard(entry.id)
+        return True
+    if entry.id not in context.naked_leg_halted:
+        context.naked_leg_halted.add(entry.id)
+        trip_kill(context.engine, f"naked short leg after close for #{entry.id}")
+        legs_desc = ", ".join(
+            f"{p.strike}{p.right} x{p.position:.0f}" for p in naked
+        )
+        await _send(
+            context,
+            f"🛑 P1: #{entry.id} {entry.symbol} {entry.strategy} has a NAKED "
+            f"SHORT leg after its close ({legs_desc}). Kill switch tripped — "
+            "re-hedge or flatten this leg in TWS immediately, then /arm.",
+        )
+    log.error("naked short after close for entry #%s: %s", entry.id, naked)
+    return False
 
 
 async def _send(context: DaemonContext, text: str) -> None:

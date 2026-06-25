@@ -64,3 +64,6 @@ class DaemonContext:
     # quote-priced exit was already alerted (re-alerted only after a fresh
     # quote clears it).
     exit_stale_warned: set[int] = field(default_factory=set)
+    # IBK-PHASE0-C2: entries already halted for a residual naked short leg
+    # after a close (P1 — alerted + kill tripped once, never re-spammed).
+    naked_leg_halted: set[int] = field(default_factory=set)
