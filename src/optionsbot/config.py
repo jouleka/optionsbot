@@ -43,6 +43,11 @@ class IBKRSettings(BaseModel):
     # fetching an option chain. IBKR's default account allowance is 100; a
     # conservative 50 stays safely under it. Bump if your data tier permits.
     max_market_data_lines: int = Field(default=50, ge=1)
+    # IBK-122: IBKR reqMarketDataType code — 1=live, 2=frozen, 3=delayed,
+    # 4=delayed-frozen. Applied in paper mode (see ibkr/client.py). Default 3
+    # (delayed) is the safe pre-IBK-122 behavior; flip to 1 once live data is
+    # shared into the paper account.
+    market_data_type: Literal[1, 2, 3, 4] = 3
 
 
 class TelegramSettings(BaseModel):

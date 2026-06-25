@@ -448,3 +448,24 @@ def test_entry_block_loss_frac_is_a_fraction() -> None:
         ExecutionSettings(entry_block_loss_frac=0.0)
     with pytest.raises(ValidationError):
         ExecutionSettings(entry_block_loss_frac=1.5)
+
+
+def test_ibkr_market_data_type_default_is_delayed() -> None:
+    from optionsbot.config import IBKRSettings
+
+    assert IBKRSettings().market_data_type == 3
+
+
+def test_ibkr_market_data_type_accepts_live() -> None:
+    from optionsbot.config import IBKRSettings
+
+    assert IBKRSettings(market_data_type=1).market_data_type == 1
+
+
+def test_ibkr_market_data_type_rejects_out_of_range() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import IBKRSettings
+
+    with pytest.raises(ValidationError):
+        IBKRSettings(market_data_type=5)
