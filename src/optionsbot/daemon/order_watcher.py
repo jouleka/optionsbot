@@ -67,20 +67,33 @@ async def run_orders_tick(
     now = now if now is not None else datetime.now(UTC)
     ttl = timedelta(minutes=context.settings.execution.order_ttl_minutes)
 
-    # IBK-128: periodic broker reconciliation, only while non-terminal orders
-    # exist (free when idle; startup always runs one pass from the runner).
+    # Work-stream D2: periodic broker reconciliation on a FIXED cadence —
+    # regardless of whether open ledger rows exist. A forgotten broker position
+    # leaves NO open order rows, so the old "only when open_orders" guard made
+    # the position-compare unreachable exactly when it mattered. Startup always
+    # runs one pass from the runner.
     rec_min = context.settings.execution.reconcile_minutes
     if rec_min > 0:
         last = context.last_reconcile_ts or context.started_at
         if now - last >= timedelta(minutes=rec_min):
-            from optionsbot.execution.orders import open_orders as open_rows
             from optionsbot.execution.reconcile import reconcile
 
-            if open_rows(engine):
-                async def _notify(text: str) -> None:
-                    await context.telegram.send_message(text, parse_mode=None)
+            async def _notify(text: str) -> None:
+                await context.telegram.send_message(text, parse_mode=None)
 
-                await reconcile(engine, context.order_client, notify=_notify, now=now)
+            async def _positions() -> Any:
+                from optionsbot.ibkr.positions import PositionsClient
+
+                async with context.ibkr_lock:
+                    return await PositionsClient(context.ibkr).get_portfolio()
+
+            await reconcile(
+                engine, context.order_client, notify=_notify, now=now,
+                walk_md=_walk_md_for(context),
+                walk_tasks=context.walk_tasks,
+                settings=context.settings,
+                positions_snapshot=_positions,
+            )
             context.last_reconcile_ts = now
 
     # --- TTL sweep: cancel at the broker FIRST, only then mark abandoned.

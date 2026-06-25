@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from alembic.config import Config
 from sqlalchemy import Engine, insert, update
 
+from alembic import command
+from optionsbot.config import Settings
+from optionsbot.daemon import order_watcher as _order_watcher_module
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.order_watcher import run_orders_tick
+from optionsbot.daemon.telegram_client import TelegramClient
 from optionsbot.execution.orders import get_order, record_fill
+from optionsbot.execution.reconcile import ReconcileSummary
+from optionsbot.ibkr import IBKRClient
+from optionsbot.ibkr.contracts import ContractResolver
+from optionsbot.storage.db import create_engine_for_path
 from optionsbot.storage.schema import orders
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 
@@ -150,3 +164,65 @@ async def test_notifies_new_terminals_once(daemon_context: DaemonContext) -> Non
     sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
     assert any("filled" in m.lower() for m in sent)
     assert any("insufficient margin" in m for m in sent)
+
+
+def _make_context(tmp_path: Path | None = None) -> DaemonContext:
+    """Build a minimal DaemonContext for tests that need one without the fixture."""
+    if tmp_path is None:
+        tmp_path = Path(tempfile.mkdtemp())
+
+    db_path = tmp_path / "test.db"
+    cfg = Config(str(_PROJECT_ROOT / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, "head")
+    engine = create_engine_for_path(db_path)
+
+    settings = Settings()
+    settings.storage.db_path = db_path
+    settings.telegram.bot_token = "test-token"
+    settings.telegram.chat_id = "test-chat"
+    settings.scan.auto_screen = False
+
+    ibkr = MagicMock(spec=IBKRClient)
+    ibkr.connect = AsyncMock()
+    ibkr.ensure_connected = AsyncMock()
+    ibkr.disconnect = AsyncMock()
+
+    tg = MagicMock(spec=TelegramClient)
+    tg.send_message = AsyncMock(return_value=12345)
+    tg.aclose = AsyncMock()
+
+    resolver = ContractResolver(ibkr)
+    return DaemonContext(
+        settings=settings,
+        engine=engine,
+        ibkr=ibkr,
+        resolver=resolver,
+        telegram=tg,
+    )
+
+
+async def test_reconcile_runs_on_fixed_cadence_with_no_open_orders(
+    monkeypatch: Any,
+) -> None:
+    # Build a context whose ledger has NO open orders. The fixed-cadence
+    # reconcile must STILL run (so the position-compare can catch orphans).
+    context = _make_context()
+    context.order_client = MagicMock()
+    context.last_reconcile_ts = datetime.now(UTC) - timedelta(minutes=10)
+    context.settings.execution.reconcile_minutes = 5
+
+    called: list[bool] = []
+
+    async def fake_reconcile(engine: Any, client: Any, **kwargs: Any) -> Any:
+        called.append("positions_snapshot" in kwargs and kwargs["positions_snapshot"] is not None)
+        return ReconcileSummary(0, 0, 0, 0, 0, 0)
+
+    monkeypatch.setattr("optionsbot.execution.reconcile.reconcile", fake_reconcile)
+    # Ensure the open-orders guard would have BLOCKED the old code path.
+    monkeypatch.setattr(
+        "optionsbot.execution.orders.open_orders", lambda engine: []
+    )
+
+    await _order_watcher_module.run_orders_tick(context)
+    assert called == [True]  # reconcile ran AND was given a positions snapshot

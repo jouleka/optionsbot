@@ -299,7 +299,7 @@ async def run_price_walk(
             )
             upsert_walk_state(
                 engine, order_id, ib_order_id=ib_order_id, symbol=symbol,
-                legs=list(legs), decision_mid=decision_mid, budget=budget,
+                legs=[dict(leg) for leg in legs], decision_mid=decision_mid, budget=budget,
                 increment=increment, step=step, prev_target=prev_target,
                 ts=datetime.now(UTC),
             )
