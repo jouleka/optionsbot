@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Engine, Row, insert, select, update
+from sqlalchemy import Engine, Row, delete, insert, select, update
 
 from optionsbot.storage.schema import (
     fills,
@@ -30,6 +30,7 @@ from optionsbot.storage.schema import (
     orders,
     snapshots,
     strategy_scores,
+    walk_state,
 )
 
 ORDER_STATUSES: frozenset[str] = frozenset(
@@ -421,6 +422,92 @@ def record_order_quotes(
                 legs_json=legs,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class WalkState:
+    """A persisted in-flight price-walk (Work-stream D1)."""
+
+    order_id: int
+    ib_order_id: int
+    symbol: str
+    legs: list[dict[str, Any]]
+    decision_mid: float
+    budget: float
+    increment: float
+    step: int
+    prev_target: float
+
+
+def upsert_walk_state(
+    engine: Engine,
+    order_id: int,
+    *,
+    ib_order_id: int,
+    symbol: str,
+    legs: list[dict[str, Any]],
+    decision_mid: float,
+    budget: float,
+    increment: float,
+    step: int,
+    prev_target: float,
+    ts: datetime,
+) -> None:
+    """Write (or overwrite) the walk-state row for an order. One row per order
+    (PK = order_id); the latest step always wins."""
+    values = {
+        "ib_order_id": ib_order_id,
+        "symbol": symbol,
+        "legs_json": legs,
+        "decision_mid": decision_mid,
+        "budget": budget,
+        "increment": increment,
+        "step": step,
+        "prev_target": prev_target,
+        "updated_ts": ts,
+    }
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(walk_state.c.order_id).where(walk_state.c.order_id == order_id)
+        ).first()
+        if existing is None:
+            conn.execute(insert(walk_state).values(order_id=order_id, **values))
+        else:
+            conn.execute(
+                update(walk_state).where(walk_state.c.order_id == order_id).values(**values)
+            )
+
+
+def clear_walk_state(engine: Engine, order_id: int) -> None:
+    """Delete the walk-state row once a walk ends (fill/cancel/exhaustion)."""
+    with engine.begin() as conn:
+        conn.execute(delete(walk_state).where(walk_state.c.order_id == order_id))
+
+
+def load_walk_states(engine: Engine) -> list[WalkState]:
+    """All persisted walks whose order is still non-terminal (resume set)."""
+    non_terminal = sorted(ORDER_STATUSES - TERMINAL_STATUSES)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(walk_state)
+            .join(orders, orders.c.id == walk_state.c.order_id)
+            .where(orders.c.status.in_(non_terminal))
+            .order_by(walk_state.c.order_id)
+        ).fetchall()
+    return [
+        WalkState(
+            order_id=r.order_id,
+            ib_order_id=r.ib_order_id,
+            symbol=r.symbol,
+            legs=list(r.legs_json or []),
+            decision_mid=r.decision_mid,
+            budget=r.budget,
+            increment=r.increment,
+            step=r.step,
+            prev_target=r.prev_target,
+        )
+        for r in rows
+    ]
 
 
 def net_premium(engine: Engine, order_id: int) -> float | None:

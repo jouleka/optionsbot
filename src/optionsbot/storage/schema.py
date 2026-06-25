@@ -274,6 +274,33 @@ order_quotes = Table(
 )
 
 
+# Work-stream D1: in-flight price-walk state, one row per walking order.
+# Persisted on every walk step so a daemon restart can re-attach (resume the
+# walk) or issue one corrective reprice instead of orphaning the in-memory
+# asyncio task until the TTL watcher cancels. Deleted when the walk ends
+# (fill/cancel/exhaustion) — a stale row is harmless (load_walk_states joins
+# orders and skips terminal rows) but the row's purpose is "actively walking".
+walk_state = Table(
+    "walk_state",
+    metadata,
+    Column(
+        "order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        primary_key=True,  # one walk per order
+    ),
+    Column("ib_order_id", Integer, nullable=False),
+    Column("symbol", Text, nullable=False),
+    Column("legs_json", JSON, nullable=False),  # the full legs list, incl. non-OPT
+    Column("decision_mid", Float, nullable=False),
+    Column("budget", Float, nullable=False),
+    Column("increment", Float, nullable=False),
+    Column("step", Integer, nullable=False),         # last completed step
+    Column("prev_target", Float, nullable=False),    # last signed net target
+    Column("updated_ts", DateTime(timezone=True), nullable=False),
+)
+
+
 fills = Table(
     "fills",
     metadata,
