@@ -112,6 +112,8 @@ def test_evaluate_is_idempotent_when_already_killed(tmp_db: Engine) -> None:
 
 
 def test_equity_verdict_is_frozen() -> None:
+    from dataclasses import FrozenInstanceError
+
     v = EquityVerdict(tripped=False, evaluable=True, drawdown_pct=0.0, reason="ok")
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         v.tripped = True  # type: ignore[misc]
