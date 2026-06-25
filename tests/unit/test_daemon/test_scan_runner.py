@@ -172,6 +172,17 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
 
+    # Task 6: PositionsClient must return a large USD equity so all picks pass
+    # the single-trade-cap affordability gate (max_loss=0.0 always fits).
+    from decimal import Decimal
+    from optionsbot.ibkr.types import AccountSummary
+    _fake_summary = AccountSummary(
+        net_liquidation=Decimal("50000"), buying_power=None,
+        available_funds=Decimal("50000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_fake_summary)
+
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
          patch(
             "optionsbot.daemon.scan_runner.scan_symbol",
@@ -180,7 +191,8 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
          patch(
             "optionsbot.daemon.scan_runner.enqueue_alert",
             new=AsyncMock(),
-         ) as mock_enqueue:
+         ) as mock_enqueue, \
+         patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=mock_pos):
         summary = await run_scan_tick(daemon_context)
 
     assert mock_enqueue.await_count == 3
@@ -202,6 +214,9 @@ def test_rank_alert_candidates_floors_and_sorts() -> None:
         scored = MagicMock(score=score)
         scored.suggestion.risk_normalized_expectancy = rne
         scored.suggestion.expected_value = rne * 100.0   # same sign as rne
+        # Task 6: new gate requires defined_risk=True and max_loss within cap.
+        scored.suggestion.defined_risk = True
+        scored.suggestion.max_loss = 100.0               # 100 <= 5000*0.15=750 -> passes
         return (sym, scored, 1)
 
     picks = [
@@ -209,7 +224,8 @@ def test_rank_alert_candidates_floors_and_sorts() -> None:
         _pick("AAPL", 80.0, 0.10),
         _pick("XYZ", 40.0, 0.99),   # below floor -> dropped despite high edge
     ]
-    out = rank_alert_candidates(picks, score_floor=50.0)
+    # Task 6: pass account_value_usd + single_trade_cap_pct (required by new signature)
+    out = rank_alert_candidates(picks, score_floor=50.0, account_value_usd=5000.0, single_trade_cap_pct=0.15)
     # Survivors (score>=50) ordered by edge desc: AAPL(0.10) then SPY(0.02).
     assert [sym for sym, _, _ in out] == ["AAPL", "SPY"]
 
@@ -219,6 +235,9 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
 ) -> None:
     """top_n is applied across the WHOLE tick, not per symbol: the 2 highest of
     4 floor-passing picks (across 2 symbols) are enqueued."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
 
@@ -228,6 +247,9 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
         sug.prob_profit = 0.6
         sug.risk_normalized_expectancy = score / 1000.0
         sug.expected_value = score        # positive -> has_positive_edge True
+        # Task 6: new gate requires defined_risk=True and numeric max_loss within cap.
+        sug.defined_risk = True
+        sug.max_loss = 0.0               # 0.0 always fits any single-trade cap
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -246,11 +268,22 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
     async def fake_scan(symbol, *a, **kw):
         return spy if symbol == "SPY" else aapl
 
+    # Task 6: patch PositionsClient so the affordability gate sees a large USD
+    # equity (all picks have max_loss=0.0 and always pass the cap).
+    _fake_summary = AccountSummary(
+        net_liquidation=Decimal("50000"), buying_power=None,
+        available_funds=Decimal("50000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_fake_summary)
+
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(side_effect=fake_scan)
     ), patch(
         "optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock(return_value=True)
-    ) as mock_enqueue:
+    ) as mock_enqueue, patch(
+        "optionsbot.daemon.scan_runner.PositionsClient", return_value=mock_pos
+    ):
         summary = await run_scan_tick(daemon_context)
 
     assert mock_enqueue.await_count == 2
@@ -425,6 +458,10 @@ def test_rank_alert_candidates_suppresses_all_negative_edge() -> None:
         scored = MagicMock(score=score)
         scored.suggestion.expected_value = ev
         scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        # Task 6: new gate requires defined_risk and max_loss; set both so the
+        # test exercises the negative-edge filter, not the affordability gate.
+        scored.suggestion.defined_risk = True
+        scored.suggestion.max_loss = max_loss
         return (sym, scored, 1)
 
     # Above floor, but every pick is negative-EV -> nothing alert-worthy.
@@ -432,7 +469,7 @@ def test_rank_alert_candidates_suppresses_all_negative_edge() -> None:
         _pick("NVDA", 80.0, -83.0, 19397.0),
         _pick("NVDA", 75.0, -49.0, 737.0),
     ]
-    assert rank_alert_candidates(picks, score_floor=50.0) == []
+    assert rank_alert_candidates(picks, score_floor=50.0, account_value_usd=50000.0) == []
 
 
 def test_rank_alert_candidates_keeps_only_positive_edge() -> None:
@@ -442,45 +479,66 @@ def test_rank_alert_candidates_keeps_only_positive_edge() -> None:
         scored = MagicMock(score=score)
         scored.suggestion.expected_value = ev
         scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        # Task 6: new gate requires defined_risk and max_loss within cap.
+        scored.suggestion.defined_risk = True
+        scored.suggestion.max_loss = max_loss
         return (sym, scored, 1)
 
     pos = _pick("AAPL", 80.0, 12.0, 600.0)      # +EV -> kept
     neg = _pick("NVDA", 85.0, -49.0, 737.0)     # -EV -> dropped despite higher score
-    out = rank_alert_candidates([neg, pos], score_floor=50.0)
+    out = rank_alert_candidates([neg, pos], score_floor=50.0, account_value_usd=50000.0)
     assert [sym for sym, _, _ in out] == ["AAPL"]
 
 
-def test_rank_alert_candidates_drops_unaffordable() -> None:
-    """A pick whose per-contract max_loss exceeds the account net-liq is dropped
-    even with the higher score/edge (e.g. a $36k cash-secured put on a $5k
-    account); affordable defined-risk picks survive. Fail-open when account_value
-    is unknown or risk is undefined."""
+def test_rank_alert_candidates_uses_single_trade_cap() -> None:
     from optionsbot.daemon.scan_runner import rank_alert_candidates
 
-    def _pick(sym, score, ev, max_loss):
+    def _pick(sym, score, ev, max_loss, defined=True):
         scored = MagicMock(score=score)
         scored.suggestion.expected_value = ev
-        scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        scored.suggestion.risk_normalized_expectancy = ev / max_loss if max_loss else 0.0
         scored.suggestion.max_loss = max_loss
+        scored.suggestion.defined_risk = defined
         return (sym, scored, 1)
 
-    cheap = _pick("SPY", 80.0, 10.0, 400.0)      # fits a $5k account
-    huge = _pick("TSLA", 90.0, 50.0, 36000.0)    # $36k CSP -> can't fit one lot
-
-    # With a known account, the oversized pick is dropped despite higher edge.
-    out = rank_alert_candidates([huge, cheap], score_floor=50.0, account_value=5000.0)
+    # equity 5000, single cap 0.15 -> $750 per-trade ceiling.
+    fits = _pick("SPY", 80.0, 10.0, 700.0)     # 700 <= 750
+    too_big = _pick("TSLA", 90.0, 50.0, 900.0)  # 900 > 750 -> dropped
+    out = rank_alert_candidates(
+        [too_big, fits], score_floor=50.0,
+        account_value_usd=5000.0, single_trade_cap_pct=0.15,
+    )
     assert [sym for sym, _, _ in out] == ["SPY"]
 
-    # Fail-open: no account_value -> affordability not enforced, both kept.
-    out2 = rank_alert_candidates([huge, cheap], score_floor=50.0)
-    assert {sym for sym, _, _ in out2} == {"SPY", "TSLA"}
 
-    # Undefined risk (max_loss None) is kept even with a known small account
-    # (execute_pick gates defined-risk/margin downstream).
-    undef = _pick("QQQ", 70.0, 5.0, 500.0)
-    undef[1].suggestion.max_loss = None
-    out3 = rank_alert_candidates([undef], score_floor=50.0, account_value=5000.0)
-    assert [sym for sym, _, _ in out3] == ["QQQ"]
+def test_rank_alert_candidates_fail_closed_without_equity() -> None:
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    def _pick(sym, max_loss):
+        scored = MagicMock(score=80.0)
+        scored.suggestion.expected_value = 10.0
+        scored.suggestion.risk_normalized_expectancy = 0.1
+        scored.suggestion.max_loss = max_loss
+        scored.suggestion.defined_risk = True
+        return (sym, scored, 1)
+
+    out = rank_alert_candidates([_pick("SPY", 400.0)], score_floor=50.0, account_value_usd=None)
+    assert out == []  # fail-closed: no equity -> nothing surfaced
+
+
+def test_rank_alert_candidates_drops_undefined_risk() -> None:
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    scored = MagicMock(score=80.0)
+    scored.suggestion.expected_value = 10.0
+    scored.suggestion.risk_normalized_expectancy = 0.1
+    scored.suggestion.max_loss = None
+    scored.suggestion.defined_risk = False
+    out = rank_alert_candidates(
+        [("QQQ", scored, 1)], score_floor=50.0,
+        account_value_usd=5000.0, single_trade_cap_pct=0.15,
+    )
+    assert out == []  # undefined risk no longer surfaced
 
 
 async def test_run_scan_tick_logs_no_edge_suppression(
@@ -489,6 +547,9 @@ async def test_run_scan_tick_logs_no_edge_suppression(
     """A tick whose floor-passing picks all lack positive edge logs the
     suppression, so a silent no-alert tick is distinguishable from 'nothing
     scored above the floor'."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
 
@@ -498,6 +559,10 @@ async def test_run_scan_tick_logs_no_edge_suppression(
         sug.prob_profit = 0.6
         sug.expected_value = ev
         sug.risk_normalized_expectancy = ev / max_loss
+        # Task 6: new gate requires defined_risk and numeric max_loss so picks
+        # pass the affordability check and are dropped by the edge filter only.
+        sug.defined_risk = True
+        sug.max_loss = max_loss
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -505,15 +570,29 @@ async def test_run_scan_tick_logs_no_edge_suppression(
         )
 
     daemon_context.settings.scan.score_threshold = 50
-    # Both pass the score floor; both are negative-EV -> suppressed.
+    # Both pass the score floor; both are negative-EV -> suppressed by edge filter.
     scored = (_mk("csp", 80.0, -83.0, 19397.0), _mk("spread", 75.0, -49.0, 737.0))
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(watchlist).values(symbol="NVDA", added_at=datetime.now(UTC)))
+
+    # Task 6: supply a large USD equity so picks pass the single-trade cap
+    # (cap = 0.10 * 50000 = 5000; max_loss is 19397/737 which exceeds it for
+    # the csp but spread is 737 <= 5000). The no-edge path fires when ALL
+    # candidates that passed affordability also fail the edge filter.
+    # To keep the test about NO-EDGE suppression (not affordability), use a very
+    # large account so ALL picks pass the cap and are only dropped by edge filter.
+    _fake_summary = AccountSummary(
+        net_liquidation=Decimal("500000"), buying_power=None,
+        available_funds=Decimal("500000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_fake_summary)
 
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
          patch("optionsbot.daemon.scan_runner.scan_symbol",
                new=AsyncMock(return_value=_scan_result_for("NVDA", scored))), \
          patch("optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock()) as mock_enq, \
+         patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=mock_pos), \
          patch("optionsbot.daemon.scan_runner.log") as mock_log:
         summary = await run_scan_tick(daemon_context)
 
