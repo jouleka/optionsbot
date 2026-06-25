@@ -32,6 +32,7 @@ from optionsbot.execution.orders import (
 )
 from optionsbot.execution.state import trip_kill
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
+from optionsbot.execution.walk import resume_walks
 from optionsbot.storage.schema import fills, orders
 
 if TYPE_CHECKING:
@@ -89,6 +90,10 @@ async def reconcile(
     *,
     notify: Notify | None = None,
     now: datetime | None = None,
+    walk_md: Any = None,
+    walk_tasks: Any = None,
+    walk_resume: Callable[..., Awaitable[int]] | None = None,
+    settings: Any = None,
 ) -> ReconcileSummary:
     """One full broker↔ledger convergence pass. Never raises."""
     ts_now = now if now is not None else datetime.now(UTC)
@@ -112,6 +117,20 @@ async def reconcile(
             continue
         adopted += 1
         at_broker[row_id] = (ib_order_id, ib_status)
+
+    # Work-stream D1: re-attach any persisted price-walks for orders we just
+    # confirmed are still at the broker. The walk's in-memory asyncio task died
+    # with the previous process; resume_walks rebuilds it (resuming from the
+    # persisted step) so the order isn't orphaned at the decision mid until TTL.
+    if walk_md is not None and walk_tasks is not None:
+        resume = walk_resume if walk_resume is not None else resume_walks
+        try:
+            await resume(
+                engine=engine, settings=settings, order_client=order_client,
+                md=walk_md, walk_tasks=walk_tasks, notify=notify,
+            )
+        except Exception:  # noqa: BLE001 -- a resume failure must not abort reconcile
+            log.exception("reconcile: walk resume failed")
 
     # Sync ledger rows that ARE at the broker (e.g. submitting -> submitted).
     for row_id, (ib_order_id, ib_status) in at_broker.items():

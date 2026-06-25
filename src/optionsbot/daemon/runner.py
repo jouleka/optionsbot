@@ -114,10 +114,15 @@ class Daemon:
                     async def _notify(text: str) -> None:
                         await telegram.send_message(text, parse_mode=None)
 
+                    from optionsbot.daemon.order_watcher import _walk_md_for
+
                     summary = await reconcile(
                         self._context.engine,
                         self._context.order_client,
                         notify=_notify,
+                        walk_md=_walk_md_for(self._context),
+                        walk_tasks=self._context.walk_tasks,
+                        settings=self._settings,
                     )
                     log.info(
                         "startup reconcile: adopted=%d foreign=%d fills=%d "

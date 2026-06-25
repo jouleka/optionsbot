@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 
@@ -262,6 +263,13 @@ async def _check_net_liq_drawdown(context: DaemonContext, now: datetime) -> None
             context,
             f"🛑 KILL SWITCH: {verdict.reason}. No new orders until /arm.",
         )
+
+
+def _walk_md_for(context: DaemonContext) -> Any:
+    if context.exec_ibkr is None:
+        return None
+    from optionsbot.ibkr.market_data import MarketDataClient
+    return MarketDataClient(context.exec_ibkr)
 
 
 async def _send(context: DaemonContext, text: str) -> None:

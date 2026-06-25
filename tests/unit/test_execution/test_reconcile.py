@@ -214,3 +214,29 @@ async def test_duplicate_fill_on_already_filled_row_no_kill(tmp_db: Engine) -> N
     summary = await reconcile(tmp_db, client, notify=notify, now=NOW)
     assert summary.mismatches == 0
     assert load_state(tmp_db).killed is False
+
+
+async def test_reconcile_resumes_persisted_walks(tmp_db: Engine, monkeypatch: Any) -> None:
+    from optionsbot.execution.orders import upsert_walk_state
+
+    order_id = _insert_order(tmp_db, "submitted")
+    upsert_walk_state(
+        tmp_db, order_id, ib_order_id=11, symbol="SPY", legs=LEGS,
+        decision_mid=1.20, budget=0.09, increment=0.01, step=1,
+        prev_target=1.17, ts=NOW,
+    )
+    client = _client(open_orders=[(11, f"obot-{order_id}", "Submitted")])
+    resumed: list[int] = []
+
+    async def fake_resume(**kwargs: Any) -> int:
+        resumed.append(kwargs["walk_tasks"] is not None)
+        return 1
+
+    monkeypatch.setattr("optionsbot.execution.reconcile.resume_walks", fake_resume)
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db, client, notify=notify, now=NOW,
+        walk_resume=fake_resume, walk_md=MagicMock(), walk_tasks=set(),
+    )
+    assert summary.adopted == 1
+    assert resumed == [True]  # resume_walks was invoked with walk_tasks

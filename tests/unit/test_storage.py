@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "orders",
     "fills",
     "order_quotes",
+    "walk_state",
 }
 
 
