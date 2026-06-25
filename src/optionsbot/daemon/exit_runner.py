@@ -168,9 +168,18 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
 
 
 async def _manage_entry(
-    context: DaemonContext, md: MarketDataClient, entry: OrderRecord, now: datetime
+    context: DaemonContext,
+    md: MarketDataClient,
+    entry: OrderRecord,
+    now: datetime,
+    *,
+    forced_reason: str | None = None,
 ) -> int:
-    """Evaluate one position; returns 1 if a closing order was submitted."""
+    """Evaluate one position; returns 1 if a closing order was submitted.
+
+    ``forced_reason`` (set by the human-initiated ``/close`` path) stands in for
+    ``evaluate_exit`` so the close fires regardless of TP/stop/DTE.
+    """
     engine = context.engine
     order_client = context.order_client
     if order_client is None:
@@ -192,7 +201,7 @@ async def _manage_entry(
             )
         return 0
     dte = _min_dte(entry.legs, now)
-    if dte is None:
+    if dte is None and forced_reason is None:
         return 0
 
     total_premium = net_premium(engine, entry.id)
@@ -252,10 +261,17 @@ async def _manage_entry(
     else:
         context.exit_stale_warned.discard(entry.id)
 
-    reason = evaluate_exit(
-        entry_net=entry_net, current_net=current_net, dte=dte,
-        settings=context.settings,
-    )
+    reason: str | None
+    if forced_reason is not None:
+        reason = forced_reason
+    else:
+        # The dte early-return above only let a None dte through on the forced
+        # path, so dte is non-None here (narrow for evaluate_exit).
+        assert dte is not None
+        reason = evaluate_exit(
+            entry_net=entry_net, current_net=current_net, dte=dte,
+            settings=context.settings,
+        )
     if reason is None:
         return 0
 
@@ -331,6 +347,53 @@ async def _manage_entry(
         f"{entry.quantity}x — {reason} (close order #{close.id})",
     )
     return 1
+
+
+async def force_close_entry(
+    context: DaemonContext, entry_id: int, now: datetime | None = None
+) -> str:
+    """Human-initiated close of one ledger-attributed open position (``/close``).
+
+    Runs the SAME close path as the exit engine (``_manage_entry``) but with the
+    human as the trigger instead of ``evaluate_exit`` — every guard (atomic
+    combo, half-closed, double-close) and the price-walk are reused untouched.
+    Returns a status line for the Telegram reply; the rich "closing #N" line is
+    sent by ``_manage_entry`` itself.
+    """
+    now = now if now is not None else datetime.now(UTC)
+    engine = context.engine
+    if context.order_client is None:
+        return "execution is not configured in this daemon build"
+    entry = get_order(engine, entry_id)
+    if entry is None:
+        return f"unknown order id {entry_id}"
+    if entry.intent != "open" or entry.status != "filled":
+        return (
+            f"#{entry_id} is {entry.intent}/{entry.status} — /close only acts on a "
+            "filled open position (see /orders)"
+        )
+    if open_close_for(engine, entry_id) is not None:
+        return f"#{entry_id} {entry.symbol} {entry.strategy} is already closing"
+    verdict = can_execute(context.settings, load_state(engine))
+    if not verdict.allowed:
+        return f"can't close #{entry_id}: {verdict.reason}"
+    if not is_market_open(now):
+        return f"market is closed — /close #{entry_id} would not fill; try during RTH"
+    md = _exec_md(context)
+    if md is None:
+        return f"can't close #{entry_id}: exec market-data connection unavailable"
+    submitted = await _manage_entry(
+        context, md, entry, now, forced_reason="manual /close via Telegram"
+    )
+    if submitted:
+        return (
+            f"close requested for #{entry_id} {entry.symbol} {entry.strategy} "
+            f"{entry.quantity}x — walking to fill; you'll get the confirmation"
+        )
+    return (
+        f"#{entry_id} {entry.symbol} {entry.strategy}: no close placed — it may be "
+        "half-closed or unpriceable (check /orders)"
+    )
 
 
 async def assert_no_naked_short_after_close(

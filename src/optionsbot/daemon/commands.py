@@ -59,6 +59,7 @@ _HELP = (
     "/execute ID — place the alerted pick with that id (paper)\n"
     "/orders [N] — recent orders + status\n"
     "/cancelorder ID — cancel a working order\n"
+    "/close ID — close an open position now (paper; id from /orders)\n"
     "/kill [reason] — trip the execution kill switch (no orders until /arm)\n"
     "/arm — clear the execution kill switch\n"
     "/watchlist list|add SYM|remove SYM\n"
@@ -387,6 +388,19 @@ async def _cmd_cancelorder(context: DaemonContext, args: list[str]) -> list[Comm
     return [CommandReply(f"cancel requested for #{order.id} — you'll get a confirmation")]
 
 
+async def _cmd_close(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    if not args or not args[0].isdigit():
+        return [CommandReply("usage: /close ORDER_ID (the # from /orders)")]
+    if context.order_client is None:
+        return [CommandReply("execution is not configured in this daemon build")]
+    # Lazy import: exit_runner pulls in execution.engine/market_hours; keeping it
+    # here matches _cmd_execute/_cmd_record and avoids a module import cycle.
+    from optionsbot.daemon.exit_runner import force_close_entry
+
+    msg = await force_close_entry(context, int(args[0]))
+    return [CommandReply(msg)]
+
+
 _REGISTRY: dict[str, Handler] = {
     "help": _cmd_help,
     "status": _cmd_status,
@@ -404,6 +418,7 @@ _REGISTRY: dict[str, Handler] = {
     "execute": _cmd_execute,
     "orders": _cmd_orders,
     "cancelorder": _cmd_cancelorder,
+    "close": _cmd_close,
 }
 
 

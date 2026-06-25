@@ -325,6 +325,7 @@ async def test_help_lists_execution_commands(daemon_context: DaemonContext) -> N
     assert "/execute" in reply.text
     assert "/orders" in reply.text
     assert "/cancelorder" in reply.text
+    assert "/close" in reply.text
 
 
 async def test_execute_requires_numeric_id(daemon_context: DaemonContext) -> None:
@@ -399,3 +400,27 @@ async def test_cancelorder_paths(daemon_context: DaemonContext) -> None:
     [reply] = await dispatch(daemon_context, f"/cancelorder {working_id}")
     assert "cancel requested" in reply.text.lower()
     daemon_context.order_client.cancel.assert_awaited_once_with(77)
+
+
+async def test_close_requires_numeric_id(daemon_context: DaemonContext) -> None:
+    [reply] = await dispatch(daemon_context, "/close")
+    assert "usage" in reply.text.lower()
+    [reply] = await dispatch(daemon_context, "/close abc")
+    assert "usage" in reply.text.lower()
+
+
+async def test_close_without_order_client(daemon_context: DaemonContext) -> None:
+    daemon_context.order_client = None
+    [reply] = await dispatch(daemon_context, "/close 5")
+    assert "not configured" in reply.text.lower()
+
+
+async def test_close_delegates_to_force_close(daemon_context: DaemonContext) -> None:
+    daemon_context.order_client = MagicMock()
+    with patch(
+        "optionsbot.daemon.exit_runner.force_close_entry",
+        new=AsyncMock(return_value="close requested for #7 SPY bull_put_spread 1x"),
+    ) as fc:
+        [reply] = await dispatch(daemon_context, "/close 7")
+    assert "close requested for #7" in reply.text
+    assert fc.await_args.args[1] == 7

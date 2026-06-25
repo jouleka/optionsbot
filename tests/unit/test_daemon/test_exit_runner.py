@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import insert, select, update
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.exit_runner import run_exits_tick
+from optionsbot.daemon.exit_runner import force_close_entry, run_exits_tick
 from optionsbot.execution.orders import record_fill
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import OptionQuote, PlacedOrder, PortfolioPosition
@@ -427,3 +427,78 @@ async def test_post_close_naked_short_trips_kill_and_alerts_p1(
 
         # No close order was submitted on either tick.
         assert first.closes_submitted == 0
+
+
+# ---- /close: human-initiated force close (force_close_entry) ----
+
+
+async def test_force_close_fires_without_a_trigger(daemon_context: DaemonContext) -> None:
+    # The whole point of /close: it bypasses evaluate_exit. Use mids where the
+    # take-profit rule would NOT fire (same mids as test_no_trigger_no_close) and
+    # assert a close is placed anyway.
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner._exec_md",
+               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+        msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_awaited_once()
+    with daemon_context.engine.connect() as conn:
+        close = conn.execute(select(orders).where(orders.c.intent == "close")).one()
+    assert close.closes_order_id == entry_id
+    assert close.status == "submitted"
+    assert str(entry_id) in msg
+
+
+async def test_force_close_unknown_id_is_reported(daemon_context: DaemonContext) -> None:
+    _wire(daemon_context, {})
+    msg = await force_close_entry(daemon_context, 999)
+    assert "unknown" in msg.lower()
+
+
+async def test_force_close_rejects_non_open_entry(daemon_context: DaemonContext) -> None:
+    # A cancelled (non-filled) order is not a closable position.
+    entry_id = _filled_entry(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(update(orders).where(orders.c.id == entry_id)
+                     .values(status="cancelled"))
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_not_awaited()
+    assert "filled open" in msg.lower()
+
+
+async def test_force_close_blocks_when_already_closing(daemon_context: DaemonContext) -> None:
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner._exec_md",
+               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+        first = await force_close_entry(daemon_context, entry_id)
+        second = await force_close_entry(daemon_context, entry_id)
+    assert order_client.place_combo_limit.await_count == 1
+    assert str(entry_id) in first
+    assert "already closing" in second.lower()
+
+
+async def test_force_close_respects_kill_switch(daemon_context: DaemonContext) -> None:
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    trip_kill(daemon_context.engine, "halt")
+    msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_not_awaited()
+    assert "kill" in msg.lower()
+
+
+async def test_force_close_refused_when_market_closed(daemon_context: DaemonContext) -> None:
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner.is_market_open", return_value=False):
+        msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_not_awaited()
+    assert "market" in msg.lower()
+
+
+async def test_force_close_without_order_client(daemon_context: DaemonContext) -> None:
+    entry_id = _filled_entry(daemon_context)
+    # order_client stays None (fixture default) -> not configured.
+    msg = await force_close_entry(daemon_context, entry_id)
+    assert "not configured" in msg.lower()
