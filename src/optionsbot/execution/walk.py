@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -23,9 +23,12 @@ from optionsbot.config import Settings
 from optionsbot.execution.orders import (
     WORKING_STATUSES,
     bump_reprice,
+    clear_walk_state,
     get_order,
+    load_walk_states,
     record_order_quotes,
     set_order_note,
+    upsert_walk_state,
 )
 from optionsbot.execution.state import load_state
 
@@ -208,6 +211,8 @@ async def run_price_walk(
     decision_mid: float,
     budget: float,
     increment: float,
+    start_step: int = 0,
+    prev_target_override: float | None = None,
 ) -> None:
     """Walk one working order from mid toward marketable, then give up.
 
@@ -221,10 +226,10 @@ async def run_price_walk(
     from optionsbot.execution.engine import combo_mid
 
     cfg = settings.execution
-    prev_target = decision_mid
+    prev_target = prev_target_override if prev_target_override is not None else decision_mid
     option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
     try:
-        for step in range(1, cfg.walk_max_steps + 1):
+        for step in range(start_step + 1, cfg.walk_max_steps + 1):
             if cfg.walk_step_seconds:
                 await asyncio.sleep(cfg.walk_step_seconds)
             record = get_order(engine, order_id)
@@ -292,6 +297,12 @@ async def run_price_walk(
                 combo_mid=current_mid, target_net=target, limit_price=-target,
                 legs=leg_rows,
             )
+            upsert_walk_state(
+                engine, order_id, ib_order_id=ib_order_id, symbol=symbol,
+                legs=list(legs), decision_mid=decision_mid, budget=budget,
+                increment=increment, step=step, prev_target=prev_target,
+                ts=datetime.now(UTC),
+            )
 
         # Final price rests, then the trade is skipped: request the cancel and
         # let the TRACKER confirm it. Marking the row terminal ourselves while
@@ -313,6 +324,13 @@ async def run_price_walk(
         raise  # daemon shutdown — let it propagate
     except Exception:  # noqa: BLE001 -- the walk must never crash the daemon
         log.exception("price walk for order %s died", order_id)
+    finally:
+        # Best-effort: a CancelledError on shutdown intentionally LEAVES the row
+        # so the next boot re-attaches; every other exit (fill/cancel/exhaustion/
+        # error) clears it. We detect shutdown via the order still being working.
+        record = get_order(engine, order_id)
+        if record is None or record.status not in WORKING_STATUSES:
+            clear_walk_state(engine, order_id)
 
 
 _CANCEL_CONFIRM_TIMEOUT = 30.0  # seconds; tests may monkeypatch
@@ -348,3 +366,49 @@ async def _request_cancel_and_confirm(
         "order %s: cancel UNCONFIRMED after %.0fs — order may still be working; "
         "TTL watcher keeps retrying", order_id, _CANCEL_CONFIRM_TIMEOUT,
     )
+
+
+async def resume_walks(
+    *,
+    engine: Engine,
+    settings: Settings,
+    order_client: OrderClient,
+    md: MarketDataClient,
+    walk_tasks: set[asyncio.Task[None]],
+    notify: Callable[[str], Awaitable[None]] | None = None,
+) -> int:
+    """Re-attach persisted price-walks after a restart (Work-stream D1).
+
+    For every non-terminal walk_state row, spawn a run_price_walk that RESUMES
+    from the persisted step (never replaying earlier repricings). The adopted
+    order is unmanaged until this fires, so we alert per resumed walk. Returns
+    the number of walks resumed.
+    """
+    resumed = 0
+    for ws in load_walk_states(engine):
+        record = get_order(engine, ws.order_id)
+        if record is None or record.status not in WORKING_STATUSES:
+            clear_walk_state(engine, ws.order_id)
+            continue
+        if notify is not None:
+            try:
+                await notify(
+                    f"↻ re-attached price walk for order #{ws.order_id} "
+                    f"({ws.symbol}) — resuming from step {ws.step}; it was "
+                    "unmanaged since the restart"
+                )
+            except Exception:  # noqa: BLE001 -- notify failure must not block resume
+                log.exception("resume_walks: notify failed for order %s", ws.order_id)
+        task = asyncio.create_task(
+            run_price_walk(
+                engine=engine, settings=settings, order_client=order_client,
+                md=md, symbol=ws.symbol, legs=ws.legs, order_id=ws.order_id,
+                ib_order_id=ws.ib_order_id, decision_mid=ws.decision_mid,
+                budget=ws.budget, increment=ws.increment,
+                start_step=ws.step, prev_target_override=ws.prev_target,
+            )
+        )
+        walk_tasks.add(task)
+        task.add_done_callback(walk_tasks.discard)
+        resumed += 1
+    return resumed
