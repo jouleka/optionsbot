@@ -361,11 +361,18 @@ async def execute_pick(
                     f"{settings.execution.max_bp_usage_pct * 100:.0f}% auto-mode cap"
                 )
     needed = preview.init_margin_change
-    if needed is not None and available is not None and needed > available:
+    if needed is None or available is None:
+        # IBK-122 fail-closed: never place blind. If IBKR gives no init-margin
+        # or no available-funds figure, reject rather than skip the money gate.
+        return _reject(
+            "margin preview incomplete (init-margin or available funds unknown) "
+            "— refusing to place blind"
+        )
+    if needed > available:
         return _reject(
             f"margin Δ ${needed:,.0f} exceeds available funds ${available:,.0f}"
         )
-    margin_note = f"margin Δ ${needed:,.0f}" if needed is not None else "margin Δ unknown"
+    margin_note = f"margin Δ ${needed:,.0f}"
     if preview.warning:
         margin_note += f" ({preview.warning})"
 

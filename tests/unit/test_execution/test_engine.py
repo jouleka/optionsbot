@@ -298,6 +298,25 @@ async def test_rejects_when_margin_exceeds_available(tmp_db: Engine) -> None:
     assert "margin" in outcome.message.lower()
 
 
+async def test_rejects_when_whatif_margin_unknown(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, margin_change=None)  # IBKR returned no init-margin
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_rejects_when_available_funds_unknown(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, available_funds=None)  # type: ignore[arg-type]
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower() or "funds" in outcome.message.lower()
+
+
 async def test_rejects_when_whatif_raises(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db)
