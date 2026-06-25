@@ -429,3 +429,22 @@ def test_aggressive_config_file_fails_to_load(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         load_settings(config_file=cfg)
+
+
+def test_entry_block_loss_frac_defaults_to_three_quarters() -> None:
+    from optionsbot.config import Settings
+
+    s = Settings()
+    assert s.execution.entry_block_loss_frac == 0.75
+
+
+def test_entry_block_loss_frac_is_a_fraction() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(entry_block_loss_frac=0.0)
+    with pytest.raises(ValidationError):
+        ExecutionSettings(entry_block_loss_frac=1.5)

@@ -196,6 +196,12 @@ class ExecutionSettings(BaseModel):
     base_risk_pct: float = Field(default=0.03, gt=0.0, le=1.0)
     max_portfolio_heat_pct: float = Field(default=0.15, gt=0.0, le=1.0)
     max_single_trade_risk_pct: float = Field(default=0.10, gt=0.0, le=1.0)
+    # PHASE 0 net-liq circuit breaker (work-stream B). The equity guard trips
+    # the kill switch on a realized+unrealized day-start drawdown >=
+    # max_daily_loss_pct, and blocks NEW entries once the drawdown reaches
+    # entry_block_loss_frac of that cap (so the bot stops adding risk while it
+    # is already bleeding, before the hard kill).
+    entry_block_loss_frac: float = Field(default=0.75, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _enforce_phase0_ceilings(self) -> ExecutionSettings:
