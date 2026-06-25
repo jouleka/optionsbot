@@ -167,7 +167,9 @@ async def test_unrealized_drawdown_under_cap_does_not_trip(
 
     daemon_context.order_client = MagicMock()
     daemon_context.order_client.cancel = AsyncMock()
-    capture_day_start_net_liq(daemon_context.engine, 100_000.0, session=nyse_session_date(NOW).isoformat())
+    capture_day_start_net_liq(
+        daemon_context.engine, 100_000.0, session=nyse_session_date(NOW).isoformat()
+    )
     with patch(
         "optionsbot.daemon.order_watcher._net_liq",
         new=AsyncMock(return_value=99_500.0),  # 0.5% down
