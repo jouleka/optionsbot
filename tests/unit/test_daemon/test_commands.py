@@ -60,7 +60,10 @@ async def test_last_lists_recent_alerts(daemon_context: DaemonContext) -> None:
 
 
 async def test_scan_returns_formatted_picks(daemon_context: DaemonContext) -> None:
+    from decimal import Decimal
+
     from optionsbot.analysis.types import MarketView
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
@@ -79,7 +82,16 @@ async def test_scan_returns_formatted_picks(daemon_context: DaemonContext) -> No
     view = MarketView("neutral", "weak", "high", 0.7, False, False)
     result = ScanResult("SPY", 1, datetime(2026, 6, 4, 15, 30, tzinfo=UTC), view, (scored,))
 
-    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+    # Task 7: patch PositionsClient so the affordability gate passes (max_loss=2
+    # easily fits within a $5k account at any single-trade cap).
+    _summary = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("5000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_summary)
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)), \
+         patch("optionsbot.daemon.commands.PositionsClient", return_value=mock_pos):
         replies = await dispatch(daemon_context, "/scan spy")
     assert any("iron_condor" in r.text for r in replies)
     assert all(r.parse_mode == "MarkdownV2" for r in replies)
@@ -122,7 +134,10 @@ async def test_watchlist_add_requires_symbol(daemon_context: DaemonContext) -> N
 
 async def test_scan_orders_picks_by_edge(daemon_context: DaemonContext) -> None:
     """/scan leads with the highest risk-normalized-edge pick, not chain order."""
+    from decimal import Decimal
+
     from optionsbot.analysis.types import MarketView
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
@@ -146,7 +161,15 @@ async def test_scan_orders_picks_by_edge(daemon_context: DaemonContext) -> None:
     scored = (_mk("low_edge", 0.01), _mk("high_edge", 0.40), _mk("mid_edge", 0.10))
     result = ScanResult("SPY", 1, datetime(2026, 6, 5, 15, 30, tzinfo=UTC), view, scored)
 
-    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+    # Task 7: patch PositionsClient so all picks pass the affordability gate.
+    _summary = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("5000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_summary)
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)), \
+         patch("optionsbot.daemon.commands.PositionsClient", return_value=mock_pos):
         replies = await dispatch(daemon_context, "/scan spy")
     # First reply (top pick) is the highest-edge strategy.
     assert "high_edge" in replies[0].text
@@ -157,7 +180,10 @@ async def test_scan_warns_and_orders_when_no_positive_edge(
 ) -> None:
     """All picks negative-EV: /scan prepends the no-edge banner and orders the
     losers by raw EV (least loss first), NOT by EV/max_loss."""
+    from decimal import Decimal
+
     from optionsbot.analysis.types import MarketView
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
@@ -181,7 +207,16 @@ async def test_scan_warns_and_orders_when_no_positive_edge(
     spread = _mk("bull_put_spread", ev=-49.0, max_loss=737.0)   # wins under raw EV
     result = ScanResult("NVDA", 1, datetime(2026, 6, 6, 15, 30, tzinfo=UTC), view, (csp, spread))
 
-    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+    # Task 7: patch PositionsClient with a large equity so both picks pass the
+    # affordability gate (cap=0.10; need >= 19397/0.10 = $193,970 for the CSP).
+    _summary = AccountSummary(
+        net_liquidation=Decimal("500000"), buying_power=None,
+        available_funds=Decimal("500000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_summary)
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)), \
+         patch("optionsbot.daemon.commands.PositionsClient", return_value=mock_pos):
         replies = await dispatch(daemon_context, "/scan nvda")
 
     # First reply is the plain-text no-edge banner.
@@ -198,7 +233,10 @@ async def test_scan_includes_execute_hint_when_armed(
 ) -> None:
     # /scan must be a self-sufficient test surface: when execution is enabled
     # the picks carry the same ➤ /execute id as scheduled alerts.
+    from decimal import Decimal
+
     from optionsbot.analysis.types import MarketView
+    from optionsbot.ibkr.types import AccountSummary
     from optionsbot.scan.types import ScanResult
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
@@ -228,7 +266,15 @@ async def test_scan_includes_execute_hint_when_armed(
     view = MarketView("neutral", "weak", "high", 0.7, False, False)
     result = ScanResult("SPY", snap_id, datetime.now(UTC), view, (scored,))
 
-    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)):
+    # Task 7: patch PositionsClient so the pick passes the affordability gate.
+    _summary = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("5000"), currency="USD",
+    )
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(return_value=_summary)
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)), \
+         patch("optionsbot.daemon.commands.PositionsClient", return_value=mock_pos):
         replies = await dispatch(daemon_context, "/scan spy")
     assert any(f"/execute {score_id}" in r.text for r in replies)
 
@@ -424,3 +470,52 @@ async def test_close_delegates_to_force_close(daemon_context: DaemonContext) -> 
         [reply] = await dispatch(daemon_context, "/close 7")
     assert "close requested for #7" in reply.text
     assert fc.await_args.args[1] == 7
+
+
+async def test_cmd_scan_filters_unaffordable(daemon_context: DaemonContext) -> None:
+    """Task 7: /scan surfaces only affordable defined-risk picks.
+    single-trade cap default 0.10 of $5k = $500; max_loss=900 > $500 is dropped,
+    max_loss=300 <= $500 survives."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.ibkr.types import AccountSummary
+    from optionsbot.scan.types import ScanResult
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def _mk(name: str, max_loss: float, rne: float = 0.1) -> ScoredStrategy:
+        sug = MagicMock()
+        sug.legs = ()
+        sug.defined_risk = True
+        sug.credit_or_debit = 1.0
+        sug.max_loss = max_loss
+        sug.prob_profit = 0.6
+        sug.reward_risk = 1.0
+        sug.expected_value = 5.0
+        sug.risk_tier = "balanced"
+        sug.suggested_quantity = 1
+        sug.risk_normalized_expectancy = rne
+        return ScoredStrategy(name, 80.0, FactorBreakdown(.5, .5, .5, .5, .5, .5), sug, "ok")
+
+    view = MarketView("neutral", "weak", "high", 0.7, False, False)
+    big = _mk("too_expensive", max_loss=900.0)   # 900 > 0.10 * 5000 = 500 -> dropped
+    small = _mk("affordable", max_loss=300.0)    # 300 <= 500 -> kept
+
+    result = ScanResult("SPY", 1, datetime(2026, 6, 26, 15, 30, tzinfo=UTC), view, (big, small))
+
+    fake_pos = MagicMock()
+    fake_pos.get_account_summary = AsyncMock(return_value=AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("5000"), currency="USD",
+    ))
+
+    with patch("optionsbot.daemon.commands.scan_symbol", new=AsyncMock(return_value=result)), \
+         patch("optionsbot.daemon.commands.PositionsClient", return_value=fake_pos):
+        replies = await dispatch(daemon_context, "/scan SPY")
+
+    # Only the affordable pick surfaces; the $900-loss pick is silently dropped.
+    text = "\n".join(r.text for r in replies)
+    assert "affordable" in text
+    assert "too_expensive" not in text

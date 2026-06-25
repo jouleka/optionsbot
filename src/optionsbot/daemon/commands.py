@@ -138,9 +138,23 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
             resolver=context.resolver,
         )
     ranked = sorted(result.scored, key=lambda s: edge_sort_key(s.suggestion), reverse=True)
-    top = ranked[:3]
+
+    from optionsbot.daemon.scan_runner import is_proposable
+
+    equity_usd: float | None = None
+    try:
+        async with context.ibkr_lock:
+            summary = await PositionsClient(context.ibkr).get_account_summary()
+        if summary.net_liquidation_usd is not None:
+            equity_usd = float(summary.net_liquidation_usd)
+    except Exception:  # noqa: BLE001 -- net-liq advisory; fail-closed below if None
+        log.exception("net-liq fetch failed in /scan; affordability gate fails closed")
+    cap = context.settings.execution.max_single_trade_risk_pct
+    top = [s for s in ranked if is_proposable(s.suggestion, equity_usd, cap)][:3]
     if not top:
-        return [CommandReply(f"{symbol}: no qualifying strategies right now")]
+        return [CommandReply(
+            f"{symbol}: no affordable defined-risk strategies at the current bankroll"
+        )]
     # IBK-126/130: /scan is the on-demand test surface — picks carry the same
     # ➤ /execute hint as scheduled alerts when execution is armed. No hint on
     # picks the execute gates would refuse anyway (undefined risk / size 0).
