@@ -190,6 +190,8 @@ execution_state = Table(
     Column("killed", Integer, nullable=False, server_default="0"),
     Column("reason", Text),
     Column("ts", DateTime(timezone=True)),
+    Column("day_start_net_liq", Float),
+    Column("day_start_session", Text),  # NYSE session date "YYYY-MM-DD" the baseline belongs to
 )
 
 
