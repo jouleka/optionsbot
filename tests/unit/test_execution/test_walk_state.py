@@ -9,12 +9,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 from sqlalchemy import Engine, insert, update
 
+from optionsbot.config import Settings
 from optionsbot.execution.orders import (
     clear_walk_state,
     get_order,
     load_walk_states,
     upsert_walk_state,
 )
+from optionsbot.execution.walk import resume_walks, run_price_walk
+from optionsbot.ibkr.types import OptionQuote
 from optionsbot.storage.schema import orders
 
 NOW = datetime(2026, 6, 11, 15, 30, tzinfo=UTC)
@@ -104,13 +107,6 @@ def test_load_skips_terminal_orders(tmp_db: Engine) -> None:
                      .values(status="filled", terminal_ts=NOW))
     assert get_order(tmp_db, order_id).status == "filled"  # type: ignore[union-attr]
     assert load_walk_states(tmp_db) == []
-
-
-import pytest
-
-from optionsbot.config import Settings
-from optionsbot.execution.walk import resume_walks, run_price_walk
-from optionsbot.ibkr.types import OptionQuote
 
 
 def _quote(
