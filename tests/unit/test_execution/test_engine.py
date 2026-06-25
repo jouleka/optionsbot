@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -79,8 +80,8 @@ def _deps(
     *,
     enabled: bool = True,
     md_mids: dict[tuple[float, str], float | None] | None = None,
-    available_funds: float = 50_000.0,
-    net_liquidation: float | None = None,
+    available_funds: float | None = 50_000.0,
+    net_liquidation: float | None = 50_000.0,
     margin_change: float | None = 380.0,
     walk: bool = False,
 ) -> ExecutionDeps:
@@ -116,8 +117,10 @@ def _deps(
     positions = MagicMock()
     positions.get_account_summary = AsyncMock(
         return_value=AccountSummary(
-            net_liquidation=net_liquidation, buying_power=None,  # type: ignore[arg-type]
-            available_funds=available_funds, currency="USD",  # type: ignore[arg-type]
+            net_liquidation=Decimal(str(net_liquidation)) if net_liquidation is not None else None,
+            buying_power=None,
+            available_funds=Decimal(str(available_funds)) if available_funds is not None else None,
+            currency="USD",
         )
     )
     return ExecutionDeps(
@@ -195,11 +198,25 @@ async def test_rejects_undefined_risk(tmp_db: Engine) -> None:
 
 
 async def test_rejects_zero_quantity(tmp_db: Engine) -> None:
-    score_id = _insert_pick(tmp_db, suggested_quantity=0)
+    # With dynamic sizing, a pick whose max_loss exceeds the single-trade cap
+    # on a tiny account should be rejected (not placed). $500 equity, $380
+    # max_loss: single-trade cap = $500 * 10% = $50 < $380 → rejects.
+    score_id = _insert_pick(tmp_db, suggested_quantity=1)
+    deps = _deps(tmp_db, net_liquidation=500.0, available_funds=500.0)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
-        outcome = await execute_pick(_deps(tmp_db), score_id, now=NOW)
+        outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
-    assert "quantity" in outcome.message.lower()
+    assert "cap" in outcome.message.lower() or "sized" in outcome.message.lower()
+
+
+async def test_rejects_when_live_equity_unavailable(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db, suggested_quantity=9)
+    deps = _deps(tmp_db, net_liquidation=None)  # net-liq read failed
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "equity" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
 
 
 async def test_rejects_when_market_closed(tmp_db: Engine) -> None:

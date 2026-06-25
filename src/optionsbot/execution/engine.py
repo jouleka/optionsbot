@@ -304,39 +304,39 @@ async def execute_pick(
     async with deps.ibkr_lock:
         summary = await deps.positions.get_account_summary()
     equity = (
-        float(summary.net_liquidation) if summary.net_liquidation is not None else None
+        float(summary.net_liquidation_usd)
+        if summary.net_liquidation_usd is not None
+        else None
     )
-    if equity is not None and equity > 0:
-        from optionsbot.execution.orders import realized_close_pairs
-        from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
-
-        decision = dynamic_quantity(
-            equity=equity,
-            max_loss_unit=max_loss_unit,
-            max_profit_unit=(
-                float(suggestion["max_profit"]) if suggestion.get("max_profit") else None
-            ),
-            prob_profit=(
-                float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
-            ),
-            open_heat=open_heat_dollars(engine),
-            recent_pnls=[p.pnl for p in realized_close_pairs(engine)[-5:]],
-            base_risk_pct=settings.execution.base_risk_pct,
-            heat_cap_pct=settings.execution.max_portfolio_heat_pct,
-            single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,
+    if equity is None or equity <= 0:
+        # IBK-122 fail-closed: never size off the stale scan-time quantity (it
+        # skips the single-trade/heat caps). A missing live net-liq is rare and
+        # transient — reject and let the human re-issue /execute.
+        return _reject(
+            "live equity unavailable — refusing to size off a stale scan-time quantity"
         )
-        if decision.quantity < 1:
-            return _reject(decision.note)
-        quantity = decision.quantity
-        sizing_note = decision.note
-    else:
-        # No live equity figure — fall back to the scan-time indicative size.
-        quantity = int(suggestion.get("suggested_quantity") or 0)
-        if quantity < 1:
-            return _reject(
-                "no live equity figure and the pick has no executable quantity"
-            )
-        sizing_note = f"sized {quantity}x (scan-time indicative; live equity unavailable)"
+    from optionsbot.execution.orders import realized_close_pairs
+    from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
+
+    decision = dynamic_quantity(
+        equity=equity,
+        max_loss_unit=max_loss_unit,
+        max_profit_unit=(
+            float(suggestion["max_profit"]) if suggestion.get("max_profit") else None
+        ),
+        prob_profit=(
+            float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
+        ),
+        open_heat=open_heat_dollars(engine),
+        recent_pnls=[p.pnl for p in realized_close_pairs(engine)[-5:]],
+        base_risk_pct=settings.execution.base_risk_pct,
+        heat_cap_pct=settings.execution.max_portfolio_heat_pct,
+        single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,
+    )
+    if decision.quantity < 1:
+        return _reject(decision.note)
+    quantity = decision.quantity
+    sizing_note = decision.note
 
     async with deps.ibkr_lock:
         try:
