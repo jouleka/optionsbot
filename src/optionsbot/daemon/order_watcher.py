@@ -57,11 +57,13 @@ def _terminal_message(row: object, premium: float | None) -> str:
     return f"⚪ {status} {head}"
 
 
-async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
+async def run_orders_tick(
+    context: DaemonContext, *, now: datetime | None = None
+) -> OrdersTickSummary:
     if context.order_client is None:
         return OrdersTickSummary(working=0, expired=0, notified=0)
     engine = context.engine
-    now = datetime.now(UTC)
+    now = now if now is not None else datetime.now(UTC)
     ttl = timedelta(minutes=context.settings.execution.order_ttl_minutes)
 
     # IBK-128: periodic broker reconciliation, only while non-terminal orders
@@ -137,12 +139,21 @@ async def run_orders_tick(context: DaemonContext) -> OrdersTickSummary:
         watermark = max(watermark, row_ts)
     context.orders_notified_through = watermark
 
-    # IBK-130: a realized round-trip just completed — evaluate loss triggers.
+    # IBK-130: a realized round-trip just completed — evaluate realized-only
+    # loss triggers (consecutive-loss + realized daily loss). Backstop only.
     if close_filled:
         try:
             await _check_loss_kill_triggers(context, now)
         except Exception:  # noqa: BLE001 -- trigger evaluation must not kill the tick
             log.exception("loss kill-trigger evaluation failed")
+
+    # PHASE 0 B1: net-liq (realized+unrealized) drawdown circuit breaker runs
+    # EVERY tick, not just on a close fill — an open position bleeding past the
+    # cap with nothing closed must still trip the kill.
+    try:
+        await _check_net_liq_drawdown(context, now)
+    except Exception:  # noqa: BLE001 -- breaker must not kill the tick
+        log.exception("net-liq drawdown evaluation failed")
 
     if expired or notified:
         log.info(
@@ -173,24 +184,28 @@ async def _check_loss_kill_triggers(context: DaemonContext, now: datetime) -> No
     engine = context.engine
     if load_state(engine).killed:
         return
-    pairs = realized_close_pairs(engine)
-    if not pairs:
+
+    from optionsbot.daemon.market_hours import nyse_session_start_utc
+
+    session_start = nyse_session_start_utc(now)
+    # PHASE 0 B3: scope BOTH the consecutive-loss streak and the realized-today
+    # tally to THIS NYSE session. A global streak would let N stale losses from
+    # a prior session trip the kill the instant one fresh close lands.
+    session_pairs = realized_close_pairs(engine, since=session_start)
+    if not session_pairs:
         return
     limit = context.settings.execution.max_consecutive_losses
-    recent = pairs[-limit:]
+    recent = session_pairs[-limit:]
     if len(recent) >= limit and all(p.pnl < 0 for p in recent):
-        trip_kill(engine, f"{limit} consecutive losing trades")
+        trip_kill(engine, f"{limit} consecutive losing trades this session")
         await _send(
             context,
-            f"🛑 KILL SWITCH: {limit} consecutive losing trades "
+            f"🛑 KILL SWITCH: {limit} consecutive losing trades this session "
             f"(latest {recent[-1].symbol} {recent[-1].pnl:+,.0f}). "
             "No new orders until /arm.",
         )
         return
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    realized_today = sum(
-        p.pnl for p in pairs if p.closed_ts is not None and p.closed_ts >= day_start
-    )
+    realized_today = sum(p.pnl for p in session_pairs)
     if realized_today >= 0:
         return
     net_liq = await _net_liq(context)
@@ -214,6 +229,38 @@ async def _check_loss_kill_triggers(context: DaemonContext, now: datetime) -> No
             context,
             f"🛑 KILL SWITCH: daily loss ${abs(realized_today):,.0f} hit the "
             f"{threshold * 100:.0f}% cap. No new orders until /arm.",
+        )
+
+
+async def _check_net_liq_drawdown(context: DaemonContext, now: datetime) -> None:
+    """PHASE 0 B1: trip the kill on a realized+unrealized day-start drawdown."""
+    from optionsbot.daemon.market_hours import nyse_session_date
+    from optionsbot.execution.equity_guard import (
+        capture_day_start_net_liq,
+        evaluate_net_liq_drawdown,
+    )
+    from optionsbot.execution.state import load_state
+
+    engine = context.engine
+    if load_state(engine).killed:
+        return
+    net_liq = await _net_liq(context)
+    if net_liq is None:
+        return  # the realized backstop already warns when net-liq is unavailable
+    # Capture the day-start baseline keyed by the NYSE session date so it resets
+    # at the ET boundary but is idempotent (restart-stable) within a session.
+    # context.day_start_net_liq mirrors it for /status without a DB hit.
+    session = nyse_session_date(now).isoformat()
+    context.day_start_net_liq = capture_day_start_net_liq(
+        engine, net_liq, session=session
+    )
+    verdict = evaluate_net_liq_drawdown(
+        engine, context.settings, current_net_liq=net_liq, now=now
+    )
+    if verdict.tripped:
+        await _send(
+            context,
+            f"🛑 KILL SWITCH: {verdict.reason}. No new orders until /arm.",
         )
 
 

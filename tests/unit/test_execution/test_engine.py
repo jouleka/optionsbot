@@ -489,3 +489,20 @@ async def test_place_failure_marks_skipped(tmp_db: Engine) -> None:
     assert record is not None
     assert record.status == "skipped"
     assert record.last_error == "gateway exploded"
+
+
+async def test_execute_pick_blocks_near_daily_loss_cap(tmp_db: Engine) -> None:
+    # PHASE 0 B1: once the day-start drawdown reaches entry_block_loss_frac of the
+    # cap, execute_pick rejects BEFORE staging — even with a valid fresh pick.
+    from optionsbot.execution.equity_guard import capture_day_start_net_liq
+
+    score_id = _insert_pick(tmp_db)
+    # Pre-capture day-start baseline of 100k. 98.4k = 1.6% down; block at 75% of 2% = 1.5%.
+    capture_day_start_net_liq(tmp_db, 100_000.0, session="2026-06-24")
+    deps = _deps(tmp_db, net_liquidation=98_400.0)
+    deps.settings.execution.entry_block_loss_frac = 0.75
+    deps.settings.execution.max_daily_loss_pct = 0.02
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert outcome.ok is False
+    assert "drawdown" in outcome.message.lower()

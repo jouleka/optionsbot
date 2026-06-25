@@ -56,3 +56,7 @@ class DaemonContext:
     # IBK-129: entries whose half-closed state was already escalated (a close
     # partially filled then died — human handoff, never auto-restaged).
     exit_handoff_warned: set[int] = field(default_factory=set)
+    # PHASE 0 B1: in-memory mirror of the persisted day-start net-liq baseline
+    # for the equity drawdown breaker (None until the first net-liq read this
+    # session). The authoritative value lives on the execution_state row.
+    day_start_net_liq: float | None = None

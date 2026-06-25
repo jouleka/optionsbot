@@ -118,6 +118,26 @@ async def execute_pick(
     if not verdict.allowed:
         return _reject(verdict.reason)
 
+    # PHASE 0 B1: stop ADDING risk as the day-start net-liq drawdown approaches
+    # the daily-loss cap. The per-tick breaker is the hard kill; this is the
+    # softer "don't pile on while bleeding" entry gate. Fails OPEN if net-liq is
+    # unreadable (the breaker remains the backstop).
+    from optionsbot.execution.equity_guard import new_entry_allowed
+
+    try:
+        async with deps.ibkr_lock:
+            _summary = await deps.positions.get_account_summary()
+        _net_liq = (
+            float(_summary.net_liquidation)
+            if _summary.net_liquidation is not None
+            else None
+        )
+    except Exception:  # noqa: BLE001 -- a flaky read must not hard-block entries
+        _net_liq = None
+    _entry = new_entry_allowed(engine, settings, current_net_liq=_net_liq)
+    if not _entry.allowed:
+        return _reject(_entry.reason)
+
     # 2. Load the pick.
     with engine.connect() as conn:
         pick = conn.execute(
