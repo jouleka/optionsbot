@@ -178,14 +178,21 @@ async def run_orders_tick(
 
 
 async def _net_liq(context: DaemonContext) -> float | None:
-    """Net liquidation for the daily-loss trigger. Patchable seam for tests."""
+    """Net liquidation in USD for the daily-loss / drawdown triggers.
+
+    IBK-122: the daily-loss kill compares this against realized PnL, which is
+    USD (option premiums), on an EUR-base account — so return the USD-converted
+    net-liq, not the raw EUR base. The drawdown check (which also reads this) is
+    a same-currency ratio, so USD keeps it self-consistent. Patchable seam for
+    tests.
+    """
     from optionsbot.ibkr.positions import PositionsClient
 
     async with context.ibkr_lock:
         summary = await PositionsClient(context.ibkr).get_account_summary()
     return (
-        float(summary.net_liquidation)
-        if summary.net_liquidation is not None
+        float(summary.net_liquidation_usd)
+        if summary.net_liquidation_usd is not None
         else None
     )
 

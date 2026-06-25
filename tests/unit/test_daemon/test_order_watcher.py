@@ -226,3 +226,27 @@ async def test_reconcile_runs_on_fixed_cadence_with_no_open_orders(
 
     await _order_watcher_module.run_orders_tick(context)
     assert called == [True]  # reconcile ran AND was given a positions snapshot
+
+
+async def test_net_liq_returns_usd_for_eur_account(
+    daemon_context: DaemonContext,
+) -> None:
+    # IBK-122: the daily-loss kill compares USD realized PnL against this, so
+    # _net_liq must return the USD-converted net-liq, not the raw EUR base.
+    from decimal import Decimal
+    from unittest.mock import patch
+
+    from optionsbot.daemon.order_watcher import _net_liq
+    from optionsbot.ibkr.types import AccountSummary
+
+    fake_pos = MagicMock()
+    fake_pos.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("5000"), buying_power=None,
+            available_funds=Decimal("5000"), currency="EUR",
+            fx_to_usd=Decimal("1.25"),
+        )
+    )
+    with patch("optionsbot.ibkr.positions.PositionsClient", return_value=fake_pos):
+        result = await _net_liq(daemon_context)
+    assert result == 6250.0  # 5000 EUR x 1.25 = USD 6250
