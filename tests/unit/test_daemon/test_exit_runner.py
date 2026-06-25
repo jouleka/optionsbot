@@ -11,8 +11,8 @@ from sqlalchemy import insert, select, update
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import run_exits_tick
 from optionsbot.execution.orders import record_fill
-from optionsbot.execution.state import trip_kill
-from optionsbot.ibkr.types import OptionQuote, PlacedOrder
+from optionsbot.execution.state import load_state, trip_kill
+from optionsbot.ibkr.types import OptionQuote, PlacedOrder, PortfolioPosition
 from optionsbot.storage.schema import orders
 
 NOW = datetime.now(UTC)
@@ -301,3 +301,129 @@ async def test_stale_quote_still_allows_expiry_guard(
 
     assert summary.closes_submitted == 1
     order_client.place_combo_limit.assert_awaited_once()
+
+
+def _half_closed_entry_with_abandoned_close(
+    context: DaemonContext, *, expiry: str = FAR
+) -> int:
+    """Create a filled open entry whose only close is terminal+partial-filled
+    (abandoned with one fill) — the condition that triggers the post-close
+    naked-short sweep in ``run_exits_tick``."""
+    entry_id = _filled_entry(context, expiry=expiry)
+    engine = context.engine
+    with engine.begin() as conn:
+        pk = conn.execute(insert(orders).values(
+            intent="close", closes_order_id=entry_id, symbol="SPY",
+            strategy="bull_put_spread", legs_json=_legs(expiry), quantity=1,
+            status="abandoned", staged_ts=NOW, submitted_ts=NOW,
+            terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key
+        assert pk is not None
+        close_id = int(pk[0])
+        conn.execute(update(orders).where(orders.c.id == close_id)
+                     .values(order_ref=f"obot-{close_id}"))
+    # Partial fill on the abandoned close — this is what _half_closed() detects.
+    record_fill(engine, close_id, exec_id="half1", side="BUY",
+                price=0.80, qty=1, ts=NOW)
+    return entry_id
+
+
+def _residual_short_position(expiry: str = FAR) -> PortfolioPosition:
+    """A broker PortfolioPosition representing the sold 580P leg still open
+    (position < 0 → naked short) after the close failed to fully fill."""
+    return PortfolioPosition(
+        account="DU123456",
+        symbol="SPY",
+        sec_type="OPT",
+        expiry=expiry,
+        strike=580.0,
+        right="P",
+        multiplier=100,
+        position=-1.0,  # still short after partial close
+        avg_cost=1.60,
+        market_price=None,
+        market_value=None,
+        unrealized_pnl=None,
+        realized_pnl=None,
+    )
+
+
+async def test_post_close_naked_short_trips_kill_and_alerts_p1(
+    daemon_context: DaemonContext,
+) -> None:
+    """Integration: run_exits_tick → assert_no_naked_short_after_close → P1.
+
+    A half-closed entry (abandoned close with a partial fill, no active close)
+    whose broker positions still show a residual SHORT 580P leg must cause the
+    exit tick to:
+      1. Trip the kill switch.
+      2. Send exactly one "🛑"/"P1" Telegram alert.
+      3. On a second tick for the SAME entry, NOT re-trip or re-alert (naked_leg_halted
+         set deduplicates).
+
+    Discriminating: if the ``await assert_no_naked_short_after_close(context, entry)``
+    call were removed from ``run_exits_tick``, ``load_state(...).killed`` would remain
+    False and no P1 telegram message would be sent, causing both ``assert killed is True``
+    and the P1-alert-count assertion to fail.
+    """
+    entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
+
+    # Wire exec_ibkr so the sweep doesn't short-circuit on "no exec connection".
+    exec_ibkr_mock = MagicMock()
+    daemon_context.exec_ibkr = exec_ibkr_mock
+
+    # _wire sets execution.enabled=True and provides the market-data mock.
+    _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+
+    residual = _residual_short_position(FAR)
+
+    with (
+        patch("optionsbot.daemon.exit_runner._exec_md",
+              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch(
+            "optionsbot.ibkr.positions.PositionsClient",
+            autospec=True,
+        ) as MockPositionsClient,
+    ):
+        mock_pc_instance = MagicMock()
+        mock_pc_instance.get_portfolio = AsyncMock(return_value=[residual])
+        MockPositionsClient.return_value = mock_pc_instance
+
+        # --- First tick: naked short detected ---
+        first = await run_exits_tick(daemon_context)
+        # Kill switch must be tripped.
+        assert load_state(daemon_context.engine).killed is True
+        # Exactly one P1 alert must have been sent.
+        all_messages = [
+            c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        ]
+        p1_alerts = [m for m in all_messages if "P1" in m or "🛑" in m]
+        assert len(p1_alerts) == 1, f"expected 1 P1 alert on first tick, got: {p1_alerts}"
+        # The entry is now tracked in the dedup set.
+        assert entry_id in daemon_context.naked_leg_halted
+
+        # --- Second tick: naked_leg_halted dedup suppresses re-alert ---
+        # After the kill is tripped, can_execute() blocks the whole tick (gate check
+        # runs before any sweep). Reset killed so the tick can reach the sweep again —
+        # the only dedup barrier we want to exercise here is naked_leg_halted.
+        with daemon_context.engine.begin() as conn:
+            from optionsbot.storage.schema import execution_state as _es
+            conn.execute(_es.update().values(killed=0))
+
+        alert_count_before = len(daemon_context.telegram.send_message.await_args_list)
+        _second = await run_exits_tick(daemon_context)
+        new_p1_alerts = [
+            c.args[0]
+            for c in daemon_context.telegram.send_message.await_args_list[alert_count_before:]
+            if "P1" in c.args[0] or "🛑" in c.args[0]
+        ]
+        assert new_p1_alerts == [], (
+            f"second tick must not re-alert via naked_leg_halted, got: {new_p1_alerts}"
+        )
+
+        # Broker was queried on both ticks (sweep still reads portfolio each tick;
+        # naked_leg_halted suppresses the alert but not the broker read itself).
+        assert mock_pc_instance.get_portfolio.await_count == 2
+
+        # No close order was submitted on either tick.
+        assert first.closes_submitted == 0
