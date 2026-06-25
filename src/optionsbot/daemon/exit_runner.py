@@ -135,20 +135,25 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     if not verdict.allowed:
         log.debug("exits tick skipped: %s", verdict.reason)
         return ExitsTickSummary(0, 0, 0)
-    if not is_market_open(now):
-        return ExitsTickSummary(0, 0, 0)
     md = _exec_md(context)
     if md is None:
         return ExitsTickSummary(0, 0, 0)
 
     entries = _open_entries(context)
     submitted = errors = 0
-    for entry in entries:
-        try:
-            submitted += await _manage_entry(context, md, entry, now)
-        except Exception:  # noqa: BLE001 -- one bad position must not starve the rest
-            errors += 1
-            log.exception("exit evaluation failed for entry #%s", entry.id)
+    # Order placement (TP / soft-stop / DTE / expiry closes) only runs during RTH
+    # -- a combo cannot fill when the market is closed. The detect-and-halt
+    # naked-short sweep below runs on EVERY tick, including outside RTH (IBK-142).
+    if is_market_open(now):
+        for entry in entries:
+            try:
+                submitted += await _manage_entry(context, md, entry, now)
+            except Exception:  # noqa: BLE001 -- one bad position must not starve the rest
+                errors += 1
+                log.exception("exit evaluation failed for entry #%s", entry.id)
+    # Post-close naked-short P1 sweep: a close that partial-fills near the bell can
+    # strand a short leg exposed overnight / over a weekend. Detect-and-halt (trip
+    # the kill + alert, no order placement) -> must run regardless of market hours.
     for entry in entries:
         try:
             if open_close_for(context.engine, entry.id) is None and _half_closed(

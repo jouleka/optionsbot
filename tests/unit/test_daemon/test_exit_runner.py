@@ -566,3 +566,60 @@ async def test_close_command_replay_is_idempotent_end_to_end(
     assert order_client.place_combo_limit.await_count == 1  # exactly one close placed
     assert str(entry_id) in first[0].text
     assert "already closing" in second[0].text.lower()
+
+
+# ---- IBK-142: exit-tick safety guards run outside market hours ----
+
+
+async def test_naked_short_sweep_runs_when_market_closed(
+    daemon_context: DaemonContext,
+) -> None:
+    # IBK-142: the post-close naked-short P1 sweep is detect-and-halt (no order
+    # placement), so it must run OUTSIDE market hours — a partial close near the
+    # bell can strand a short leg overnight/over a weekend, and the sweep must
+    # trip the kill + alert before the next session, not stay dormant.
+    entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
+    daemon_context.exec_ibkr = MagicMock()
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    residual = _residual_short_position(FAR)
+
+    with (
+        patch("optionsbot.daemon.exit_runner.is_market_open", return_value=False),
+        patch("optionsbot.daemon.exit_runner._exec_md",
+              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.ibkr.positions.PositionsClient", autospec=True) as MockPC,
+    ):
+        mock_pc = MagicMock()
+        mock_pc.get_portfolio = AsyncMock(return_value=[residual])
+        MockPC.return_value = mock_pc
+        summary = await run_exits_tick(daemon_context)
+
+    # The sweep ran despite the closed market: kill tripped + exactly one P1 alert.
+    assert load_state(daemon_context.engine).killed is True
+    p1 = [
+        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        if "P1" in c.args[0] or "🛑" in c.args[0]
+    ]
+    assert len(p1) == 1
+    assert entry_id in daemon_context.naked_leg_halted
+    # Order placement stays market-gated: no close orders were placed.
+    order_client.place_combo_limit.assert_not_awaited()
+    assert summary.closes_submitted == 0
+
+
+async def test_market_closed_skips_order_placement(
+    daemon_context: DaemonContext,
+) -> None:
+    # IBK-142 complement: with the market closed, a position that WOULD hit the
+    # expiry guard gets NO close placed (order placement stays gated), even though
+    # the tick now runs past the old early-return.
+    _filled_entry(daemon_context, expiry=NEAR)
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+    with (
+        patch("optionsbot.daemon.exit_runner.is_market_open", return_value=False),
+        patch("optionsbot.daemon.exit_runner._exec_md",
+              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+    order_client.place_combo_limit.assert_not_awaited()
+    assert summary.closes_submitted == 0
