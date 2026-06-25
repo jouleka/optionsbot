@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from sqlalchemy import insert, select, update
 
 from optionsbot.daemon.context import DaemonContext
@@ -17,6 +18,19 @@ from optionsbot.storage.schema import orders
 NOW = datetime.now(UTC)
 FAR = (NOW + timedelta(days=36)).strftime("%Y%m%d")
 NEAR = (NOW + timedelta(days=2)).strftime("%Y%m%d")
+
+
+@pytest.fixture(autouse=True)
+def _force_market_open():
+    """``run_exits_tick`` short-circuits when NYSE is closed (exit_runner.py).
+
+    Every test in this module asserts open-market exit behavior, so without
+    pinning the gate they only pass during live US trading hours and fail (or
+    pass vacuously with ``positions=0``) the rest of the day. Force the gate
+    open so the suite is deterministic regardless of wall-clock time.
+    """
+    with patch("optionsbot.daemon.exit_runner.is_market_open", return_value=True):
+        yield
 
 
 def _legs(expiry: str) -> list[dict[str, object]]:

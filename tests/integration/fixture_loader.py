@@ -15,17 +15,57 @@ No ``ib_async`` import is needed here: we emulate the shapes with
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+# Strategy viability is computed from option DTE against the real wall-clock
+# (``strategies/base.py`` uses ``date.today()``). A fixture with a hardcoded
+# expiry therefore rots: captured at ~``_FRONT_DTE`` days out, its DTE shrinks
+# as real time passes until every strategy filters it out and the scan scores
+# nothing. We re-anchor the fixture's nearest expiry to this many days from
+# today on load, preserving the spacing of any back-month expiries, so the
+# integration replay stays viable on any calendar day.
+_FRONT_DTE = 45
 
-def load_fixture(name: str) -> dict[str, Any]:
-    """Load ``tests/fixtures/ibkr/<name>.json``."""
+
+def _relativize_expiries(fixture: dict[str, Any], front_dte: int = _FRONT_DTE) -> None:
+    """Shift every expiry in ``fixture`` so its nearest one sits ``front_dte``
+    days from today, mutating ``option_params.expirations``, ``option_chain``
+    legs, and any ``positions`` legs in place (the lookup keys stay consistent
+    because both the param list and the chain legs are rewritten together)."""
+    params = fixture.get("option_params", {})
+    expirations = params.get("expirations") or []
+    if not expirations:
+        return
+    parsed = {e: datetime.strptime(e, "%Y%m%d").date() for e in set(expirations)}
+    delta = timedelta(days=front_dte) - (min(parsed.values()) - date.today())
+    remap = {old: (d + delta).strftime("%Y%m%d") for old, d in parsed.items()}
+
+    params["expirations"] = [remap[e] for e in expirations]
+    for leg in fixture.get("option_chain", []):
+        if leg.get("expiry") in remap:
+            leg["expiry"] = remap[leg["expiry"]]
+    for pos in fixture.get("positions", []):
+        if pos.get("expiry") in remap:
+            pos["expiry"] = remap[pos["expiry"]]
+
+
+def load_fixture(name: str, *, relativize_expiries: bool = True) -> dict[str, Any]:
+    """Load ``tests/fixtures/ibkr/<name>.json``.
+
+    By default the fixture's option expiries are re-anchored to today (see
+    ``_relativize_expiries``) so replay tests do not rot as the calendar
+    advances. Pass ``relativize_expiries=False`` for tests that assert on the
+    raw on-disk expiry strings.
+    """
     path = Path(__file__).resolve().parents[1] / "fixtures" / "ibkr" / f"{name}.json"
     with path.open() as f:
-        return json.load(f)
+        fixture: dict[str, Any] = json.load(f)
+    if relativize_expiries:
+        _relativize_expiries(fixture)
+    return fixture
 
 
 def _bar_mock(b: dict[str, Any]) -> MagicMock:
