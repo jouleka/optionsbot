@@ -6,7 +6,7 @@ trading days, half-days, and holidays. Equity options follow equity hours.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
@@ -39,3 +39,30 @@ def is_market_open(now: datetime) -> bool:
     # schedule() returns a DataFrame typed as Any; explicitly cast to bool
     # so mypy's no-any-return check is satisfied.
     return bool(market_open <= now <= market_close)
+
+
+def nyse_session_date(now: datetime) -> date:
+    """The America/New_York calendar date ``now`` belongs to.
+
+    This is the right anchor for "today's" trading bucket: the daily-loss
+    window must roll at ET midnight, NOT UTC midnight, or late-session losses
+    after ~20:00 ET (when the UTC date has already advanced) land in the wrong
+    day — and the ET/UTC offset itself shifts an hour across DST transitions.
+    """
+    if now.tzinfo is None:
+        raise ValueError("nyse_session_date requires a tz-aware datetime")
+    return now.astimezone(ET).date()
+
+
+def nyse_session_start_utc(now: datetime) -> datetime:
+    """UTC instant of ET midnight that opens ``now``'s NYSE session date.
+
+    Returned tz-aware in UTC so it compares directly against UTC-stored
+    ``closed_ts`` values. DST-correct: ET midnight is -04:00 in summer (EDT)
+    and -05:00 in winter (EST), and ``astimezone`` resolves the offset.
+    """
+    session = nyse_session_date(now)
+    et_midnight = datetime(
+        session.year, session.month, session.day, 0, 0, tzinfo=ET
+    )
+    return et_midnight.astimezone(UTC)
