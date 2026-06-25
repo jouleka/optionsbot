@@ -26,6 +26,7 @@ from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
     get_order,
+    open_position_legs,
     record_fill,
     set_fill_commission,
     transition,
@@ -37,6 +38,7 @@ from optionsbot.storage.schema import fills, orders
 
 if TYPE_CHECKING:
     from optionsbot.ibkr.orders import OrderClient
+    from optionsbot.ibkr.types import PortfolioPosition
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ class ReconcileSummary:
     fills_replayed: int
     resolved: int  # ledger rows whose status was corrected
     mismatches: int
+    orphan_positions: int = 0  # broker positions with no open ledger row
 
 
 async def _send(notify: Notify | None, text: str) -> None:
@@ -94,6 +97,7 @@ async def reconcile(
     walk_tasks: Any = None,
     walk_resume: Callable[..., Awaitable[int]] | None = None,
     settings: Any = None,
+    positions_snapshot: Callable[[], Awaitable[list[PortfolioPosition]]] | None = None,
 ) -> ReconcileSummary:
     """One full broker↔ledger convergence pass. Never raises."""
     ts_now = now if now is not None else datetime.now(UTC)
@@ -256,12 +260,50 @@ async def reconcile(
         except IllegalOrderTransition:
             log.warning("reconcile: race resolving order %s (%s)", row.id, row.status)
 
-    if adopted or foreign or replayed or resolved or mismatches:
+    # Work-stream D2: position-level compare. Beyond orders, ask the broker for
+    # OPEN POSITIONS and confirm every one maps to a leg the ledger believes is
+    # open. A broker position with no matching open ledger leg is a forgotten
+    # position — the most dangerous mismatch after a fill-the-books-deny, since
+    # it is unmanaged by the exit engine. Alert and trip the kill switch.
+    orphan_positions = 0
+    if positions_snapshot is not None:
+        try:
+            broker_positions = await positions_snapshot()
+        except Exception:  # noqa: BLE001 -- a dead positions read must not abort reconcile
+            log.exception("reconcile: positions snapshot failed")
+            broker_positions = []
+        ledger_legs = open_position_legs(engine)
+        for pos in broker_positions:
+            if pos.sec_type != "OPT" or pos.position == 0:
+                continue
+            if pos.expiry is None or pos.strike is None or pos.right is None:
+                continue
+            key = (pos.symbol, pos.expiry, float(pos.strike), pos.right)
+            if key in ledger_legs:
+                continue
+            orphan_positions += 1
+            trip_kill(
+                engine,
+                f"reconcile orphan position: broker holds {pos.position:+g} "
+                f"{pos.symbol} {pos.expiry} {pos.strike:g}{pos.right} with no "
+                "open ledger row",
+            )
+            await _send(
+                notify,
+                f"🛑 KILL SWITCH: broker holds an unmanaged position "
+                f"{pos.position:+g} {pos.symbol} {pos.expiry} {pos.strike:g}"
+                f"{pos.right} that the ledger has no open order for — the exit "
+                "engine will NOT manage it. /positions to inspect; flatten or "
+                "adopt manually, then /arm.",
+            )
+
+    if adopted or foreign or replayed or resolved or mismatches or orphan_positions:
         log.info(
-            "reconcile: adopted=%d foreign=%d fills=%d resolved=%d mismatches=%d",
-            adopted, foreign, replayed, resolved, mismatches,
+            "reconcile: adopted=%d foreign=%d fills=%d resolved=%d mismatches=%d "
+            "orphan_positions=%d",
+            adopted, foreign, replayed, resolved, mismatches, orphan_positions,
         )
     return ReconcileSummary(
         adopted=adopted, foreign=foreign, fills_replayed=replayed,
-        resolved=resolved, mismatches=mismatches,
+        resolved=resolved, mismatches=mismatches, orphan_positions=orphan_positions,
     )

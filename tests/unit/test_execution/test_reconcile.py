@@ -11,7 +11,7 @@ from sqlalchemy import Engine, insert, select, update
 from optionsbot.execution.orders import get_order, record_fill
 from optionsbot.execution.reconcile import reconcile
 from optionsbot.execution.state import load_state
-from optionsbot.ibkr.types import ExecutionFill
+from optionsbot.ibkr.types import ExecutionFill, PortfolioPosition
 from optionsbot.storage.schema import fills, orders
 
 NOW = datetime(2026, 6, 11, 16, 0, tzinfo=UTC)
@@ -240,3 +240,73 @@ async def test_reconcile_resumes_persisted_walks(tmp_db: Engine, monkeypatch: An
     )
     assert summary.adopted == 1
     assert resumed == [True]  # resume_walks was invoked with walk_tasks
+
+
+def _portfolio_pos(
+    symbol: str, *, strike: float, right: str, position: float,
+    expiry: str = "20260717",
+) -> PortfolioPosition:
+    return PortfolioPosition(
+        account="DU123", symbol=symbol, sec_type="OPT", expiry=expiry,
+        strike=strike, right=right, multiplier=100, position=position,  # type: ignore[arg-type]
+        avg_cost=120.0, market_price=1.2, market_value=120.0,
+        unrealized_pnl=0.0, realized_pnl=0.0,
+    )
+
+
+async def test_broker_position_with_no_ledger_row_alerts_and_kills(tmp_db: Engine) -> None:
+    # No open or filled ledger rows at all, but the broker holds an SPY put.
+    snapshot = [_portfolio_pos("SPY", strike=580.0, right="P", position=-1.0)]
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return snapshot
+
+    client = _client(open_orders=[], executions=[])
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db, client, notify=notify, now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+    assert summary.orphan_positions == 1
+    assert load_state(tmp_db).killed
+    assert any("KILL SWITCH" in m and "position" in m.lower() for m in sent)
+
+
+async def test_broker_position_matching_a_filled_ledger_order_is_fine(tmp_db: Engine) -> None:
+    # A filled open-intent order in the ledger that matches the broker position:
+    # no orphan, no kill.
+    order_id = _insert_order(tmp_db, "submitted")
+    from optionsbot.execution.orders import transition
+    transition(tmp_db, order_id, "filled", now=NOW)
+    snapshot = [
+        _portfolio_pos("SPY", strike=580.0, right="P", position=-1.0),
+        _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
+    ]
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return snapshot
+
+    client = _client(open_orders=[], executions=[])
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db, client, notify=notify, now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+    assert summary.orphan_positions == 0
+    assert not load_state(tmp_db).killed
+    assert not any("KILL SWITCH" in m for m in sent)
+
+
+async def test_position_snapshot_failure_does_not_crash_reconcile(tmp_db: Engine) -> None:
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        raise RuntimeError("gateway down")
+
+    client = _client(open_orders=[], executions=[])
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db, client, notify=notify, now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+    # A dead positions read must not abort reconcile or trip the kill switch.
+    assert summary.orphan_positions == 0
+    assert not load_state(tmp_db).killed

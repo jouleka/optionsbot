@@ -601,6 +601,42 @@ def open_orders(engine: Engine) -> list[OrderRecord]:
     return [_to_record(r) for r in rows]
 
 
+def open_position_legs(engine: Engine) -> set[tuple[str, str, float, str]]:
+    """The (symbol, expiry, strike, right) legs the ledger believes are OPEN.
+
+    An entry is open when its open-intent order is filled and no close order
+    that references it (closes_order_id) has filled. Used by reconcile's
+    position-compare to spot broker positions the ledger lacks."""
+    with engine.connect() as conn:
+        entries = conn.execute(
+            select(orders.c.id, orders.c.legs_json).where(
+                (orders.c.intent == "open") & (orders.c.status == "filled")
+            )
+        ).fetchall()
+        closed_entry_ids = {
+            r.closes_order_id
+            for r in conn.execute(
+                select(orders.c.closes_order_id).where(
+                    (orders.c.intent == "close")
+                    & (orders.c.status == "filled")
+                    & (orders.c.closes_order_id.isnot(None))
+                )
+            ).fetchall()
+        }
+    legs_out: set[tuple[str, str, float, str]] = set()
+    for entry in entries:
+        if entry.id in closed_entry_ids:
+            continue
+        for leg in entry.legs_json or []:
+            if leg.get("sec_type", "OPT") != "OPT":
+                continue
+            legs_out.add((
+                str(leg["symbol"]), str(leg["expiry"]),
+                float(leg["strike"]), str(leg["right"]),
+            ))
+    return legs_out
+
+
 def working_orders(engine: Engine) -> list[OrderRecord]:
     """Orders resting at IBKR (submitted/partial) — the reprice/TTL sweep set."""
     with engine.connect() as conn:
