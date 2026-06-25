@@ -175,6 +175,7 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
     # Task 6: PositionsClient must return a large USD equity so all picks pass
     # the single-trade-cap affordability gate (max_loss=0.0 always fits).
     from decimal import Decimal
+
     from optionsbot.ibkr.types import AccountSummary
     _fake_summary = AccountSummary(
         net_liquidation=Decimal("50000"), buying_power=None,
@@ -225,7 +226,9 @@ def test_rank_alert_candidates_floors_and_sorts() -> None:
         _pick("XYZ", 40.0, 0.99),   # below floor -> dropped despite high edge
     ]
     # Task 6: pass account_value_usd + single_trade_cap_pct (required by new signature)
-    out = rank_alert_candidates(picks, score_floor=50.0, account_value_usd=5000.0, single_trade_cap_pct=0.15)
+    out = rank_alert_candidates(
+        picks, score_floor=50.0, account_value_usd=5000.0, single_trade_cap_pct=0.15
+    )
     # Survivors (score>=50) ordered by edge desc: AAPL(0.10) then SPY(0.02).
     assert [sym for sym, _, _ in out] == ["AAPL", "SPY"]
 
