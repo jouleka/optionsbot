@@ -251,3 +251,33 @@ def test_execution_report_empty(tmp_db: Engine) -> None:
     report = execution_report(tmp_db)
     assert report.closed == 0
     assert report.sample_warning
+
+
+def test_loss_streak_suppresses_min1_floor() -> None:
+    # IBK-Phase0: with the drawdown governor active (>=3 straight losses),
+    # a trade whose sized quantity rounds to 0 must STAY 0 (skip), not get
+    # floored back up to the min-1 lot.
+    from optionsbot.execution.sizing import dynamic_quantity
+
+    # $5k equity, base 3% = $150; governor ×0.5 → $75 budget; $90 max loss
+    # → floor(75/90) = 0. Pre-fix this floored to 1; now it must be 0.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=90, max_profit_unit=30, prob_profit=0.70,
+        open_heat=0, recent_pnls=[-10, -20, -5], base_risk_pct=0.03,
+        heat_cap_pct=0.15, single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 0
+    assert "loss streak" in d.note
+
+
+def test_no_loss_streak_still_floors_to_min1() -> None:
+    # Same fitting trade with NO loss streak must still floor to the
+    # minimum-viable 1 lot (it fits both caps).
+    from optionsbot.execution.sizing import dynamic_quantity
+
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=90, max_profit_unit=30, prob_profit=0.70,
+        open_heat=0, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10,
+    )
+    assert d.quantity == 1 and "min-1" in d.note

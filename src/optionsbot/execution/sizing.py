@@ -117,6 +117,14 @@ def dynamic_quantity(
     quantity = math.floor(min(budget, single_cap, heat_room) / max_loss_unit)
     floored = ""
     if quantity == 0:
+        if streak >= 3:
+            # Drawdown governor is active: a losing streak that sizes to 0
+            # must SKIP the trade, not get floored up to a min-1 lot.
+            return SizeDecision(
+                0,
+                f"skipped — loss streak {streak} (governor ×{governor:.1f}) "
+                f"sizes below 1 lot; no min-1 floor while drawing down",
+            )
         quantity = 1  # minimum viable lot — it already fits both caps
         floored = ", min-1"
     note = (
