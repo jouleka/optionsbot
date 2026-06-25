@@ -49,10 +49,17 @@ async def auto_execute_candidates(
         else None
     )
     submitted = 0
+    log.info("auto-execute pass: %d candidate(s)", len(candidates))
     for symbol, scored, snapshot_id in candidates:
         try:
             score_id = _score_id_for(context, snapshot_id, scored.strategy_name)
             if score_id is None:
+                # Silent-skip guard: without this, a pick that can't be resolved
+                # to a strategy_scores row vanished with no trace in the journal.
+                log.warning(
+                    "auto-execute skip %s/%s: no score_id for snapshot %s",
+                    symbol, scored.strategy_name, snapshot_id,
+                )
                 continue
             deps = execution_engine.ExecutionDeps(
                 engine=context.engine,
@@ -67,6 +74,13 @@ async def auto_execute_candidates(
             outcome = await execution_engine.execute_pick(deps, score_id)
             if outcome.ok:
                 submitted += 1
+            # Mirror the Telegram outcome into the journal so "why didn't it
+            # trade?" is answerable from `journalctl` alone.
+            log.info(
+                "auto-execute %s/%s -> ok=%s | %s",
+                symbol, scored.strategy_name, outcome.ok,
+                outcome.message.replace("\n", " "),
+            )
             await _send(
                 context,
                 f"🤖 auto-execute {symbol} {scored.strategy_name}:\n{outcome.message}",

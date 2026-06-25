@@ -450,6 +450,39 @@ def test_rank_alert_candidates_keeps_only_positive_edge() -> None:
     assert [sym for sym, _, _ in out] == ["AAPL"]
 
 
+def test_rank_alert_candidates_drops_unaffordable() -> None:
+    """A pick whose per-contract max_loss exceeds the account net-liq is dropped
+    even with the higher score/edge (e.g. a $36k cash-secured put on a $5k
+    account); affordable defined-risk picks survive. Fail-open when account_value
+    is unknown or risk is undefined."""
+    from optionsbot.daemon.scan_runner import rank_alert_candidates
+
+    def _pick(sym, score, ev, max_loss):
+        scored = MagicMock(score=score)
+        scored.suggestion.expected_value = ev
+        scored.suggestion.risk_normalized_expectancy = ev / max_loss
+        scored.suggestion.max_loss = max_loss
+        return (sym, scored, 1)
+
+    cheap = _pick("SPY", 80.0, 10.0, 400.0)      # fits a $5k account
+    huge = _pick("TSLA", 90.0, 50.0, 36000.0)    # $36k CSP -> can't fit one lot
+
+    # With a known account, the oversized pick is dropped despite higher edge.
+    out = rank_alert_candidates([huge, cheap], score_floor=50.0, account_value=5000.0)
+    assert [sym for sym, _, _ in out] == ["SPY"]
+
+    # Fail-open: no account_value -> affordability not enforced, both kept.
+    out2 = rank_alert_candidates([huge, cheap], score_floor=50.0)
+    assert {sym for sym, _, _ in out2} == {"SPY", "TSLA"}
+
+    # Undefined risk (max_loss None) is kept even with a known small account
+    # (execute_pick gates defined-risk/margin downstream).
+    undef = _pick("QQQ", 70.0, 5.0, 500.0)
+    undef[1].suggestion.max_loss = None
+    out3 = rank_alert_candidates([undef], score_floor=50.0, account_value=5000.0)
+    assert [sym for sym, _, _ in out3] == ["QQQ"]
+
+
 async def test_run_scan_tick_logs_no_edge_suppression(
     daemon_context: DaemonContext,
 ) -> None:
