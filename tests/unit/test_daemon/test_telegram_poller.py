@@ -3,7 +3,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.telegram_poller import _initial_offset, poll_once
+from optionsbot.daemon.telegram_poller import (
+    _BACKLOG_MAX_AGE_S,
+    _initial_offset,
+    poll_once,
+)
 
 NOW_TS = 1_000_000.0
 
@@ -56,6 +60,22 @@ async def test_initial_offset_skips_stale_keeps_fresh(
     daemon_context.telegram.get_updates = AsyncMock(return_value=updates)
     offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
     assert offset == 41
+
+
+async def test_initial_offset_freshness_window_is_inclusive(
+    daemon_context: DaemonContext,
+) -> None:
+    # Exactly at the window edge counts as fresh (<= is inclusive); one second
+    # older is stale and dropped.
+    at_edge = [_update(41, "5356256463", "/status", date=int(NOW_TS) - _BACKLOG_MAX_AGE_S)]
+    daemon_context.telegram.get_updates = AsyncMock(return_value=at_edge)
+    assert await _initial_offset(daemon_context, now_ts=NOW_TS) == 41
+
+    just_over = [
+        _update(41, "5356256463", "/status", date=int(NOW_TS) - _BACKLOG_MAX_AGE_S - 1)
+    ]
+    daemon_context.telegram.get_updates = AsyncMock(return_value=just_over)
+    assert await _initial_offset(daemon_context, now_ts=NOW_TS) == 42
 
 
 async def test_initial_offset_empty_backlog_returns_none(

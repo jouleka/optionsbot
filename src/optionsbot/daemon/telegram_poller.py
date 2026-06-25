@@ -44,9 +44,10 @@ async def _initial_offset(
 
     Replay safety: this can re-deliver a command that was processed just before
     the daemon died (Telegram confirms an offset only on the next getUpdates).
-    That is harmless — the only side-effectful commands are idempotent against
+    That is harmless — the only POSITION-MUTATING commands are idempotent against
     replay: /execute refuses a pick that already has an order, /close refuses a
-    position already closing; read-only and /kill//arm replays are benign.
+    position already closing. Other replays at worst re-run a read/scan or
+    re-send a message the user already saw.
     """
     now_ts = now_ts if now_ts is not None else time.time()
     try:
@@ -59,6 +60,8 @@ async def _initial_offset(
     for update in updates:
         message = update.get("message") or {}
         date = message.get("date")
+        # A future-dated message (clock skew) gives a negative age and counts as
+        # fresh — the safe direction (process a recent command, don't drop it).
         if date is not None and (now_ts - float(date)) <= _BACKLOG_MAX_AGE_S:
             return int(update["update_id"])  # process from the first fresh command
     return int(updates[-1]["update_id"]) + 1  # all stale -> drop the backlog
