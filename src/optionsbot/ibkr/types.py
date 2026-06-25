@@ -107,6 +107,16 @@ class AccountSummary:
     buying_power: Decimal | None
     available_funds: Decimal | None
     currency: str
+    # IBK-122: USD per 1 unit of the account base currency. 1 when base is
+    # USD. net_liquidation is in base currency (EUR for this account) while
+    # strategy max_loss is USD, so callers compare via net_liquidation_usd.
+    fx_to_usd: Decimal = Decimal(1)
+
+    @property
+    def net_liquidation_usd(self) -> Decimal | None:
+        if self.net_liquidation is None:
+            return None
+        return self.net_liquidation * self.fx_to_usd
 
 
 @dataclass(frozen=True, slots=True)

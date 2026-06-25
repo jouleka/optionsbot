@@ -1,11 +1,11 @@
-"""Tests for positions + account-summary read-only access."""
+"""Tests for positions + account-summary read-only access (incl. EUR->USD)."""
 
 from __future__ import annotations
 
 import sys
 import time
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -145,3 +145,60 @@ async def test_get_account_summary_handles_missing_tags(positions_client, mock_i
     assert summary.net_liquidation is None
     assert summary.buying_power == Decimal("5000.00")
     assert summary.available_funds is None
+
+
+# ---------------------------------------------------------------------------
+# EUR -> USD conversion tests (Task 3 / IBK-122)
+# ---------------------------------------------------------------------------
+
+def _row(tag: str, value: str, currency: str) -> MagicMock:
+    r = MagicMock()
+    r.tag = tag
+    r.value = value
+    r.currency = currency
+    return r
+
+
+def test_account_summary_net_liq_usd_identity_for_usd() -> None:
+    s = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("5000"), currency="USD",
+    )
+    assert s.fx_to_usd == Decimal(1)
+    assert s.net_liquidation_usd == Decimal("5000")
+
+
+def test_account_summary_net_liq_usd_converts_eur() -> None:
+    # base EUR; ExchangeRate(USD)=0.80 EUR/USD -> usd_per_base = 1/0.80 = 1.25
+    s = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("4000"), currency="EUR",
+        fx_to_usd=Decimal("1.25"),
+    )
+    assert s.net_liquidation_usd == Decimal("6250")
+
+
+def test_account_summary_net_liq_usd_none_when_netliq_none() -> None:
+    s = AccountSummary(
+        net_liquidation=None, buying_power=None,
+        available_funds=None, currency="USD",
+    )
+    assert s.net_liquidation_usd is None
+
+
+async def test_get_account_summary_parses_eur_exchange_rate() -> None:
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(return_value=[
+        _row("NetLiquidation", "5000", "EUR"),
+        _row("AvailableFunds", "4000", "EUR"),
+        _row("ExchangeRate", "0.80", "USD"),   # 0.80 EUR per USD
+        _row("ExchangeRate", "1", "EUR"),
+    ])
+    client = MagicMock()
+    client.ib = ib
+    client.ensure_connected = AsyncMock()
+    pc = PositionsClient(client)
+    summary = await pc.get_account_summary()
+    assert summary.currency == "EUR"
+    assert summary.fx_to_usd == Decimal("1.25")          # 1 / 0.80
+    assert summary.net_liquidation_usd == Decimal("6250")  # 5000 * 1.25

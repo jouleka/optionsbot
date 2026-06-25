@@ -18,6 +18,7 @@ inside our running loop), so we use the awaitable
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
@@ -34,6 +35,7 @@ from optionsbot.ibkr.types import (
 if TYPE_CHECKING:
     from ib_async import Position
 
+log = logging.getLogger(__name__)
 
 _DEFAULT_TTL = 60.0  # seconds
 _ACCOUNT_TAGS = ("NetLiquidation", "BuyingPower", "AvailableFunds")
@@ -46,6 +48,26 @@ def _to_decimal(s: str | None) -> Decimal | None:
         return Decimal(s)
     except (InvalidOperation, ValueError):
         return None
+
+
+def _usd_per_base(rows: object, base_currency: str) -> Decimal:
+    """USD per 1 unit of the account base currency, from the $LEDGER rows.
+
+    IBKR reports an ``ExchangeRate`` row per held currency = base-currency
+    units per 1 unit of that currency. With base=EUR the ``currency="USD"``
+    row is EUR-per-USD, so USD-per-base = 1 / that. Falls back to 1 (treat
+    base as USD — the *conservative* direction, never over-sizing) when base
+    is already USD or the USD rate is unavailable.
+    """
+    if base_currency == "USD":
+        return Decimal(1)
+    for row in rows:  # type: ignore[attr-defined]
+        if getattr(row, "tag", None) == "ExchangeRate" and getattr(row, "currency", None) == "USD":
+            rate = _to_decimal(getattr(row, "value", None))
+            if rate and rate > 0:
+                return Decimal(1) / rate
+    log.warning("no USD ExchangeRate row for base %s; treating net-liq as USD 1:1", base_currency)
+    return Decimal(1)
 
 
 def _norm_right(right: str | None) -> OptionRight | None:
@@ -156,11 +178,13 @@ class PositionsClient:
                         getattr(row, "currency", "USD") or "USD",
                     )
             currency = next((c for (_, c) in by_tag.values()), "USD")
+            fx_to_usd = _usd_per_base(rows, currency)
             summary = AccountSummary(
                 net_liquidation=_to_decimal(by_tag.get("NetLiquidation", (None, ""))[0]),
                 buying_power=_to_decimal(by_tag.get("BuyingPower", (None, ""))[0]),
                 available_funds=_to_decimal(by_tag.get("AvailableFunds", (None, ""))[0]),
                 currency=currency,
+                fx_to_usd=fx_to_usd,
             )
             self._summary_cache = (now, summary)
             return summary
