@@ -502,3 +502,47 @@ async def test_force_close_without_order_client(daemon_context: DaemonContext) -
     # order_client stays None (fixture default) -> not configured.
     msg = await force_close_entry(daemon_context, entry_id)
     assert "not configured" in msg.lower()
+
+
+async def test_force_close_with_stale_quotes_places_and_skips_deferred_alert(
+    daemon_context: DaemonContext,
+) -> None:
+    # P1 (Opus review): a forced /close with STALE quotes must STILL place the
+    # close (priced off entry-net; the walk re-anchors) AND must NOT emit the
+    # "TP/stop deferred" staleness alert — that message is false on the forced path.
+    entry_id = _filled_entry(daemon_context)
+    daemon_context.settings.execution.exit_quote_max_age_seconds = 30
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+
+    stale_ts = NOW - timedelta(seconds=120)
+    md = MagicMock()
+
+    def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
+        mid = {(580.0, "P"): 0.80, (575.0, "P"): 0.30}[(strike, right)]
+        return OptionQuote(
+            symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
+            iv=None, delta=None, gamma=None, theta=None, vega=None,
+            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=md):
+        msg = await force_close_entry(daemon_context, entry_id)
+
+    order_client.place_combo_limit.assert_awaited_once()  # close DID place
+    assert str(entry_id) in msg
+    sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
+    assert not any("stale" in m.lower() or "deferred" in m.lower() for m in sent)
+
+
+async def test_force_close_on_half_closed_hands_off(daemon_context: DaemonContext) -> None:
+    # A half-closed position (abandoned close with a partial fill) must NOT be
+    # re-closed by /close either — the _half_closed guard hands off to the human.
+    entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner._exec_md",
+               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+        msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_not_awaited()
+    assert "no close placed" in msg.lower()

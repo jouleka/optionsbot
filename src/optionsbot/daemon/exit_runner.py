@@ -244,7 +244,11 @@ async def _manage_entry(
     )
     if stale:
         oldest = max(quote_ages.values())
-        if entry.id not in context.exit_stale_warned:
+        # Suppress the staleness ALERT on a forced /close: nothing is deferred
+        # there (the close still proceeds priced off entry-net + a walk re-anchor),
+        # so the "TP/stop deferred" message would be false/confusing. The pricing
+        # suppression (current_net=None) below still applies on both paths.
+        if forced_reason is None and entry.id not in context.exit_stale_warned:
             context.exit_stale_warned.add(entry.id)
             await _send(
                 context,
@@ -372,6 +376,10 @@ async def force_close_entry(
             f"#{entry_id} is {entry.intent}/{entry.status} — /close only acts on a "
             "filled open position (see /orders)"
         )
+    # Double-close guard. Safe without a lock only because neither this function
+    # nor _manage_entry awaits between this check and stage_close_order/transition
+    # — the cadence exits tick sees the resulting non-terminal close row. Keep it
+    # that way: any await inserted before staging reopens a double-close race.
     if open_close_for(engine, entry_id) is not None:
         return f"#{entry_id} {entry.symbol} {entry.strategy} is already closing"
     verdict = can_execute(context.settings, load_state(engine))
