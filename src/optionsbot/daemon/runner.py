@@ -6,6 +6,7 @@ import asyncio
 import logging
 import signal
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -101,36 +102,43 @@ class Daemon:
             return 1
 
         # IBK-128: startup reconciliation — adopt working orders across the
-        # restart, resolve crash-orphaned rows, replay missed fills. Failure
-        # must never block boot (the periodic pass retries).
+        # restart, resolve crash-orphaned rows, replay missed fills, and check
+        # for orphan broker positions (IBK-136: I2 fix — run unconditionally so
+        # the position-level compare fires even with zero open ledger rows).
+        # Failure must never block boot (the periodic pass retries).
         if self._context.order_client is not None:
             try:
-                from optionsbot.execution.orders import open_orders as _open_rows
                 from optionsbot.execution.reconcile import reconcile
 
-                if _open_rows(self._context.engine):
-                    telegram = self._context.telegram
+                telegram = self._context.telegram
 
-                    async def _notify(text: str) -> None:
-                        await telegram.send_message(text, parse_mode=None)
+                async def _notify(text: str) -> None:
+                    await telegram.send_message(text, parse_mode=None)
 
-                    from optionsbot.daemon.order_watcher import _walk_md_for
+                from optionsbot.daemon.order_watcher import _walk_md_for
 
-                    summary = await reconcile(
-                        self._context.engine,
-                        self._context.order_client,
-                        notify=_notify,
-                        walk_md=_walk_md_for(self._context),
-                        walk_tasks=self._context.walk_tasks,
-                        settings=self._settings,
-                    )
-                    log.info(
-                        "startup reconcile: adopted=%d foreign=%d fills=%d "
-                        "resolved=%d mismatches=%d",
-                        summary.adopted, summary.foreign, summary.fills_replayed,
-                        summary.resolved, summary.mismatches,
-                    )
-                    self._context.last_reconcile_ts = datetime.now(UTC)
+                async def _positions() -> Any:
+                    from optionsbot.ibkr.positions import PositionsClient
+
+                    async with self._context.ibkr_lock:  # type: ignore[union-attr]
+                        return await PositionsClient(self._context.ibkr).get_portfolio()  # type: ignore[union-attr]
+
+                summary = await reconcile(
+                    self._context.engine,
+                    self._context.order_client,
+                    notify=_notify,
+                    walk_md=_walk_md_for(self._context),
+                    walk_tasks=self._context.walk_tasks,
+                    settings=self._settings,
+                    positions_snapshot=_positions,
+                )
+                log.info(
+                    "startup reconcile: adopted=%d foreign=%d fills=%d "
+                    "resolved=%d mismatches=%d orphan_positions=%d",
+                    summary.adopted, summary.foreign, summary.fills_replayed,
+                    summary.resolved, summary.mismatches, summary.orphan_positions,
+                )
+                self._context.last_reconcile_ts = datetime.now(UTC)
             except Exception:
                 log.exception("startup reconciliation failed; periodic pass will retry")
 

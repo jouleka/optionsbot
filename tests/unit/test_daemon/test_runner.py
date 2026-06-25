@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from optionsbot.config import Settings
 from optionsbot.daemon.runner import Daemon
+from optionsbot.execution.reconcile import ReconcileSummary
 
 
 async def test_request_stop_sets_event() -> None:
@@ -149,3 +151,67 @@ async def test_request_reload_retains_task_and_guards_reentrancy(
     release.set()
     await task1
     assert task1.done()
+
+
+async def test_startup_reconcile_passes_positions_snapshot_with_zero_open_rows(
+    daemon_settings: Settings,
+    daemon_context: Any,
+    monkeypatch: Any,
+) -> None:
+    """IBK-136 I2: startup reconcile must call reconcile() with a non-None
+    positions_snapshot even when the ledger has ZERO open rows, so the
+    position-level orphan compare (Task 9) fires at boot and a fresh-start
+    orphan position trips the kill rather than waiting for the periodic pass.
+
+    This test FAILS against the pre-fix code because the old guard
+    ``if _open_rows(self._context.engine):`` skipped the reconcile entirely
+    when there were no open ledger rows.
+    """
+    d = Daemon(settings=daemon_settings)
+
+    # Wire connect/disconnect so start() doesn't error before the reconcile.
+    async def _ok_connect(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _ok_connect)
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.disconnect", AsyncMock())
+
+    # Inject a mock order_client so the startup reconcile block is entered.
+    daemon_context.order_client = MagicMock()
+
+    # Capture the kwargs reconcile() is called with.
+    captured: list[dict[str, Any]] = []
+
+    async def fake_reconcile(engine: Any, client: Any, **kwargs: Any) -> ReconcileSummary:
+        captured.append(kwargs)
+        return ReconcileSummary(0, 0, 0, 0, 0, 0)
+
+    monkeypatch.setattr("optionsbot.execution.reconcile.reconcile", fake_reconcile)
+
+    # Confirm there are genuinely ZERO open ledger rows (ledger is freshly
+    # migrated via daemon_engine fixture).
+    from optionsbot.execution.orders import open_orders
+    assert open_orders(daemon_context.engine) == []
+
+    # Patch _build_context to return the pre-built daemon_context so the
+    # Daemon uses our engine (with zero rows) and order_client.
+    monkeypatch.setattr(d, "_build_context", lambda: daemon_context)
+
+    async def _stop_soon() -> None:
+        await asyncio.sleep(0.02)
+        d.request_stop()
+
+    asyncio.create_task(_stop_soon())
+    code = await d.start()
+    assert code == 0
+
+    # Discriminating assertions:
+    # 1. reconcile() was called at all (failed with the old ``if open_rows`` guard).
+    assert len(captured) == 1, "startup reconcile must call reconcile() unconditionally"
+    # 2. positions_snapshot was passed and is not None (so Task-9 orphan compare runs).
+    assert "positions_snapshot" in captured[0], (
+        "startup reconcile must pass positions_snapshot= to reconcile()"
+    )
+    assert captured[0]["positions_snapshot"] is not None, (
+        "positions_snapshot must be a non-None callable, not omitted"
+    )
