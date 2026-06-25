@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -196,6 +196,27 @@ class ExecutionSettings(BaseModel):
     base_risk_pct: float = Field(default=0.03, gt=0.0, le=1.0)
     max_portfolio_heat_pct: float = Field(default=0.15, gt=0.0, le=1.0)
     max_single_trade_risk_pct: float = Field(default=0.10, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _enforce_phase0_ceilings(self) -> ExecutionSettings:
+        # Phase 0 hard ceilings: reject a config that lifts the risk caps
+        # past what is safe to run unattended 24/7. These are absolute
+        # upper bounds — the per-field Field(le=...) bounds are looser
+        # ranges; this guard is the safety backstop, applied on load.
+        ceilings: tuple[tuple[str, float], ...] = (
+            ("base_risk_pct", 0.05),
+            ("max_portfolio_heat_pct", 0.25),
+            ("max_single_trade_risk_pct", 0.15),
+            ("max_bp_usage_pct", 0.50),
+        )
+        for name, ceiling in ceilings:
+            value = getattr(self, name)
+            if value > ceiling:
+                raise ValueError(
+                    f"execution.{name}={value} exceeds the Phase 0 safety "
+                    f"ceiling of {ceiling}"
+                )
+        return self
 
 
 class StorageSettings(BaseModel):

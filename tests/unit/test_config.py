@@ -358,3 +358,74 @@ def test_execution_bounds_reject_out_of_range() -> None:
         ExecutionSettings(max_open_positions=0)
     with pytest.raises(ValidationError):
         ExecutionSettings(max_consecutive_losses=0)
+
+
+def test_execution_rejects_base_risk_above_ceiling() -> None:
+    # Phase 0 safety: base_risk_pct must not exceed 0.05.
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(base_risk_pct=0.25)
+
+
+def test_execution_rejects_heat_above_ceiling() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_portfolio_heat_pct=1.0)
+
+
+def test_execution_rejects_single_trade_above_ceiling() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_single_trade_risk_pct=1.0)
+
+
+def test_execution_rejects_bp_usage_above_ceiling() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_bp_usage_pct=0.95)
+
+
+def test_execution_accepts_values_at_the_ceiling() -> None:
+    # The ceilings themselves are valid (<=, not <).
+    from optionsbot.config import ExecutionSettings
+
+    e = ExecutionSettings(
+        base_risk_pct=0.05,
+        max_portfolio_heat_pct=0.25,
+        max_single_trade_risk_pct=0.15,
+        max_bp_usage_pct=0.50,
+    )
+    assert e.base_risk_pct == 0.05
+    assert e.max_portfolio_heat_pct == 0.25
+    assert e.max_single_trade_risk_pct == 0.15
+    assert e.max_bp_usage_pct == 0.50
+
+
+def test_aggressive_config_file_fails_to_load(tmp_path: Path) -> None:
+    # A config that lifts the caps the way the old aggressive live file did
+    # must be REJECTED at load time, not silently accepted.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[execution]\n"
+        "enabled = true\n"
+        "base_risk_pct = 0.25\n"
+        "max_single_trade_risk_pct = 1.0\n"
+        "max_portfolio_heat_pct = 1.0\n"
+        "max_bp_usage_pct = 0.95\n"
+    )
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        load_settings(config_file=cfg)
