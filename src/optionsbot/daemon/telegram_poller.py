@@ -2,14 +2,16 @@
 
 Long-polls getUpdates inside the daemon event loop, authorizes by chat_id, and
 dispatches to the command registry. The loop never dies on transient errors and
-exits cleanly on cancellation (daemon shutdown). Backlog from while the daemon
-was down is dropped on startup.
+exits cleanly on cancellation (daemon shutdown). Pre-startup backlog is processed
+only when fresh (e.g. a command sent seconds before a restart); genuinely-stale
+backlog is dropped so old commands never replay on startup.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from optionsbot.daemon.commands import CommandReply, dispatch
 from optionsbot.daemon.context import DaemonContext
@@ -18,6 +20,9 @@ log = logging.getLogger(__name__)
 
 _POLL_TIMEOUT = 30
 _ERROR_BACKOFF = 5.0
+# Process a command sent within this window before startup (e.g. one issued
+# seconds before a restart); drop genuinely-stale backlog older than this.
+_BACKLOG_MAX_AGE_S = 120
 _ACK = {
     "scan": "⏳ scanning, one moment…",
     "screen": "⏳ screening the universe…",
@@ -25,16 +30,38 @@ _ACK = {
 }
 
 
-async def _drop_backlog(context: DaemonContext) -> int | None:
-    """Return the starting offset, skipping any updates queued before startup."""
+async def _initial_offset(
+    context: DaemonContext, now_ts: float | None = None
+) -> int | None:
+    """Starting offset for the command loop.
+
+    Telegram retains commands sent while the daemon was down/restarting. We honor
+    a command sent shortly before a restart (message newer than
+    ``_BACKLOG_MAX_AGE_S``) but still DROP genuinely-stale backlog so an hours-old
+    /execute can never fire on startup. Returns the offset to begin polling from:
+    the first fresh update's id (process it + everything after), or last+1 when
+    all backlog is stale.
+
+    Replay safety: this can re-deliver a command that was processed just before
+    the daemon died (Telegram confirms an offset only on the next getUpdates).
+    That is harmless — the only side-effectful commands are idempotent against
+    replay: /execute refuses a pick that already has an order, /close refuses a
+    position already closing; read-only and /kill//arm replays are benign.
+    """
+    now_ts = now_ts if now_ts is not None else time.time()
     try:
-        updates = await context.telegram.get_updates(offset=-1, timeout=0)
+        updates = await context.telegram.get_updates(offset=None, timeout=0)
     except Exception:  # noqa: BLE001 -- best-effort; fall back to default offset
-        log.exception("getUpdates backlog drop failed; starting from default offset")
+        log.exception("getUpdates backlog scan failed; starting from default offset")
         return None
-    if updates:
-        return int(updates[-1]["update_id"]) + 1
-    return None
+    if not updates:
+        return None
+    for update in updates:
+        message = update.get("message") or {}
+        date = message.get("date")
+        if date is not None and (now_ts - float(date)) <= _BACKLOG_MAX_AGE_S:
+            return int(update["update_id"])  # process from the first fresh command
+    return int(updates[-1]["update_id"]) + 1  # all stale -> drop the backlog
 
 
 async def poll_once(context: DaemonContext, offset: int | None) -> int | None:
@@ -74,7 +101,7 @@ async def poll_once(context: DaemonContext, offset: int | None) -> int | None:
 
 async def poll_commands(context: DaemonContext) -> None:
     """Run the inbound command loop until cancelled."""
-    offset = await _drop_backlog(context)
+    offset = await _initial_offset(context)
     log.info("telegram command poller started")
     while True:
         try:

@@ -3,19 +3,93 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.telegram_poller import _drop_backlog, poll_once
+from optionsbot.daemon.telegram_poller import _initial_offset, poll_once
+
+NOW_TS = 1_000_000.0
 
 
-def _update(uid: int, chat_id: str, text: str) -> dict:
-    return {"update_id": uid, "message": {"chat": {"id": int(chat_id)}, "text": text}}
+def _update(uid: int, chat_id: str, text: str, date: int | None = None) -> dict:
+    message: dict = {"chat": {"id": int(chat_id)}, "text": text}
+    if date is not None:
+        message["date"] = date
+    return {"update_id": uid, "message": message}
 
 
-async def test_drop_backlog_advances_past_last(daemon_context: DaemonContext) -> None:
+async def test_initial_offset_drops_stale_backlog(daemon_context: DaemonContext) -> None:
+    # An old command in the backlog is dropped (offset advances past it) — keeps
+    # the original "don't replay stale commands on startup" safety.
+    updates = [_update(41, "5356256463", "/status", date=int(NOW_TS) - 3600)]
+    daemon_context.telegram.get_updates = AsyncMock(return_value=updates)
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+    assert offset == 42  # last+1 -> dropped
+
+
+async def test_initial_offset_dateless_update_treated_stale(
+    daemon_context: DaemonContext,
+) -> None:
+    # Defensive: an update with no date can't be confirmed fresh -> dropped.
     updates = [_update(41, "5356256463", "/status")]
     daemon_context.telegram.get_updates = AsyncMock(return_value=updates)
-    daemon_context.settings.telegram.chat_id = "5356256463"
-    offset = await _drop_backlog(daemon_context)
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
     assert offset == 42
+
+
+async def test_initial_offset_processes_fresh_backlog(
+    daemon_context: DaemonContext,
+) -> None:
+    # THE FIX: a command sent moments before a restart (fresh) is NOT dropped —
+    # the loop starts AT its update_id so poll_once dispatches it.
+    updates = [_update(41, "5356256463", "/close 8", date=int(NOW_TS) - 5)]
+    daemon_context.telegram.get_updates = AsyncMock(return_value=updates)
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+    assert offset == 41  # start AT the fresh command, not 42
+
+
+async def test_initial_offset_skips_stale_keeps_fresh(
+    daemon_context: DaemonContext,
+) -> None:
+    # Mixed backlog (stale then fresh): start at the first fresh update.
+    updates = [
+        _update(40, "5356256463", "/status", date=int(NOW_TS) - 7200),  # stale
+        _update(41, "5356256463", "/close 8", date=int(NOW_TS) - 10),   # fresh
+    ]
+    daemon_context.telegram.get_updates = AsyncMock(return_value=updates)
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+    assert offset == 41
+
+
+async def test_initial_offset_empty_backlog_returns_none(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.telegram.get_updates = AsyncMock(return_value=[])
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+    assert offset is None
+
+
+async def test_initial_offset_getupdates_failure_falls_back_to_none(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.telegram.get_updates = AsyncMock(side_effect=RuntimeError("net"))
+    offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+    assert offset is None
+
+
+async def test_fresh_backlog_command_reaches_dispatch_not_dropped(
+    daemon_context: DaemonContext,
+) -> None:
+    # End-to-end: compose the startup offset + first poll exactly as poll_commands
+    # does; the fresh backlog command must reach dispatch (the bug dropped it).
+    daemon_context.settings.telegram.chat_id = "5356256463"
+    fresh = _update(41, "5356256463", "/status", date=int(NOW_TS) - 5)
+    daemon_context.telegram.get_updates = AsyncMock(return_value=[fresh])
+    daemon_context.telegram.send_message = AsyncMock()
+    with patch(
+        "optionsbot.daemon.telegram_poller.dispatch", new=AsyncMock(return_value=[])
+    ) as disp:
+        offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
+        await poll_once(daemon_context, offset)
+    disp.assert_awaited_once()
+    assert disp.await_args.args[1] == "/status"
 
 
 async def test_poll_once_dispatches_authorized_and_advances_offset(
