@@ -546,3 +546,23 @@ async def test_force_close_on_half_closed_hands_off(daemon_context: DaemonContex
         msg = await force_close_entry(daemon_context, entry_id)
     order_client.place_combo_limit.assert_not_awaited()
     assert "no close placed" in msg.lower()
+
+
+async def test_close_command_replay_is_idempotent_end_to_end(
+    daemon_context: DaemonContext,
+) -> None:
+    # Replay-safety (Opus follow-up): dispatching /close twice — as a restart
+    # backlog replay would — must place EXACTLY ONE close. Exercises the full
+    # seam: dispatch -> _cmd_close -> force_close_entry -> open_close_for guard.
+    from optionsbot.daemon.commands import dispatch
+
+    daemon_context.settings.telegram.chat_id = "5356256463"
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    with patch("optionsbot.daemon.exit_runner._exec_md",
+               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+        first = await dispatch(daemon_context, f"/close {entry_id}")
+        second = await dispatch(daemon_context, f"/close {entry_id}")
+    assert order_client.place_combo_limit.await_count == 1  # exactly one close placed
+    assert str(entry_id) in first[0].text
+    assert "already closing" in second[0].text.lower()
