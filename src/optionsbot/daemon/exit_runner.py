@@ -198,6 +198,45 @@ async def _manage_entry(
     except Exception:  # noqa: BLE001 -- expiry guard must still work quote-blind
         log.warning("exit quotes failed for entry #%s — DTE rules only", entry.id)
 
+    # Quote-freshness gate (IBK-PHASE0-C1). If ANY quote feeding current_net is
+    # older than the threshold, drop current_net to None: evaluate_exit then
+    # takes its quote-blind path (expiry/DTE only), so a TP/soft stop can never
+    # be priced off a stale mid. Always log the timestamps the decision used.
+    max_age = context.settings.execution.exit_quote_max_age_seconds
+    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
+    if quotes:
+        log.info(
+            "exit quotes for entry #%s: %s",
+            entry.id,
+            ", ".join(
+                f"{spec[1]}{spec[2]}@{q.ts.isoformat()} (age {quote_ages[spec]:.0f}s)"
+                for spec, q in quotes.items()
+            ),
+        )
+    stale = bool(
+        max_age > 0
+        and current_net is not None
+        and any(age > max_age for age in quote_ages.values())
+    )
+    if stale:
+        oldest = max(quote_ages.values())
+        if entry.id not in context.exit_stale_warned:
+            context.exit_stale_warned.add(entry.id)
+            await _send(
+                context,
+                f"⚠ exit pricing for #{entry.id} {entry.symbol} {entry.strategy} "
+                f"suppressed: quotes are STALE (oldest {oldest:.0f}s > "
+                f"{max_age}s). TP/stop deferred; expiry/DTE rules still active.",
+            )
+        log.warning(
+            "exit #%s quote-priced exit suppressed (stale: oldest %.0fs > %ss)",
+            entry.id, oldest, max_age,
+        )
+        current_net = None
+        quotes = {}  # stale quotes must not price the close/walk either
+    else:
+        context.exit_stale_warned.discard(entry.id)
+
     reason = evaluate_exit(
         entry_net=entry_net, current_net=current_net, dte=dte,
         settings=context.settings,

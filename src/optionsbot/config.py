@@ -185,6 +185,14 @@ class ExecutionSettings(BaseModel):
     # bot position this many days before its NEAREST leg expiry.
     exit_stop_enabled: bool = False
     expiry_guard_dte: int = Field(default=3, ge=0)
+    # IBK-PHASE0-C1: quote-freshness gate for QUOTE-PRICED exits (TP/soft
+    # stop). If the option snapshots driving an exit decision are older than
+    # this many seconds, the quote-priced exit is SUPPRESSED for that tick
+    # (never price a close off a stale mid / cross a moved spread). The
+    # time-based expiry/DTE guard is unaffected and always fires. 0 disables
+    # the freshness gate (legacy behavior). Sized to the exit cadence and the
+    # delayed-feed latency.
+    exit_quote_max_age_seconds: int = Field(default=45, ge=0)
     # IBK-130 full-auto gates: reject new auto entries once this fraction of
     # net liquidation is already deployed ((net_liq - available)/net_liq).
     # Confirm-mode /execute is NOT bound by it — the human decides.

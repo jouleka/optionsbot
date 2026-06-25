@@ -201,3 +201,69 @@ async def test_missing_quote_skips_and_retries_later(
     assert summary.closes_submitted == 0
     assert summary.errors >= 0  # tick survives
     order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_stale_quote_suppresses_take_profit_and_alerts(
+    daemon_context: DaemonContext,
+) -> None:
+    # TP would fire (kept 58% of credit), but the quotes are older than the
+    # freshness threshold -> the quote-priced exit is suppressed and a
+    # staleness alert is sent exactly once. No close is placed.
+    _filled_entry(daemon_context)
+    daemon_context.settings.execution.exit_quote_max_age_seconds = 30
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+
+    stale_ts = NOW - timedelta(seconds=120)
+    md = MagicMock()
+
+    def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
+        mid = {(580.0, "P"): 0.80, (575.0, "P"): 0.30}[(strike, right)]
+        return OptionQuote(
+            symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
+            iv=None, delta=None, gamma=None, theta=None, vega=None,
+            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=md):
+        first = await run_exits_tick(daemon_context)
+        second = await run_exits_tick(daemon_context)
+
+    assert first.closes_submitted == 0
+    assert second.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    stale_alerts = [
+        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        if "stale" in c.args[0].lower()
+    ]
+    assert len(stale_alerts) == 1  # escalated exactly once
+
+
+async def test_stale_quote_still_allows_expiry_guard(
+    daemon_context: DaemonContext,
+) -> None:
+    # Even with stale quotes, the time-based expiry guard must still force a
+    # close (assignment/pin risk is not a function of quote freshness).
+    _filled_entry(daemon_context, expiry=NEAR)
+    daemon_context.settings.execution.exit_quote_max_age_seconds = 30
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+
+    stale_ts = NOW - timedelta(seconds=600)
+    md = MagicMock()
+
+    def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
+        mid = {(580.0, "P"): 1.40, (575.0, "P"): 0.30}[(strike, right)]
+        return OptionQuote(
+            symbol="SPY", expiry=NEAR, strike=strike, right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
+            iv=None, delta=None, gamma=None, theta=None, vega=None,
+            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=md):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()

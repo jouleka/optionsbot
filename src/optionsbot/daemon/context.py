@@ -60,3 +60,7 @@ class DaemonContext:
     # for the equity drawdown breaker (None until the first net-liq read this
     # session). The authoritative value lives on the execution_state row.
     day_start_net_liq: float | None = None
+    # IBK-PHASE0-C1: entries for which a stale-quote suppression of the
+    # quote-priced exit was already alerted (re-alerted only after a fresh
+    # quote clears it).
+    exit_stale_warned: set[int] = field(default_factory=set)
