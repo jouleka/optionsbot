@@ -131,29 +131,31 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     if context.order_client is None:
         return ExitsTickSummary(0, 0, 0)
     now = datetime.now(UTC)
-    verdict = can_execute(context.settings, load_state(context.engine))
-    if not verdict.allowed:
-        log.debug("exits tick skipped: %s", verdict.reason)
-        return ExitsTickSummary(0, 0, 0)
-    md = _exec_md(context)
-    if md is None:
+    entries = _open_entries(context)
+    if not entries:
         return ExitsTickSummary(0, 0, 0)
 
-    entries = _open_entries(context)
     submitted = errors = 0
-    # Order placement (TP / soft-stop / DTE / expiry closes) only runs during RTH
-    # -- a combo cannot fill when the market is closed. The detect-and-halt
-    # naked-short sweep below runs on EVERY tick, including outside RTH (IBK-142).
-    if is_market_open(now):
+    verdict = can_execute(context.settings, load_state(context.engine))
+    md = _exec_md(context)
+    # Order placement (TP / soft-stop / DTE / expiry closes) requires the
+    # execution interlock open AND a live quote source AND an open market -- a
+    # combo cannot fill while killed, without quotes, or outside RTH.
+    if verdict.allowed and md is not None and is_market_open(now):
         for entry in entries:
             try:
                 submitted += await _manage_entry(context, md, entry, now)
             except Exception:  # noqa: BLE001 -- one bad position must not starve the rest
                 errors += 1
                 log.exception("exit evaluation failed for entry #%s", entry.id)
-    # Post-close naked-short P1 sweep: a close that partial-fills near the bell can
-    # strand a short leg exposed overnight / over a weekend. Detect-and-halt (trip
-    # the kill + alert, no order placement) -> must run regardless of market hours.
+    elif not verdict.allowed:
+        log.debug("exits tick: order placement skipped: %s", verdict.reason)
+    # Post-close naked-short P1 sweep: detect-and-halt (trip the kill + alert, no
+    # order placement). It reads only the broker portfolio, so it runs on EVERY
+    # tick regardless of the interlock, market hours, or quote availability
+    # (IBK-142 freed it from the market-hours gate; IBK-145 from can_execute + md)
+    # -- a residual naked short is most dangerous exactly when the account is
+    # halted or the market is closed.
     for entry in entries:
         try:
             if open_close_for(context.engine, entry.id) is None and _half_closed(

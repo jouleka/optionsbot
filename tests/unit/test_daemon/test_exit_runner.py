@@ -403,13 +403,10 @@ async def test_post_close_naked_short_trips_kill_and_alerts_p1(
         assert entry_id in daemon_context.naked_leg_halted
 
         # --- Second tick: naked_leg_halted dedup suppresses re-alert ---
-        # After the kill is tripped, can_execute() blocks the whole tick (gate check
-        # runs before any sweep). Reset killed so the tick can reach the sweep again —
-        # the only dedup barrier we want to exercise here is naked_leg_halted.
-        with daemon_context.engine.begin() as conn:
-            from optionsbot.storage.schema import execution_state as _es
-            conn.execute(_es.update().values(killed=0))
-
+        # IBK-145: the sweep runs even with the kill tripped (it reads the broker,
+        # places no orders), so we do NOT reset killed here. The only dedup barrier
+        # under test is naked_leg_halted, which suppresses the repeat P1 alert.
+        assert load_state(daemon_context.engine).killed is True
         alert_count_before = len(daemon_context.telegram.send_message.await_args_list)
         _second = await run_exits_tick(daemon_context)
         new_p1_alerts = [
@@ -603,6 +600,73 @@ async def test_naked_short_sweep_runs_when_market_closed(
     assert len(p1) == 1
     assert entry_id in daemon_context.naked_leg_halted
     # Order placement stays market-gated: no close orders were placed.
+    order_client.place_combo_limit.assert_not_awaited()
+    assert summary.closes_submitted == 0
+
+
+async def test_naked_short_sweep_runs_when_kill_switched(
+    daemon_context: DaemonContext,
+) -> None:
+    # IBK-145: the detect-and-halt sweep must run even when the execution
+    # interlock is tripped -- a stranded naked short is most dangerous exactly
+    # when the account is halted. With can_execute() false (kill switch), the
+    # sweep still reads the broker, keeps the kill tripped, and sends the P1 alert,
+    # while order placement stays blocked.
+    entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
+    daemon_context.exec_ibkr = MagicMock()
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    residual = _residual_short_position(FAR)
+    trip_kill(daemon_context.engine, "operator halt")  # interlock tripped BEFORE the tick
+
+    with (
+        patch("optionsbot.daemon.exit_runner._exec_md",
+              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.ibkr.positions.PositionsClient", autospec=True) as MockPC,
+    ):
+        mock_pc = MagicMock()
+        mock_pc.get_portfolio = AsyncMock(return_value=[residual])
+        MockPC.return_value = mock_pc
+        summary = await run_exits_tick(daemon_context)
+
+    assert load_state(daemon_context.engine).killed is True
+    p1 = [
+        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        if "P1" in c.args[0] or "🛑" in c.args[0]
+    ]
+    assert len(p1) == 1                                   # sweep alerted despite the kill
+    assert entry_id in daemon_context.naked_leg_halted
+    order_client.place_combo_limit.assert_not_awaited()   # placement still interlocked
+    assert summary.closes_submitted == 0
+    assert summary.positions == 1                          # real count even while killed
+
+
+async def test_naked_short_sweep_runs_when_md_unavailable(
+    daemon_context: DaemonContext,
+) -> None:
+    # IBK-145: the sweep reads broker positions, not market data, so it must run
+    # even when the exec quote source is down (md is None) -- the md gate only
+    # blocks order placement.
+    entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
+    daemon_context.exec_ibkr = MagicMock()
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    residual = _residual_short_position(FAR)
+
+    with (
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=None),  # md down
+        patch("optionsbot.ibkr.positions.PositionsClient", autospec=True) as MockPC,
+    ):
+        mock_pc = MagicMock()
+        mock_pc.get_portfolio = AsyncMock(return_value=[residual])
+        MockPC.return_value = mock_pc
+        summary = await run_exits_tick(daemon_context)
+
+    assert load_state(daemon_context.engine).killed is True
+    p1 = [
+        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        if "P1" in c.args[0] or "🛑" in c.args[0]
+    ]
+    assert len(p1) == 1
+    assert entry_id in daemon_context.naked_leg_halted
     order_client.place_combo_limit.assert_not_awaited()
     assert summary.closes_submitted == 0
 
