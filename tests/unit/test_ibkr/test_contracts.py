@@ -164,3 +164,55 @@ async def test_qualify_options_only_qualifies_the_misses(resolver, mock_ib) -> N
     assert set(out.keys()) == {seeded, fresh}  # both returned
     mock_ib.qualifyContractsAsync.assert_awaited_once()  # only the miss qualified
     assert len(mock_ib.qualifyContractsAsync.await_args.args) == 1  # just 405C
+
+
+# --- listed_strikes: per-expiry real strike enumeration (IBK-147) ----------
+
+
+def _contract_details(
+    *, symbol: str = "SPY", expiry: str = "20260918", strike: float = 400.0, right: str = "C"
+) -> MagicMock:
+    """Mimic one ContractDetails row: a fully-qualified contract under .contract."""
+    cd = MagicMock()
+    cd.contract = _qualified_option(symbol=symbol, expiry=expiry, strike=strike, right=right)
+    return cd
+
+
+async def test_listed_strikes_returns_sorted_distinct_per_expiry(resolver, mock_ib) -> None:
+    mock_ib.reqContractDetailsAsync.return_value = [
+        _contract_details(expiry="20260918", strike=s, right=r)
+        for s in (535.0, 525.0, 530.0)
+        for r in ("C", "P")
+    ]
+    strikes = await resolver.listed_strikes("SPY", "20260918")
+    assert strikes == [525.0, 530.0, 535.0]  # sorted, deduped across both rights
+    mock_ib.reqContractDetailsAsync.assert_awaited_once()
+
+
+async def test_listed_strikes_empty_when_no_contracts(resolver, mock_ib) -> None:
+    mock_ib.reqContractDetailsAsync.return_value = []
+    assert await resolver.listed_strikes("SPY", "20260918") == []
+
+
+async def test_listed_strikes_returns_empty_on_ib_error(resolver, mock_ib) -> None:
+    """Enumeration is best-effort: an IBKR/transport error yields [] (the caller
+    falls back to the union grid) rather than propagating and crashing the scan."""
+    mock_ib.reqContractDetailsAsync.side_effect = ConnectionError("gateway dropped")
+    assert await resolver.listed_strikes("SPY", "20260918") == []
+
+
+async def test_listed_strikes_primes_qualify_cache(resolver, mock_ib) -> None:
+    """The enumerated, already-qualified contracts are cached, so a follow-up
+    qualify_options for those (expiry, strike, right) specs is a pure cache hit
+    -- no second round trip, no Error 200 on non-existent strikes."""
+    mock_ib.reqContractDetailsAsync.return_value = [
+        _contract_details(expiry="20260918", strike=s, right=r)
+        for s in (525.0, 530.0)
+        for r in ("C", "P")
+    ]
+    await resolver.listed_strikes("SPY", "20260918")
+    out = await resolver.qualify_options(
+        "SPY", [("20260918", 525.0, "C"), ("20260918", 530.0, "P")]
+    )
+    assert set(out.keys()) == {("20260918", 525.0, "C"), ("20260918", 530.0, "P")}
+    mock_ib.qualifyContractsAsync.assert_not_awaited()  # served entirely from primed cache

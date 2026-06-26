@@ -8,6 +8,7 @@ of truth and contracts don't change mid-session.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -16,6 +17,8 @@ from optionsbot.ibkr.types import OptionRight
 
 if TYPE_CHECKING:
     from ib_async import Contract
+
+log = logging.getLogger(__name__)
 
 
 _CacheKey = tuple[str, str, str | None, float | None, str | None]
@@ -125,6 +128,52 @@ class ContractResolver:
                 self._cache[key] = contract
                 result[spec] = contract
         return result
+
+    async def listed_strikes(
+        self,
+        symbol: str,
+        expiry: str,
+        exchange: str = "SMART",
+    ) -> list[float]:
+        """Return the strikes ACTUALLY listed for one specific expiry.
+
+        ``reqSecDefOptParams`` reports the UNION of strikes across all of an
+        underlying's expirations, so a strike present there may not exist for a
+        given (especially far-dated) expiry -- a longer-dated month often lists a
+        sparser grid (e.g. $5 vs the front week's $1). Qualifying those phantom
+        strikes spams IBKR ``Error 200`` and wastes round trips.
+
+        This enumerates the real per-expiry grid via a single
+        ``reqContractDetails`` on a strike-less partial option, and primes the
+        qualified-contract cache with every returned contract so a subsequent
+        ``qualify_options`` for those legs is a pure cache hit (no extra round
+        trip, no phantom-strike Error 200). Returns ``[]`` if the expiry has no
+        listed contracts (caller may fall back to the union grid).
+        """
+        await self._client.ensure_connected()
+        from ib_async import Option
+        partial = Option(symbol, expiry, 0.0, "", exchange)
+        try:
+            details = await self._client.ib.reqContractDetailsAsync(partial)
+        except Exception:  # noqa: BLE001 -- best-effort; caller falls back to union
+            log.debug("listed_strikes(%s, %s) enumeration failed", symbol, expiry)
+            return []
+        strikes: set[float] = set()
+        for cd in details or []:
+            contract = getattr(cd, "contract", None)
+            if contract is None:
+                continue
+            strike = getattr(contract, "strike", None)
+            right = getattr(contract, "right", None)
+            if strike is None or right not in ("C", "P"):
+                continue
+            strike = float(strike)
+            strikes.add(strike)
+            # Key with the REQUESTED symbol/expiry so the entry matches the key
+            # qualify_options builds for the same spec (the contract echoes them).
+            key = _contract_cache_key("OPT", symbol, expiry, strike, right)
+            self._cache[key] = cast("Contract", contract)
+        return sorted(strikes)
 
     async def qualify(self, contract: Contract) -> Contract:
         """Qualify an already-constructed Contract. Used for advanced flows."""

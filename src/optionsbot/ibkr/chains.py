@@ -199,20 +199,31 @@ class ChainClient:
             if underlying_price is not None and underlying_price > 0
             else statistics.median(strikes)
         )
-        strikes = _select_strikes(strikes, reference, strike_band_pct, max_strikes_per_side)
-        if not strikes:
-            return []
-        # Build the full leg set, then fetch it in chunks bounded by the
-        # simultaneous market-data line cap. Each chunk subscribes all its legs,
-        # waits ONCE, reads, then cancels -- so greeks for a whole chunk compute
-        # in parallel server-side instead of one leg at a time.
+        # Select strikes PER EXPIRY from that expiry's REAL listed grid rather
+        # than the cross-expiry UNION reqSecDefOptParams returns. A far-dated
+        # month lists a sparser grid (e.g. $5 vs the front week's $1), so the
+        # union contains strikes that don't exist for it -- qualifying those
+        # spams IBKR Error 200 and wastes round trips. ``listed_strikes`` also
+        # primes the qualify cache, so _fetch_chunk re-qualifies nothing. Fall
+        # back to the union if per-expiry enumeration is empty (no worse than
+        # before, never drops the expiry).
         rights: tuple[OptionRight, ...] = ("C", "P")
-        specs: list[_LegSpec] = [
-            (expiry, strike, right)
-            for expiry in expiries
-            for strike in strikes
-            for right in rights
-        ]
+        specs: list[_LegSpec] = []
+        for expiry in expiries:
+            listed = await self._resolver.listed_strikes(symbol, expiry)
+            expiry_strikes = listed or strikes
+            selected = _select_strikes(
+                expiry_strikes, reference, strike_band_pct, max_strikes_per_side
+            )
+            specs.extend(
+                (expiry, strike, right) for strike in selected for right in rights
+            )
+        if not specs:
+            return []
+        # Fetch the leg set in chunks bounded by the simultaneous market-data
+        # line cap. Each chunk subscribes all its legs, waits ONCE, reads, then
+        # cancels -- so greeks for a whole chunk compute in parallel server-side
+        # instead of one leg at a time.
         legs: list[OptionChainLeg] = []
         for chunk in _chunked(specs, self._max_lines):
             legs.extend(await self._fetch_chunk(symbol, chunk))

@@ -393,3 +393,107 @@ async def test_chain_fetches_front_and_back_month(chain_client, mock_ib) -> None
     mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
     legs = await chain_client.get_chain("SPY", dte_window=(25, 55), back_dte_gap=30)
     assert {leg.expiry for leg in legs} == {_expiry(45), _expiry(75)}
+
+
+# --- per-expiry real strike selection (IBK-147) ----------------------------
+
+
+def _contract_details(*, expiry: str, strike: float, right: str) -> MagicMock:
+    cd = MagicMock()
+    cd.contract = _qualified_option(expiry=expiry, strike=strike, right=right)
+    return cd
+
+
+def _listed_details(strikes_by_expiry: dict[str, list[float]]):
+    """reqContractDetailsAsync side_effect: return per-expiry ContractDetails for
+    a strike-less partial option (the per-expiry ground truth)."""
+
+    def _details(contract, *a, **k):
+        expiry = contract.lastTradeDateOrContractMonth
+        return [
+            _contract_details(expiry=expiry, strike=s, right=r)
+            for s in strikes_by_expiry.get(expiry, [])
+            for r in ("C", "P")
+        ]
+
+    return _details
+
+
+async def test_chain_uses_per_expiry_listed_strikes(chain_client, mock_ib) -> None:
+    """reqSecDefOptParams returns the UNION of strikes across all expiries, but a
+    far-dated month lists a sparser grid. get_chain must select each expiry's band
+    from its OWN listed strikes -- so a strike that exists only on the front month
+    never produces a (non-existent) back-month leg (the Error 200 root cause)."""
+    front, back = _expiry(45), _expiry(80)
+    # Union from reqSecDefOptParams: dense -- includes 528, which exists ONLY on
+    # the front month (a $1 strike absent from the back month's $5 grid).
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params(
+        [front, back], [525.0, 528.0, 530.0, 535.0]
+    )
+    mock_ib.reqContractDetailsAsync.side_effect = _listed_details(
+        {
+            front: [525.0, 528.0, 530.0, 535.0],  # dense $1 grid
+            back: [525.0, 530.0, 535.0],  # sparse $5 grid -- NO 528
+        }
+    )
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain(
+        "SPY",
+        dte_window=(25, 55),
+        underlying_price=530.0,
+        strike_band_pct=0.10,
+        max_strikes_per_side=10,
+        back_dte_gap=30,
+    )
+    front_strikes = {leg.strike for leg in legs if leg.expiry == front}
+    back_strikes = {leg.strike for leg in legs if leg.expiry == back}
+    assert 528.0 in front_strikes  # exists on the front -> kept
+    assert 528.0 not in back_strikes  # absent on the back -> never requested
+    assert back_strikes == {525.0, 530.0, 535.0}
+
+
+async def test_chain_enumerates_strikes_once_per_expiry(chain_client, mock_ib) -> None:
+    front, back = _expiry(45), _expiry(80)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([front, back], [400.0])
+    mock_ib.reqContractDetailsAsync.side_effect = _listed_details(
+        {front: [400.0], back: [400.0]}
+    )
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    await chain_client.get_chain("SPY", dte_window=(25, 55), back_dte_gap=30)
+    assert mock_ib.reqContractDetailsAsync.await_count == 2  # one enumeration per expiry
+
+
+async def test_chain_primes_cache_so_qualify_options_is_a_hit(chain_client, mock_ib) -> None:
+    """listed_strikes returns fully-qualified contracts; priming the resolver cache
+    makes _fetch_chunk's qualify_options a pure cache hit -> the only
+    qualifyContractsAsync call is the underlying stock (no per-leg re-qualify)."""
+    exp = _expiry(35)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([exp], [400.0, 405.0])
+    mock_ib.reqContractDetailsAsync.side_effect = _listed_details({exp: [400.0, 405.0]})
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain("SPY", dte_window=(25, 55), underlying_price=400.0)
+    assert len(legs) == 4  # 2 strikes x 2 rights
+    # 1 qualify for the stock; the option legs are served from the primed cache.
+    assert mock_ib.qualifyContractsAsync.await_count == 1
+
+
+async def test_chain_falls_back_to_union_when_enumeration_empty(chain_client, mock_ib) -> None:
+    """If per-expiry enumeration yields nothing (transient/unavailable), fall back
+    to the union strike grid -- no worse than the pre-fix behavior -- rather than
+    dropping the expiry entirely."""
+    exp = _expiry(35)
+    mock_ib.reqSecDefOptParamsAsync.return_value = _opt_params([exp], [395.0, 400.0, 405.0])
+    mock_ib.reqContractDetailsAsync.return_value = []  # enumeration empty
+    mock_ib.qualifyContractsAsync.side_effect = _qualify_side_effect
+    mock_ib.reqMktData.return_value = _ticker(bid=5.0, ask=5.1)
+    legs = await chain_client.get_chain(
+        "SPY",
+        dte_window=(25, 55),
+        underlying_price=400.0,
+        strike_band_pct=0.10,
+        max_strikes_per_side=10,
+    )
+    assert sorted({leg.strike for leg in legs}) == [395.0, 400.0, 405.0]

@@ -184,6 +184,42 @@ def build_ib_mock(*fixtures: dict[str, Any]) -> MagicMock:
 
     ib.qualifyContractsAsync = AsyncMock(side_effect=_qualify)
 
+    # reqContractDetailsAsync(partial): enumerate the REAL listed contracts for
+    # one expiry (strike-less partial option). get_chain uses this to select
+    # strikes per-expiry rather than from the cross-expiry union; we derive the
+    # per-expiry grid from the fixture's own option_chain (IBK-147).
+    async def _contract_details(contract: Any) -> list[MagicMock]:
+        symbol = getattr(contract, "symbol", None)
+        expiry = getattr(contract, "lastTradeDateOrContractMonth", "")
+        fx = by_symbol.get(symbol)
+        if fx is None:
+            return []
+        out: list[MagicMock] = []
+        seen: set[tuple[float, str]] = set()
+        for leg in fx["option_chain"]:
+            if leg["expiry"] != expiry:
+                continue
+            key = (leg["strike"], leg["right"])
+            if key in seen:
+                continue
+            seen.add(key)
+            c = MagicMock()
+            c.symbol = symbol
+            c.secType = "OPT"
+            c.lastTradeDateOrContractMonth = expiry
+            c.strike = leg["strike"]
+            c.right = leg["right"]
+            c.exchange = "SMART"
+            c.currency = "USD"
+            c.multiplier = "100"
+            c.conId = abs(hash((symbol, expiry, leg["strike"], leg["right"]))) & 0xFFFFFFFF
+            cd = MagicMock()
+            cd.contract = c
+            out.append(cd)
+        return out
+
+    ib.reqContractDetailsAsync = AsyncMock(side_effect=_contract_details)
+
     # reqSecDefOptParamsAsync: return option_params for the matching symbol.
     async def _opt_params(
         symbol: str,

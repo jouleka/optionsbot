@@ -30,6 +30,10 @@ def mock_ib() -> MagicMock:
     ib.qualifyContractsAsync = AsyncMock()
     ib.reqTickersAsync = AsyncMock()
     ib.reqSecDefOptParamsAsync = AsyncMock()
+    # Per-expiry strike enumeration. Defaults to [] so tests that don't model a
+    # specific listed grid exercise get_chain's union-strike fallback path;
+    # tests covering per-expiry selection set .return_value / .side_effect.
+    ib.reqContractDetailsAsync = AsyncMock(return_value=[])
     ib.reqHistoricalDataAsync = AsyncMock()
     ib.accountSummaryAsync = AsyncMock()
     # Sync methods (return values directly on the real IB):
