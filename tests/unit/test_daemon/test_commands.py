@@ -73,6 +73,7 @@ async def test_scan_returns_formatted_picks(daemon_context: DaemonContext) -> No
     sug.defined_risk = True
     sug.credit_or_debit = 1.0
     sug.max_loss = 2.0
+    sug.max_profit = 4.0
     sug.prob_profit = 0.6
     sug.reward_risk = 1.0
     sug.expected_value = 5.0
@@ -148,6 +149,7 @@ async def test_scan_orders_picks_by_edge(daemon_context: DaemonContext) -> None:
         sug.defined_risk = True
         sug.credit_or_debit = 1.0
         sug.max_loss = 2.0
+        sug.max_profit = 4.0
         sug.prob_profit = 0.6
         sug.reward_risk = 1.0
         sug.expected_value = 5.0
@@ -194,6 +196,7 @@ async def test_scan_warns_and_orders_when_no_positive_edge(
         sug.defined_risk = True
         sug.credit_or_debit = 1.0
         sug.max_loss = max_loss
+        sug.max_profit = 1.0
         sug.prob_profit = 0.6
         sug.reward_risk = 1.0
         sug.expected_value = ev
@@ -257,6 +260,7 @@ async def test_scan_includes_execute_hint_when_armed(
     sug.defined_risk = True
     sug.credit_or_debit = 1.0
     sug.max_loss = 2.0
+    sug.max_profit = 4.0
     sug.prob_profit = 0.6
     sug.reward_risk = 1.0
     sug.expected_value = 5.0
@@ -491,6 +495,7 @@ async def test_cmd_scan_filters_unaffordable(daemon_context: DaemonContext) -> N
         sug.defined_risk = True
         sug.credit_or_debit = 1.0
         sug.max_loss = max_loss
+        sug.max_profit = 1.0
         sug.prob_profit = 0.6
         sug.reward_risk = 1.0
         sug.expected_value = 5.0

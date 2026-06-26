@@ -101,8 +101,11 @@ async def test_manage_tick_tolerates_spot_failure(daemon_engine, daemon_settings
 def _profit_book() -> list[PortfolioPosition]:
     # QQQ short put, far OTM vs the mocked spot (99) and far-dated, so the ONLY possible
     # trigger is profit: avg_cost 250 (net credit), up $200 -> 80% -> take_profit.
+    # Expiry is relative to today (+60d, beyond manage_dte=21) so the DTE never rots
+    # into the dte_manage/dte_urgent buckets and adds a spurious second alert.
+    expiry = (date.today() + timedelta(days=60)).strftime("%Y%m%d")
     return [PortfolioPosition(
-        account="DU1", symbol="QQQ", sec_type="OPT", expiry="20260717", strike=80.0,
+        account="DU1", symbol="QQQ", sec_type="OPT", expiry=expiry, strike=80.0,
         right="P", multiplier=100, position=-1.0, avg_cost=250.0, market_price=0.5,
         market_value=-50.0, unrealized_pnl=200.0, realized_pnl=0.0,
     )]

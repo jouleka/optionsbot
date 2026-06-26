@@ -40,6 +40,25 @@ def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
     )
 
 
+def _mock_positions(net_liq: float = 5000.0) -> MagicMock:
+    """A PositionsClient whose get_account_summary returns a USD net-liq, so the
+    IBK-146 affordability gate in run_scan_tick passes (without it, account_value
+    is None and rank_alert_candidates fail-closes, dropping every pick)."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
+
+    summary = AccountSummary(
+        net_liquidation=Decimal(str(net_liq)),
+        buying_power=None,
+        available_funds=Decimal(str(net_liq)),
+        currency="USD",
+    )
+    pos = MagicMock()
+    pos.get_account_summary = AsyncMock(return_value=summary)
+    return pos
+
+
 def _scan_result(
     *, scored: tuple[ScoredStrategy, ...], snapshot_id: int = 1, symbol: str = "SPY"
 ) -> ScanResult:
@@ -113,6 +132,8 @@ async def test_daemon_enqueues_score_at_configured_threshold(
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
     ), patch(
+        "optionsbot.daemon.scan_runner.PositionsClient", return_value=_mock_positions()
+    ), patch(
         "optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock(return_value=True)
     ) as mock_enqueue:
         summary = await run_scan_tick(daemon_context)
@@ -134,6 +155,8 @@ async def test_full_tick_dispatches_alert_end_to_end(
 
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
+    ), patch(
+        "optionsbot.daemon.scan_runner.PositionsClient", return_value=_mock_positions()
     ):
         summary = await run_scan_tick(daemon_context)
 
@@ -174,6 +197,8 @@ async def test_full_tick_dedup_suppresses_duplicate_second_tick(
 
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
+    ), patch(
+        "optionsbot.daemon.scan_runner.PositionsClient", return_value=_mock_positions()
     ):
         first = await run_scan_tick(daemon_context)
         second = await run_scan_tick(daemon_context)
