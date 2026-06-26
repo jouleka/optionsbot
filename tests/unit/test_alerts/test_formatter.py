@@ -11,10 +11,10 @@ from optionsbot.scoring import ScoredStrategy
 from optionsbot.scoring.types import FactorBreakdown
 
 
-def _view(direction="bull", iv_regime="high") -> MarketView:
+def _view(direction="bull", iv_regime="high", earnings=False) -> MarketView:
     return MarketView(
         direction=direction, direction_strength="strong", iv_regime=iv_regime,
-        iv_rank_value=0.72, earnings_in_window=False, warming_up=False,
+        iv_rank_value=0.72, earnings_in_window=earnings, warming_up=False,
     )
 
 
@@ -129,7 +129,7 @@ def test_format_wraps_underscore_strategy_name_in_code_span() -> None:
 
 
 def test_format_escapes_specials_outside_code_spans() -> None:
-    """Verify the rationale's `+` and `.` and the timestamp's `-` and `+`
+    """Verify the rationale's `+` and `.` and the timestamp's `-`
     are properly backslash-escaped (Telegram MarkdownV2 requires escaping
     these even inside italic _..._ spans)."""
     md = format_alert_markdown(
@@ -140,9 +140,9 @@ def test_format_escapes_specials_outside_code_spans() -> None:
     # Rationale "High IV rank + tight liquidity." -> "+" and "." escaped.
     assert "\\+ tight liquidity" in md
     assert "liquidity\\." in md
-    # Timestamp 2026-05-27T15:30:00+00:00 -> "-" and "+" escaped.
+    # Timestamp "2026-05-27 15:30:00 UTC" -> the date "-" stays escaped
+    # (":" is not a MarkdownV2 special char, so the time needs no escaping).
     assert "2026\\-05\\-27" in md
-    assert "\\+00:00" in md
 
 
 def test_format_wraps_iv_rank_decimal_in_code_span() -> None:
@@ -199,3 +199,47 @@ def test_formatter_includes_ev_reward_and_tier() -> None:
     assert "reward:risk" in text
     assert "exp value" in text
     assert "conservative" in text
+
+
+def test_format_relabels_snapshot_as_quotes_as_of() -> None:
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(), scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "quotes as of" in md
+    assert "UTC" in md
+    assert "+00:00" not in md  # the raw isoformat offset is gone
+
+
+def test_format_warns_on_earnings_in_window() -> None:
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(earnings=True), scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "EARNINGS" in md
+
+
+def test_format_no_earnings_warning_when_clear() -> None:
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(earnings=False), scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "EARNINGS" not in md
+
+
+def test_format_includes_max_profit() -> None:
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(), scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "max profit" in md.lower()
+
+
+def test_format_includes_dte() -> None:
+    # legs expire 2026-07-11; snapshot 2026-05-27 -> 45 calendar days.
+    md = format_alert_markdown(
+        symbol="SPY", view=_view(), scored=_scored(),
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+    )
+    assert "DTE" in md
+    assert "45d" in md

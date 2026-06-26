@@ -54,6 +54,25 @@ def _format_legs(legs: Iterable[Leg]) -> str:
     return "\n".join(parts)
 
 
+def _nearest_dte(legs: Iterable[Leg], snapshot_ts: datetime) -> int | None:
+    """Calendar days to the nearest dated option-leg expiry (None if none).
+
+    Stock legs have no expiry and are skipped; an unparseable expiry is
+    ignored rather than raising.
+    """
+    today = snapshot_ts.date()
+    dtes: list[int] = []
+    for leg in legs:
+        if not leg.expiry:
+            continue
+        try:
+            exp = datetime.strptime(leg.expiry, "%Y%m%d").date()
+        except ValueError:
+            continue
+        dtes.append((exp - today).days)
+    return min(dtes) if dtes else None
+
+
 def format_alert_markdown(
     symbol: str,
     view: MarketView,
@@ -68,6 +87,11 @@ def format_alert_markdown(
     # Undefined-risk warning (plain text — ⚠ is safe, UNDEFINED RISK contains no special chars)
     if not sug.defined_risk:
         lines.append("⚠ *UNDEFINED RISK*")
+
+    # Earnings before the trade expires can gap the underlying through the
+    # strikes — surface it prominently (computed in MarketView, IBK-66).
+    if view.earnings_in_window:
+        lines.append("⚠ *EARNINGS before expiry*")
 
     # Header line: bold symbol, strategy name in backticks (snake_case names
     # like iron_condor or bull_put_spread contain `_` which would otherwise
@@ -87,6 +111,11 @@ def format_alert_markdown(
     else:
         lines.append(f"view: {view.direction}/{view.iv_regime}")
 
+    # Days to the nearest leg expiry — quick horizon read.
+    dte = _nearest_dte(sug.legs, snapshot_ts)
+    if dte is not None:
+        lines.append(f"DTE `{dte}d`")
+
     lines.append("")
     lines.append("legs:")
     lines.append(_format_legs(sug.legs))
@@ -97,6 +126,8 @@ def format_alert_markdown(
     lines.append(f"net {kind} `${abs(sug.credit_or_debit):.2f}`")
     if sug.max_loss is not None:
         lines.append(f"max loss `${sug.max_loss:.2f}`")
+    if sug.max_profit is not None:
+        lines.append(f"max profit `${sug.max_profit:.2f}`")
     if sug.prob_profit is not None:
         lines.append(f"prob profit `{sug.prob_profit * 100:.0f}%`")
     if sug.reward_risk is not None:
@@ -117,10 +148,12 @@ def format_alert_markdown(
     if execute_hint:
         lines.append(f"➤ {_md_escape(execute_hint)}")
         lines.append("")
-    # Snapshot timestamp inside italic: even inside _..._ all special chars
-    # except `_` and `\` still need escaping (Telegram MarkdownV2 rule).
-    # The isoformat() output has `-`, `:`, `+`, `.` — all of which must be escaped.
-    lines.append(f"_snapshot {_md_escape(snapshot_ts.isoformat())}_")
+    # Data-capture timestamp inside italic. Even inside _..._ all special chars
+    # except `_` and `\` still need escaping (Telegram MarkdownV2 rule): the
+    # formatted "YYYY-MM-DD HH:MM:SS" has `-` and `:` which must be escaped.
+    lines.append(
+        f"_quotes as of {_md_escape(snapshot_ts.strftime('%Y-%m-%d %H:%M:%S'))} UTC_"
+    )
 
     return "\n".join(lines)
 
