@@ -73,8 +73,8 @@ class ContractResolver:
                 continue
             try:
                 expiry_date = datetime.strptime(expiry, "%Y%m%d").date()
-            except ValueError:
-                continue  # fail-safe: keep anything we can't parse
+            except (ValueError, TypeError):
+                continue  # fail-safe: keep anything malformed/unparseable
             if expiry_date < today:
                 stale.append(key)
         for key in stale:

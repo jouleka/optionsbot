@@ -255,3 +255,17 @@ def test_prune_expired_keeps_stock_and_unparseable(resolver) -> None:
 
 def test_prune_expired_empty_cache_returns_zero(resolver) -> None:
     assert resolver.prune_expired(date(2026, 6, 28)) == 0
+
+
+def test_prune_expired_never_raises_on_malformed_key(resolver) -> None:
+    # The call site is un-wrapped on the daemon hot path, so prune_expired must
+    # NEVER raise. A future caller inserting a non-str expiry (contract
+    # violation) must be kept, not crash a scan tick. strptime(non-str) raises
+    # TypeError, not ValueError -- the fail-safe must catch that too.
+    bad = _contract_cache_key("OPT", "SPY", 20260101, 400.0, "C")  # non-str expiry
+    resolver._cache[bad] = _qualified_option()
+
+    evicted = resolver.prune_expired(date(2026, 6, 28))
+
+    assert evicted == 0
+    assert bad in resolver._cache            # malformed -> kept (fail-safe)
