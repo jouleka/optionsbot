@@ -603,3 +603,30 @@ async def test_run_scan_tick_logs_no_edge_suppression(
     assert summary.alerts_enqueued == 0
     logged = " ".join(str(call.args[0]) for call in mock_log.info.call_args_list)
     assert "no-edge" in logged
+
+
+async def test_run_scan_tick_prunes_expired_contracts_from_resolver_cache(
+    daemon_context: DaemonContext,
+) -> None:
+    """Each tick evicts expired OPT entries from the shared resolver cache while
+    leaving live ones, so the long-lived cache stays bounded across trading days
+    (IBK-148). Far past/future expiries keep this independent of the run date."""
+    from optionsbot.ibkr.contracts import _contract_cache_key
+
+    stale = _contract_cache_key("OPT", "SPY", "20000101", 400.0, "C")  # long expired
+    live = _contract_cache_key("OPT", "SPY", "20991231", 400.0, "C")   # far future
+    daemon_context.resolver._cache[stale] = MagicMock()
+    daemon_context.resolver._cache[live] = MagicMock()
+
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(side_effect=lambda s, *a, **kw: _fake_scan_result(s)),
+         ):
+        await run_scan_tick(daemon_context)
+
+    assert stale not in daemon_context.resolver._cache  # expired -> pruned
+    assert live in daemon_context.resolver._cache        # live -> kept

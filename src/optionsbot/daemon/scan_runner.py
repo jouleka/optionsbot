@@ -13,7 +13,7 @@ from sqlalchemy import insert, select
 from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.daemon.market_hours import is_market_open, nyse_session_date
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.observability import bind_log_context
@@ -100,6 +100,12 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
     # exit, so an outer `symbol=None` would simply disappear after the first
     # iteration. Bind only scan_run_id at the outer scope.
     with bind_log_context(scan_run_id=scan_run_id):
+        # IBK-148: bound the long-lived resolver cache -- drop option contracts
+        # that expired on a prior trading day before they accumulate forever.
+        # Runs before the market gate so cleanup happens on closed days too.
+        evicted = context.resolver.prune_expired(nyse_session_date(started_at))
+        if evicted:
+            log.info("pruned %d expired contracts from resolver cache", evicted)
         if not is_market_open(started_at):
             finished_at = datetime.now(UTC)
             _persist_scan_run(context, started_at, finished_at, 0, 0, [])
