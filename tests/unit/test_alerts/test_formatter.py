@@ -194,7 +194,10 @@ def test_formatter_includes_ev_reward_and_tier() -> None:
         iv_rank_value=0.9, earnings_in_window=False, warming_up=False,
     )
     text = format_alert_markdown(
-        symbol="SPY", view=view, scored=scored, snapshot_ts=datetime.now(UTC)
+        symbol="SPY", view=view, scored=scored,
+        # Fixed snapshot (not datetime.now): keeps the test hermetic / rot-proof
+        # even if legs + a DTE assertion are added later (IBK-141 audit).
+        snapshot_ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
     )
     assert "reward:risk" in text
     assert "exp value" in text
