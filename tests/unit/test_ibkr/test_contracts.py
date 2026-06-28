@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -216,3 +217,41 @@ async def test_listed_strikes_primes_qualify_cache(resolver, mock_ib) -> None:
     )
     assert set(out.keys()) == {("20260918", 525.0, "C"), ("20260918", 530.0, "P")}
     mock_ib.qualifyContractsAsync.assert_not_awaited()  # served entirely from primed cache
+
+
+# --- prune_expired: bound the long-lived cache across trading days (IBK-148) --
+
+
+def test_prune_expired_drops_only_past_expiries(resolver) -> None:
+    today = date(2026, 6, 28)
+    past = _contract_cache_key("OPT", "SPY", "20260101", 400.0, "C")
+    same = _contract_cache_key("OPT", "SPY", "20260628", 400.0, "C")
+    future = _contract_cache_key("OPT", "SPY", "20261218", 400.0, "C")
+    resolver._cache[past] = _qualified_option(expiry="20260101")
+    resolver._cache[same] = _qualified_option(expiry="20260628")
+    resolver._cache[future] = _qualified_option(expiry="20261218")
+
+    evicted = resolver.prune_expired(today)
+
+    assert evicted == 1
+    assert past not in resolver._cache       # expired -> dropped
+    assert same in resolver._cache           # expiry == today -> kept (tradeable today)
+    assert future in resolver._cache         # future -> kept
+
+
+def test_prune_expired_keeps_stock_and_unparseable(resolver) -> None:
+    today = date(2026, 6, 28)
+    stk = _contract_cache_key("STK", "SPY", None, None, None)
+    junk = _contract_cache_key("OPT", "SPY", "NOTADATE", 400.0, "C")
+    resolver._cache[stk] = _qualified_stock("SPY")
+    resolver._cache[junk] = _qualified_option(expiry="NOTADATE")
+
+    evicted = resolver.prune_expired(today)
+
+    assert evicted == 0
+    assert stk in resolver._cache            # STK (None expiry) -> kept
+    assert junk in resolver._cache           # unparseable expiry -> kept (fail-safe)
+
+
+def test_prune_expired_empty_cache_returns_zero(resolver) -> None:
+    assert resolver.prune_expired(date(2026, 6, 28)) == 0

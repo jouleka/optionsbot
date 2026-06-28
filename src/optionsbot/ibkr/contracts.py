@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from datetime import date, datetime
 from typing import TYPE_CHECKING, cast
 
 from optionsbot.ibkr.client import IBKRClient
@@ -49,6 +50,36 @@ class ContractResolver:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+
+    def prune_expired(self, today: date) -> int:
+        """Evict cached OPT contracts whose expiry is strictly before ``today``.
+
+        Bounds the long-lived cache: a daemon sharing one resolver across
+        trading days otherwise accumulates expired-option entries forever
+        (``listed_strikes`` primes the full per-expiry grid each scan). Returns
+        the number of entries evicted.
+
+        Fail-safe -- never evicts STK entries (``expiry is None``) or any expiry
+        string that does not parse as ``YYYYMMDD``: it is safer to keep a
+        maybe-live entry than to drop a live one, and the leak is slow. An
+        option is tradeable through its expiry date, so ``expiry == today`` is
+        kept. Never raises (the date parse is the only failure point and it is
+        handled by keeping the entry).
+        """
+        stale: list[_CacheKey] = []
+        for key in self._cache:
+            sec_type, _symbol, expiry, _strike, _right = key
+            if sec_type != "OPT" or expiry is None:
+                continue
+            try:
+                expiry_date = datetime.strptime(expiry, "%Y%m%d").date()
+            except ValueError:
+                continue  # fail-safe: keep anything we can't parse
+            if expiry_date < today:
+                stale.append(key)
+        for key in stale:
+            del self._cache[key]
+        return len(stale)
 
     async def stock(self, symbol: str) -> Contract:
         key = _contract_cache_key("STK", symbol, None, None, None)
