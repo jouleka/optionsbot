@@ -83,7 +83,11 @@ class Daemon:
         self.install_signal_handlers(loop)
         self._context = self._build_context()
         try:
-            await self._context.ibkr.connect()
+            # IBK-137: forever=True so a down/wedged Gateway makes the daemon
+            # WAIT (backoff-reconnect indefinitely) instead of raising -> exiting
+            # -> systemd restart-looping. The except remains a safety net for a
+            # non-connection error.
+            await self._context.ibkr.connect(forever=True)
         except Exception:
             log.exception("Failed to connect to IB Gateway; daemon will exit")
             await self._shutdown_context()

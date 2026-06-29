@@ -113,6 +113,35 @@ async def test_reconnect_eventually_gives_up(mock_ib) -> None:
     assert mock_ib.connectAsync.await_count == 3
 
 
+async def test_connect_forever_retries_past_the_finite_limit(mock_ib) -> None:
+    """forever=True (the daemon startup path) must NOT give up after the finite
+    backoff schedule -- it keeps retrying so a down/wedged Gateway makes the
+    daemon WAIT rather than crash-loop (IBK-137). Here 5 failures (well past the
+    3-attempt finite limit) precede success."""
+    mock_ib.isConnected.return_value = False
+    mock_ib.connectAsync.side_effect = [
+        ConnectionError("1"), ConnectionError("2"), ConnectionError("3"),
+        ConnectionError("4"), ConnectionError("5"), None,
+    ]
+    client = IBKRClient(
+        role="daemon", settings=Settings(), ib=mock_ib, backoff_seconds=(0, 0)
+    )
+    await client.connect(forever=True)  # must not raise
+    assert mock_ib.connectAsync.await_count == 6  # kept trying past the finite 3
+
+
+async def test_connect_forever_caps_backoff_at_longest_delay(mock_ib) -> None:
+    """Past the configured schedule the forever retry delay is capped at the
+    longest configured value (not unbounded growth)."""
+    from optionsbot.ibkr.client import IBKRClient as _C
+
+    c = _C(role="daemon", settings=Settings(), ib=mock_ib, backoff_seconds=(1.0, 2.0, 5.0))
+    assert c._reconnect_delay(0) == 0.0   # immediate first attempt
+    assert c._reconnect_delay(1) == 1.0
+    assert c._reconnect_delay(3) == 5.0
+    assert c._reconnect_delay(99) == 5.0  # capped at the longest
+
+
 async def test_async_context_manager_connects_and_disconnects(mock_ib) -> None:
     mock_ib.isConnected.side_effect = [False, True, True]  # initial False, then connected
     client = IBKRClient(role="cli", settings=Settings(), ib=mock_ib, backoff_seconds=())

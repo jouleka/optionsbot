@@ -85,8 +85,26 @@ class IBKRClient:
         # mcp and cli share an id-space; the cli path is short-lived and unlikely to collide
         return self._settings.ibkr.client_id_mcp
 
-    async def connect(self) -> None:
-        """Connect to IB Gateway with exponential backoff on failure."""
+    def _reconnect_delay(self, attempt: int) -> float:
+        """Backoff delay before retry ``attempt`` (0 = immediate first try).
+
+        Past the configured schedule the delay is held at the longest configured
+        value, so ``connect(forever=True)`` retries with a bounded (not unbounded)
+        cadence rather than growing without limit.
+        """
+        if attempt <= 0 or not self._backoff:
+            return 0.0
+        return self._backoff[min(attempt - 1, len(self._backoff) - 1)]
+
+    async def connect(self, *, forever: bool = False) -> None:
+        """Connect to IB Gateway with exponential backoff on failure.
+
+        With ``forever=True`` (the daemon's startup path) the retry loop NEVER
+        gives up: it keeps trying on the backoff schedule, capped at the longest
+        delay, so a down or wedged Gateway makes the daemon WAIT rather than
+        crash-loop (raise -> process exit -> systemd restart). One-shot callers
+        (cli/mcp) leave ``forever=False`` and keep the finite fail-fast behavior.
+        """
         async with self._connect_lock:
             if self._ib.isConnected():
                 return
@@ -95,11 +113,13 @@ class IBKRClient:
             client_id = self._client_id()
             log.info(
                 "Connecting to IB Gateway "
-                "host=%s port=%s client_id=%s paper=%s role=%s",
-                host, port, client_id, self._settings.ibkr.paper, self._role,
+                "host=%s port=%s client_id=%s paper=%s role=%s forever=%s",
+                host, port, client_id, self._settings.ibkr.paper, self._role, forever,
             )
             last_exc: Exception | None = None
-            for delay in (0.0, *self._backoff):
+            attempt = 0
+            while True:
+                delay = self._reconnect_delay(attempt)
                 if delay:
                     log.warning("Reconnect backoff %.1fs", delay)
                     await asyncio.sleep(delay)
@@ -115,10 +135,12 @@ class IBKRClient:
                 except Exception as e:  # noqa: BLE001 -- connection failures are heterogeneous
                     last_exc = e
                     log.warning("IB Gateway connect failed: %s", e)
-            attempts = len(self._backoff) + 1
-            raise ConnectionError(
-                f"Could not connect to IB Gateway at {host}:{port} after {attempts} attempts"
-            ) from last_exc
+                attempt += 1
+                if not forever and attempt > len(self._backoff):
+                    raise ConnectionError(
+                        f"Could not connect to IB Gateway at {host}:{port} "
+                        f"after {attempt} attempts"
+                    ) from last_exc
 
     async def ensure_connected(self) -> None:
         if not self._ib.isConnected():
