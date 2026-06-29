@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -634,3 +635,45 @@ async def test_run_scan_tick_prunes_expired_contracts_from_resolver_cache(
 
     assert stale not in daemon_context.resolver._cache  # expired -> pruned
     assert live in daemon_context.resolver._cache        # live -> kept
+
+
+async def test_run_scan_tick_skips_symbol_that_exceeds_budget(
+    daemon_context: DaemonContext,
+) -> None:
+    """A symbol whose scan exceeds the per-symbol budget is timed out + skipped;
+    the rest of the watchlist still scans (IBK-149)."""
+    daemon_context.settings.scan.scan_symbol_timeout_s = 0.2
+    with daemon_context.engine.begin() as conn:
+        for s in ("AAPL", "SLOW", "MSFT"):
+            conn.execute(insert(watchlist).values(symbol=s, added_at=datetime.now(UTC)))
+
+    async def fake_scan(symbol, *a, **kw):
+        if symbol == "SLOW":
+            await asyncio.sleep(5)  # exceeds the 0.2s budget -> timed out
+        return _fake_scan_result(symbol)
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch("optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(side_effect=fake_scan)):
+        summary = await run_scan_tick(daemon_context)
+
+    assert summary.tickers_scanned == 2  # AAPL + MSFT; SLOW skipped
+    assert any("SLOW" in e for e in summary.errors)
+
+
+async def test_resolve_scan_symbols_falls_back_when_screen_exceeds_budget(
+    daemon_context: DaemonContext,
+) -> None:
+    """A universe screen that exceeds the screener budget times out -> the tick
+    falls back to watchlist-only rather than hanging (IBK-149)."""
+    daemon_context.settings.scan.auto_screen = True
+    daemon_context.settings.scan.screen_timeout_s = 0.2
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    async def hang(*a, **kw):
+        await asyncio.sleep(5)
+
+    with patch("optionsbot.daemon.scan_runner.screen_universe", new=AsyncMock(side_effect=hang)):
+        resolved = await _resolve_scan_symbols(daemon_context)
+
+    assert resolved == [("AAPL", None)]  # timed out -> watchlist-only

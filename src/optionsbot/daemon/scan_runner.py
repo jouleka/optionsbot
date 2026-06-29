@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -129,11 +130,26 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             for sym, override in symbols:
                 with bind_log_context(symbol=sym):
                     try:
-                        result = await scan_symbol(
-                            sym, context.ibkr, context.engine, context.settings,
-                            resolver=context.resolver,
-                            view_override=override,
+                        # IBK-149: bound each symbol so one wedged dependency
+                        # (a hung IB Gateway option lookup) can't stall the whole
+                        # tick and starve orders management. TimeoutError is
+                        # caught below -> the symbol is skipped, the tick proceeds.
+                        result = await asyncio.wait_for(
+                            scan_symbol(
+                                sym, context.ibkr, context.engine, context.settings,
+                                resolver=context.resolver,
+                                view_override=override,
+                            ),
+                            timeout=context.settings.scan.scan_symbol_timeout_s,
                         )
+                    except TimeoutError:
+                        log.warning(
+                            "scan_symbol(%s) exceeded %.0fs budget; skipping",
+                            sym,
+                            context.settings.scan.scan_symbol_timeout_s,
+                        )
+                        errors.append(f"{sym}: TimeoutError (scan budget)")
+                        continue
                     except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
                         log.exception("scan_symbol failed for %s", sym)
                         errors.append(f"{sym}: {type(e).__name__}: {e}")
@@ -256,11 +272,17 @@ async def _resolve_scan_symbols(
     try:
         history = HistoryClient(context.ibkr, context.resolver)
         universe = context.settings.screener.universe or DEFAULT_UNIVERSE
-        candidates = await screen_universe(
-            history, universe, context.settings.screener.min_dollar_volume
+        # IBK-149: bound the universe screen so a wedged IB Gateway during
+        # screening (it runs BEFORE the symbol loop) can't hang the whole tick.
+        # A timeout is caught below -> fall back to watchlist-only.
+        candidates = await asyncio.wait_for(
+            screen_universe(
+                history, universe, context.settings.screener.min_dollar_volume
+            ),
+            timeout=context.settings.scan.screen_timeout_s,
         )
-    except Exception:  # noqa: BLE001 -- screening must never abort the tick
-        log.exception("auto-screen failed; falling back to watchlist only")
+    except Exception:  # noqa: BLE001 -- screening (incl. timeout) must never abort the tick
+        log.exception("auto-screen failed/timed out; falling back to watchlist only")
         return watchlist_symbols
 
     seen = {sym for sym, _ in watchlist_symbols}
