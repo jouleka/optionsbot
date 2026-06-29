@@ -206,6 +206,10 @@ def test_scan_settings_alert_calibration_defaults() -> None:
     s = ScanSettings()
     assert s.alert_top_n == 3
     assert s.score_threshold == 55  # repurposed as the alert quality floor
+    # IBK-149 scan-resilience timeout defaults
+    assert s.scan_symbol_timeout_s == 30.0
+    assert s.screen_timeout_s == 60.0
+    assert s.external_data_timeout_s == 5.0
 
 
 def test_rank_alert_candidates_floors_and_sorts() -> None:

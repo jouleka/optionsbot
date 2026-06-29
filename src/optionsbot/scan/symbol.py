@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import cast
@@ -12,9 +13,10 @@ from typing import cast
 import pandas as pd
 from sqlalchemy import Engine, insert
 
+from optionsbot.analysis.events import next_earnings
 from optionsbot.analysis.news import refresh_news_if_stale
 from optionsbot.analysis.relative_strength import relative_strength
-from optionsbot.analysis.types import Direction, IVRegime, MarketView
+from optionsbot.analysis.types import Direction, EarningsInfo, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
 from optionsbot.analysis.volatility import historical_volatility, iv_hv_ratio
 from optionsbot.config import Settings
@@ -35,6 +37,26 @@ from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies import Leg, StrategySnapshot
 
 log = logging.getLogger(__name__)
+
+
+async def _bounded_to_thread[T](
+    fn: Callable[..., T], *args: object, timeout: float, default: T, label: str
+) -> T:
+    """Run a blocking ``fn`` on a worker thread, bounded by ``timeout`` seconds.
+
+    Returns ``default`` (and logs) on timeout or error. This is how the scan
+    calls yfinance (earnings/news): a hung or failing Yahoo response neither
+    blocks the asyncio event loop (the call runs off-loop) nor stalls the scan
+    (it's time-bounded) -- it just degrades to the fallback value (IBK-149).
+    """
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout)
+    except TimeoutError:
+        log.warning("%s timed out after %.1fs; using fallback", label, timeout)
+        return default
+    except Exception:  # noqa: BLE001 -- external deps fail variously; degrade
+        log.exception("%s failed; using fallback", label)
+        return default
 
 
 def _atm_iv(chain: list[OptionChainLeg], spot: float) -> float | None:
@@ -146,7 +168,19 @@ async def scan_symbol(
     else:
         # No option data today: don't rank a bogus 0.0 against real history.
         iv_history = pd.Series([], dtype=float)
-    view = infer_view(symbol, bars, current_atm_iv=atm_iv or 0.0, atm_iv_history=iv_history)
+    # Earnings comes from yfinance (blocking, occasionally slow/down). Fetch it
+    # off the event loop with a hard timeout so a Yahoo hiccup can't freeze the
+    # loop or stall the scan; infer_view itself is pure (IBK-149).
+    earnings = await _bounded_to_thread(
+        next_earnings,
+        symbol,
+        timeout=settings.scan.external_data_timeout_s,
+        default=EarningsInfo(next_date=None, source="unknown"),
+        label=f"next_earnings({symbol})",
+    )
+    view = infer_view(
+        bars, current_atm_iv=atm_iv or 0.0, atm_iv_history=iv_history, earnings=earnings
+    )
     view = _override_view(view, view_override)
 
     sym_position = next(
@@ -263,12 +297,18 @@ async def scan_symbol(
                 ],
             )
 
-    # Best-effort catalyst refresh (throttled inside). A news failure must never
-    # break a scan, so wrap it defensively on top of its own graceful handling.
-    try:
-        refresh_news_if_stale(symbol, engine)
-    except Exception:  # noqa: BLE001 -- news is best-effort
-        log.exception("news refresh failed for %s", symbol)
+    # Best-effort catalyst refresh (throttled inside, never raises). Run it
+    # off-loop + time-bounded too: recent_news is the same blocking yfinance
+    # path as earnings, so a slow Yahoo response must not freeze the loop or
+    # stall the scan (IBK-149).
+    await _bounded_to_thread(
+        refresh_news_if_stale,
+        symbol,
+        engine,
+        timeout=settings.scan.external_data_timeout_s,
+        default=None,
+        label=f"refresh_news({symbol})",
+    )
 
     return ScanResult(
         symbol=symbol,

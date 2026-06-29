@@ -59,7 +59,9 @@ def _stub_next_earnings(monkeypatch: pytest.MonkeyPatch) -> None:
     def _no_earnings(symbol: str, manual_overrides=None):  # type: ignore[no-untyped-def]
         return EarningsInfo(next_date=None, source="manual")
 
-    monkeypatch.setattr("optionsbot.analysis.view.next_earnings", _no_earnings)
+    # IBK-149: next_earnings now lives at the scan.symbol call site (infer_view
+    # is pure and no longer imports it).
+    monkeypatch.setattr("optionsbot.scan.symbol.next_earnings", _no_earnings)
 
 
 @pytest.fixture()

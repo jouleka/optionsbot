@@ -88,6 +88,15 @@ class ScanSettings(BaseModel):
     # in addition to the watchlist (IBK-101). False = watchlist-only tick (the
     # pre-IBK-101 behavior).
     auto_screen: bool = True
+    # IBK-149 (scan-resilience): bound blocking external calls so a flaky
+    # dependency degrades the scan gracefully instead of stalling it (and the
+    # asyncio loop). scan_symbol_timeout_s caps any per-symbol awaitable hang
+    # (e.g. a wedged IB Gateway); screen_timeout_s caps the universe screen
+    # (falls back to watchlist-only); external_data_timeout_s bounds the
+    # off-loop yfinance earnings/news calls.
+    scan_symbol_timeout_s: float = Field(default=30.0, gt=0.0)
+    screen_timeout_s: float = Field(default=60.0, gt=0.0)
+    external_data_timeout_s: float = Field(default=5.0, gt=0.0)
 
 
 class ManageSettings(BaseModel):
