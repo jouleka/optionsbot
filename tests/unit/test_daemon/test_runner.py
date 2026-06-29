@@ -37,7 +37,7 @@ async def test_start_exits_cleanly_on_stop_event(
     """start() returns 0 when stop_event is set, after shutting down cleanly."""
     d = Daemon(settings=daemon_settings)
 
-    async def _ok_connect(self):
+    async def _ok_connect(self, *, forever: bool = False):
         return None
 
     monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _ok_connect)
@@ -54,17 +54,45 @@ async def test_start_exits_cleanly_on_stop_event(
     assert code == 0
 
 
-async def test_start_returns_1_on_ibkr_connect_failure(
+async def test_start_returns_1_on_non_connection_connect_error(
     daemon_settings, monkeypatch,
 ) -> None:
+    """A genuine (non-connection) error from connect still surfaces as exit 1.
+    IBK-137: forever=True never raises on a CONNECTION failure (that path now
+    WAITS -- see test_start_aborts_cleanly_when_stopped_before_connect), but a
+    real programming error must still propagate to a clean exit-1."""
     d = Daemon(settings=daemon_settings)
 
-    async def _fail_connect(self):
-        raise ConnectionError("gateway down")
+    async def _raise_runtime(self, *, forever: bool = False):
+        raise RuntimeError("boom")
 
-    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _fail_connect)
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _raise_runtime)
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.disconnect", AsyncMock())
     code = await d.start()
     assert code == 1
+
+
+async def test_start_aborts_cleanly_when_stopped_before_connect(
+    daemon_settings, monkeypatch,
+) -> None:
+    """IBK-137: with forever=True a down Gateway makes connect WAIT; a stop
+    signal during that wait must exit PROMPTLY with code 0 -- not crash-loop,
+    and not stall until SIGKILL (the redeploy-during-outage path)."""
+    d = Daemon(settings=daemon_settings)
+
+    async def _never_connects(self, *, forever: bool = False):
+        await asyncio.sleep(3600)  # Gateway never comes up
+
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.connect", _never_connects)
+    monkeypatch.setattr("optionsbot.ibkr.IBKRClient.disconnect", AsyncMock())
+
+    async def _stop_soon() -> None:
+        await asyncio.sleep(0.01)
+        d.request_stop()
+
+    asyncio.create_task(_stop_soon())
+    code = await d.start()
+    assert code == 0
 
 
 def test_config_summary_includes_key_fields(daemon_settings) -> None:

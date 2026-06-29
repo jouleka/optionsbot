@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 from datetime import UTC, datetime, timedelta
@@ -82,12 +83,29 @@ class Daemon:
         loop = asyncio.get_running_loop()
         self.install_signal_handlers(loop)
         self._context = self._build_context()
+        # IBK-137: forever=True -> a down/wedged Gateway makes the daemon WAIT
+        # (backoff-reconnect indefinitely) instead of raising -> exiting ->
+        # systemd restart-looping. Race the wait against the stop signal so a
+        # `systemctl stop/restart` DURING a Gateway outage exits promptly rather
+        # than stalling until SIGKILL.
+        connect_task = asyncio.create_task(self._context.ibkr.connect(forever=True))
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        await asyncio.wait(
+            {connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if not connect_task.done():
+            # Stop won the race (Gateway never came up): abort startup cleanly.
+            connect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await connect_task
+            log.info("Stop requested before IB Gateway connected; daemon exiting")
+            await self._shutdown_context()
+            return 0
+        stop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stop_task
         try:
-            # IBK-137: forever=True so a down/wedged Gateway makes the daemon
-            # WAIT (backoff-reconnect indefinitely) instead of raising -> exiting
-            # -> systemd restart-looping. The except remains a safety net for a
-            # non-connection error.
-            await self._context.ibkr.connect(forever=True)
+            connect_task.result()  # re-raise a genuine (non-connection) connect error
         except Exception:
             log.exception("Failed to connect to IB Gateway; daemon will exit")
             await self._shutdown_context()
