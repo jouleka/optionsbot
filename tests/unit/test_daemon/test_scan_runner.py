@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -663,17 +664,60 @@ async def test_run_scan_tick_skips_symbol_that_exceeds_budget(
 async def test_resolve_scan_symbols_falls_back_when_screen_exceeds_budget(
     daemon_context: DaemonContext,
 ) -> None:
-    """A universe screen that exceeds the screener budget times out -> the tick
-    falls back to watchlist-only rather than hanging (IBK-149)."""
+    """A universe screen that exceeds the screener budget times out FAST -> the
+    tick falls back to watchlist-only rather than waiting it out (IBK-149).
+
+    The screen returns a VALID (empty) result after a long sleep, so the only
+    thing that makes this finish quickly is the timeout firing -- the timing
+    assert gates the new budget (without it, the call would wait the full 5s)."""
     daemon_context.settings.scan.auto_screen = True
     daemon_context.settings.scan.screen_timeout_s = 0.2
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
 
-    async def hang(*a, **kw):
+    async def slow_screen(*a, **kw):
         await asyncio.sleep(5)
+        return ()  # valid empty result -> WITHOUT the budget this awaits the full 5s
 
-    with patch("optionsbot.daemon.scan_runner.screen_universe", new=AsyncMock(side_effect=hang)):
+    start = time.monotonic()
+    with patch(
+        "optionsbot.daemon.scan_runner.screen_universe",
+        new=AsyncMock(side_effect=slow_screen),
+    ):
         resolved = await _resolve_scan_symbols(daemon_context)
+    elapsed = time.monotonic() - start
 
     assert resolved == [("AAPL", None)]  # timed out -> watchlist-only
+    assert elapsed < 2.0  # the 0.2s budget fired; the tick did NOT wait the 5s
+
+
+async def test_run_scan_tick_bounds_hung_account_summary(
+    daemon_context: DaemonContext,
+) -> None:
+    """The end-of-tick net-liq fetch (an IBKR await held under ibkr_lock) is
+    bounded, so a Gateway that wedges after the symbol loop can't hang the tick
+    and starve orders management; the tick completes with affordability off
+    (IBK-149)."""
+    daemon_context.settings.scan.scan_symbol_timeout_s = 0.2
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+
+    async def hang_summary() -> object:
+        await asyncio.sleep(5)
+        return MagicMock()
+
+    mock_pos = MagicMock()
+    mock_pos.get_account_summary = AsyncMock(side_effect=hang_summary)
+
+    start = time.monotonic()
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(side_effect=lambda s, *a, **kw: _fake_scan_result(s)),
+         ), \
+         patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=mock_pos):
+        summary = await run_scan_tick(daemon_context)
+    elapsed = time.monotonic() - start
+
+    assert summary.tickers_scanned == 1  # tick completed despite the hung net-liq fetch
+    assert elapsed < 2.0  # net-liq timeout fired; did NOT wait the 5s under the lock

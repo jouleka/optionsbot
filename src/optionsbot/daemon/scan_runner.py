@@ -165,11 +165,18 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             # everything that requires an affordability check.
             account_value_usd: float | None = None
             try:
-                _summary = await PositionsClient(context.ibkr).get_account_summary()
+                # IBK-149: bound this end-of-tick IBKR await too -- it runs under
+                # ibkr_lock after the symbol loop, so a Gateway that wedges here
+                # would hang the whole tick and starve orders management. A
+                # timeout is caught below -> affordability filter simply off.
+                _summary = await asyncio.wait_for(
+                    PositionsClient(context.ibkr).get_account_summary(),
+                    timeout=context.settings.scan.scan_symbol_timeout_s,
+                )
                 if _summary.net_liquidation_usd is not None:
                     account_value_usd = float(_summary.net_liquidation_usd)
-            except Exception:  # noqa: BLE001 -- net-liq is advisory; never abort a tick
-                log.exception("net-liq fetch failed; affordability filter off this tick")
+            except Exception:  # noqa: BLE001 -- net-liq is advisory (incl. timeout); never abort a tick
+                log.exception("net-liq fetch failed/timed out; affordability filter off this tick")
 
         # Alert the day's best: floor by score, rank desc, enqueue the top N that
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
