@@ -247,6 +247,19 @@ class ExecutionSettings(BaseModel):
         return self
 
 
+class MonitorSettings(BaseModel):
+    # IBK-137 Increment 2: gateway health paging. The daemon pages the human via
+    # Telegram when the Gateway is WEDGED (a majority of scanned symbols dying on
+    # the IBK-149 per-symbol budget during RTH -- connected but option data dead)
+    # or DISCONNECTED during RTH with open positions (exit protection is DOWN).
+    enabled: bool = True
+    # Minimum per-symbol budget timeouts in one scan before a wedge can page
+    # (floor so a tiny scan can't trip it); a MAJORITY of symbols must also fail.
+    wedge_min_budget_timeouts: int = Field(default=3, ge=1)
+    # Re-page cadence while a condition persists (first page is immediate).
+    page_repeat_minutes: int = Field(default=30, ge=1)
+
+
 class StorageSettings(BaseModel):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -280,6 +293,7 @@ class Settings(BaseSettings):
     validation: ValidationSettings = ValidationSettings()
     portfolio: PortfolioSettings = PortfolioSettings()
     execution: ExecutionSettings = ExecutionSettings()
+    monitor: MonitorSettings = MonitorSettings()
 
     log_level: str = "INFO"
 

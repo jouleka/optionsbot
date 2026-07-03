@@ -285,6 +285,12 @@ class Daemon:
                 summary.alerts_enqueued,
                 len(summary.errors),
             )
+            # IBK-137 Inc 2: page the human on gateway wedge/disconnect. The
+            # helper never raises; called from the source module so tests can
+            # patch optionsbot.daemon.gateway_health.page_gateway_health.
+            from optionsbot.daemon import gateway_health
+
+            await gateway_health.page_gateway_health(self._context, summary)
         except Exception:
             log.exception("scan tick failed catastrophically")
         # Position-management pass runs as a sibling of the scan; its own try/except

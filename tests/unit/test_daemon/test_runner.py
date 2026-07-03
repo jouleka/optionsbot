@@ -95,6 +95,36 @@ async def test_start_aborts_cleanly_when_stopped_before_connect(
     assert code == 0
 
 
+async def test_scan_tick_feeds_summary_to_gateway_health_paging(
+    daemon_settings,
+) -> None:
+    """IBK-137 Inc 2: after each scan the tick hands the summary to the gateway
+    health pager (wedge/disconnect detection). Light test: no Daemon.start(),
+    all sibling ticks stubbed."""
+    d = Daemon(settings=daemon_settings)
+    d._context = MagicMock()
+    fake_summary = MagicMock()
+    fake_summary.tickers_scanned = 0
+    fake_summary.alerts_enqueued = 0
+    fake_summary.errors = ["SPY: TimeoutError (scan budget)"]
+
+    with patch(
+        "optionsbot.daemon.scan_runner.run_scan_tick",
+        new=AsyncMock(return_value=fake_summary),
+    ), patch(
+        "optionsbot.daemon.gateway_health.page_gateway_health", new=AsyncMock()
+    ) as mock_page, patch(
+        "optionsbot.daemon.manage_runner.run_manage_tick",
+        new=AsyncMock(return_value=MagicMock(positions_seen=0, alerts_sent=0, errors=[])),
+    ), patch(
+        "optionsbot.daemon.exit_runner.run_exits_tick", new=AsyncMock()
+    ):
+        await d._scan_tick()
+
+    mock_page.assert_awaited_once()
+    assert mock_page.await_args.args[1] is fake_summary  # (context, summary)
+
+
 def test_config_summary_includes_key_fields(daemon_settings) -> None:
     from optionsbot.daemon.runner import _config_summary
 

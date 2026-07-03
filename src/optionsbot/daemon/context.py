@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from sqlalchemy import Engine
 
 from optionsbot.config import Settings
+from optionsbot.daemon.gateway_health import GatewayHealthMonitor
 from optionsbot.daemon.telegram_client import TelegramClient
 from optionsbot.ibkr import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
@@ -67,3 +68,6 @@ class DaemonContext:
     # IBK-PHASE0-C2: entries already halted for a residual naked short leg
     # after a close (P1 — alerted + kill tripped once, never re-spammed).
     naked_leg_halted: set[int] = field(default_factory=set)
+    # IBK-137 Increment 2: gateway wedge/disconnect paging state (in-memory;
+    # a restart re-detects within one scan tick).
+    monitor: GatewayHealthMonitor = field(default_factory=GatewayHealthMonitor)
