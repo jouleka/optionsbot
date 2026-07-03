@@ -126,6 +126,20 @@ def test_recovery_sends_one_recovered_message_and_resets() -> None:
     assert len(_eval(m, now=t4, tickers_scanned=0, budget_timeouts=10)) == 1
 
 
+def test_reason_change_pages_immediately_even_inside_repage_window() -> None:
+    """WEDGED -> DISCONNECTED is a severity ESCALATION (protection degraded ->
+    DOWN): the changed condition must page NOW, not wait out the 30-min window."""
+    m = GatewayHealthMonitor()
+    assert len(_eval(m, tickers_scanned=0, budget_timeouts=10)) == 1  # ENTER wedged
+    t2 = _NOW + timedelta(minutes=5)  # well inside the 30-min re-page window
+    msgs = _eval(
+        m, now=t2, connected=False, tickers_scanned=0, budget_timeouts=0,
+        open_positions=2,
+    )
+    assert len(msgs) == 1
+    assert "DISCONNECTED" in msgs[0]
+
+
 def test_disabled_monitor_never_pages() -> None:
     m = GatewayHealthMonitor()
     assert _eval(
@@ -167,7 +181,6 @@ async def test_page_gateway_health_never_raises() -> None:
     paging must not poison the scan tick."""
     context = MagicMock()
     context.monitor = GatewayHealthMonitor()
-    context.ikbr = MagicMock()
     context.ibkr.is_connected = True
     context.telegram.send_message = AsyncMock(side_effect=RuntimeError("tg down"))
     context.settings.monitor = _settings()

@@ -14,6 +14,7 @@ from sqlalchemy import insert, select
 from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
+from optionsbot.daemon.gateway_health import BUDGET_TIMEOUT_SUFFIX
 from optionsbot.daemon.market_hours import is_market_open, nyse_session_date
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.positions import PositionsClient
@@ -148,7 +149,9 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                             sym,
                             context.settings.scan.scan_symbol_timeout_s,
                         )
-                        errors.append(f"{sym}: TimeoutError (scan budget)")
+                        # Suffix is the shared constant so gateway_health's
+                        # wedge detection can never drift from this format.
+                        errors.append(f"{sym}: {BUDGET_TIMEOUT_SUFFIX}")
                         continue
                     except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
                         log.exception("scan_symbol failed for %s", sym)

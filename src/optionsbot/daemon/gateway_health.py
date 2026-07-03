@@ -42,15 +42,19 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
 
     return impl(context)
 
-# The exact suffix run_scan_tick appends for a per-symbol budget timeout.
-_BUDGET_TIMEOUT_SUFFIX = "TimeoutError (scan budget)"
+# The per-symbol budget-timeout error suffix. scan_runner IMPORTS this to build
+# its error strings, so wedge detection can never silently drift from the
+# producer's format. (The constant lives here, not in scan_runner, because
+# scan_runner imports DaemonContext which imports this module — the reverse
+# import would be circular.)
+BUDGET_TIMEOUT_SUFFIX = "TimeoutError (scan budget)"
 
 _ACTION = "Restart IB Gateway (ibgateway.exe) and log in."
 
 
 def count_budget_timeouts(errors: list[str]) -> int:
     """How many scan errors were IBK-149 per-symbol budget timeouts."""
-    return sum(1 for e in errors if e.endswith(_BUDGET_TIMEOUT_SUFFIX))
+    return sum(1 for e in errors if e.endswith(BUDGET_TIMEOUT_SUFFIX))
 
 
 class GatewayHealthMonitor:
@@ -90,12 +94,16 @@ class GatewayHealthMonitor:
 
         if reasons:
             first = not self._active_reasons
+            # A CHANGED reason set is effectively a new ENTER (e.g. wedged ->
+            # disconnected escalates "degraded" to "DOWN") — page immediately
+            # rather than waiting out the re-page window (Opus review MEDIUM).
+            changed = reasons != self._active_reasons
             due = self._last_page_at is None or (
                 now - self._last_page_at
                 >= timedelta(minutes=settings.page_repeat_minutes)
             )
             self._active_reasons = reasons
-            if first or due:
+            if first or changed or due:
                 self._last_page_at = now
                 return [
                     self._page_text(
