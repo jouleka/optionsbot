@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, update
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
@@ -24,6 +24,11 @@ from optionsbot.execution.close_safety import (
     find_naked_short_legs,
 )
 from optionsbot.execution.engine import combo_mid
+from optionsbot.execution.exit_requests import (
+    ExitRequestGateInput,
+    QuoteGateState,
+    evaluate_exit_request_gate,
+)
 from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
@@ -44,7 +49,7 @@ from optionsbot.execution.walk import (
 )
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import fills, orders
+from optionsbot.storage.schema import exit_requests, fills, orders
 
 log = logging.getLogger(__name__)
 
@@ -69,9 +74,7 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
     engine = context.engine
     with engine.connect() as conn:
         entry_rows = conn.execute(
-            select(orders.c.id)
-            .where(orders.c.intent == "open")
-            .where(orders.c.status == "filled")
+            select(orders.c.id).where(orders.c.intent == "open").where(orders.c.status == "filled")
         ).fetchall()
         closed_ids = {
             row.closes_order_id
@@ -97,8 +100,7 @@ def _half_closed(engine: Engine, entry_id: int) -> bool:
     full quantity (Opus IBK-129 critical)."""
     with engine.connect() as conn:
         closes = conn.execute(
-            select(orders.c.id, orders.c.status)
-            .where(orders.c.closes_order_id == entry_id)
+            select(orders.c.id, orders.c.status).where(orders.c.closes_order_id == entry_id)
         ).fetchall()
         for row in closes:
             if row.status not in FAILED_TERMINAL_STATUSES:
@@ -118,13 +120,169 @@ def _min_dte(legs: list[dict[str, object]], now: datetime) -> int | None:
             continue
         expiry = str(leg["expiry"])
         try:
-            exp_date = datetime(
-                int(expiry[:4]), int(expiry[4:6]), int(expiry[6:8]), tzinfo=UTC
-            )
+            exp_date = datetime(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:8]), tzinfo=UTC)
         except ValueError:
             continue
         dtes.append((exp_date.date() - now.date()).days)
     return min(dtes) if dtes else None
+
+
+def _day_start(now: datetime) -> datetime:
+    return datetime(now.year, now.month, now.day, tzinfo=UTC)
+
+
+def _mark_exit_request(
+    engine: Engine,
+    request_id: int,
+    status: str,
+    decision_reason: str,
+    now: datetime,
+    *,
+    close_order_id: int | None = None,
+) -> None:
+    values = {
+        "status": status,
+        "decision_reason": decision_reason,
+        "processed_at": now,
+    }
+    if close_order_id is not None:
+        values["close_order_id"] = close_order_id
+    with engine.begin() as conn:
+        conn.execute(update(exit_requests).where(exit_requests.c.id == request_id).values(**values))
+
+
+def _request_counts(engine: Engine, position_id: int, now: datetime) -> tuple[int, int]:
+    start = _day_start(now)
+    with engine.connect() as conn:
+        position_count = conn.execute(
+            select(exit_requests.c.id)
+            .where(exit_requests.c.position_id == position_id)
+            .where(exit_requests.c.requested_at >= start)
+            .where(exit_requests.c.status == "submitted")
+        ).fetchall()
+        portfolio_count = conn.execute(
+            select(exit_requests.c.id)
+            .where(exit_requests.c.requested_at >= start)
+            .where(exit_requests.c.status == "submitted")
+        ).fetchall()
+    return len(position_count), len(portfolio_count)
+
+
+async def _quote_gate_state(
+    context: DaemonContext,
+    md: MarketDataClient,
+    entry: OrderRecord,
+    now: datetime,
+) -> tuple[QuoteGateState | None, str | None]:
+    total_premium = net_premium(context.engine, entry.id)
+    if total_premium is None or entry.quantity < 1:
+        return None, "entry premium unavailable"
+    entry_net = total_premium / (100 * entry.quantity)
+    dte = _min_dte(entry.legs, now)
+    option_legs = [leg for leg in entry.legs if leg.get("sec_type", "OPT") == "OPT"]
+    quotes: dict[tuple[str, float, str], OptionQuote] = {}
+    current_net: float | None = None
+    try:
+        for leg in option_legs:
+            spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+            quotes[spec] = await md.get_option_snapshot(
+                entry.symbol,
+                spec[0],
+                spec[1],
+                spec[2],  # type: ignore[arg-type]
+            )
+        current_net = combo_mid(entry.legs, quotes)
+    except Exception:  # noqa: BLE001 -- request_exit fails closed without quote corroboration
+        log.warning("request_exit quote gate failed for entry #%s", entry.id)
+    max_age = context.settings.execution.exit_quote_max_age_seconds
+    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
+    if (
+        max_age > 0
+        and current_net is not None
+        and any(age > max_age for age in quote_ages.values())
+    ):
+        current_net = None
+    deterministic_reason = None
+    if dte is not None:
+        deterministic_reason = evaluate_exit(
+            entry_net=entry_net,
+            current_net=current_net,
+            dte=dte,
+            settings=context.settings,
+        )
+    return QuoteGateState(
+        entry_net=entry_net,
+        current_net=current_net,
+        dte=dte,
+        deterministic_exit_reason=deterministic_reason,
+    ), None
+
+
+async def _process_exit_requests(
+    context: DaemonContext,
+    md: MarketDataClient,
+    entries: list[OrderRecord],
+    now: datetime,
+) -> int:
+    by_id = {entry.id: entry for entry in entries}
+    with context.engine.connect() as conn:
+        rows = conn.execute(
+            select(exit_requests)
+            .where(exit_requests.c.status == "requested")
+            .order_by(exit_requests.c.requested_at)
+        ).fetchall()
+    submitted = 0
+    for row in rows:
+        entry = by_id.get(row.position_id)
+        if entry is None:
+            _mark_exit_request(context.engine, row.id, "refused", "position is no longer open", now)
+            continue
+        if open_close_for(context.engine, entry.id) is not None:
+            _mark_exit_request(
+                context.engine, row.id, "refused", "position is already closing", now
+            )
+            continue
+        state, unavailable = await _quote_gate_state(context, md, entry, now)
+        if state is None:
+            _mark_exit_request(context.engine, row.id, "refused", unavailable or "unavailable", now)
+            continue
+        position_count, portfolio_count = _request_counts(context.engine, entry.id, now)
+        decision = evaluate_exit_request_gate(
+            ExitRequestGateInput(
+                position_id=entry.id,
+                catalyst_type=row.catalyst_type,
+                confidence=float(row.confidence),
+                sources=list(row.sources_json or []),
+                reason=row.reason,
+                today_position_requests=position_count,
+                today_portfolio_requests=portfolio_count,
+            ),
+            state,
+        )
+        if not decision.allowed:
+            _mark_exit_request(context.engine, row.id, "refused", decision.reason, now)
+            continue
+        placed = await _manage_entry(
+            context,
+            md,
+            entry,
+            now,
+            forced_reason=f"Hermes request_exit #{row.id}: {decision.reason}",
+        )
+        if placed:
+            close = open_close_for(context.engine, entry.id)
+            _mark_exit_request(
+                context.engine,
+                row.id,
+                "submitted",
+                decision.reason,
+                now,
+                close_order_id=close.id if close is not None else None,
+            )
+            submitted += placed
+        else:
+            _mark_exit_request(context.engine, row.id, "failed", "no close was placed", now)
+    return submitted
 
 
 async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
@@ -142,6 +300,11 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     # execution interlock open AND a live quote source AND an open market -- a
     # combo cannot fill while killed, without quotes, or outside RTH.
     if verdict.allowed and md is not None and is_market_open(now):
+        try:
+            submitted += await _process_exit_requests(context, md, entries, now)
+        except Exception:  # noqa: BLE001 -- request queue must not starve deterministic exits
+            errors += 1
+            log.exception("request_exit queue processing failed")
         for entry in entries:
             try:
                 submitted += await _manage_entry(context, md, entry, now)
@@ -169,7 +332,9 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     if entries:
         log.info(
             "exits tick: positions=%d closes=%d errors=%d",
-            len(entries), submitted, errors,
+            len(entries),
+            submitted,
+            errors,
         )
     return ExitsTickSummary(positions=len(entries), closes_submitted=submitted, errors=errors)
 
@@ -223,7 +388,10 @@ async def _manage_entry(
         for leg in option_legs:
             spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
             quotes[spec] = await md.get_option_snapshot(
-                entry.symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
+                entry.symbol,
+                spec[0],
+                spec[1],
+                spec[2],  # type: ignore[arg-type]
             )
         current_net = combo_mid(entry.legs, quotes)
     except Exception:  # noqa: BLE001 -- expiry guard must still work quote-blind
@@ -265,7 +433,9 @@ async def _manage_entry(
             )
         log.warning(
             "exit #%s quote-priced exit suppressed (stale: oldest %.0fs > %ss)",
-            entry.id, oldest, max_age,
+            entry.id,
+            oldest,
+            max_age,
         )
         current_net = None
         quotes = {}  # stale quotes must not price the close/walk either
@@ -280,7 +450,9 @@ async def _manage_entry(
         # path, so dte is non-None here (narrow for evaluate_exit).
         assert dte is not None
         reason = evaluate_exit(
-            entry_net=entry_net, current_net=current_net, dte=dte,
+            entry_net=entry_net,
+            current_net=current_net,
+            dte=dte,
             settings=context.settings,
         )
     if reason is None:
@@ -331,9 +503,11 @@ async def _manage_entry(
         flipped_nbbo = combo_bid_ask(close.legs, quotes) if quotes else None
         budget = (
             slippage_budget(
-                flipped_nbbo[0], flipped_nbbo[1],
+                flipped_nbbo[0],
+                flipped_nbbo[1],
                 frac=cfg.max_slippage_spread_frac,
-                abs_cap=cfg.max_slippage_abs, increment=increment,
+                abs_cap=cfg.max_slippage_abs,
+                increment=increment,
             )
             if flipped_nbbo is not None
             else increment
@@ -342,11 +516,17 @@ async def _manage_entry(
 
         task = asyncio.create_task(
             run_price_walk(
-                engine=engine, settings=context.settings,
-                order_client=order_client, md=md, symbol=entry.symbol,
-                legs=close.legs, order_id=close.id,
-                ib_order_id=placed.ib_order_id, decision_mid=close_net,
-                budget=budget, increment=increment,
+                engine=engine,
+                settings=context.settings,
+                order_client=order_client,
+                md=md,
+                symbol=entry.symbol,
+                legs=close.legs,
+                order_id=close.id,
+                ib_order_id=placed.ib_order_id,
+                decision_mid=close_net,
+                budget=budget,
+                increment=increment,
             )
         )
         context.walk_tasks.add(task)
@@ -411,9 +591,7 @@ async def force_close_entry(
     )
 
 
-async def assert_no_naked_short_after_close(
-    context: DaemonContext, entry: OrderRecord
-) -> bool:
+async def assert_no_naked_short_after_close(context: DaemonContext, entry: OrderRecord) -> bool:
     """After a close fills, verify no SHORT leg of this entry is still open at
     the broker. A residual naked short is a P1 incident: trip the kill switch
     and alert (once). Returns True when clean, False when a naked short was
@@ -434,9 +612,7 @@ async def assert_no_naked_short_after_close(
     if entry.id not in context.naked_leg_halted:
         context.naked_leg_halted.add(entry.id)
         trip_kill(context.engine, f"naked short leg after close for #{entry.id}")
-        legs_desc = ", ".join(
-            f"{p.strike}{p.right} x{p.position:.0f}" for p in naked
-        )
+        legs_desc = ", ".join(f"{p.strike}{p.right} x{p.position:.0f}" for p in naked)
         await _send(
             context,
             f"🛑 P1: #{entry.id} {entry.symbol} {entry.strategy} has a NAKED "

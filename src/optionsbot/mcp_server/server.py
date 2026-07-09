@@ -18,6 +18,7 @@ def _register_tools(server: FastMCP) -> None:
     from optionsbot.mcp_server.tools import (
         analyze,
         daily_brief,
+        nightwatch,
         positions,
         snapshots,
         track_record,
@@ -30,3 +31,4 @@ def _register_tools(server: FastMCP) -> None:
     daily_brief.register(server)
     positions.register(server)
     track_record.register(server)
+    nightwatch.register(server)

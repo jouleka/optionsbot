@@ -23,7 +23,7 @@ watchlist = Table(
     metadata,
     Column("symbol", Text, primary_key=True),
     Column("view_override_dir", Text),  # nullable; values like 'bull'|'neutral'|'bear'
-    Column("view_override_iv", Text),   # nullable; 'high'|'neutral'|'low'
+    Column("view_override_iv", Text),  # nullable; 'high'|'neutral'|'low'
     Column("notes", Text),
     Column("added_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
@@ -48,9 +48,9 @@ snapshots = Table(
     Column("hv20", Float),
     Column("iv_hv_ratio", Float),
     Column("expected_move", Float),
-    Column("regime_dir", Text),   # 'bull'|'neutral'|'bear'
-    Column("regime_iv", Text),    # 'high'|'neutral'|'low'
-    Column("raw_json", JSON),     # serialized blob of supporting metrics
+    Column("regime_dir", Text),  # 'bull'|'neutral'|'bear'
+    Column("regime_iv", Text),  # 'high'|'neutral'|'low'
+    Column("raw_json", JSON),  # serialized blob of supporting metrics
     CheckConstraint(
         "regime_dir IN ('bull','neutral','bear') OR regime_dir IS NULL",
         name="ck_snapshots_regime_dir",
@@ -242,6 +242,43 @@ orders = Table(
 )
 
 
+# IBK-138: audited Hermes-originated close requests. MCP writes only a request;
+# the daemon owns the trading-soundness gate and converts at most approved
+# requests into close orders.
+exit_requests = Table(
+    "exit_requests",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "position_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("requested_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("catalyst_type", Text, nullable=False),
+    Column("confidence", Float, nullable=False),
+    Column("sources_json", JSON, nullable=False),
+    Column("reason", Text, nullable=False),
+    Column("status", Text, nullable=False, server_default="requested", index=True),
+    Column("decision_reason", Text),
+    Column("processed_at", DateTime(timezone=True)),
+    Column("close_order_id", Integer, ForeignKey("orders.id", ondelete="SET NULL")),
+    CheckConstraint(
+        "status IN ('requested','refused','submitted','failed')",
+        name="ck_exit_requests_status",
+    ),
+)
+
+Index("ix_exit_requests_status_requested_at", exit_requests.c.status, exit_requests.c.requested_at)
+Index(
+    "ix_exit_requests_position_requested_at",
+    exit_requests.c.position_id,
+    exit_requests.c.requested_at,
+)
+
+
 # IBK-124: per-LEG executions (combo orders report one execution per leg, each
 # with its own execId; IBKR re-sends executions on reconnect, hence the UNIQUE
 # ib_exec_id dedupe). commission arrives separately via commissionReport,
@@ -295,8 +332,8 @@ walk_state = Table(
     Column("decision_mid", Float, nullable=False),
     Column("budget", Float, nullable=False),
     Column("increment", Float, nullable=False),
-    Column("step", Integer, nullable=False),         # last completed step
-    Column("prev_target", Float, nullable=False),    # last signed net target
+    Column("step", Integer, nullable=False),  # last completed step
+    Column("prev_target", Float, nullable=False),  # last signed net target
     Column("updated_ts", DateTime(timezone=True), nullable=False),
 )
 
