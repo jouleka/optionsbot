@@ -63,6 +63,20 @@ def _ticker_ts(ticker: Ticker) -> datetime:
     return datetime.now(UTC)
 
 
+def _ticker_delayed(ticker: Ticker) -> bool:
+    """Classify from the feed IBKR actually delivered, not requested config.
+
+    IBKR marketDataType 1 is live; 2/3/4 are frozen or delayed. An absent or
+    malformed value is conservatively non-live so execution cannot treat an
+    unknown quote as fresh real-time data.
+    """
+    try:
+        market_data_type = int(ticker.marketDataType)
+    except (AttributeError, TypeError, ValueError):
+        return True
+    return market_data_type != 1
+
+
 class MarketDataClient:
     def __init__(
         self, client: IBKRClient, resolver: ContractResolver | None = None
@@ -87,7 +101,7 @@ class MarketDataClient:
             last=last,
             mid=_mid(bid, ask),
             ts=_ticker_ts(ticker),
-            delayed=self._client.settings.ibkr.paper,
+            delayed=_ticker_delayed(ticker),
         )
 
     async def get_option_snapshot(
@@ -127,7 +141,7 @@ class MarketDataClient:
             open_interest=open_interest,
             volume=volume,
             ts=_ticker_ts(ticker),
-            delayed=self._client.settings.ibkr.paper,
+            delayed=_ticker_delayed(ticker),
         )
 
     async def _fetch_ticker(self, contract: Contract) -> Ticker:

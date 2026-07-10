@@ -10,10 +10,12 @@ from sqlalchemy import insert, select, update
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import force_close_entry, run_exits_tick
+from optionsbot.daemon.market_hours import nyse_session_date
+from optionsbot.execution.equity_guard import capture_day_start_net_liq
 from optionsbot.execution.orders import record_fill
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import OptionQuote, PlacedOrder, PortfolioPosition
-from optionsbot.storage.schema import orders
+from optionsbot.storage.schema import exit_requests, orders
 
 NOW = datetime.now(UTC)
 FAR = (NOW + timedelta(days=36)).strftime("%Y%m%d")
@@ -92,6 +94,36 @@ def _wire(context: DaemonContext, mids: dict[tuple[float, str], float]) -> Magic
     return order_client
 
 
+def _capture_loss_baseline(context: DaemonContext, net_liq: float = 10_000.0) -> None:
+    capture_day_start_net_liq(
+        context.engine,
+        net_liq,
+        session=nyse_session_date(NOW).isoformat(),
+    )
+
+
+def _queue_exit_request(
+    context: DaemonContext,
+    position_id: int,
+    *,
+    catalyst_type: str = "downgrade_upgrade",
+) -> int:
+    with context.engine.begin() as conn:
+        pk = conn.execute(
+            insert(exit_requests).values(
+                position_id=position_id,
+                requested_at=NOW,
+                catalyst_type=catalyst_type,
+                confidence=0.85,
+                sources_json=["source A", "source B"],
+                reason="corroborated adverse catalyst",
+                status="requested",
+            )
+        ).inserted_primary_key
+    assert pk is not None
+    return int(pk[0])
+
+
 async def test_take_profit_fires_closing_order(daemon_context: DaemonContext) -> None:
     entry_id = _filled_entry(daemon_context)
     # Entry credit 1.20; structure now reopens at 0.50 -> kept 58% -> close.
@@ -121,6 +153,186 @@ async def test_no_trigger_no_close(daemon_context: DaemonContext) -> None:
         summary = await run_exits_tick(daemon_context)
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_request_exit_adverse_loser_submits_audited_close(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    request_id = _queue_exit_request(daemon_context, entry_id)
+    _capture_loss_baseline(daemon_context)
+    # Entry credit 1.20; current debit 1.60 -> -0.40, beyond the 25% adverse gate.
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.90, (575.0, "P"): 0.30})
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(
+            select(exit_requests).where(exit_requests.c.id == request_id)
+        ).one()
+    assert row.status == "submitted"
+    assert row.close_order_id is not None
+    assert "adverse" in row.decision_reason
+
+
+async def test_request_exit_refuses_winning_headline_without_deterministic_exit(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    request_id = _queue_exit_request(
+        daemon_context,
+        entry_id,
+        catalyst_type="headline_news",
+    )
+    _capture_loss_baseline(daemon_context)
+    # Current debit 0.80 is a winner but below the deterministic 50% TP threshold.
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.10, (575.0, "P"): 0.30})
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(
+            select(exit_requests).where(exit_requests.c.id == request_id)
+        ).one()
+    assert row.status == "refused"
+    assert "winner" in row.decision_reason
+
+
+async def test_cumulative_hermes_realized_loss_trips_kill_before_another_exit(
+    daemon_context: DaemonContext,
+) -> None:
+    engine = daemon_context.engine
+    closed_entry_id = _filled_entry(daemon_context)
+    with engine.begin() as conn:
+        close_pk = conn.execute(
+            insert(orders).values(
+                intent="close",
+                closes_order_id=closed_entry_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                legs_json=[
+                    {**leg, "side": "buy" if leg["side"] == "sell" else "sell"}
+                    for leg in _legs(FAR)
+                ],
+                quantity=1,
+                status="filled",
+                staged_ts=NOW,
+                submitted_ts=NOW,
+                terminal_ts=NOW,
+                order_ref="hermes-loss-close",
+                ib_order_id=77,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
+    assert close_pk is not None
+    close_id = int(close_pk[0])
+    # Entry +$120, close -$370 => Hermes-driven realized P&L -$250.
+    record_fill(engine, close_id, exec_id="hermes-loss-a", side="BUY", price=3.80, qty=1, ts=NOW)
+    record_fill(engine, close_id, exec_id="hermes-loss-b", side="SELL", price=0.10, qty=1, ts=NOW)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(exit_requests).values(
+                position_id=closed_entry_id,
+                requested_at=NOW,
+                catalyst_type="downgrade_upgrade",
+                confidence=0.90,
+                sources_json=["source A", "source B"],
+                reason="prior Hermes close",
+                status="submitted",
+                decision_reason="corroborated adverse move",
+                processed_at=NOW,
+                close_order_id=close_id,
+            )
+        )
+
+    _filled_entry(daemon_context)  # another open position remains at risk
+    _capture_loss_baseline(daemon_context, 10_000.0)
+    daemon_context.settings.execution.max_daily_loss_pct = 0.02
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    state = load_state(engine)
+    assert state.killed is True
+    assert state.reason is not None and "Hermes" in state.reason
+
+
+async def test_cumulative_hermes_loss_trips_kill_after_last_position_closes(
+    daemon_context: DaemonContext,
+) -> None:
+    engine = daemon_context.engine
+    closed_entry_id = _filled_entry(daemon_context)
+    with engine.begin() as conn:
+        close_pk = conn.execute(
+            insert(orders).values(
+                intent="close",
+                closes_order_id=closed_entry_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                legs_json=[
+                    {**leg, "side": "buy" if leg["side"] == "sell" else "sell"}
+                    for leg in _legs(FAR)
+                ],
+                quantity=1,
+                status="filled",
+                staged_ts=NOW,
+                submitted_ts=NOW,
+                terminal_ts=NOW,
+                order_ref="hermes-final-loss-close",
+                ib_order_id=78,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
+    assert close_pk is not None
+    close_id = int(close_pk[0])
+    record_fill(engine, close_id, exec_id="hermes-final-loss-a", side="BUY",
+                price=3.80, qty=1, ts=NOW)
+    record_fill(engine, close_id, exec_id="hermes-final-loss-b", side="SELL",
+                price=0.10, qty=1, ts=NOW)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(exit_requests).values(
+                position_id=closed_entry_id,
+                requested_at=NOW,
+                catalyst_type="downgrade_upgrade",
+                confidence=0.90,
+                sources_json=["source A", "source B"],
+                reason="Hermes closed the final position",
+                status="submitted",
+                decision_reason="corroborated adverse move",
+                processed_at=NOW,
+                close_order_id=close_id,
+            )
+        )
+
+    _capture_loss_baseline(daemon_context, 10_000.0)
+    daemon_context.settings.execution.max_daily_loss_pct = 0.02
+    daemon_context.order_client = MagicMock()
+
+    summary = await run_exits_tick(daemon_context)
+
+    assert summary.positions == 0
+    state = load_state(engine)
+    assert state.killed is True
+    assert state.reason is not None and "Hermes" in state.reason
 
 
 async def test_active_close_blocks_duplicate(daemon_context: DaemonContext) -> None:

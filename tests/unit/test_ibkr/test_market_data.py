@@ -20,6 +20,7 @@ def _ticker(
     ask: float = 400.2,
     last: float = 400.1,
     time: datetime | None = None,
+    market_data_type: int | None = None,
     **extra: Any,
 ) -> MagicMock:
     """Mimic ib_async Ticker. Extra kwargs become attrs (modelGreeks etc.)."""
@@ -28,6 +29,7 @@ def _ticker(
     t.ask = ask
     t.last = last
     t.time = time if time is not None else datetime(2026, 5, 26, 14, 30)
+    t.marketDataType = market_data_type
     for k, v in extra.items():
         setattr(t, k, v)
     return t
@@ -161,6 +163,40 @@ async def test_get_snapshot_records_live_when_not_paper(mock_ib: MagicMock) -> N
     client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
     md = MarketDataClient(client)
     mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
-    mock_ib.reqTickersAsync.return_value = [_ticker()]
+    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=1)]
     quote = await md.get_stock_snapshot("SPY")
+    assert quote.delayed is False
+
+
+async def test_actual_delayed_feed_overrides_live_configuration(
+    mock_ib: MagicMock,
+) -> None:
+    s = Settings()
+    s.ibkr.paper = True
+    s.ibkr.market_data_type = 1
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
+    md = MarketDataClient(client)
+    mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
+    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=3)]
+
+    quote = await md.get_stock_snapshot("SPY")
+
+    assert quote.delayed is True
+
+
+async def test_actual_live_feed_overrides_delayed_configuration(
+    mock_ib: MagicMock,
+) -> None:
+    s = Settings()
+    s.ibkr.paper = True
+    s.ibkr.market_data_type = 3
+    mock_ib.isConnected.return_value = True
+    client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
+    md = MarketDataClient(client)
+    mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
+    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=1)]
+
+    quote = await md.get_stock_snapshot("SPY")
+
     assert quote.delayed is False

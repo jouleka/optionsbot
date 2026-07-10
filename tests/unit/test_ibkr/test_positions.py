@@ -178,6 +178,16 @@ def test_account_summary_net_liq_usd_converts_eur() -> None:
     assert s.net_liquidation_usd == Decimal("6250")
 
 
+def test_account_summary_non_usd_without_fx_fails_closed() -> None:
+    s = AccountSummary(
+        net_liquidation=Decimal("5000"), buying_power=None,
+        available_funds=Decimal("4000"), currency="EUR",
+    )
+
+    assert s.fx_to_usd is None
+    assert s.net_liquidation_usd is None
+
+
 def test_account_summary_net_liq_usd_none_when_netliq_none() -> None:
     s = AccountSummary(
         net_liquidation=None, buying_power=None,
@@ -202,3 +212,22 @@ async def test_get_account_summary_parses_eur_exchange_rate() -> None:
     assert summary.currency == "EUR"
     assert summary.fx_to_usd == Decimal("1.25")          # 1 / 0.80
     assert summary.net_liquidation_usd == Decimal("6250")  # 5000 * 1.25
+
+
+async def test_get_account_summary_missing_non_usd_exchange_rate_fails_closed() -> None:
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(return_value=[
+        _row("NetLiquidation", "5000", "EUR"),
+        _row("AvailableFunds", "4000", "EUR"),
+        _row("ExchangeRate", "1", "EUR"),
+    ])
+    client = MagicMock()
+    client.ib = ib
+    client.ensure_connected = AsyncMock()
+    pc = PositionsClient(client)
+
+    summary = await pc.get_account_summary()
+
+    assert summary.currency == "EUR"
+    assert summary.fx_to_usd is None
+    assert summary.net_liquidation_usd is None

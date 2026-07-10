@@ -107,14 +107,26 @@ class AccountSummary:
     buying_power: Decimal | None
     available_funds: Decimal | None
     currency: str
-    # IBK-122: USD per 1 unit of the account base currency. 1 when base is
-    # USD. net_liquidation is in base currency (EUR for this account) while
-    # strategy max_loss is USD, so callers compare via net_liquidation_usd.
-    fx_to_usd: Decimal = Decimal(1)
+    # IBK-122: USD per 1 unit of the account base currency. ``None`` for a
+    # non-USD account means the broker did not provide a usable conversion and
+    # USD risk sizing must fail closed. USD accounts normalize the field to 1.
+    fx_to_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if self.currency.upper() == "USD" and self.fx_to_usd is None:
+            object.__setattr__(self, "fx_to_usd", Decimal(1))
 
     @property
     def net_liquidation_usd(self) -> Decimal | None:
-        if self.net_liquidation is None:
+        if self.net_liquidation is None or not self.net_liquidation.is_finite():
+            return None
+        if self.currency.upper() == "USD":
+            return self.net_liquidation
+        if (
+            self.fx_to_usd is None
+            or not self.fx_to_usd.is_finite()
+            or self.fx_to_usd <= 0
+        ):
             return None
         return self.net_liquidation * self.fx_to_usd
 

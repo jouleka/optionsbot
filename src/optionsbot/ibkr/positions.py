@@ -50,24 +50,26 @@ def _to_decimal(s: str | None) -> Decimal | None:
         return None
 
 
-def _usd_per_base(rows: object, base_currency: str) -> Decimal:
+def _usd_per_base(rows: object, base_currency: str) -> Decimal | None:
     """USD per 1 unit of the account base currency, from the $LEDGER rows.
 
     IBKR reports an ``ExchangeRate`` row per held currency = base-currency
     units per 1 unit of that currency. With base=EUR the ``currency="USD"``
-    row is EUR-per-USD, so USD-per-base = 1 / that. Falls back to 1 (treat
-    base as USD — the *conservative* direction, never over-sizing) when base
-    is already USD or the USD rate is unavailable.
+    row is EUR-per-USD, so USD-per-base = 1 / that. A missing or malformed
+    non-USD conversion returns ``None`` so dollar risk sizing fails closed.
     """
-    if base_currency == "USD":
+    if base_currency.upper() == "USD":
         return Decimal(1)
     for row in rows:  # type: ignore[attr-defined]
         if getattr(row, "tag", None) == "ExchangeRate" and getattr(row, "currency", None) == "USD":
             rate = _to_decimal(getattr(row, "value", None))
-            if rate and rate > 0:
+            if rate is not None and rate.is_finite() and rate > 0:
                 return Decimal(1) / rate
-    log.warning("no USD ExchangeRate row for base %s; treating net-liq as USD 1:1", base_currency)
-    return Decimal(1)
+    log.error(
+        "no usable USD ExchangeRate row for base %s; USD net-liq is unavailable",
+        base_currency,
+    )
+    return None
 
 
 def _norm_right(right: str | None) -> OptionRight | None:

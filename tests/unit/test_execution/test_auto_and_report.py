@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -17,8 +18,14 @@ from optionsbot.execution.orders import (
 )
 from optionsbot.storage.schema import orders
 from optionsbot.validation.execution_report import execution_report
-from tests.unit.test_execution.test_engine import NOW as ENGINE_NOW
-from tests.unit.test_execution.test_engine import _deps, _insert_pick
+from tests.unit.test_execution.test_engine import (
+    CONDOR_LEGS,
+    _deps,
+    _insert_pick,
+)
+from tests.unit.test_execution.test_engine import (
+    NOW as ENGINE_NOW,
+)
 
 NOW = datetime(2026, 6, 11, 16, 0, tzinfo=UTC)
 
@@ -34,6 +41,23 @@ async def test_auto_mode_rejects_earnings_window(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
     assert not outcome.ok
     assert "earnings" in outcome.message.lower()
+
+
+@pytest.mark.parametrize("quality_flag", ["delayed", "warming_up"])
+async def test_auto_mode_rejects_unready_snapshot(
+    tmp_db: Engine,
+    quality_flag: str,
+) -> None:
+    score_id = _insert_pick(tmp_db, raw_json={quality_flag: True})
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert not outcome.ok
+    assert quality_flag.replace("_", " ") in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 async def test_confirm_mode_allows_earnings_window(tmp_db: Engine) -> None:
@@ -151,6 +175,178 @@ def test_dynamic_sizing_matrix() -> None:
         single_trade_cap_pct=0.10,
     )
     assert d.quantity == 0 and "heat" in d.note
+
+
+def test_open_heat_includes_scoreless_adopted_defined_risk_positions(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    spy_legs = [
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 717.0, "right": "P", "quantity": 1},
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 734.0, "right": "P", "quantity": 1},
+    ]
+    tlt_legs = [
+        {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 85.0, "right": "P", "quantity": 1},
+        {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 88.0, "right": "C", "quantity": 1},
+    ]
+    with tmp_db.begin() as conn:
+        spy_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=spy_legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+        tlt_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="TLT", strategy="long_strangle",
+            legs_json=tlt_legs, quantity=6, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, spy_id, exec_id="adopt-spy-long", side="BUY",
+                price=5.167983, qty=1, ts=NOW)
+    record_fill(tmp_db, spy_id, exec_id="adopt-spy-short", side="SELL",
+                price=8.031819, qty=1, ts=NOW)
+    record_fill(tmp_db, tlt_id, exec_id="adopt-tlt-put", side="BUY",
+                price=0.5941991665, qty=6, ts=NOW)
+    record_fill(tmp_db, tlt_id, exec_id="adopt-tlt-call", side="BUY",
+                price=0.4841991665, qty=6, ts=NOW)
+
+    expected_spy = (17.0 - 2.863836) * 100
+    expected_tlt = (0.5941991665 + 0.4841991665) * 6 * 100
+    assert open_heat_dollars(tmp_db) == pytest.approx(expected_spy + expected_tlt)
+
+
+@pytest.mark.parametrize("bad_max_loss", [float("nan"), -1.0])
+def test_open_heat_fails_closed_for_invalid_scored_max_loss(
+    tmp_db: Engine,
+    bad_max_loss: float,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    score_id = _insert_pick(tmp_db, max_loss=bad_max_loss)
+    with tmp_db.begin() as conn:
+        conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            strategy_score_id=score_id, legs_json=CONDOR_LEGS,
+            quantity=1, status="filled", staged_ts=NOW, submitted_ts=NOW,
+            terminal_ts=NOW, reprice_count=0,
+        ))
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_scoreless_undefined_risk(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="short_call",
+            legs_json=[{
+                "symbol": "SPY", "side": "sell", "sec_type": "OPT",
+                "expiry": "20260731", "strike": 800.0, "right": "C", "quantity": 1,
+            }],
+            quantity=1, status="filled", staged_ts=NOW, submitted_ts=NOW,
+            terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="adopt-short-call", side="SELL",
+                price=1.00, qty=1, ts=NOW)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_when_adopted_fills_are_missing(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1},
+    ]
+    with tmp_db.begin() as conn:
+        conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, limit_price=-1.00, status="filled",
+            staged_ts=NOW, submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        ))
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_when_adopted_fills_are_incomplete(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="adopt-only-short", side="SELL",
+                price=1.40, qty=1, ts=NOW)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_mixed_expiry_adoption(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "C", "quantity": 1},
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260831",
+         "strike": 110.0, "right": "C", "quantity": 1},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="calendar_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="adopt-near-long", side="BUY",
+                price=4.00, qty=1, ts=NOW)
+    record_fill(tmp_db, order_id, exec_id="adopt-far-short", side="SELL",
+                price=3.00, qty=1, ts=NOW)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_non_finite_adopted_leg(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="long_call",
+            legs_json=[{
+                "symbol": "SPY", "side": "buy", "sec_type": "OPT",
+                "expiry": "20260731", "strike": float("nan"), "right": "C", "quantity": 1,
+            }],
+            quantity=1, status="filled", staged_ts=NOW, submitted_ts=NOW,
+            terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="adopt-nan-strike", side="BUY",
+                price=1.00, qty=1, ts=NOW)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
 
 
 async def test_engine_uses_dynamic_size_with_live_equity(tmp_db: Engine) -> None:

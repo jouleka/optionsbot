@@ -398,19 +398,29 @@ def test_execution_rejects_bp_usage_above_ceiling() -> None:
 
 
 def test_execution_accepts_values_at_the_ceiling() -> None:
-    # The ceilings themselves are valid (<=, not <).
+    # The ceilings themselves are valid (<=, not <). Portfolio heat may use
+    # up to half of live USD net liquidation, but no single trade gets that cap.
     from optionsbot.config import ExecutionSettings
 
     e = ExecutionSettings(
         base_risk_pct=0.05,
-        max_portfolio_heat_pct=0.25,
+        max_portfolio_heat_pct=0.50,
         max_single_trade_risk_pct=0.15,
         max_bp_usage_pct=0.50,
     )
     assert e.base_risk_pct == 0.05
-    assert e.max_portfolio_heat_pct == 0.25
+    assert e.max_portfolio_heat_pct == 0.50
     assert e.max_single_trade_risk_pct == 0.15
     assert e.max_bp_usage_pct == 0.50
+
+
+def test_execution_rejects_portfolio_heat_above_half_account() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(max_portfolio_heat_pct=0.500001)
 
 
 def test_aggressive_config_file_fails_to_load(tmp_path: Path) -> None:

@@ -17,7 +17,11 @@ from datetime import UTC, datetime
 from sqlalchemy import Engine, select, update
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.daemon.market_hours import (
+    is_market_open,
+    nyse_session_date,
+    nyse_session_start_utc,
+)
 from optionsbot.execution.close_safety import (
     NonAtomicCloseError,
     assert_atomic_close_legs,
@@ -26,8 +30,10 @@ from optionsbot.execution.close_safety import (
 from optionsbot.execution.engine import combo_mid
 from optionsbot.execution.exit_requests import (
     ExitRequestGateInput,
+    HermesLossCapDecision,
     QuoteGateState,
     evaluate_exit_request_gate,
+    evaluate_hermes_loss_cap,
 )
 from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
@@ -37,6 +43,7 @@ from optionsbot.execution.orders import (
     get_order,
     net_premium,
     open_close_for,
+    realized_close_pairs,
     stage_close_order,
     transition,
 )
@@ -49,7 +56,7 @@ from optionsbot.execution.walk import (
 )
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import exit_requests, fills, orders
+from optionsbot.storage.schema import execution_state, exit_requests, fills, orders
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +225,82 @@ async def _quote_gate_state(
     ), None
 
 
+def _hermes_loss_cap_decision(
+    context: DaemonContext,
+    now: datetime,
+) -> HermesLossCapDecision:
+    session = nyse_session_date(now).isoformat()
+    session_start = nyse_session_start_utc(now)
+    with context.engine.connect() as conn:
+        baseline_row = conn.execute(
+            select(
+                execution_state.c.day_start_net_liq,
+                execution_state.c.day_start_session,
+            ).where(execution_state.c.id == 1)
+        ).first()
+        close_rows = conn.execute(
+            select(exit_requests.c.close_order_id)
+            .where(exit_requests.c.status == "submitted")
+            .where(exit_requests.c.close_order_id.is_not(None))
+        ).fetchall()
+    baseline = None
+    if baseline_row is not None and baseline_row.day_start_session == session:
+        baseline = baseline_row.day_start_net_liq
+    hermes_close_ids = {int(row.close_order_id) for row in close_rows}
+    cumulative_pnl = sum(
+        pair.pnl
+        for pair in realized_close_pairs(context.engine, since=session_start)
+        if pair.close_id in hermes_close_ids
+    )
+    return evaluate_hermes_loss_cap(
+        cumulative_realized_pnl=cumulative_pnl,
+        day_start_net_liq=None if baseline is None else float(baseline),
+        max_daily_loss_pct=context.settings.execution.max_daily_loss_pct,
+    )
+
+
+async def _enforce_hermes_loss_cap(
+    context: DaemonContext,
+    now: datetime,
+) -> HermesLossCapDecision:
+    """Evaluate the cap every tick, even after the final position closes.
+
+    A breached, evaluable cap trips the persisted kill switch once. Any queued
+    Hermes requests are refused for both a breach and an unavailable cap; the
+    deterministic exit path remains independent when the cap is unevaluable.
+    """
+    loss_cap = _hermes_loss_cap_decision(context, now)
+    if loss_cap.allowed:
+        return loss_cap
+
+    if loss_cap.evaluable and not load_state(context.engine).killed:
+        trip_kill(context.engine, loss_cap.reason, now=now)
+        await _send(
+            context,
+            "🛑 HALT: cumulative Hermes-driven realized losses breached the daily cap. "
+            f"{loss_cap.reason}. No further Hermes exit requests will be processed.",
+        )
+
+    with context.engine.connect() as conn:
+        pending_ids = [
+            int(row.id)
+            for row in conn.execute(
+                select(exit_requests.c.id)
+                .where(exit_requests.c.status == "requested")
+                .order_by(exit_requests.c.requested_at)
+            ).fetchall()
+        ]
+    for request_id in pending_ids:
+        _mark_exit_request(
+            context.engine,
+            request_id,
+            "refused",
+            loss_cap.reason,
+            now,
+        )
+    return loss_cap
+
+
 async def _process_exit_requests(
     context: DaemonContext,
     md: MarketDataClient,
@@ -286,9 +369,10 @@ async def _process_exit_requests(
 
 
 async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
+    now = datetime.now(UTC)
+    await _enforce_hermes_loss_cap(context, now)
     if context.order_client is None:
         return ExitsTickSummary(0, 0, 0)
-    now = datetime.now(UTC)
     entries = _open_entries(context)
     if not entries:
         return ExitsTickSummary(0, 0, 0)

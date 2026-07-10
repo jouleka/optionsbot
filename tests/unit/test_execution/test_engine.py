@@ -30,13 +30,19 @@ CONDOR_LEGS: list[dict[str, Any]] = [
 QUOTE_MIDS = {(580.0, "P"): 1.60, (575.0, "P"): 0.40}  # fresh net credit 1.20
 
 
-def _quote(strike: float, right: str, mid: float | None) -> OptionQuote:
+def _quote(
+    strike: float,
+    right: str,
+    mid: float | None,
+    *,
+    delayed: bool = False,
+) -> OptionQuote:
     bid = round(mid - 0.05, 4) if mid is not None else None
     ask = round(mid + 0.05, 4) if mid is not None else None
     return OptionQuote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
         bid=bid, ask=ask, last=None, mid=mid, iv=None, delta=None, gamma=None,
-        theta=None, vega=None, open_interest=None, volume=None, ts=NOW, delayed=True,
+        theta=None, vega=None, open_interest=None, volume=None, ts=NOW, delayed=delayed,
     )
 
 
@@ -82,8 +88,11 @@ def _deps(
     md_mids: dict[tuple[float, str], float | None] | None = None,
     available_funds: float | None = 50_000.0,
     net_liquidation: float | None = 50_000.0,
+    account_currency: str = "USD",
+    fx_to_usd: float = 1.0,
     margin_change: float | None = 380.0,
     walk: bool = False,
+    delayed: bool = False,
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
@@ -107,7 +116,7 @@ def _deps(
     md = MagicMock()
     md.get_option_snapshot = AsyncMock(
         side_effect=lambda symbol, expiry, strike, right: _quote(
-            strike, right, mids.get((strike, right))
+            strike, right, mids.get((strike, right)), delayed=delayed
         )
     )
 
@@ -120,7 +129,8 @@ def _deps(
             net_liquidation=Decimal(str(net_liquidation)) if net_liquidation is not None else None,
             buying_power=None,
             available_funds=Decimal(str(available_funds)) if available_funds is not None else None,
-            currency="USD",
+            currency=account_currency,
+            fx_to_usd=Decimal(str(fx_to_usd)),
         )
     )
     return ExecutionDeps(
@@ -197,6 +207,30 @@ async def test_rejects_undefined_risk(tmp_db: Engine) -> None:
     assert "undefined risk" in outcome.message.lower()
 
 
+async def test_rejects_non_finite_max_loss(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db, max_loss=float("nan"))
+    deps = _deps(tmp_db)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "defined max loss" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_rejects_delayed_option_quotes(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, delayed=True)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "delayed" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
 async def test_rejects_zero_quantity(tmp_db: Engine) -> None:
     # With dynamic sizing, a pick whose max_loss exceeds the single-trade cap
     # on a tiny account should be rejected (not placed). $500 equity, $380
@@ -207,6 +241,30 @@ async def test_rejects_zero_quantity(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
     assert "cap" in outcome.message.lower() or "sized" in outcome.message.lower()
+
+
+async def test_entry_drawdown_uses_usd_net_liquidation_for_non_usd_account(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.equity_guard import capture_day_start_net_liq
+
+    # Baseline is persisted in USD. EUR 8k at 1.25 USD/EUR is unchanged
+    # $10k equity; comparing the raw EUR value would invent a 20% drawdown.
+    capture_day_start_net_liq(tmp_db, 10_000.0)
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(
+        tmp_db,
+        net_liquidation=8_000.0,
+        available_funds=8_000.0,
+        account_currency="EUR",
+        fx_to_usd=1.25,
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    deps.order_client.place_combo_limit.assert_awaited_once()
 
 
 async def test_rejects_when_live_equity_unavailable(tmp_db: Engine) -> None:

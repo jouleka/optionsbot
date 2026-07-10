@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 
 from optionsbot.execution.exit_requests import (
     ExitRequestGateInput,
     QuoteGateState,
     evaluate_exit_request_gate,
+    evaluate_hermes_loss_cap,
 )
 
 NOW = datetime(2026, 7, 9, 15, 0, tzinfo=UTC)
@@ -90,3 +92,60 @@ def test_gate_enforces_daily_caps() -> None:
 
     assert gate.allowed is False
     assert "portfolio/day" in gate.reason
+
+
+def test_hermes_loss_cap_fails_closed_without_current_session_baseline() -> None:
+    decision = evaluate_hermes_loss_cap(
+        cumulative_realized_pnl=-50.0,
+        day_start_net_liq=None,
+        max_daily_loss_pct=0.02,
+    )
+
+    assert decision.allowed is False
+    assert decision.evaluable is False
+    assert "baseline" in decision.reason
+
+
+def test_hermes_loss_cap_fails_closed_for_non_finite_inputs() -> None:
+    cases = [
+        {"cumulative_realized_pnl": math.nan, "day_start_net_liq": 10_000.0,
+         "max_daily_loss_pct": 0.02},
+        {"cumulative_realized_pnl": -50.0, "day_start_net_liq": math.nan,
+         "max_daily_loss_pct": 0.02},
+        {"cumulative_realized_pnl": -50.0, "day_start_net_liq": math.inf,
+         "max_daily_loss_pct": 0.02},
+        {"cumulative_realized_pnl": -50.0, "day_start_net_liq": 10_000.0,
+         "max_daily_loss_pct": math.inf},
+    ]
+
+    for case in cases:
+        decision = evaluate_hermes_loss_cap(**case)
+        assert decision.allowed is False
+        assert decision.evaluable is False
+        assert decision.cap_dollars is None
+        assert "non-finite" in decision.reason
+
+
+def test_hermes_loss_cap_blocks_at_daily_loss_limit() -> None:
+    decision = evaluate_hermes_loss_cap(
+        cumulative_realized_pnl=-200.0,
+        day_start_net_liq=10_000.0,
+        max_daily_loss_pct=0.02,
+    )
+
+    assert decision.allowed is False
+    assert decision.evaluable is True
+    assert decision.cap_dollars == 200.0
+    assert "breached" in decision.reason
+
+
+def test_hermes_loss_cap_allows_when_cumulative_pnl_is_above_limit() -> None:
+    decision = evaluate_hermes_loss_cap(
+        cumulative_realized_pnl=-199.99,
+        day_start_net_liq=10_000.0,
+        max_daily_loss_pct=0.02,
+    )
+
+    assert decision.allowed is True
+    assert decision.evaluable is True
+    assert decision.cap_dollars == 200.0

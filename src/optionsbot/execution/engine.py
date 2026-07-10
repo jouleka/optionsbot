@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -134,8 +135,8 @@ async def execute_pick(
         async with deps.ibkr_lock:
             _summary = await deps.positions.get_account_summary()
         _net_liq = (
-            float(_summary.net_liquidation)
-            if _summary.net_liquidation is not None
+            float(_summary.net_liquidation_usd)
+            if _summary.net_liquidation_usd is not None
             else None
         )
     except Exception:  # noqa: BLE001 -- a flaky read must not hard-block entries
@@ -187,10 +188,14 @@ async def execute_pick(
                 "earnings inside the expiry window — auto mode skips "
                 "(use /execute to override deliberately)"
             )
+        if snapshot_raw.get("delayed"):
+            return _reject("delayed snapshot data — auto mode requires a live delivered feed")
+        if snapshot_raw.get("warming_up"):
+            return _reject("snapshot history is warming up — auto mode requires mature data")
     if not suggestion.get("defined_risk", False):
         return _reject("undefined risk strategies are not executable")
     max_loss_unit = float(suggestion.get("max_loss") or 0.0)
-    if max_loss_unit <= 0:
+    if not math.isfinite(max_loss_unit) or max_loss_unit <= 0:
         return _reject("pick carries no defined max loss — not sizeable")
 
     # 5. Market hours.
@@ -251,6 +256,10 @@ async def execute_pick(
                 )
             except Exception as exc:  # noqa: BLE001 -- per-leg quote failure = reject
                 return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
+    if any(quote.delayed for quote in quotes.values()):
+        return _reject(
+            "delayed or unknown option quote feed — refusing to price an entry without live data"
+        )
     issues = liquidity_issues(
         legs, quotes,
         leg_spread_frac=settings.execution.max_leg_spread_frac,

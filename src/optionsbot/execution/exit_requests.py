@@ -7,6 +7,7 @@ pure code so MCP, daemon, and tests agree on the refusal reasons.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,6 +65,67 @@ class QuoteGateState:
 class ExitRequestGateDecision:
     allowed: bool
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HermesLossCapDecision:
+    allowed: bool
+    evaluable: bool
+    cumulative_realized_pnl: float
+    cap_dollars: float | None
+    reason: str
+
+
+def evaluate_hermes_loss_cap(
+    *,
+    cumulative_realized_pnl: float,
+    day_start_net_liq: float | None,
+    max_daily_loss_pct: float,
+) -> HermesLossCapDecision:
+    """Fail closed when the daily Hermes-driven realized-loss cap is unavailable or breached."""
+    numeric_inputs = (
+        cumulative_realized_pnl,
+        max_daily_loss_pct,
+        *(() if day_start_net_liq is None else (day_start_net_liq,)),
+    )
+    if any(not math.isfinite(value) for value in numeric_inputs):
+        return HermesLossCapDecision(
+            allowed=False,
+            evaluable=False,
+            cumulative_realized_pnl=cumulative_realized_pnl,
+            cap_dollars=None,
+            reason="non-finite input for Hermes loss cap",
+        )
+    if day_start_net_liq is None or day_start_net_liq <= 0 or max_daily_loss_pct <= 0:
+        return HermesLossCapDecision(
+            allowed=False,
+            evaluable=False,
+            cumulative_realized_pnl=cumulative_realized_pnl,
+            cap_dollars=None,
+            reason="current-session net-liq baseline unavailable for Hermes loss cap",
+        )
+    cap_dollars = day_start_net_liq * max_daily_loss_pct
+    if cumulative_realized_pnl <= -cap_dollars:
+        return HermesLossCapDecision(
+            allowed=False,
+            evaluable=True,
+            cumulative_realized_pnl=cumulative_realized_pnl,
+            cap_dollars=cap_dollars,
+            reason=(
+                "daily cumulative Hermes realized-loss cap breached "
+                f"(${cumulative_realized_pnl:,.2f} <= -${cap_dollars:,.2f})"
+            ),
+        )
+    return HermesLossCapDecision(
+        allowed=True,
+        evaluable=True,
+        cumulative_realized_pnl=cumulative_realized_pnl,
+        cap_dollars=cap_dollars,
+        reason=(
+            "daily cumulative Hermes realized P&L remains above cap "
+            f"(${cumulative_realized_pnl:,.2f} > -${cap_dollars:,.2f})"
+        ),
+    )
 
 
 def evaluate_exit_request_gate(
