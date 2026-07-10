@@ -27,3 +27,12 @@ def test_register_periodic_jobs_skips_outcomes_when_zero() -> None:
     d = _daemon(0)
     d._register_periodic_jobs()
     assert d._scheduler.get_job("outcomes") is None
+
+
+def test_register_periodic_jobs_adds_entry_review_consumer() -> None:
+    d = _daemon(0)
+    d._register_periodic_jobs()
+
+    job = d._scheduler.get_job("entry_reviews")
+    assert job is not None
+    assert job.trigger.interval.total_seconds() == 60

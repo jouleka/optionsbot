@@ -600,3 +600,25 @@ async def test_execute_pick_blocks_near_daily_loss_cap(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert outcome.ok is False
     assert "drawdown" in outcome.message.lower()
+
+
+async def test_entry_drawdown_compares_usd_values_for_non_usd_account(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.equity_guard import capture_day_start_net_liq
+
+    capture_day_start_net_liq(tmp_db, 10_000.0, session="2026-06-24")
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(
+        tmp_db,
+        net_liquidation=8_000.0,
+        available_funds=8_000.0,
+        account_currency="EUR",
+        fx_to_usd=1.25,
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    deps.order_client.place_combo_limit.assert_awaited_once()  # type: ignore[attr-defined]

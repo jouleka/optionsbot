@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.telegram_poller import (
     _BACKLOG_MAX_AGE_S,
     _initial_offset,
+    poll_commands,
     poll_once,
 )
 
@@ -92,6 +96,26 @@ async def test_initial_offset_getupdates_failure_falls_back_to_none(
     daemon_context.telegram.get_updates = AsyncMock(side_effect=RuntimeError("net"))
     offset = await _initial_offset(daemon_context, now_ts=NOW_TS)
     assert offset is None
+
+
+async def test_poll_commands_yields_after_immediate_successful_poll(
+    daemon_context: DaemonContext,
+) -> None:
+    """A successful await need not suspend; the poll loop must yield explicitly."""
+    get_updates = AsyncMock(
+        side_effect=[*([[]] * 10), RuntimeError("finite-loop sentinel")]
+    )
+    daemon_context.telegram.get_updates = get_updates
+
+    task = asyncio.create_task(poll_commands(daemon_context))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # One startup backlog read plus one long-poll read. Without a cooperative
+    # yield, the task consumes every immediate result before cancellation runs.
+    assert get_updates.await_count == 2
 
 
 async def test_fresh_backlog_command_reaches_dispatch_not_dropped(

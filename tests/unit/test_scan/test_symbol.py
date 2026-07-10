@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 from sqlalchemy import select
@@ -47,6 +49,34 @@ async def test_scan_symbol_persists_strategy_scores(
     for r in rows:
         assert 0.0 <= r.score <= 100.0
         assert r.legs_json is not None
+
+
+async def test_scan_symbol_sizes_with_usd_equity_for_non_usd_account(
+    monkeypatch, mock_ibkr_for_scan: object, scan_engine: object, scan_settings: object
+) -> None:  # type: ignore[no-untyped-def]
+    from optionsbot.ibkr.types import AccountSummary
+    from optionsbot.scan import symbol as symbol_mod
+
+    positions = MagicMock()
+    positions.get_positions = AsyncMock(return_value=[])
+    positions.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("8000"),
+            buying_power=Decimal("8000"),
+            available_funds=Decimal("8000"),
+            currency="EUR",
+            fx_to_usd=Decimal("1.25"),
+        )
+    )
+    monkeypatch.setattr(symbol_mod, "PositionsClient", MagicMock(return_value=positions))
+    score_all = MagicMock(return_value=())
+    monkeypatch.setattr(symbol_mod, "score_all", score_all)
+
+    await scan_symbol(
+        "SPY", mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[arg-type]
+    )
+
+    assert score_all.call_args.kwargs["account_value"] == 10_000.0
 
 
 async def test_scan_symbol_ensures_ibkr_connected(

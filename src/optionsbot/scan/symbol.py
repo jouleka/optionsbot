@@ -200,7 +200,9 @@ async def scan_symbol(
     )
 
     account_value = (
-        float(account.net_liquidation) if account.net_liquidation is not None else None
+        float(account.net_liquidation_usd)
+        if account.net_liquidation_usd is not None
+        else None
     )
     if account_value is None:
         log.info(

@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "order_quotes",
     "walk_state",
     "exit_requests",
+    "entry_reviews",
 }
 
 

@@ -109,6 +109,11 @@ async def poll_commands(context: DaemonContext) -> None:
     while True:
         try:
             offset = await poll_once(context, offset)
+            # Awaiting an async function is not guaranteed to suspend (a mock,
+            # cache, or immediately-completed transport can return inline).
+            # Yield explicitly so cancellation and daemon stop tasks cannot be
+            # starved by a tight successful-poll loop.
+            await asyncio.sleep(0)
         except asyncio.CancelledError:
             log.info("telegram command poller stopping")
             raise

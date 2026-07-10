@@ -11,6 +11,7 @@ from sqlalchemy import insert, select
 from optionsbot.daemon.alert_pipeline import (
     BACKOFF_MINUTES,
     MAX_RETRIES,
+    _reconstruct_scored,
     dispatch_alert,
     enqueue_alert,
     sweep_retries,
@@ -65,6 +66,80 @@ async def test_enqueue_alert_inserts_pending_row_and_dispatches(
     assert len(rows) == 1
     assert rows[0].status == "sent"
     assert rows[0].telegram_msg_id == 12345  # from mock_telegram fixture
+
+
+async def test_enqueue_alert_links_exact_strategy_score(
+    daemon_context: DaemonContext,
+) -> None:
+    snap_id = _seed_snapshot(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        score_id = conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=snap_id,
+                strategy="iron_condor",
+                score=85.0,
+                rationale="candidate",
+                legs_json=[],
+                suggestion_json={"defined_risk": True},
+            )
+        ).inserted_primary_key[0]
+
+    with patch(
+        "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
+    ):
+        await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
+
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(select(alerts)).one()
+    assert row.strategy_score_id == score_id
+
+
+def test_reconstruct_alert_uses_linked_score_not_newer_snapshot(
+    daemon_context: DaemonContext,
+) -> None:
+    old_snapshot_id = _seed_snapshot(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        old_score_id = conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=old_snapshot_id,
+                strategy="iron_condor",
+                score=85.0,
+                rationale="original candidate",
+                legs_json=[],
+                suggestion_json={"defined_risk": True},
+            )
+        ).inserted_primary_key[0]
+        alert_id = conn.execute(
+            insert(alerts).values(
+                strategy_score_id=old_score_id,
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+            )
+        ).inserted_primary_key[0]
+
+    newer_snapshot_id = _seed_snapshot(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=newer_snapshot_id,
+                strategy="iron_condor",
+                score=99.0,
+                rationale="newer unrelated candidate",
+                legs_json=[],
+                suggestion_json={"defined_risk": True},
+            )
+        )
+
+    reconstructed = _reconstruct_scored(
+        daemon_context, int(alert_id), "iron_condor", 85.0
+    )
+
+    assert reconstructed is not None
+    assert reconstructed.rationale == "original candidate"
+    assert reconstructed.score == 85.0
 
 
 async def test_enqueue_alert_skips_when_dedup_says_no(
@@ -178,6 +253,60 @@ async def test_sweep_retries_processes_failed_rows_past_next_retry_ts(
     # stale last_error or next_retry_ts is a state-machine bug.
     assert row.last_error is None
     assert row.next_retry_ts is None
+
+
+async def test_sweep_retries_uses_linked_scores_original_snapshot(
+    daemon_context: DaemonContext,
+) -> None:
+    old_snapshot_id = _seed_snapshot(daemon_context)
+    past = datetime.now(UTC) - timedelta(minutes=5)
+    with daemon_context.engine.begin() as conn:
+        old_score_id = conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=old_snapshot_id,
+                strategy="iron_condor",
+                score=85.0,
+                rationale="original candidate",
+                legs_json=[],
+                suggestion_json={"defined_risk": True},
+            )
+        ).inserted_primary_key[0]
+        alert_id = conn.execute(
+            insert(alerts).values(
+                strategy_score_id=old_score_id,
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+                retry_count=1,
+                next_retry_ts=past,
+            )
+        ).inserted_primary_key[0]
+
+    newer_snapshot_id = _seed_snapshot(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=newer_snapshot_id,
+                strategy="iron_condor",
+                score=99.0,
+                rationale="newer unrelated candidate",
+                legs_json=[],
+                suggestion_json={"defined_risk": True},
+            )
+        )
+
+    dispatch = AsyncMock()
+    with patch("optionsbot.daemon.alert_pipeline.dispatch_alert", new=dispatch):
+        count = await sweep_retries(daemon_context)
+
+    assert count == 1
+    dispatch.assert_awaited_once()
+    call = dispatch.await_args
+    assert call is not None
+    assert call.args[1] == alert_id
+    assert call.args[2] == old_snapshot_id
 
 
 async def test_sweep_retries_skips_row_when_reconstruct_returns_none(

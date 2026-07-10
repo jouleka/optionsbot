@@ -98,6 +98,12 @@ alerts = Table(
     "alerts",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="SET NULL"),
+        index=True,
+    ),
     Column("ts", DateTime(timezone=True), nullable=False, index=True),
     Column("symbol", Text, nullable=False),
     Column("strategy", Text, nullable=False),
@@ -276,6 +282,53 @@ Index(
     "ix_exit_requests_position_requested_at",
     exit_requests.c.position_id,
     exit_requests.c.requested_at,
+)
+
+
+# Hermes-originated pre-trade reviews. A review is evidence only: the daemon
+# may consume a fresh vetted row, but every deterministic execute_pick gate
+# remains authoritative. Non-vetted verdicts are persisted as terminal holds.
+entry_reviews = Table(
+    "entry_reviews",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    ),
+    Column("reviewed_at", DateTime(timezone=True), nullable=False),
+    Column("verdict", Text, nullable=False),
+    Column("confidence", Float, nullable=False),
+    Column("sources_json", JSON, nullable=False),
+    Column("reason", Text, nullable=False),
+    Column("checks_json", JSON, nullable=False),
+    Column("status", Text, nullable=False, server_default="requested", index=True),
+    Column("decision_reason", Text),
+    Column("claimed_at", DateTime(timezone=True)),
+    Column("processed_at", DateTime(timezone=True)),
+    Column("order_id", Integer, ForeignKey("orders.id", ondelete="SET NULL")),
+    CheckConstraint(
+        "verdict IN ('vetted_paper_candidate','watch_only','no_trade')",
+        name="ck_entry_reviews_verdict",
+    ),
+    CheckConstraint(
+        "status IN ('requested','processing','held','refused','submitted','expired','failed')",
+        name="ck_entry_reviews_status",
+    ),
+    CheckConstraint(
+        "confidence >= 0.0 AND confidence <= 1.0",
+        name="ck_entry_reviews_confidence",
+    ),
+)
+
+Index(
+    "ix_entry_reviews_status_reviewed_at",
+    entry_reviews.c.status,
+    entry_reviews.c.reviewed_at,
 )
 
 

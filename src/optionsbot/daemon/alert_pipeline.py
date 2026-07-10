@@ -43,9 +43,13 @@ async def enqueue_alert(
     ):
         return False
     now = datetime.now(UTC)
+    strategy_score_id = _strategy_score_id_for(
+        context, snapshot_id, scored.strategy_name
+    )
     with context.engine.begin() as conn:
         result = conn.execute(
             insert(alerts).values(
+                strategy_score_id=strategy_score_id,
                 ts=now, symbol=symbol, strategy=scored.strategy_name,
                 score=scored.score, status="pending",
             )
@@ -53,6 +57,20 @@ async def enqueue_alert(
         alert_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
     await dispatch_alert(context, alert_id, snapshot_id, scored)
     return True
+
+
+def _strategy_score_id_for(
+    context: DaemonContext, snapshot_id: int, strategy: str
+) -> int | None:
+    with context.engine.connect() as conn:
+        row = conn.execute(
+            select(strategy_scores.c.id)
+            .where(strategy_scores.c.snapshot_id == snapshot_id)
+            .where(strategy_scores.c.strategy == strategy)
+            .order_by(strategy_scores.c.id.desc())
+            .limit(1)
+        ).first()
+    return cast(int, row.id) if row is not None else None
 
 
 def execute_hint_for(
@@ -136,7 +154,7 @@ async def sweep_retries(context: DaemonContext) -> int:
     count = 0
     for row in rows:
         scored = _reconstruct_scored(context, row.id, row.strategy, row.score)
-        snapshot_id = _latest_snapshot_id_for_symbol(context, row.symbol)
+        snapshot_id = _snapshot_id_for_alert(context, row.id, row.symbol)
         if scored is None or snapshot_id is None:
             log.warning("retry skipped for alert %d: missing scored/snapshot", row.id)
             continue
@@ -232,6 +250,25 @@ def _load_symbol_for_alert(context: DaemonContext, alert_id: int) -> str:
     return cast(str, row.symbol)
 
 
+def _snapshot_id_for_alert(
+    context: DaemonContext, alert_id: int, symbol: str
+) -> int | None:
+    with context.engine.connect() as conn:
+        row = conn.execute(
+            select(strategy_scores.c.snapshot_id)
+            .select_from(
+                alerts.join(
+                    strategy_scores,
+                    alerts.c.strategy_score_id == strategy_scores.c.id,
+                )
+            )
+            .where(alerts.c.id == alert_id)
+        ).first()
+    if row is not None:
+        return cast(int, row.snapshot_id)
+    return _latest_snapshot_id_for_symbol(context, symbol)
+
+
 def _latest_snapshot_id_for_symbol(
     context: DaemonContext, symbol: str
 ) -> int | None:
@@ -254,17 +291,30 @@ def _reconstruct_scored(
     Uses SimpleNamespace for the suggestion since the formatter only reads
     duck-typed fields (legs/credit_or_debit/max_loss/etc.).
     """
-    symbol = _load_symbol_for_alert(context, alert_id)
-    snap_id = _latest_snapshot_id_for_symbol(context, symbol)
-    if snap_id is None:
-        return None
     with context.engine.connect() as conn:
-        score_row = conn.execute(
-            select(strategy_scores)
-            .where(strategy_scores.c.snapshot_id == snap_id)
-            .where(strategy_scores.c.strategy == strategy)
-            .limit(1)
-        ).fetchone()
+        alert_row = conn.execute(
+            select(alerts.c.strategy_score_id).where(alerts.c.id == alert_id)
+        ).first()
+        linked_score_id = (
+            int(alert_row.strategy_score_id)
+            if alert_row is not None and alert_row.strategy_score_id is not None
+            else None
+        )
+        if linked_score_id is not None:
+            score_row = conn.execute(
+                select(strategy_scores).where(strategy_scores.c.id == linked_score_id)
+            ).fetchone()
+        else:
+            symbol = _load_symbol_for_alert(context, alert_id)
+            snap_id = _latest_snapshot_id_for_symbol(context, symbol)
+            if snap_id is None:
+                return None
+            score_row = conn.execute(
+                select(strategy_scores)
+                .where(strategy_scores.c.snapshot_id == snap_id)
+                .where(strategy_scores.c.strategy == strategy)
+                .limit(1)
+            ).fetchone()
     if score_row is None:
         return None
     legs_data = score_row.legs_json or []

@@ -341,6 +341,17 @@ class Daemon:
         except Exception:
             log.exception("outcomes tick failed")
 
+    async def _entry_reviews_tick(self) -> None:
+        from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+        assert self._context is not None
+        try:
+            n = await run_entry_reviews_tick(self._context)
+            if n:
+                log.info("entry-review tick: submitted=%d", n)
+        except Exception:
+            log.exception("entry-review tick failed")
+
     async def _orders_tick(self) -> None:
         from optionsbot.daemon.order_watcher import run_orders_tick
 
@@ -380,4 +391,12 @@ class Daemon:
             self._orders_tick,
             trigger=IntervalTrigger(minutes=1),
             id="orders", max_instances=1, coalesce=True, replace_existing=True,
+        )
+        # Hermes entry reviews are advisory requests, never direct orders. This
+        # consumer feeds fresh vetted requests back through execute_pick once a
+        # minute; all deterministic execution gates remain authoritative.
+        self._scheduler.add_job(
+            self._entry_reviews_tick,
+            trigger=IntervalTrigger(minutes=1),
+            id="entry_reviews", max_instances=1, coalesce=True, replace_existing=True,
         )
