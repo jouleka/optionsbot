@@ -164,6 +164,9 @@ class ExecutionSettings(BaseModel):
     # the reprice ladder arrives in IBK-127. credit_drift_warn_pct flags when
     # the fresh mid drifted from the alerted credit.
     max_pick_age_minutes: int = Field(default=20, ge=1)
+    # Every option leg used to price an entry must carry a recent provider
+    # timestamp. Unknown or stale quote times fail closed before staging.
+    entry_quote_max_age_seconds: int = Field(default=45, ge=1)
     order_ttl_minutes: int = Field(default=10, ge=1)
     credit_drift_warn_pct: float = Field(default=0.25, gt=0.0)
     # IBK-127 price walk: submit at mid, reprice toward marketable every

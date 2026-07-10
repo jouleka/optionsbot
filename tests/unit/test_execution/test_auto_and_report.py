@@ -34,7 +34,14 @@ NOW = datetime(2026, 6, 11, 16, 0, tzinfo=UTC)
 
 
 async def test_auto_mode_rejects_earnings_window(tmp_db: Engine) -> None:
-    score_id = _insert_pick(tmp_db, raw_json={"earnings_in_window": True})
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={
+            "delayed": False,
+            "warming_up": False,
+            "earnings_in_window": True,
+        },
+    )
     deps = _deps(tmp_db)
     deps.settings.execution.mode = "auto"
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
@@ -48,7 +55,9 @@ async def test_auto_mode_rejects_unready_snapshot(
     tmp_db: Engine,
     quality_flag: str,
 ) -> None:
-    score_id = _insert_pick(tmp_db, raw_json={quality_flag: True})
+    raw_json = {"delayed": False, "warming_up": False}
+    raw_json[quality_flag] = True
+    score_id = _insert_pick(tmp_db, raw_json=raw_json)
     deps = _deps(tmp_db)
     deps.settings.execution.mode = "auto"
 
@@ -69,7 +78,10 @@ async def test_confirm_mode_allows_earnings_window(tmp_db: Engine) -> None:
 
 
 async def test_auto_mode_rejects_at_bp_cap(tmp_db: Engine) -> None:
-    score_id = _insert_pick(tmp_db)
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={"delayed": False, "warming_up": False},
+    )
     # net_liq 100k, available 60k -> 40% deployed >= 30% cap.
     deps = _deps(tmp_db, available_funds=60_000.0, net_liquidation=100_000.0)
     deps.settings.execution.mode = "auto"

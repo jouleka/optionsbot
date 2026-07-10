@@ -21,7 +21,7 @@ class StockQuote:
     ask: float | None
     last: float | None
     mid: float | None  # (bid + ask) / 2 when both available
-    ts: datetime
+    ts: datetime | None
     delayed: bool  # True when the quote came from delayed market data
 
 
@@ -42,7 +42,7 @@ class OptionQuote:
     vega: float | None
     open_interest: int | None
     volume: int | None
-    ts: datetime
+    ts: datetime | None
     delayed: bool
 
 

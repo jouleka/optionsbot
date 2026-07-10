@@ -134,6 +134,30 @@ def _min_dte(legs: list[dict[str, object]], now: datetime) -> int | None:
     return min(dtes) if dtes else None
 
 
+def _exit_quote_readiness(
+    quotes: dict[tuple[str, float, str], OptionQuote],
+    now: datetime,
+    max_age_seconds: int,
+) -> tuple[dict[tuple[str, float, str], float], str | None]:
+    """Require exact live provenance and known, current timestamps for every quote."""
+    ages: dict[tuple[str, float, str], float] = {}
+    if not quotes:
+        return ages, "quotes unavailable"
+    for spec, quote in quotes.items():
+        if quote.delayed is not False:
+            return ages, "delayed or unknown quote delivery"
+        if not isinstance(quote.ts, datetime):
+            return ages, "quote timestamp unknown"
+        quote_ts = quote.ts if quote.ts.tzinfo is not None else quote.ts.replace(tzinfo=UTC)
+        age = (now - quote_ts.astimezone(UTC)).total_seconds()
+        ages[spec] = age
+        if age < 0:
+            return ages, "quote timestamp is in the future"
+        if max_age_seconds > 0 and age > max_age_seconds:
+            return ages, f"quotes are stale (oldest {age:.0f}s > {max_age_seconds}s)"
+    return ages, None
+
+
 def _day_start(now: datetime) -> datetime:
     return datetime(now.year, now.month, now.day, tzinfo=UTC)
 
@@ -201,13 +225,13 @@ async def _quote_gate_state(
         current_net = combo_mid(entry.legs, quotes)
     except Exception:  # noqa: BLE001 -- request_exit fails closed without quote corroboration
         log.warning("request_exit quote gate failed for entry #%s", entry.id)
-    max_age = context.settings.execution.exit_quote_max_age_seconds
-    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
-    if (
-        max_age > 0
-        and current_net is not None
-        and any(age > max_age for age in quote_ages.values())
-    ):
+        quotes = {}
+    _, quote_issue = _exit_quote_readiness(
+        quotes,
+        datetime.now(UTC),
+        context.settings.execution.exit_quote_max_age_seconds,
+    )
+    if current_net is None or quote_issue is not None:
         current_net = None
     deterministic_reason = None
     if dte is not None:
@@ -478,37 +502,35 @@ async def _manage_entry(
                 spec[2],  # type: ignore[arg-type]
             )
         current_net = combo_mid(entry.legs, quotes)
-    except Exception:  # noqa: BLE001 -- expiry guard must still work quote-blind
+    except Exception:  # noqa: BLE001 -- deterministic exits must still work quote-blind
         log.warning("exit quotes failed for entry #%s — DTE rules only", entry.id)
+        quotes = {}
 
-    # Quote-freshness gate (IBK-PHASE0-C1). If ANY quote feeding current_net is
-    # older than the threshold, drop current_net to None: evaluate_exit then
-    # takes its quote-blind path (expiry/DTE only), so a TP/soft stop can never
-    # be priced off a stale mid. Always log the timestamps the decision used.
     max_age = context.settings.execution.exit_quote_max_age_seconds
-    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
-    if quotes:
+    quote_ages, quote_issue = _exit_quote_readiness(quotes, datetime.now(UTC), max_age)
+    if quote_issue is None and current_net is None:
+        quote_issue = "quote mid unavailable"
+    if quotes and quote_issue is None:
         log.info(
             "exit quotes for entry #%s: %s",
             entry.id,
             ", ".join(
                 f"{spec[1]}{spec[2]}@{q.ts.isoformat()} (age {quote_ages[spec]:.0f}s)"
                 for spec, q in quotes.items()
+                if q.ts is not None
             ),
         )
-    stale = bool(
-        max_age > 0
-        and current_net is not None
-        and any(age > max_age for age in quote_ages.values())
-    )
-    if stale:
-        oldest = max(quote_ages.values())
-        # Suppress the staleness ALERT on a forced /close: nothing is deferred
-        # there (the close still proceeds priced off entry-net + a walk re-anchor),
-        # so the "TP/stop deferred" message would be false/confusing. The pricing
-        # suppression (current_net=None) below still applies on both paths.
-        if forced_reason is None and entry.id not in context.exit_stale_warned:
+    if quote_issue is not None:
+        # Keep the existing one-shot operator alert for stale delivery. Other
+        # unavailable shapes are logged and fail closed without quote-driven
+        # TP/stop evaluation; deterministic DTE/expiry rules remain active.
+        if (
+            "stale" in quote_issue
+            and forced_reason is None
+            and entry.id not in context.exit_stale_warned
+        ):
             context.exit_stale_warned.add(entry.id)
+            oldest = max(quote_ages.values(), default=0.0)
             await _send(
                 context,
                 f"⚠ exit pricing for #{entry.id} {entry.symbol} {entry.strategy} "
@@ -516,13 +538,12 @@ async def _manage_entry(
                 f"{max_age}s). TP/stop deferred; expiry/DTE rules still active.",
             )
         log.warning(
-            "exit #%s quote-priced exit suppressed (stale: oldest %.0fs > %ss)",
+            "exit #%s quote-priced exit suppressed (%s)",
             entry.id,
-            oldest,
-            max_age,
+            quote_issue,
         )
         current_net = None
-        quotes = {}  # stale quotes must not price the close/walk either
+        quotes = {}  # unusable quotes must not price the close or a walk
     else:
         context.exit_stale_warned.discard(entry.id)
 
@@ -543,8 +564,8 @@ async def _manage_entry(
         return 0
 
     # Price the FLIPPED structure. Closing a credit pays; closing a debit
-    # collects. With no usable quote (expiry guard path) fall back to the
-    # entry net — the walk re-anchors from live quotes immediately anyway.
+    # collects. A deterministic time/DTE close with no usable live quote falls
+    # back to the entry net and does not start a quote-driven price walk.
     # Rounded to the symbol tick: IBKR rejects sub-increment limits (Error 110).
     increment = price_increment_for(entry.symbol)
     close_net = round_to_increment(
@@ -581,9 +602,11 @@ async def _manage_entry(
         return 0
     transition(engine, close.id, "submitted", ib_order_id=placed.ib_order_id, now=now)
 
-    # Walk the close like an entry (IBK-127).
+    # Walk only when this close was initially priced from a complete live,
+    # current quote set. Quote-blind deterministic closes must never re-anchor
+    # to delayed/unknown data in the generic walk implementation.
     cfg = context.settings.execution
-    if cfg.walk_max_steps > 0:
+    if cfg.walk_max_steps > 0 and current_net is not None:
         flipped_nbbo = combo_bid_ask(close.legs, quotes) if quotes else None
         budget = (
             slippage_budget(

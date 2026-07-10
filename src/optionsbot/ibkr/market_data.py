@@ -53,28 +53,19 @@ def _greek(greeks: object, name: str) -> float | None:
     return None if v == -2.0 else v
 
 
-def _ticker_ts(ticker: Ticker) -> datetime:
+def _ticker_ts(ticker: Ticker) -> datetime | None:
     ts = getattr(ticker, "time", None)
     if isinstance(ts, datetime):
         # Preserve tz if present; else treat as UTC (IBKR returns UTC).
         if ts.tzinfo is None:
             return ts.replace(tzinfo=UTC)
         return ts
-    return datetime.now(UTC)
+    return None
 
 
-def _ticker_delayed(ticker: Ticker) -> bool:
-    """Classify from the feed IBKR actually delivered, not requested config.
-
-    IBKR marketDataType 1 is live; 2/3/4 are frozen or delayed. An absent or
-    malformed value is conservatively non-live so execution cannot treat an
-    unknown quote as fresh real-time data.
-    """
-    try:
-        market_data_type = int(ticker.marketDataType)
-    except (AttributeError, TypeError, ValueError):
-        return True
-    return market_data_type != 1
+def _market_data_type_delayed(observed: object) -> bool:
+    """Only an explicitly observed, exact IBKR integer ``1`` proves live data."""
+    return type(observed) is not int or observed != 1
 
 
 class MarketDataClient:
@@ -83,6 +74,39 @@ class MarketDataClient:
     ) -> None:
         self._client = client
         self._resolver = resolver if resolver is not None else ContractResolver(client)
+        self._delivered_market_data_types: dict[int, object] = {}
+        self._install_market_data_type_observer()
+
+    def _install_market_data_type_observer(self) -> None:
+        """Record IBKR delivery callbacks before ``reqTickersAsync`` returns.
+
+        ``ib_async.Ticker.marketDataType`` defaults to ``1`` even when IBKR has
+        not sent the callback. Wrapping the adapter's underlying callback keeps
+        provenance separate from that unsafe object default. The wrapper-level
+        observation map keeps repeated adapter construction idempotent.
+        """
+        wrapper = getattr(self._client.ib, "wrapper", None)
+        observations = getattr(wrapper, "_optionsbot_market_data_types", None)
+        if isinstance(observations, dict):
+            self._delivered_market_data_types = observations
+            return
+        callback = getattr(wrapper, "marketDataType", None)
+        if wrapper is None or not callable(callback):
+            return
+        observations = {}
+        self._delivered_market_data_types = observations
+        wrapper._optionsbot_market_data_types = observations
+
+        def _observe(req_id: int, market_data_type: object) -> None:
+            callback(req_id, market_data_type)
+            req_id_to_ticker = getattr(wrapper, "reqId2Ticker", None)
+            if not isinstance(req_id_to_ticker, dict):
+                return
+            ticker = req_id_to_ticker.get(req_id)
+            if ticker is not None:
+                observations[id(ticker)] = market_data_type
+
+        wrapper.marketDataType = _observe
 
     @property
     def client(self) -> IBKRClient:
@@ -94,6 +118,7 @@ class MarketDataClient:
         bid = clean_float(getattr(ticker, "bid", None))
         ask = clean_float(getattr(ticker, "ask", None))
         last = clean_float(getattr(ticker, "last", None))
+        observed_market_data_type = self._delivered_market_data_types.pop(id(ticker), None)
         return StockQuote(
             symbol=symbol,
             bid=bid,
@@ -101,7 +126,7 @@ class MarketDataClient:
             last=last,
             mid=_mid(bid, ask),
             ts=_ticker_ts(ticker),
-            delayed=_ticker_delayed(ticker),
+            delayed=_market_data_type_delayed(observed_market_data_type),
         )
 
     async def get_option_snapshot(
@@ -124,6 +149,7 @@ class MarketDataClient:
         vega = _greek(greeks, "vega") if greeks is not None else None
         open_interest = clean_int(getattr(ticker, "openInterest", None))
         volume = clean_int(getattr(ticker, "volume", None))
+        observed_market_data_type = self._delivered_market_data_types.pop(id(ticker), None)
         return OptionQuote(
             symbol=symbol,
             expiry=expiry,
@@ -141,7 +167,7 @@ class MarketDataClient:
             open_interest=open_interest,
             volume=volume,
             ts=_ticker_ts(ticker),
-            delayed=_ticker_delayed(ticker),
+            delayed=_market_data_type_delayed(observed_market_data_type),
         )
 
     async def _fetch_ticker(self, contract: Contract) -> Ticker:

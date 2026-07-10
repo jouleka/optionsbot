@@ -184,16 +184,24 @@ async def execute_pick(
     # are skipped — binary jump risk overwhelms theta edge for neutral
     # structures (the human can still /execute deliberately in confirm mode).
     if settings.execution.mode == "auto":
-        snapshot_raw: dict[str, Any] = pick.raw_json or {}
+        snapshot_raw = pick.raw_json
+        if not isinstance(snapshot_raw, dict):
+            return _reject(
+                "snapshot data readiness unavailable — auto mode requires audited live data"
+            )
+        if (
+            snapshot_raw.get("delayed") is not False
+            or snapshot_raw.get("warming_up") is not False
+        ):
+            return _reject(
+                "snapshot data not explicitly live and ready — auto mode requires "
+                "delayed=false and warming up=false"
+            )
         if snapshot_raw.get("earnings_in_window"):
             return _reject(
                 "earnings inside the expiry window — auto mode skips "
                 "(use /execute to override deliberately)"
             )
-        if snapshot_raw.get("delayed"):
-            return _reject("delayed snapshot data — auto mode requires a live delivered feed")
-        if snapshot_raw.get("warming_up"):
-            return _reject("snapshot history is warming up — auto mode requires mature data")
     if (
         suggestion.get("defined_risk") is not True
         or not has_structurally_defined_option_risk(legs)
@@ -261,10 +269,23 @@ async def execute_pick(
                 )
             except Exception as exc:  # noqa: BLE001 -- per-leg quote failure = reject
                 return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
-    if any(quote.delayed for quote in quotes.values()):
+    if any(quote.delayed is not False for quote in quotes.values()):
         return _reject(
             "delayed or unknown option quote feed — refusing to price an entry without live data"
         )
+    quote_max_age = timedelta(seconds=settings.execution.entry_quote_max_age_seconds)
+    quote_now = ts_now if now is not None else datetime.now(UTC)
+    for quote in quotes.values():
+        if not isinstance(quote.ts, datetime):
+            return _reject("option quote timestamp unknown — refusing to price an entry blind")
+        quote_ts = quote.ts if quote.ts.tzinfo is not None else quote.ts.replace(tzinfo=UTC)
+        quote_age = quote_now - quote_ts.astimezone(UTC)
+        if quote_age < timedelta(0) or quote_age > quote_max_age:
+            return _reject(
+                "option quote age outside execution window "
+                f"({quote_age.total_seconds():.0f}s; max "
+                f"{settings.execution.entry_quote_max_age_seconds}s)"
+            )
     issues = liquidity_issues(
         legs, quotes,
         leg_spread_frac=settings.execution.max_leg_spread_frac,
@@ -380,6 +401,11 @@ async def execute_pick(
         # or no available-funds figure, reject rather than skip the money gate.
         return _reject(
             "margin preview incomplete (init-margin or available funds unknown) "
+            "— refusing to place blind"
+        )
+    if not math.isfinite(needed) or not math.isfinite(available):
+        return _reject(
+            "margin preview invalid (init-margin or available funds non-finite) "
             "— refusing to place blind"
         )
     if needed > available:

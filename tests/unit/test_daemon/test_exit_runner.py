@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -63,16 +64,30 @@ def _filled_entry(context: DaemonContext, *, expiry: str = FAR) -> int:
     return order_id
 
 
-def _quote(strike: float, right: str, mid: float) -> OptionQuote:
+def _quote(
+    strike: float,
+    right: str,
+    mid: float,
+    *,
+    delayed: bool | None = False,
+    ts: datetime | None = None,
+) -> OptionQuote:
     return OptionQuote(
         symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
         bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
         iv=None, delta=None, gamma=None, theta=None, vega=None,
-        open_interest=None, volume=None, ts=datetime.now(UTC), delayed=True,
+        open_interest=None, volume=None, ts=ts or datetime.now(UTC),
+        delayed=delayed,  # type: ignore[arg-type]
     )
 
 
-def _wire(context: DaemonContext, mids: dict[tuple[float, str], float]) -> MagicMock:
+def _wire(
+    context: DaemonContext,
+    mids: dict[tuple[float, str], float],
+    *,
+    delayed: bool | None = False,
+    quote_ts: datetime | None = None,
+) -> MagicMock:
     context.settings.execution.enabled = True
     context.settings.execution.walk_max_steps = 0  # no walk task in tests
     order_client = MagicMock()
@@ -87,7 +102,7 @@ def _wire(context: DaemonContext, mids: dict[tuple[float, str], float]) -> Magic
     md = MagicMock()
     md.get_option_snapshot = AsyncMock(
         side_effect=lambda symbol, expiry, strike, right: _quote(
-            strike, right, mids[(strike, right)]
+            strike, right, mids[(strike, right)], delayed=delayed, ts=quote_ts
         )
     )
     context._test_md = md  # type: ignore[attr-defined]
@@ -155,6 +170,49 @@ async def test_no_trigger_no_close(daemon_context: DaemonContext) -> None:
     order_client.place_combo_limit.assert_not_awaited()
 
 
+@pytest.mark.parametrize("delivery_state", [True, None])
+async def test_delayed_or_unknown_quote_never_triggers_take_profit(
+    daemon_context: DaemonContext, delivery_state: bool | None
+) -> None:
+    _filled_entry(daemon_context)
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 0.80, (575.0, "P"): 0.30},
+        delayed=delivery_state,
+    )
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+
+
+@pytest.mark.parametrize("delivery_state", [True, None])
+async def test_delayed_or_unknown_quote_never_triggers_soft_stop(
+    daemon_context: DaemonContext, delivery_state: bool | None
+) -> None:
+    _filled_entry(daemon_context)
+    daemon_context.settings.execution.exit_stop_enabled = True
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 4.00, (575.0, "P"): 0.30},
+        delayed=delivery_state,
+    )
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+
+
 async def test_request_exit_adverse_loser_submits_audited_close(
     daemon_context: DaemonContext,
 ) -> None:
@@ -179,6 +237,33 @@ async def test_request_exit_adverse_loser_submits_audited_close(
     assert row.status == "submitted"
     assert row.close_order_id is not None
     assert "adverse" in row.decision_reason
+
+
+@pytest.mark.parametrize("delivery_state", [True, None])
+async def test_delayed_or_unknown_quote_cannot_corroborate_hermes_exit(
+    daemon_context: DaemonContext, delivery_state: bool | None
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    request_id = _queue_exit_request(daemon_context, entry_id)
+    _capture_loss_baseline(daemon_context)
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 1.90, (575.0, "P"): 0.30},
+        delayed=delivery_state,
+    )
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
+    assert row.status == "refused"
+    assert "no live quote" in row.decision_reason
 
 
 async def test_request_exit_refuses_winning_headline_without_deterministic_exit(
@@ -366,6 +451,33 @@ async def test_expiry_guard_forces_close(daemon_context: DaemonContext) -> None:
     order_client.place_combo_limit.assert_awaited_once()
 
 
+async def test_delayed_expiry_guard_is_quote_blind_and_does_not_walk(
+    daemon_context: DaemonContext,
+) -> None:
+    _filled_entry(daemon_context, expiry=NEAR)
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 4.00, (575.0, "P"): 0.30},
+        delayed=True,
+    )
+    daemon_context.settings.execution.walk_max_steps = 2
+
+    with (
+        patch(
+            "optionsbot.daemon.exit_runner._exec_md",
+            return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+        ),
+        patch("optionsbot.execution.walk.run_price_walk", new_callable=AsyncMock) as walk,
+    ):
+        summary = await run_exits_tick(daemon_context)
+        await asyncio.sleep(0)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
+    assert order_client.place_combo_limit.await_args.kwargs["limit_price"] == pytest.approx(1.20)
+    walk.assert_not_awaited()
+
+
 async def test_half_closed_position_hands_off_instead_of_reclosing(
     daemon_context: DaemonContext,
 ) -> None:
@@ -434,7 +546,7 @@ async def test_stale_quote_suppresses_take_profit_and_alerts(
             symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
             bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
             iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+            open_interest=None, volume=None, ts=stale_ts, delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
@@ -504,7 +616,7 @@ async def test_stale_quote_still_allows_expiry_guard(
             symbol="SPY", expiry=NEAR, strike=strike, right=right,  # type: ignore[arg-type]
             bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
             iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+            open_interest=None, volume=None, ts=stale_ts, delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
@@ -732,7 +844,7 @@ async def test_force_close_with_stale_quotes_places_and_skips_deferred_alert(
             symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
             bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
             iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=True,
+            open_interest=None, volume=None, ts=stale_ts, delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)

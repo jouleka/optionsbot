@@ -36,13 +36,14 @@ def _quote(
     mid: float | None,
     *,
     delayed: bool = False,
+    ts: datetime | None = NOW,
 ) -> OptionQuote:
     bid = round(mid - 0.05, 4) if mid is not None else None
     ask = round(mid + 0.05, 4) if mid is not None else None
     return OptionQuote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
         bid=bid, ask=ask, last=None, mid=mid, iv=None, delta=None, gamma=None,
-        theta=None, vega=None, open_interest=None, volume=None, ts=NOW, delayed=delayed,
+        theta=None, vega=None, open_interest=None, volume=None, ts=ts, delayed=delayed,
     )
 
 
@@ -56,7 +57,7 @@ def _insert_pick(
     credit_or_debit: float = 120.0,  # dollars per set; 1.20/unit
     max_loss: float = 380.0,
     legs: list[dict[str, Any]] | None = None,
-    raw_json: dict[str, Any] | None = None,
+    raw_json: Any = None,
 ) -> int:
     with engine.begin() as conn:
         snapshot_id = conn.execute(
@@ -93,6 +94,7 @@ def _deps(
     margin_change: float | None = 380.0,
     walk: bool = False,
     delayed: bool = False,
+    quote_ts: datetime | None = NOW,
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
@@ -116,7 +118,7 @@ def _deps(
     md = MagicMock()
     md.get_option_snapshot = AsyncMock(
         side_effect=lambda symbol, expiry, strike, right: _quote(
-            strike, right, mids.get((strike, right)), delayed=delayed
+            strike, right, mids.get((strike, right)), delayed=delayed, ts=quote_ts
         )
     )
 
@@ -199,6 +201,51 @@ async def test_rejects_stale_pick(tmp_db: Engine) -> None:
     assert "stale" in outcome.message.lower()
 
 
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        None,
+        {},
+        {"delayed": False},
+        {"warming_up": False},
+        {"delayed": 0, "warming_up": False},
+        {"delayed": False, "warming_up": 0},
+        {"delayed": "false", "warming_up": False},
+        {"delayed": False, "warming_up": "false"},
+        [],
+        "legacy",
+    ],
+)
+async def test_auto_entry_rejects_snapshot_without_exact_ready_flags(
+    tmp_db: Engine, raw_json: Any
+) -> None:
+    score_id = _insert_pick(tmp_db, raw_json=raw_json)
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "snapshot" in outcome.message.lower() or "data" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_auto_entry_accepts_exact_false_ready_flags(tmp_db: Engine) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={"delayed": False, "warming_up": False},
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    deps.order_client.place_combo_limit.assert_awaited_once()  # type: ignore[attr-defined]
+
+
 async def test_rejects_undefined_risk(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db, defined_risk=False)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
@@ -216,6 +263,30 @@ async def test_rejects_non_finite_max_loss(tmp_db: Engine) -> None:
 
     assert not outcome.ok
     assert "defined max loss" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_rejects_option_quote_with_unknown_timestamp(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, quote_ts=None)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "timestamp" in outcome.message.lower() or "quote age" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_rejects_stale_option_quote_timestamp(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, quote_ts=NOW - timedelta(seconds=46))
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "quote age" in outcome.message.lower()
     deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
@@ -375,6 +446,36 @@ async def test_rejects_when_available_funds_unknown(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
     assert "margin" in outcome.message.lower() or "funds" in outcome.message.lower()
+
+
+@pytest.mark.parametrize("margin_change", [float("nan"), float("inf"), float("-inf")])
+async def test_rejects_non_finite_final_margin_requirement(
+    tmp_db: Engine, margin_change: float
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, margin_change=margin_change)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("available_funds", [float("nan"), float("inf"), float("-inf")])
+async def test_rejects_non_finite_final_available_funds(
+    tmp_db: Engine, available_funds: float
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, available_funds=available_funds)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower() or "funds" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 async def test_rejects_when_whatif_raises(tmp_db: Engine) -> None:
