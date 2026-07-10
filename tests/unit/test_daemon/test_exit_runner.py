@@ -68,7 +68,7 @@ def _quote(strike: float, right: str, mid: float) -> OptionQuote:
         symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
         bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
         iv=None, delta=None, gamma=None, theta=None, vega=None,
-        open_interest=None, volume=None, ts=NOW, delayed=True,
+        open_interest=None, volume=None, ts=datetime.now(UTC), delayed=True,
     )
 
 
