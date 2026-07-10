@@ -229,9 +229,9 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
             "SELECT version_num FROM alembic_version"
         ).scalar_one()
         indexes = {idx["name"] for idx in inspect(conn).get_indexes("orders")}
-    assert [row.status for row in closes] == ["staged", "abandoned"]
-    assert closes[1].terminal_ts is not None
-    assert "migration 0016" in closes[1].last_error
+    assert [row.status for row in closes] == ["abandoned", "submitted"]
+    assert closes[0].terminal_ts is not None
+    assert "migration 0016" in closes[0].last_error
     assert state.killed == 1
     assert "duplicate active closes" in state.reason
     assert revision == "0016"
@@ -251,7 +251,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
         revision_after_roundtrip = conn.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
         ).scalar_one()
-    assert statuses == ["staged", "abandoned"]
+    assert statuses == ["abandoned", "submitted"]
     assert state_after_roundtrip.killed == 1
     assert revision_after_roundtrip == "0016"
 

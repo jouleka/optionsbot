@@ -38,8 +38,9 @@ def upgrade() -> None:
         )
     ).first()
     if duplicate is not None:
-        # Preserve every historical row but retain only the oldest active claim.
-        # Later duplicate attempts become terminal evidence, and the persisted
+        # Preserve every historical row but retain the claim with the strongest
+        # evidence of broker mutation (partial > submitted > submitting > staged).
+        # Later/weaker duplicates become terminal evidence, and the persisted
         # kill switch forces broker/ledger reconciliation before any re-arm.
         bind.execute(
             sa.text(
@@ -51,19 +52,26 @@ def upgrade() -> None:
                         'migration 0016 quarantined duplicate active close; ' ||
                         'reconcile broker state before re-arming'
                 WHERE id IN (
-                    SELECT candidate.id
-                    FROM orders AS candidate
-                    JOIN (
-                        SELECT closes_order_id, MIN(id) AS keep_id
+                    SELECT ranked.id
+                    FROM (
+                        SELECT
+                            id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY closes_order_id
+                                ORDER BY
+                                    CASE status
+                                        WHEN 'partial' THEN 0
+                                        WHEN 'submitted' THEN 1
+                                        WHEN 'submitting' THEN 2
+                                        ELSE 3
+                                    END,
+                                    id
+                            ) AS claim_rank
                         FROM orders
                         WHERE closes_order_id IS NOT NULL
                           AND status IN ('staged', 'submitting', 'submitted', 'partial')
-                        GROUP BY closes_order_id
-                        HAVING COUNT(*) > 1
-                    ) AS duplicates
-                      ON duplicates.closes_order_id = candidate.closes_order_id
-                    WHERE candidate.status IN ('staged', 'submitting', 'submitted', 'partial')
-                      AND candidate.id <> duplicates.keep_id
+                    ) AS ranked
+                    WHERE ranked.claim_rank > 1
                 )
                 """
             )
