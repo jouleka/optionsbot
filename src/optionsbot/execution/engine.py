@@ -26,13 +26,13 @@ from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
-    IllegalOrderTransition,
     record_order_quotes,
+    set_order_note,
     stage_order,
     transition,
 )
 from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
-from optionsbot.execution.state import load_state
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
     combo_spread_issue,
@@ -464,33 +464,48 @@ async def execute_pick(
             limit_price=limit_price,
             order_ref=record.order_ref or f"obot-{record.id}",
         )
-    except Exception as exc:  # noqa: BLE001 -- a failed place must land in the ledger
-        transition(engine, record.id, "skipped", error=str(exc), now=ts_now)
+    except Exception as exc:  # noqa: BLE001 -- broker outcome may be unknown
+        halt_reason = (
+            f"entry order #{record.id} broker placement outcome unknown after "
+            f"exception: {exc}"
+        )
+        try:
+            set_order_note(engine, record.id, halt_reason)
+        except Exception:  # noqa: BLE001 -- kill still takes precedence
+            log.exception("failed to annotate uncertain entry order #%s", record.id)
+        trip_kill(engine, halt_reason, now=ts_now)
         return ExecuteOutcome(
             ok=False,
-            message=f"❌ order #{record.id} not placed: {exc}",
+            message=(
+                f"🛑 HALT: order #{record.id} placement outcome unknown: {exc}. "
+                "Reconcile broker and ledger state before re-arming."
+            ),
             order_id=record.id,
         )
     try:
         transition(
             engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
         )
-    except IllegalOrderTransition:
-        # A reconcile pass raced the place and resolved this row terminal
-        # while we were awaiting the broker. The order is REAL at IBKR — pull
-        # it immediately rather than leave a position the ledger denies.
-        log.error(
-            "order #%s went terminal during place — cancelling at broker", record.id
+    except Exception as exc:  # noqa: BLE001 -- broker order is already real
+        # A reconcile or persistence race resolved/prevented this transition
+        # while we were awaiting the broker. The order may be live at IBKR;
+        # halt even if cancellation appears to succeed because its final state
+        # is not yet reconciled.
+        halt_reason = (
+            f"entry order #{record.id} broker/ledger completion race after "
+            f"placement of IB order {placed.ib_order_id}: {exc}"
         )
+        trip_kill(engine, halt_reason, now=ts_now)
+        log.error("%s — cancelling at broker", halt_reason)
         try:
             await deps.order_client.cancel(placed.ib_order_id)
-        except Exception:  # noqa: BLE001 -- reconcile/kill-switch is the backstop
+        except Exception:  # noqa: BLE001 -- persisted kill switch is the backstop
             log.exception("race-cancel failed for order #%s", record.id)
         return ExecuteOutcome(
             ok=False,
             message=(
-                f"❌ order #{record.id} hit a reconcile race — cancelled at the "
-                "broker; /execute again"
+                f"🛑 HALT: order #{record.id} hit a broker/ledger race after "
+                "placement; cancellation requested. Reconcile before re-arming."
             ),
             order_id=record.id,
         )

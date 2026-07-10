@@ -9,14 +9,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import Engine, insert
+from sqlalchemy import Engine, insert, select
 
 from optionsbot.config import Settings
 from optionsbot.execution.engine import ExecutionDeps, combo_mid, execute_pick
 from optionsbot.execution.orders import get_order, stage_order, transition
-from optionsbot.execution.state import trip_kill
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import AccountSummary, MarginPreview, OptionQuote, PlacedOrder
-from optionsbot.storage.schema import snapshots, strategy_scores
+from optionsbot.storage.schema import execution_state, snapshots, strategy_scores
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 
@@ -98,6 +98,14 @@ def _deps(
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
+    with tmp_db.connect() as conn:
+        day_start = conn.execute(
+            select(execution_state.c.day_start_net_liq).where(execution_state.c.id == 1)
+        ).scalar_one_or_none()
+    if net_liquidation is not None and day_start is None:
+        from optionsbot.execution.equity_guard import capture_day_start_net_liq
+
+        capture_day_start_net_liq(tmp_db, float(net_liquidation))
 
     order_client = MagicMock()
     order_client.place_combo_limit = AsyncMock(
@@ -669,23 +677,29 @@ async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
     assert not outcome.ok
     assert "race" in outcome.message.lower()
     deps.order_client.cancel.assert_awaited_once_with(77)
+    state = load_state(tmp_db)
+    assert state.killed is True
+    assert state.reason is not None and "broker" in state.reason
 
 
-async def test_place_failure_marks_skipped(tmp_db: Engine) -> None:
+async def test_place_failure_halts_and_preserves_submitting_claim(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db)
     deps.order_client.place_combo_limit = AsyncMock(
-        side_effect=RuntimeError("gateway exploded")
+        side_effect=RuntimeError("gateway acknowledgement lost")
     )
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
-    assert "gateway exploded" in outcome.message
+    assert "outcome unknown" in outcome.message
     assert outcome.order_id is not None
     record = get_order(tmp_db, outcome.order_id)
     assert record is not None
-    assert record.status == "skipped"
-    assert record.last_error == "gateway exploded"
+    assert record.status == "submitting"
+    assert record.last_error is not None and "unknown" in record.last_error
+    state = load_state(tmp_db)
+    assert state.killed is True
+    assert state.reason is not None and "unknown" in state.reason
 
 
 async def test_execute_pick_blocks_near_daily_loss_cap(tmp_db: Engine) -> None:

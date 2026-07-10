@@ -271,6 +271,47 @@ async def test_delayed_or_unknown_quote_cannot_corroborate_hermes_exit(
     assert "no live quote" in row.decision_reason
 
 
+@pytest.mark.parametrize(
+    ("confidence", "sources"),
+    [
+        (float("inf"), ["source A", "source B"]),
+        (0.90, "ab"),
+        (0.90, ["same", "same"]),
+        (0.90, ["", "source B"]),
+    ],
+)
+async def test_persisted_exit_request_evidence_must_be_finite_and_well_formed(
+    daemon_context: DaemonContext,
+    confidence: float,
+    sources: object,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    request_id = _queue_exit_request(daemon_context, entry_id)
+    _capture_loss_baseline(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .values(confidence=confidence, sources_json=sources)
+        )
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.90, (575.0, "P"): 0.30})
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(
+            select(exit_requests).where(exit_requests.c.id == request_id)
+        ).one()
+    assert row.status == "refused"
+    assert "evidence" in row.decision_reason
+
+
 async def test_request_exit_is_bound_before_broker_placement(
     daemon_context: DaemonContext,
 ) -> None:
@@ -427,6 +468,33 @@ async def test_request_exit_completion_rowcount_failure_halts_after_placement(
         ).one()
     assert request.status == "refused"
     assert request.close_order_id is not None
+
+
+async def test_request_exit_completion_exception_halts_after_placement(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    _queue_exit_request(daemon_context, entry_id)
+    _capture_loss_baseline(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.90, (575.0, "P"): 0.30})
+
+    with (
+        patch(
+            "optionsbot.daemon.exit_runner._exec_md",
+            return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+        ),
+        patch(
+            "optionsbot.daemon.exit_runner._finish_bound_exit_request",
+            side_effect=RuntimeError("simulated completion write failure"),
+        ),
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert state.reason is not None and "completion" in state.reason
 
 
 async def test_close_ledger_failure_after_broker_placement_halts(

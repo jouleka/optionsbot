@@ -91,11 +91,12 @@ def test_new_entry_allowed_below_block_frac(tmp_db: Engine) -> None:
     assert ok.allowed is True
 
 
-def test_new_entry_allowed_when_not_evaluable(tmp_db: Engine) -> None:
-    # No baseline or unknown current -> fail OPEN for entries (the per-tick
-    # breaker is the real backstop; entries shouldn't hard-block on a flaky read).
-    ok = new_entry_allowed(tmp_db, _settings(), current_net_liq=None)
-    assert ok.allowed is True
+def test_new_entry_blocked_when_not_evaluable(tmp_db: Engine) -> None:
+    # Missing baseline/current equity cannot prove the daily-loss guard, so new
+    # risk must fail closed even though exits remain available.
+    decision = new_entry_allowed(tmp_db, _settings(), current_net_liq=None)
+    assert decision.allowed is False
+    assert "not evaluable" in decision.reason
 
 
 def test_evaluate_is_idempotent_when_already_killed(tmp_db: Engine) -> None:

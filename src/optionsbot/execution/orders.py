@@ -26,6 +26,7 @@ from typing import Any
 from sqlalchemy import Engine, Row, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
+from optionsbot.execution.close_safety import NonAtomicCloseError, assert_atomic_close_legs
 from optionsbot.storage.schema import (
     entry_intent_consumptions,
     fills,
@@ -682,6 +683,26 @@ def realized_close_pairs(
             engine, close.closes_order_id
         )
         close_premium, close_commissions = _complete_order_accounting(engine, close.id)
+        entry = get_order(engine, int(close.closes_order_id))
+        if (
+            entry is None
+            or entry.status != "filled"
+            or entry.symbol != close.symbol
+            or entry.quantity != close.quantity
+        ):
+            raise RealizedPnLUnavailable(
+                f"close order {close.id}: exact inverse entry unavailable"
+            )
+        try:
+            assert_atomic_close_legs(
+                entry_legs=entry.legs,
+                close_legs=list(close.legs_json or []),
+            )
+        except (NonAtomicCloseError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(
+                f"close order {close.id}: close is not the exact inverse of entry "
+                f"{entry.id}"
+            ) from exc
         commissions = entry_commissions + close_commissions
         pairs.append(
             ClosedPair(

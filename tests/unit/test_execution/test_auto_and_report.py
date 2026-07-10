@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import Engine, delete, insert, update
+from sqlalchemy import Engine, delete, insert, select, update
 
 from optionsbot.execution.engine import execute_pick
 from optionsbot.execution.orders import (
@@ -617,6 +617,21 @@ def test_realized_close_pairs_math(tmp_db: Engine) -> None:
     # (1.20 - 0.50) * 100 - 2 x 0.65 commissions = 68.70
     assert pair.pnl == pytest.approx(68.70)
     assert total_commissions(tmp_db, entry_id) == pytest.approx(0.65)
+
+
+def test_realized_close_pairs_requires_exact_inverse_structure(tmp_db: Engine) -> None:
+    _, close_id = _pair(tmp_db)
+    with tmp_db.begin() as conn:
+        close_legs = conn.execute(
+            select(orders.c.legs_json).where(orders.c.id == close_id)
+        ).scalar_one()
+        malformed = [{**close_legs[0], "strike": 575.0}]
+        conn.execute(
+            update(orders).where(orders.c.id == close_id).values(legs_json=malformed)
+        )
+
+    with pytest.raises(RealizedPnLUnavailable, match="exact inverse"):
+        realized_close_pairs(tmp_db)
 
 
 def test_realized_close_pairs_since_filter(tmp_db: Engine) -> None:

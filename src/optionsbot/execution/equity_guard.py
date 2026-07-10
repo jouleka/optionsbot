@@ -125,13 +125,15 @@ def new_entry_allowed(
     engine: Engine, settings: Settings, *, current_net_liq: float | None
 ) -> EntryDecision:
     """Block NEW entries once the drawdown reaches entry_block_loss_frac of the
-    cap. Fails OPEN when not evaluable: the per-tick breaker is the real
-    backstop, and a single flaky net-liq read shouldn't hard-block trading.
+    cap. Missing baseline/current equity fails closed because the daily-loss
+    guard cannot be proven before adding risk.
     """
     day_start, _ = _day_start_row(engine)
     dd = _drawdown(day_start, current_net_liq)
     if dd is None:
-        return EntryDecision(True, "net-liq drawdown not evaluable (entry allowed)")
+        return EntryDecision(
+            False, "equity/net-liq drawdown not evaluable (entry blocked)"
+        )
     cap = settings.execution.max_daily_loss_pct
     block_at = settings.execution.entry_block_loss_frac * cap
     if dd >= block_at:

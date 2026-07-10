@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -430,6 +431,32 @@ async def _process_exit_requests(
                 context.engine, row.id, "refused", "position is already closing", now
             )
             continue
+        raw_sources = row.sources_json
+        try:
+            confidence = float(row.confidence)
+        except (TypeError, ValueError, OverflowError):
+            confidence = math.nan
+        sources = (
+            [source.strip() for source in raw_sources]
+            if isinstance(raw_sources, list)
+            and all(isinstance(source, str) for source in raw_sources)
+            else []
+        )
+        if (
+            not math.isfinite(confidence)
+            or not 0.0 <= confidence <= 1.0
+            or len(sources) < 2
+            or any(not source for source in sources)
+            or len(set(sources)) != len(sources)
+        ):
+            _mark_exit_request(
+                context.engine,
+                row.id,
+                "refused",
+                "persisted exit authorization evidence is invalid",
+                now,
+            )
+            continue
         state, unavailable = await _quote_gate_state(context, md, entry, now)
         if state is None:
             _mark_exit_request(context.engine, row.id, "refused", unavailable or "unavailable", now)
@@ -439,8 +466,8 @@ async def _process_exit_requests(
             ExitRequestGateInput(
                 position_id=entry.id,
                 catalyst_type=row.catalyst_type,
-                confidence=float(row.confidence),
-                sources=list(row.sources_json or []),
+                confidence=confidence,
+                sources=sources,
                 reason=row.reason,
                 today_position_requests=position_count,
                 today_portfolio_requests=portfolio_count,
@@ -773,14 +800,27 @@ async def _manage_entry(
         return 1
 
     if exit_request_id is not None and exit_decision_reason is not None:
-        completed = _finish_bound_exit_request(
-            engine,
-            exit_request_id,
-            close.id,
-            "submitted",
-            exit_decision_reason,
-            now,
-        )
+        try:
+            completed = _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "submitted",
+                exit_decision_reason,
+                now,
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker side effect already exists
+            halt_reason = (
+                f"Hermes exit request #{exit_request_id} completion failed after "
+                f"broker placement of close #{close.id}: {exc}"
+            )
+            trip_kill(engine, halt_reason, now=now)
+            await _send(
+                context,
+                f"🛑 HALT: {halt_reason}. The close remains broker-submitted; "
+                "reconcile before re-arming.",
+            )
+            return 1
         if not completed:
             halt_reason = (
                 f"Hermes exit request #{exit_request_id} completion lost after "

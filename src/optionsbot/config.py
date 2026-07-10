@@ -242,6 +242,12 @@ class ExecutionSettings(BaseModel):
             # One unattended trade may risk at most 10% of live net liquidation.
             ("max_single_trade_risk_pct", 0.10),
             ("max_bp_usage_pct", 0.50),
+            # Operational caps must not be configurable into ineffective
+            # values that disable concentration or drawdown protection.
+            ("max_daily_loss_pct", 0.05),
+            ("max_open_positions", 10),
+            ("max_per_symbol", 3),
+            ("max_consecutive_losses", 10),
         )
         for name, ceiling in ceilings:
             value = getattr(self, name)

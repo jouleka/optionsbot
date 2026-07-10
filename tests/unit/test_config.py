@@ -389,6 +389,22 @@ def test_execution_rejects_single_trade_above_ceiling() -> None:
         ExecutionSettings(max_single_trade_risk_pct=math.nextafter(0.10, math.inf))
 
 
+def test_execution_rejects_operational_risk_caps_above_hard_ceilings() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    unsafe = (
+        {"max_daily_loss_pct": 0.0500001},
+        {"max_open_positions": 11},
+        {"max_per_symbol": 4},
+        {"max_consecutive_losses": 11},
+    )
+    for override in unsafe:
+        with pytest.raises(ValidationError):
+            ExecutionSettings(**override)  # type: ignore[arg-type]
+
+
 def test_execution_rejects_bp_usage_above_ceiling() -> None:
     from pydantic import ValidationError
 

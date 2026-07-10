@@ -144,6 +144,10 @@ def evaluate_exit_request_gate(
     catalyst = request.catalyst_type.strip().lower()
     if catalyst not in ALLOWED_CATALYST_TYPES:
         return ExitRequestGateDecision(False, f"unknown catalyst_type: {request.catalyst_type}")
+    if not math.isfinite(request.confidence) or not 0.0 <= request.confidence <= 1.0:
+        return ExitRequestGateDecision(
+            False, "confidence evidence must be finite and within [0, 1]"
+        )
     if request.confidence < MIN_CONFIDENCE:
         return ExitRequestGateDecision(
             False,
@@ -153,15 +157,21 @@ def evaluate_exit_request_gate(
         return ExitRequestGateDecision(False, "daily cap: ≤1 close/position/day")
     if request.today_portfolio_requests >= MAX_CLOSES_PER_PORTFOLIO_PER_DAY:
         return ExitRequestGateDecision(False, "daily cap: ≤2 closes/portfolio/day")
-
     deterministic = quote_state.deterministic_exit_reason
     if deterministic:
         return ExitRequestGateDecision(
             True, f"deterministic exit already triggered: {deterministic}"
         )
 
-    if len(request.sources) < 2:
-        return ExitRequestGateDecision(False, "need at least 2 corroborating sources")
+    if (
+        not isinstance(request.sources, list)
+        or len(request.sources) < 2
+        or any(not isinstance(source, str) or not source.strip() for source in request.sources)
+        or len({source.strip() for source in request.sources}) != len(request.sources)
+    ):
+        return ExitRequestGateDecision(
+            False, "need at least 2 distinct non-empty corroborating sources"
+        )
 
     if quote_state.current_net is None:
         return ExitRequestGateDecision(

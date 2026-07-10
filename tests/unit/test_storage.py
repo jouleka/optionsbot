@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 
 from optionsbot.storage import schema
 from optionsbot.storage.db import create_engine_for_path
@@ -169,6 +169,91 @@ def test_active_close_unique_index_migration_round_trips(tmp_path: Path) -> None
         )
     command.upgrade(cfg, "head")
     assert "uq_orders_active_close_per_entry" in index_names()
+
+
+def test_active_close_migration_quarantines_legacy_duplicate_claims(
+    tmp_path: Path,
+) -> None:
+    from alembic.config import Config
+
+    from alembic import command
+
+    project_root = Path(__file__).resolve().parents[2]
+    db = tmp_path / "duplicate_active_close.db"
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+    command.upgrade(cfg, "0015")
+    engine = create_engine_for_path(db)
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                schema.orders.insert().values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    legs_json=[],
+                    quantity=1,
+                    status="filled",
+                    staged_ts=now,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+        for status in ("staged", "submitted"):
+            conn.execute(
+                schema.orders.insert().values(
+                    intent="close",
+                    closes_order_id=entry_id,
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    legs_json=[],
+                    quantity=1,
+                    status=status,
+                    staged_ts=now,
+                    reprice_count=0,
+                )
+            )
+
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        closes = conn.execute(
+            schema.orders.select()
+            .where(schema.orders.c.closes_order_id == entry_id)
+            .order_by(schema.orders.c.id)
+        ).fetchall()
+        state = conn.execute(
+            schema.execution_state.select().where(schema.execution_state.c.id == 1)
+        ).one()
+        revision = conn.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one()
+        indexes = {idx["name"] for idx in inspect(conn).get_indexes("orders")}
+    assert [row.status for row in closes] == ["staged", "abandoned"]
+    assert closes[1].terminal_ts is not None
+    assert "migration 0016" in closes[1].last_error
+    assert state.killed == 1
+    assert "duplicate active closes" in state.reason
+    assert revision == "0016"
+    assert "uq_orders_active_close_per_entry" in indexes
+
+    command.downgrade(cfg, "0015")
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        statuses = conn.execute(
+            select(schema.orders.c.status)
+            .where(schema.orders.c.closes_order_id == entry_id)
+            .order_by(schema.orders.c.id)
+        ).scalars().all()
+        state_after_roundtrip = conn.execute(
+            schema.execution_state.select().where(schema.execution_state.c.id == 1)
+        ).one()
+        revision_after_roundtrip = conn.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one()
+    assert statuses == ["staged", "abandoned"]
+    assert state_after_roundtrip.killed == 1
+    assert revision_after_roundtrip == "0016"
 
 
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:
