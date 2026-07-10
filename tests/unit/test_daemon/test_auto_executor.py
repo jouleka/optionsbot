@@ -582,15 +582,26 @@ async def test_auto_noop_in_confirm_mode(daemon_context: DaemonContext) -> None:
 
 def _closed_pair(context: DaemonContext, *, pnl_credit: float, closed_ts: datetime) -> int:
     engine = context.engine
+    entry_leg = {
+        "symbol": "SPY",
+        "side": "sell",
+        "sec_type": "OPT",
+        "expiry": "20260731",
+        "strike": 580.0,
+        "right": "P",
+        "quantity": 1,
+    }
     with engine.begin() as conn:
         epk = int(conn.execute(insert(orders).values(
-            intent="open", symbol="SPY", strategy="bull_put_spread", legs_json=[],
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=[entry_leg],
             quantity=1, status="filled", staged_ts=closed_ts - timedelta(days=3),
             terminal_ts=closed_ts - timedelta(days=3), reprice_count=0,
         )).inserted_primary_key[0])
         cpk = int(conn.execute(insert(orders).values(
             intent="close", closes_order_id=epk, symbol="SPY",
-            strategy="bull_put_spread", legs_json=[], quantity=1, status="filled",
+            strategy="bull_put_spread", legs_json=[{**entry_leg, "side": "buy"}],
+            quantity=1, status="filled",
             staged_ts=closed_ts, terminal_ts=closed_ts, reprice_count=0,
         )).inserted_primary_key[0])
         for oid in (epk, cpk):

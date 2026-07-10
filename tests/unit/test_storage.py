@@ -118,6 +118,59 @@ def test_orders_closes_column_exists_after_migration(tmp_path: Path) -> None:
     assert "closes_order_id" in cols
 
 
+def test_active_close_unique_index_migration_round_trips(tmp_path: Path) -> None:
+    from alembic.config import Config
+    from sqlalchemy.exc import IntegrityError
+
+    from alembic import command
+
+    project_root = Path(__file__).resolve().parents[2]
+    db = tmp_path / "roundtrip_active_close.db"
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+    engine = create_engine_for_path(db)
+
+    def index_names() -> set[str]:
+        with engine.connect() as conn:
+            return {idx["name"] for idx in inspect(conn).get_indexes("orders")}
+
+    command.upgrade(cfg, "head")
+    assert "uq_orders_active_close_per_entry" in index_names()
+    with engine.begin() as conn:
+        entry_id = int(conn.execute(schema.orders.insert().values(
+            intent="open", symbol="SPY", strategy="bull_put_spread", legs_json=[],
+            quantity=1, status="filled", staged_ts=datetime.now(UTC), reprice_count=0,
+        )).inserted_primary_key[0])
+        conn.execute(schema.orders.insert().values(
+            intent="close", closes_order_id=entry_id, symbol="SPY",
+            strategy="bull_put_spread", legs_json=[], quantity=1, status="staged",
+            staged_ts=datetime.now(UTC), reprice_count=0,
+        ))
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(schema.orders.insert().values(
+                intent="close", closes_order_id=entry_id, symbol="SPY",
+                strategy="bull_put_spread", legs_json=[], quantity=1, status="submitting",
+                staged_ts=datetime.now(UTC), reprice_count=0,
+            ))
+
+    command.downgrade(cfg, "0014")
+    assert "uq_orders_active_close_per_entry" not in index_names()
+    with engine.begin() as conn:
+        duplicate_id = int(conn.execute(schema.orders.insert().values(
+            intent="close", closes_order_id=entry_id, symbol="SPY",
+            strategy="bull_put_spread", legs_json=[], quantity=1, status="submitted",
+            staged_ts=datetime.now(UTC), reprice_count=0,
+        )).inserted_primary_key[0])
+        conn.execute(
+            schema.orders.update().where(schema.orders.c.id == duplicate_id).values(
+                status="skipped", terminal_ts=datetime.now(UTC)
+            )
+        )
+    command.upgrade(cfg, "head")
+    assert "uq_orders_active_close_per_entry" in index_names()
+
+
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:
     """0009 upgrade->downgrade->upgrade is reversible."""
     from alembic.config import Config

@@ -237,10 +237,10 @@ class ExecutionSettings(BaseModel):
         ceilings: tuple[tuple[str, float], ...] = (
             ("base_risk_pct", 0.05),
             # Aggregate defined-risk exposure may use at most half of live
-            # USD net liquidation. The separate 15% single-trade ceiling keeps
-            # one position from consuming the entire account-relative budget.
+            # USD net liquidation.
             ("max_portfolio_heat_pct", 0.50),
-            ("max_single_trade_risk_pct", 0.15),
+            # One unattended trade may risk at most 10% of live net liquidation.
+            ("max_single_trade_risk_pct", 0.10),
             ("max_bp_usage_pct", 0.50),
         )
         for name, ceiling in ceilings:

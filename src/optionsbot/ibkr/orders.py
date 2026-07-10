@@ -17,6 +17,7 @@ while ``execution.paper_only`` holds.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -55,7 +56,7 @@ def _parse_ib_double(value: object) -> float | None:
         parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    if abs(parsed) >= _UNSET_DOUBLE:
+    if not math.isfinite(parsed) or abs(parsed) >= _UNSET_DOUBLE:
         return None
     return parsed
 

@@ -18,11 +18,13 @@ Illegal transitions raise rather than silently corrupting the ledger.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Engine, Row, delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.storage.schema import (
     entry_intent_consumptions,
@@ -85,6 +87,20 @@ _OPTION_MULTIPLIER = 100
 
 class IllegalOrderTransition(RuntimeError):
     """Raised when a status change violates LEGAL_TRANSITIONS."""
+
+
+class RealizedPnLUnavailable(RuntimeError):
+    """Raised when a filled round trip lacks complete, finite accounting."""
+
+
+class CloseAlreadyClaimed(RuntimeError):
+    """Raised when another active close already owns an entry."""
+
+    def __init__(self, entry_id: int, close_id: int | None) -> None:
+        self.entry_id = entry_id
+        self.close_id = close_id
+        winner = f"close order {close_id}" if close_id is not None else "another close order"
+        super().__init__(f"entry {entry_id} is already claimed by {winner}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,26 +235,34 @@ def stage_close_order(
         {**leg, "side": "buy" if leg.get("side") == "sell" else "sell"}
         for leg in entry.legs
     ]
-    with engine.begin() as conn:
-        inserted = conn.execute(
-            insert(orders).values(
-                strategy_score_id=entry.strategy_score_id,
-                closes_order_id=entry.id,
-                intent="close",
-                symbol=entry.symbol,
-                strategy=entry.strategy,
-                legs_json=flipped,
-                quantity=entry.quantity,
-                status="staged",
-                staged_ts=ts,
-                reprice_count=0,
+    try:
+        with engine.begin() as conn:
+            inserted = conn.execute(
+                insert(orders).values(
+                    strategy_score_id=entry.strategy_score_id,
+                    closes_order_id=entry.id,
+                    intent="close",
+                    symbol=entry.symbol,
+                    strategy=entry.strategy,
+                    legs_json=flipped,
+                    quantity=entry.quantity,
+                    status="staged",
+                    staged_ts=ts,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key
+            assert inserted is not None
+            order_id = int(inserted[0])
+            conn.execute(
+                update(orders)
+                .where(orders.c.id == order_id)
+                .values(order_ref=f"obot-{order_id}")
             )
-        ).inserted_primary_key
-        assert inserted is not None
-        order_id = int(inserted[0])
-        conn.execute(
-            update(orders).where(orders.c.id == order_id).values(order_ref=f"obot-{order_id}")
-        )
+    except IntegrityError as exc:
+        winner = open_close_for(engine, entry.id)
+        if winner is None:
+            raise
+        raise CloseAlreadyClaimed(entry.id, winner.id) from exc
     record = get_order(engine, order_id)
     assert record is not None
     return record
@@ -561,6 +585,79 @@ def total_commissions(engine: Engine, order_id: int) -> float:
     return sum(float(r.commission) for r in rows if r.commission is not None)
 
 
+def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, float]:
+    """Return signed premium and commissions only for a provably complete fill."""
+    with engine.connect() as conn:
+        order = conn.execute(
+            select(orders.c.status, orders.c.quantity, orders.c.legs_json).where(
+                orders.c.id == order_id
+            )
+        ).first()
+        fill_rows = conn.execute(
+            select(fills.c.side, fills.c.price, fills.c.qty, fills.c.commission).where(
+                fills.c.order_id == order_id
+            )
+        ).fetchall()
+    if order is None or order.status != "filled":
+        raise RealizedPnLUnavailable(f"order {order_id}: filled order unavailable")
+    quantity = order.quantity
+    legs = list(order.legs_json or [])
+    if quantity <= 0 or not legs:
+        raise RealizedPnLUnavailable(f"order {order_id}: expected fill quantity unavailable")
+
+    expected = {"BUY": 0, "SELL": 0}
+    for leg in legs:
+        if leg.get("sec_type", "OPT") != "OPT":
+            continue
+        side = str(leg.get("side", "")).upper()
+        raw_ratio = leg.get("quantity", 1)
+        try:
+            ratio = int(raw_ratio)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: expected fill quantity unavailable"
+            ) from exc
+        if side not in expected or isinstance(raw_ratio, bool) or ratio <= 0 or ratio != raw_ratio:
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: expected fill quantity unavailable"
+            )
+        expected[side] += ratio * quantity
+    if not any(expected.values()):
+        raise RealizedPnLUnavailable(f"order {order_id}: expected fill quantity unavailable")
+
+    actual = {"BUY": 0, "SELL": 0}
+    premium = 0.0
+    commissions = 0.0
+    for fill in fill_rows:
+        try:
+            price = float(fill.price)
+            qty = int(fill.qty)
+            commission = float(fill.commission)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(f"order {order_id}: fill accounting unavailable") from exc
+        if (
+            fill.side not in actual
+            or isinstance(fill.qty, bool)
+            or qty <= 0
+            or qty != fill.qty
+            or price < 0
+            or not math.isfinite(price)
+            or not math.isfinite(commission)
+        ):
+            raise RealizedPnLUnavailable(f"order {order_id}: fill accounting unavailable")
+        actual[fill.side] += qty
+        premium += (
+            (1.0 if fill.side == "SELL" else -1.0)
+            * price
+            * qty
+            * _OPTION_MULTIPLIER
+        )
+        commissions += commission
+    if actual != expected or not math.isfinite(premium) or not math.isfinite(commissions):
+        raise RealizedPnLUnavailable(f"order {order_id}: incomplete fills")
+    return premium, commissions
+
+
 def realized_close_pairs(
     engine: Engine, *, since: datetime | None = None
 ) -> list[ClosedPair]:
@@ -581,11 +678,11 @@ def realized_close_pairs(
         closed_ts = _aware(close.terminal_ts)
         if since is not None and (closed_ts is None or closed_ts <= since):
             continue
-        entry_premium = net_premium(engine, close.closes_order_id) or 0.0
-        close_premium = net_premium(engine, close.id) or 0.0
-        commissions = total_commissions(engine, close.closes_order_id) + total_commissions(
-            engine, close.id
+        entry_premium, entry_commissions = _complete_order_accounting(
+            engine, close.closes_order_id
         )
+        close_premium, close_commissions = _complete_order_accounting(engine, close.id)
+        commissions = entry_commissions + close_commissions
         pairs.append(
             ClosedPair(
                 entry_id=close.closes_order_id,

@@ -1,5 +1,6 @@
 """Tests for the Settings class."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -385,7 +386,7 @@ def test_execution_rejects_single_trade_above_ceiling() -> None:
     from optionsbot.config import ExecutionSettings
 
     with pytest.raises(ValidationError):
-        ExecutionSettings(max_single_trade_risk_pct=1.0)
+        ExecutionSettings(max_single_trade_risk_pct=math.nextafter(0.10, math.inf))
 
 
 def test_execution_rejects_bp_usage_above_ceiling() -> None:
@@ -405,12 +406,12 @@ def test_execution_accepts_values_at_the_ceiling() -> None:
     e = ExecutionSettings(
         base_risk_pct=0.05,
         max_portfolio_heat_pct=0.50,
-        max_single_trade_risk_pct=0.15,
+        max_single_trade_risk_pct=0.10,
         max_bp_usage_pct=0.50,
     )
     assert e.base_risk_pct == 0.05
     assert e.max_portfolio_heat_pct == 0.50
-    assert e.max_single_trade_risk_pct == 0.15
+    assert e.max_single_trade_risk_pct == 0.10
     assert e.max_bp_usage_pct == 0.50
 
 

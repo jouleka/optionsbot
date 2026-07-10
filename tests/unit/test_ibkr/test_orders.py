@@ -320,6 +320,21 @@ async def test_whatif_handles_unparseable_margins(
     assert preview.warning == "check this"
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+async def test_whatif_rejects_non_finite_margins(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    value: float,
+) -> None:
+    from ib_async import OrderState
+
+    order_ib.whatIfOrderAsync.return_value = OrderState(initMarginChange=value)
+    preview = await order_client.whatif_combo(
+        "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.55,
+    )
+    assert preview.init_margin_change is None
+
+
 async def test_whatif_tolerates_list_result(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:

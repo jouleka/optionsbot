@@ -350,8 +350,13 @@ async def execute_pick(
         return _reject(
             "live equity unavailable — refusing to size off a stale scan-time quantity"
         )
-    from optionsbot.execution.orders import realized_close_pairs
+    from optionsbot.execution.orders import RealizedPnLUnavailable, realized_close_pairs
     from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
+
+    try:
+        recent_pnls = [p.pnl for p in realized_close_pairs(engine)[-5:]]
+    except RealizedPnLUnavailable as exc:
+        return _reject(f"realized P&L accounting unavailable — refusing new risk: {exc}")
 
     decision = dynamic_quantity(
         equity=equity,
@@ -363,7 +368,7 @@ async def execute_pick(
             float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
         ),
         open_heat=open_heat_dollars(engine),
-        recent_pnls=[p.pnl for p in realized_close_pairs(engine)[-5:]],
+        recent_pnls=recent_pnls,
         base_risk_pct=settings.execution.base_risk_pct,
         heat_cap_pct=settings.execution.max_portfolio_heat_pct,
         single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,

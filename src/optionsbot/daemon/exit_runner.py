@@ -39,7 +39,9 @@ from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
+    CloseAlreadyClaimed,
     OrderRecord,
+    RealizedPnLUnavailable,
     get_order,
     net_premium,
     open_close_for,
@@ -168,18 +170,87 @@ def _mark_exit_request(
     status: str,
     decision_reason: str,
     now: datetime,
-    *,
-    close_order_id: int | None = None,
-) -> None:
-    values = {
-        "status": status,
-        "decision_reason": decision_reason,
-        "processed_at": now,
-    }
-    if close_order_id is not None:
-        values["close_order_id"] = close_order_id
+) -> bool:
+    """Conditionally terminalize an unclaimed request without overwriting races."""
     with engine.begin() as conn:
-        conn.execute(update(exit_requests).where(exit_requests.c.id == request_id).values(**values))
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.status == "requested")
+            .values(
+                status=status,
+                decision_reason=decision_reason,
+                processed_at=now,
+            )
+        )
+    return result.rowcount == 1
+
+
+def _bind_exit_request(
+    engine: Engine,
+    request_id: int,
+    position_id: int,
+    close_order_id: int,
+    decision_reason: str,
+) -> bool:
+    """Persist exact Hermes attribution before any broker mutation."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.position_id == position_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id.is_(None))
+            .values(
+                close_order_id=close_order_id,
+                decision_reason=decision_reason,
+            )
+        )
+    return result.rowcount == 1
+
+
+def _bound_exit_request_is_eligible(
+    engine: Engine,
+    request_id: int,
+    position_id: int,
+    close_order_id: int,
+    decision_reason: str,
+) -> bool:
+    """Re-confirm the bound request after the last awaited safety check."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.position_id == position_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id == close_order_id)
+            .values(decision_reason=decision_reason)
+        )
+    return result.rowcount == 1
+
+
+def _finish_bound_exit_request(
+    engine: Engine,
+    request_id: int,
+    close_order_id: int,
+    status: str,
+    decision_reason: str,
+    now: datetime,
+) -> bool:
+    """Conditionally terminalize the exact request/close binding."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id == close_order_id)
+            .values(
+                status=status,
+                decision_reason=decision_reason,
+                processed_at=now,
+            )
+        )
+    return result.rowcount == 1
 
 
 def _request_counts(engine: Engine, position_id: int, now: datetime) -> tuple[int, int]:
@@ -263,19 +334,28 @@ def _hermes_loss_cap_decision(
             ).where(execution_state.c.id == 1)
         ).first()
         close_rows = conn.execute(
-            select(exit_requests.c.close_order_id)
-            .where(exit_requests.c.status == "submitted")
-            .where(exit_requests.c.close_order_id.is_not(None))
+            select(exit_requests.c.close_order_id).where(
+                exit_requests.c.close_order_id.is_not(None)
+            )
         ).fetchall()
     baseline = None
     if baseline_row is not None and baseline_row.day_start_session == session:
         baseline = baseline_row.day_start_net_liq
     hermes_close_ids = {int(row.close_order_id) for row in close_rows}
-    cumulative_pnl = sum(
-        pair.pnl
-        for pair in realized_close_pairs(context.engine, since=session_start)
-        if pair.close_id in hermes_close_ids
-    )
+    try:
+        cumulative_pnl = sum(
+            pair.pnl
+            for pair in realized_close_pairs(context.engine, since=session_start)
+            if pair.close_id in hermes_close_ids
+        )
+    except RealizedPnLUnavailable as exc:
+        return HermesLossCapDecision(
+            allowed=False,
+            evaluable=False,
+            cumulative_realized_pnl=0.0,
+            cap_dollars=None,
+            reason=f"Hermes realized P&L accounting unavailable: {exc}",
+        )
     return evaluate_hermes_loss_cap(
         cumulative_realized_pnl=cumulative_pnl,
         day_start_net_liq=None if baseline is None else float(baseline),
@@ -375,17 +455,10 @@ async def _process_exit_requests(
             entry,
             now,
             forced_reason=f"Hermes request_exit #{row.id}: {decision.reason}",
+            exit_request_id=int(row.id),
+            exit_decision_reason=decision.reason,
         )
         if placed:
-            close = open_close_for(context.engine, entry.id)
-            _mark_exit_request(
-                context.engine,
-                row.id,
-                "submitted",
-                decision.reason,
-                now,
-                close_order_id=close.id if close is not None else None,
-            )
             submitted += placed
         else:
             _mark_exit_request(context.engine, row.id, "failed", "no close was placed", now)
@@ -454,11 +527,14 @@ async def _manage_entry(
     now: datetime,
     *,
     forced_reason: str | None = None,
+    exit_request_id: int | None = None,
+    exit_decision_reason: str | None = None,
 ) -> int:
     """Evaluate one position; returns 1 if a closing order was submitted.
 
-    ``forced_reason`` (set by the human-initiated ``/close`` path) stands in for
-    ``evaluate_exit`` so the close fires regardless of TP/stop/DTE.
+    ``forced_reason`` bypasses ``evaluate_exit`` for an approved manual or
+    Hermes-triggered close. Hermes requests additionally carry their exact
+    persisted identity so attribution is bound before broker placement.
     """
     engine = context.engine
     order_client = context.order_client
@@ -573,12 +649,19 @@ async def _manage_entry(
     )
     limit_price = -close_net  # BAG convention: limit = -net
 
-    close = stage_close_order(engine, entry, now=now)
+    try:
+        close = stage_close_order(engine, entry, now=now)
+    except CloseAlreadyClaimed as exc:
+        if exit_request_id is not None:
+            _mark_exit_request(engine, exit_request_id, "refused", str(exc), now)
+        return 0
     try:
         assert_atomic_close_legs(entry_legs=entry.legs, close_legs=close.legs)
     except NonAtomicCloseError as exc:
         # Fail safe: a close we cannot guarantee atomic must NOT be legged out.
         transition(engine, close.id, "skipped", error=str(exc), now=now)
+        if exit_request_id is not None:
+            _mark_exit_request(engine, exit_request_id, "failed", str(exc), now)
         trip_kill(engine, f"non-atomic close for #{entry.id}: {exc}")
         await _send(
             context,
@@ -587,6 +670,59 @@ async def _manage_entry(
             "Flatten manually and /arm after fixing.",
         )
         return 0
+
+    if exit_request_id is not None:
+        if exit_decision_reason is None:
+            transition(engine, close.id, "skipped", error="missing Hermes decision", now=now)
+            _mark_exit_request(
+                engine,
+                exit_request_id,
+                "failed",
+                "missing Hermes decision attribution",
+                now,
+            )
+            return 0
+        if not _bind_exit_request(
+            engine,
+            exit_request_id,
+            entry.id,
+            close.id,
+            exit_decision_reason,
+        ):
+            transition(engine, close.id, "skipped", error="exit request claim lost", now=now)
+            return 0
+
+        # This is the last awaited gate before placement. Recompute from the
+        # complete bound-close ledger for every Hermes broker mutation, rather
+        # than relying on the once-per-tick value.
+        loss_cap = await _enforce_hermes_loss_cap(context, now)
+        if not loss_cap.allowed:
+            transition(engine, close.id, "skipped", error=loss_cap.reason, now=now)
+            _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "refused",
+                loss_cap.reason,
+                now,
+            )
+            return 0
+        if not _bound_exit_request_is_eligible(
+            engine,
+            exit_request_id,
+            entry.id,
+            close.id,
+            exit_decision_reason,
+        ):
+            transition(
+                engine,
+                close.id,
+                "skipped",
+                error="exit request no longer eligible",
+                now=now,
+            )
+            return 0
+
     transition(engine, close.id, "submitting", now=now)
     try:
         placed = await order_client.place_combo_limit(
@@ -598,9 +734,40 @@ async def _manage_entry(
         )
     except Exception as exc:  # noqa: BLE001 -- a failed close lands in the ledger + retries next tick
         transition(engine, close.id, "skipped", error=str(exc), now=now)
+        if exit_request_id is not None and exit_decision_reason is not None:
+            _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "failed",
+                f"broker placement failed: {exc}",
+                now,
+            )
         await _send(context, f"⚠ closing #{entry.id} failed to place: {exc} — will retry")
         return 0
     transition(engine, close.id, "submitted", ib_order_id=placed.ib_order_id, now=now)
+
+    if exit_request_id is not None and exit_decision_reason is not None:
+        completed = _finish_bound_exit_request(
+            engine,
+            exit_request_id,
+            close.id,
+            "submitted",
+            exit_decision_reason,
+            now,
+        )
+        if not completed:
+            halt_reason = (
+                f"Hermes exit request #{exit_request_id} completion lost after "
+                f"broker placement of close #{close.id}"
+            )
+            trip_kill(engine, halt_reason, now=now)
+            await _send(
+                context,
+                f"🛑 HALT: {halt_reason}. The close remains broker-submitted; "
+                "no further automated mutations will be started.",
+            )
+            return 1
 
     # Walk only when this close was initially priced from a complete live,
     # current quote set. Quote-blind deterministic closes must never re-anchor

@@ -7,16 +7,17 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import Engine, insert, update
+from sqlalchemy import Engine, delete, insert, update
 
 from optionsbot.execution.engine import execute_pick
 from optionsbot.execution.orders import (
+    RealizedPnLUnavailable,
     realized_close_pairs,
     record_fill,
     record_order_quotes,
     total_commissions,
 )
-from optionsbot.storage.schema import orders
+from optionsbot.storage.schema import fills, orders
 from optionsbot.validation.execution_report import execution_report
 from tests.unit.test_execution.test_engine import (
     CONDOR_LEGS,
@@ -196,16 +197,21 @@ def test_open_heat_includes_scoreless_adopted_defined_risk_positions(
 
     spy_legs = [
         {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
-         "strike": 717.0, "right": "P", "quantity": 1},
+         "strike": 717.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 717},
         {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
-         "strike": 734.0, "right": "P", "quantity": 1},
+         "strike": 734.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 734},
     ]
     tlt_legs = [
         {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
-         "strike": 85.0, "right": "P", "quantity": 1},
+         "strike": 85.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 850},
         {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
-         "strike": 88.0, "right": "C", "quantity": 1},
+         "strike": 88.0, "right": "C", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 880},
     ]
+
     with tmp_db.begin() as conn:
         spy_id = int(conn.execute(insert(orders).values(
             intent="open", symbol="SPY", strategy="bull_put_spread",
@@ -218,17 +224,177 @@ def test_open_heat_includes_scoreless_adopted_defined_risk_positions(
             submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
         )).inserted_primary_key[0])
     record_fill(tmp_db, spy_id, exec_id="adopt-spy-long", side="BUY",
-                price=5.167983, qty=1, ts=NOW)
+                price=5.167983, qty=1, ts=NOW, leg_con_id=717)
     record_fill(tmp_db, spy_id, exec_id="adopt-spy-short", side="SELL",
-                price=8.031819, qty=1, ts=NOW)
+                price=8.031819, qty=1, ts=NOW, leg_con_id=734)
     record_fill(tmp_db, tlt_id, exec_id="adopt-tlt-put", side="BUY",
-                price=0.5941991665, qty=6, ts=NOW)
+                price=0.5941991665, qty=6, ts=NOW, leg_con_id=850)
     record_fill(tmp_db, tlt_id, exec_id="adopt-tlt-call", side="BUY",
-                price=0.4841991665, qty=6, ts=NOW)
+                price=0.4841991665, qty=6, ts=NOW, leg_con_id=880)
 
     expected_spy = (17.0 - 2.863836) * 100
     expected_tlt = (0.5941991665 + 0.4841991665) * 6 * 100
     assert open_heat_dollars(tmp_db) == pytest.approx(expected_spy + expected_tlt)
+
+
+def test_open_heat_fails_closed_for_cross_underlying_adoption(tmp_db: Engine) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 1001},
+        {"symbol": "QQQ", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 1002},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="cross-short", side="SELL",
+                price=1.40, qty=1, ts=NOW, leg_con_id=1001)
+    record_fill(tmp_db, order_id, exec_id="cross-long", side="BUY",
+                price=0.40, qty=1, ts=NOW, leg_con_id=1002)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+@pytest.mark.parametrize(
+    ("currency", "multiplier"),
+    [(None, 100), ("EUR", 100), ("USD", None), ("USD", 50), ("USD", float("nan"))],
+)
+def test_open_heat_fails_closed_without_supported_usd_contract_terms(
+    tmp_db: Engine,
+    currency: object,
+    multiplier: object,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1, "currency": currency,
+         "multiplier": multiplier, "con_id": 2001},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1, "currency": currency,
+         "multiplier": multiplier, "con_id": 2002},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="terms-short", side="SELL",
+                price=1.40, qty=1, ts=NOW, leg_con_id=2001)
+    record_fill(tmp_db, order_id, exec_id="terms-long", side="BUY",
+                price=0.40, qty=1, ts=NOW, leg_con_id=2002)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_misattributed_conid_fill(tmp_db: Engine) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 3001},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 3002},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="wrong-short", side="SELL",
+                price=1.40, qty=1, ts=NOW, leg_con_id=9999)
+    record_fill(tmp_db, order_id, exec_id="right-long", side="BUY",
+                price=0.40, qty=1, ts=NOW, leg_con_id=3002)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_when_same_side_legs_lack_conid_attribution(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 85.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100},
+        {"symbol": "TLT", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 88.0, "right": "C", "quantity": 1, "currency": "USD",
+         "multiplier": 100},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="TLT", strategy="long_strangle",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="unknown-buy-a", side="BUY",
+                price=0.60, qty=1, ts=NOW)
+    record_fill(tmp_db, order_id, exec_id="unknown-buy-b", side="BUY",
+                price=0.40, qty=1, ts=NOW)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_non_integral_order_quantity(tmp_db: Engine) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 100.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 4001},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260731",
+         "strike": 95.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 4002},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1.5, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="fraction-short", side="SELL",
+                price=1.40, qty=1, ts=NOW, leg_con_id=4001)
+    record_fill(tmp_db, order_id, exec_id="fraction-long", side="BUY",
+                price=0.40, qty=1, ts=NOW, leg_con_id=4002)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
+def test_open_heat_fails_closed_for_impossible_expiry_date(tmp_db: Engine) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    legs = [
+        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260230",
+         "strike": 100.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 5001},
+        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260230",
+         "strike": 95.0, "right": "P", "quantity": 1, "currency": "USD",
+         "multiplier": 100, "con_id": 5002},
+    ]
+    with tmp_db.begin() as conn:
+        order_id = int(conn.execute(insert(orders).values(
+            intent="open", symbol="SPY", strategy="bull_put_spread",
+            legs_json=legs, quantity=1, status="filled", staged_ts=NOW,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
+        )).inserted_primary_key[0])
+    record_fill(tmp_db, order_id, exec_id="date-short", side="SELL",
+                price=1.40, qty=1, ts=NOW, leg_con_id=5001)
+    record_fill(tmp_db, order_id, exec_id="date-long", side="BUY",
+                price=0.40, qty=1, ts=NOW, leg_con_id=5002)
+
+    assert math.isinf(open_heat_dollars(tmp_db))
 
 
 @pytest.mark.parametrize("bad_max_loss", [float("nan"), -1.0])
@@ -383,6 +549,23 @@ async def test_engine_rejects_oversized_trade_for_small_account(tmp_db: Engine) 
     assert "single-trade cap" in outcome.message
 
 
+async def test_engine_rejects_entry_when_realized_accounting_is_unavailable(
+    tmp_db: Engine,
+) -> None:
+    entry_id, _ = _pair(tmp_db)
+    with tmp_db.begin() as conn:
+        conn.execute(delete(fills).where(fills.c.order_id == entry_id))
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert not outcome.ok
+    assert "realized P&L accounting unavailable" in outcome.message
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
 # --- IBK-131 realized pairs + report --------------------------------------------------
 
 
@@ -390,9 +573,16 @@ def _pair(
     engine: Engine, *, entry_credit: float = 1.20, close_debit: float = 0.50,
     commission: float = 0.65, closed_ts: datetime = NOW, strategy: str = "bull_put_spread",
 ) -> tuple[int, int]:
+    entry_legs = [
+        {
+            "symbol": "SPY", "side": "sell", "sec_type": "OPT",
+            "expiry": "20260731", "strike": 580.0, "right": "P", "quantity": 1,
+        }
+    ]
+    close_legs = [{**entry_legs[0], "side": "buy"}]
     with engine.begin() as conn:
         epk = conn.execute(insert(orders).values(
-            intent="open", symbol="SPY", strategy=strategy, legs_json=[],
+            intent="open", symbol="SPY", strategy=strategy, legs_json=entry_legs,
             quantity=1, status="filled", staged_ts=NOW - timedelta(days=5),
             submitted_ts=NOW - timedelta(days=5), terminal_ts=NOW - timedelta(days=5),
             reprice_count=0,
@@ -401,7 +591,7 @@ def _pair(
         entry_id = int(epk[0])
         cpk = conn.execute(insert(orders).values(
             intent="close", closes_order_id=entry_id, symbol="SPY",
-            strategy=strategy, legs_json=[], quantity=1, status="filled",
+            strategy=strategy, legs_json=close_legs, quantity=1, status="filled",
             staged_ts=closed_ts, submitted_ts=closed_ts, terminal_ts=closed_ts,
             reprice_count=0,
         )).inserted_primary_key
@@ -434,6 +624,38 @@ def test_realized_close_pairs_since_filter(tmp_db: Engine) -> None:
     _pair(tmp_db, closed_ts=NOW)
     assert len(realized_close_pairs(tmp_db)) == 2
     assert len(realized_close_pairs(tmp_db, since=NOW - timedelta(hours=1))) == 1
+
+
+@pytest.mark.parametrize(
+    ("target", "mutation"),
+    [
+        ("entry", "missing_fill"),
+        ("entry", "partial_fill"),
+        ("close", "missing_fill"),
+        ("close", "partial_fill"),
+        ("entry", "missing_commission"),
+        ("close", "missing_commission"),
+    ],
+)
+def test_realized_close_pairs_is_unavailable_for_incomplete_accounting(
+    tmp_db: Engine,
+    target: str,
+    mutation: str,
+) -> None:
+    entry_id, close_id = _pair(tmp_db)
+    order_id = entry_id if target == "entry" else close_id
+    with tmp_db.begin() as conn:
+        if mutation == "missing_fill":
+            conn.execute(delete(fills).where(fills.c.order_id == order_id))
+        elif mutation == "partial_fill":
+            conn.execute(update(orders).where(orders.c.id == order_id).values(quantity=2))
+        else:
+            conn.execute(
+                update(fills).where(fills.c.order_id == order_id).values(commission=None)
+            )
+
+    with pytest.raises(RealizedPnLUnavailable, match=f"order {order_id}"):
+        realized_close_pairs(tmp_db)
 
 
 def test_execution_report_aggregates(tmp_db: Engine) -> None:
