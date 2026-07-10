@@ -81,6 +81,40 @@ async def test_explicit_live_callback_marks_returned_ticker_live(
     assert quote.delayed is False
 
 
+async def test_discarded_snapshot_callback_cannot_prove_later_request_live(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    import math
+
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    discarded = _ticker(bid=math.nan, ask=math.nan, last=math.nan)
+    streamed = _ticker(bid=400.0, ask=400.2, last=400.1)
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    mock_ib.wrapper.reqId2Ticker = {46: discarded}
+    calls = 0
+
+    async def _snapshots(*contracts: object) -> list[MagicMock]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            mock_ib.wrapper.marketDataType(46, 1)
+        return [discarded]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshots
+    mock_ib.reqMktData.return_value = streamed
+    mock_ib.cancelMktData = MagicMock()
+
+    first = await md.get_stock_snapshot("SPY")
+    assert first.delayed is True  # streaming ticker received no callback
+
+    discarded.bid = 400.0
+    discarded.ask = 400.2
+    discarded.last = 400.1
+    second = await md.get_stock_snapshot("SPY")
+
+    assert second.delayed is True  # prior callback is stale, not request provenance
+
+
 @pytest.mark.parametrize("callback_value", [True, 1.0, "1", 2, None])
 async def test_only_exact_integer_live_callback_proves_live_delivery(
     md: MarketDataClient, mock_ib: MagicMock, callback_value: object

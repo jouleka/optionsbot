@@ -74,7 +74,8 @@ class MarketDataClient:
     ) -> None:
         self._client = client
         self._resolver = resolver if resolver is not None else ContractResolver(client)
-        self._delivered_market_data_types: dict[int, object] = {}
+        self._delivered_market_data_types: dict[int, tuple[int, object]] = {}
+        self._market_data_type_wrapper: object | None = None
         self._install_market_data_type_observer()
 
     def _install_market_data_type_observer(self) -> None:
@@ -86,6 +87,7 @@ class MarketDataClient:
         observation map keeps repeated adapter construction idempotent.
         """
         wrapper = getattr(self._client.ib, "wrapper", None)
+        self._market_data_type_wrapper = wrapper
         observations = getattr(wrapper, "_optionsbot_market_data_types", None)
         if isinstance(observations, dict):
             self._delivered_market_data_types = observations
@@ -104,9 +106,35 @@ class MarketDataClient:
                 return
             ticker = req_id_to_ticker.get(req_id)
             if ticker is not None:
-                observations[id(ticker)] = market_data_type
+                previous = getattr(
+                    wrapper, "_optionsbot_market_data_type_sequence", 0
+                )
+                sequence = previous + 1 if type(previous) is int else 1
+                wrapper._optionsbot_market_data_type_sequence = sequence
+                observations[id(ticker)] = (sequence, market_data_type)
 
         wrapper.marketDataType = _observe
+
+    def _market_data_type_sequence(self) -> int:
+        sequence = getattr(
+            self._market_data_type_wrapper,
+            "_optionsbot_market_data_type_sequence",
+            0,
+        )
+        return sequence if type(sequence) is int else 0
+
+    def _take_observed_market_data_type(
+        self, ticker: Ticker, *, after_sequence: int
+    ) -> object | None:
+        observation = self._delivered_market_data_types.pop(id(ticker), None)
+        if (
+            not isinstance(observation, tuple)
+            or len(observation) != 2
+            or type(observation[0]) is not int
+            or observation[0] <= after_sequence
+        ):
+            return None
+        return observation[1]
 
     @property
     def client(self) -> IBKRClient:
@@ -114,11 +142,10 @@ class MarketDataClient:
 
     async def get_stock_snapshot(self, symbol: str) -> StockQuote:
         contract = await self._resolver.stock(symbol)
-        ticker = await self._fetch_ticker(contract)
+        ticker, observed_market_data_type = await self._fetch_ticker(contract)
         bid = clean_float(getattr(ticker, "bid", None))
         ask = clean_float(getattr(ticker, "ask", None))
         last = clean_float(getattr(ticker, "last", None))
-        observed_market_data_type = self._delivered_market_data_types.pop(id(ticker), None)
         return StockQuote(
             symbol=symbol,
             bid=bid,
@@ -137,7 +164,7 @@ class MarketDataClient:
         right: OptionRight,
     ) -> OptionQuote:
         contract = await self._resolver.option(symbol, expiry, strike, right)
-        ticker = await self._fetch_ticker(contract)
+        ticker, observed_market_data_type = await self._fetch_ticker(contract)
         bid = clean_float(getattr(ticker, "bid", None))
         ask = clean_float(getattr(ticker, "ask", None))
         last = clean_float(getattr(ticker, "last", None))
@@ -149,7 +176,6 @@ class MarketDataClient:
         vega = _greek(greeks, "vega") if greeks is not None else None
         open_interest = clean_int(getattr(ticker, "openInterest", None))
         volume = clean_int(getattr(ticker, "volume", None))
-        observed_market_data_type = self._delivered_market_data_types.pop(id(ticker), None)
         return OptionQuote(
             symbol=symbol,
             expiry=expiry,
@@ -170,17 +196,29 @@ class MarketDataClient:
             delayed=_market_data_type_delayed(observed_market_data_type),
         )
 
-    async def _fetch_ticker(self, contract: Contract) -> Ticker:
+    async def _fetch_ticker(self, contract: Contract) -> tuple[Ticker, object | None]:
         await self._client.ensure_connected()
+        start_sequence = self._market_data_type_sequence()
         tickers = await self._client.ib.reqTickersAsync(contract)
         ticker = tickers[0] if tickers else None
         if ticker is not None and _has_quote(ticker):
-            return ticker  # fast path: snapshot had the quote (always for stocks)
+            observed = self._take_observed_market_data_type(
+                ticker, after_sequence=start_sequence
+            )
+            return ticker, observed  # fast path: snapshot had the quote
         streamed = await self._stream_until_quote(contract)
         if streamed is not None:
-            return streamed
+            if ticker is not None and streamed is not ticker:
+                self._delivered_market_data_types.pop(id(ticker), None)
+            observed = self._take_observed_market_data_type(
+                streamed, after_sequence=start_sequence
+            )
+            return streamed, observed
         if ticker is not None:
-            return ticker  # empty, but a real Ticker — caller sees None bid/ask
+            observed = self._take_observed_market_data_type(
+                ticker, after_sequence=start_sequence
+            )
+            return ticker, observed  # empty, but real; caller sees None bid/ask
         raise ValueError(f"No ticker returned for {contract!r}")
 
     async def _stream_until_quote(self, contract: Contract) -> Ticker | None:
