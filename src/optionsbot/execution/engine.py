@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Engine, select
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import is_market_open
@@ -30,6 +31,7 @@ from optionsbot.execution.orders import (
     stage_order,
     transition,
 )
+from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
 from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import (
     combo_bid_ask,
@@ -192,8 +194,11 @@ async def execute_pick(
             return _reject("delayed snapshot data — auto mode requires a live delivered feed")
         if snapshot_raw.get("warming_up"):
             return _reject("snapshot history is warming up — auto mode requires mature data")
-    if not suggestion.get("defined_risk", False):
-        return _reject("undefined risk strategies are not executable")
+    if (
+        suggestion.get("defined_risk") is not True
+        or not has_structurally_defined_option_risk(legs)
+    ):
+        return _reject("undefined risk: option legs do not independently prove a bound")
     max_loss_unit = float(suggestion.get("max_loss") or 0.0)
     if not math.isfinite(max_loss_unit) or max_loss_unit <= 0:
         return _reject("pick carries no defined max loss — not sizeable")
@@ -398,7 +403,12 @@ async def execute_pick(
         if nbbo is not None
         else increment
     )
-    record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
+    try:
+        record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
+    except IntegrityError:
+        return _reject(
+            f"pick {score_id} already has an order intent; its authorization is consumed"
+        )
     record_order_quotes(
         engine, record.id, kind="decision", step=0, ts=ts_now,
         combo_bid=nbbo[0] if nbbo else None,

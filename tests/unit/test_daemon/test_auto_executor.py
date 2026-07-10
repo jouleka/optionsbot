@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from sqlalchemy import insert, select, update
+import pytest
+from sqlalchemy import insert, select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.daemon.auto_executor import auto_execute_candidates
 from optionsbot.daemon.context import DaemonContext
@@ -14,34 +16,127 @@ from optionsbot.daemon.order_watcher import run_orders_tick
 from optionsbot.execution.engine import ExecuteOutcome
 from optionsbot.execution.orders import record_fill, set_fill_commission
 from optionsbot.execution.state import load_state
-from optionsbot.storage.schema import entry_reviews, orders, snapshots, strategy_scores
+from optionsbot.storage.schema import (
+    alerts,
+    entry_intent_consumptions,
+    entry_reviews,
+    orders,
+    snapshots,
+    strategy_scores,
+)
 
 NOW = datetime.now(UTC)
 
 
-def _pick(context: DaemonContext, symbol: str = "SPY") -> tuple[int, int]:
+def _pick(
+    context: DaemonContext,
+    symbol: str = "SPY",
+    *,
+    snapshot_ts: datetime = NOW,
+) -> tuple[int, int]:
     with context.engine.begin() as conn:
         snap = int(conn.execute(insert(snapshots).values(
-            symbol=symbol, ts=NOW, spot=600.0,
+            symbol=symbol, ts=snapshot_ts, spot=600.0,
+            raw_json={"delayed": False, "warming_up": False},
         )).inserted_primary_key[0])
         score = int(conn.execute(insert(strategy_scores).values(
             snapshot_id=snap, strategy="bull_put_spread", score=80.0,
-            rationale="t", legs_json=[], suggestion_json={},
+            rationale="t",
+            legs_json=[
+                {
+                    "symbol": symbol,
+                    "side": "sell",
+                    "sec_type": "OPT",
+                    "expiry": "20260717",
+                    "strike": 590.0,
+                    "right": "P",
+                    "quantity": 1,
+                },
+                {
+                    "symbol": symbol,
+                    "side": "buy",
+                    "sec_type": "OPT",
+                    "expiry": "20260717",
+                    "strike": 585.0,
+                    "right": "P",
+                    "quantity": 1,
+                },
+            ],
+            suggestion_json={
+                "defined_risk": True,
+                "credit_or_debit": 100.0,
+                "max_loss": 400.0,
+                "max_profit": 100.0,
+                "prob_profit": 0.70,
+                "expected_value": 15.0,
+                "suggested_quantity": 1,
+            },
         )).inserted_primary_key[0])
     return snap, score
 
 
-def _review(context: DaemonContext, score_id: int) -> int:
+def _alert(
+    context: DaemonContext,
+    score_id: int,
+    *,
+    status: str = "sent",
+    sent_ts: datetime | None = NOW,
+    telegram_msg_id: int | None = 12345,
+) -> int:
+    with context.engine.begin() as conn:
+        row = conn.execute(
+            select(strategy_scores.c.strategy, snapshots.c.symbol)
+            .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+            .where(strategy_scores.c.id == score_id)
+        ).one()
+        pk = conn.execute(
+            insert(alerts).values(
+                strategy_score_id=score_id,
+                ts=NOW,
+                symbol=row.symbol,
+                strategy=row.strategy,
+                score=80.0,
+                status=status,
+                sent_ts=sent_ts if status == "sent" else None,
+                telegram_msg_id=telegram_msg_id if status == "sent" else None,
+            )
+        ).inserted_primary_key
+    return int(pk[0])
+
+
+def _review(
+    context: DaemonContext,
+    score_id: int,
+    *,
+    alert_id: int | None = None,
+    create_alert: bool = True,
+    confidence: float = 0.90,
+    sources: list[str] | None = None,
+    checks: dict[str, bool] | None = None,
+) -> int:
+    if alert_id is None and create_alert:
+        alert_id = _alert(context, score_id)
+    if checks is None:
+        checks = {
+            "bot_health": True,
+            "candidate": True,
+            "microstructure": True,
+            "greeks": True,
+            "regime_history": True,
+            "catalysts": True,
+            "account_risk": True,
+        }
     with context.engine.begin() as conn:
         pk = conn.execute(
             insert(entry_reviews).values(
                 strategy_score_id=score_id,
+                alert_id=alert_id,
                 reviewed_at=NOW,
                 verdict="vetted_paper_candidate",
-                confidence=0.90,
-                sources_json=["source A", "source B"],
+                confidence=confidence,
+                sources_json=sources or ["source A", "source B"],
                 reason="test review",
-                checks_json={"all": True},
+                checks_json=checks,
                 status="requested",
             )
         ).inserted_primary_key
@@ -64,31 +159,138 @@ async def test_auto_does_not_execute_unreviewed_candidate(
     run.assert_not_awaited()
 
 
+async def test_daemon_rejects_malformed_persisted_review_even_if_ingress_was_bypassed(
+    daemon_context: DaemonContext,
+) -> None:
+    """The order-capable consumer is the final trust boundary."""
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TRIGGER trg_entry_reviews_validate_insert")
+    _review(
+        daemon_context,
+        score,
+        create_alert=False,
+        confidence=0.0,
+        sources=["one source"],
+        checks={},
+    )
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        n = await run_entry_reviews_tick(daemon_context)
+
+    assert n == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+    assert "invalid authorization" in review.decision_reason
+
+
+async def test_daemon_rejects_review_whose_alert_links_another_score(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, reviewed_score = _pick(daemon_context, "SPY")
+    _, other_score = _pick(daemon_context, "QQQ")
+    wrong_alert = _alert(daemon_context, other_score)
+    with daemon_context.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TRIGGER trg_entry_reviews_validate_insert")
+    _review(
+        daemon_context,
+        reviewed_score,
+        alert_id=wrong_alert,
+        create_alert=False,
+    )
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        n = await run_entry_reviews_tick(daemon_context)
+
+    assert n == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+
+
+async def test_daemon_requires_review_after_proven_alert_delivery(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    alert_id = _alert(
+        daemon_context,
+        score,
+        sent_ts=NOW + timedelta(minutes=5),
+        telegram_msg_id=None,
+    )
+    with daemon_context.engine.begin() as conn:
+        conn.execute(text("DROP TRIGGER trg_entry_reviews_validate_insert"))
+    _review(daemon_context, score, alert_id=alert_id, create_alert=False)
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await run_entry_reviews_tick(daemon_context)
+
+    assert submitted == 0
+    run.assert_not_awaited()
+
+
+async def test_daemon_derives_defined_risk_from_legs_not_suggestion_flag(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            update(strategy_scores)
+            .where(strategy_scores.c.id == score)
+            .values(
+                legs_json=[
+                    {
+                        "symbol": "SPY",
+                        "side": "sell",
+                        "sec_type": "OPT",
+                        "expiry": "20260717",
+                        "strike": 590.0,
+                        "right": "P",
+                        "quantity": 1,
+                    }
+                ]
+            )
+        )
+    _review(daemon_context, score)
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await run_entry_reviews_tick(daemon_context)
+
+    assert submitted == 0
+    run.assert_not_awaited()
+
+
 async def test_auto_executes_alerted_candidates(daemon_context: DaemonContext) -> None:
     daemon_context.settings.execution.mode = "auto"
     daemon_context.order_client = MagicMock()
     snap, score = _pick(daemon_context)
     _review(daemon_context, score)
-    with daemon_context.engine.begin() as conn:
-        conn.execute(
-            insert(orders).values(
-                id=9,
-                intent="open",
-                strategy_score_id=score,
-                symbol="SPY",
-                strategy="bull_put_spread",
-                legs_json=[],
-                quantity=1,
-                status="staged",
-                staged_ts=NOW,
-                reprice_count=0,
-            )
-        )
     scored = MagicMock()
     scored.strategy_name = "bull_put_spread"
     with patch(
         "optionsbot.execution.engine.execute_pick",
-        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="✅ submitted #9", order_id=9)),
+        new=AsyncMock(
+            return_value=ExecuteOutcome(ok=True, message="✅ submitted", order_id=None)
+        ),
     ) as run:
         n = await auto_execute_candidates(daemon_context, [("SPY", scored, snap)])
     assert n == 1
@@ -96,10 +298,10 @@ async def test_auto_executes_alerted_candidates(daemon_context: DaemonContext) -
     with daemon_context.engine.connect() as conn:
         review = conn.execute(select(entry_reviews)).one()
     assert review.status == "submitted"
-    assert review.order_id == 9
+    assert review.order_id is None
     assert review.processed_at is not None
     sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
-    assert any("🤖" in m and "submitted #9" in m for m in sent)
+    assert any("🤖" in m and "submitted" in m for m in sent)
 
 
 async def test_review_tick_executes_review_submitted_after_scan(
@@ -111,25 +313,10 @@ async def test_review_tick_executes_review_submitted_after_scan(
     daemon_context.order_client = MagicMock()
     _, score = _pick(daemon_context)
     _review(daemon_context, score)
-    with daemon_context.engine.begin() as conn:
-        conn.execute(
-            insert(orders).values(
-                id=9,
-                intent="open",
-                strategy_score_id=score,
-                symbol="SPY",
-                strategy="bull_put_spread",
-                legs_json=[],
-                quantity=1,
-                status="staged",
-                staged_ts=NOW,
-                reprice_count=0,
-            )
-        )
 
     with patch(
         "optionsbot.execution.engine.execute_pick",
-        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="submitted #9", order_id=9)),
+        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="submitted", order_id=None)),
     ) as run:
         n = await run_entry_reviews_tick(daemon_context)
 
@@ -138,7 +325,26 @@ async def test_review_tick_executes_review_submitted_after_scan(
     with daemon_context.engine.connect() as conn:
         review = conn.execute(select(entry_reviews)).one()
     assert review.status == "submitted"
-    assert review.order_id == 9
+    assert review.order_id is None
+
+
+async def test_strategy_identity_is_unique_within_snapshot(
+    daemon_context: DaemonContext,
+) -> None:
+    snap, _ = _pick(daemon_context)
+
+    with pytest.raises(IntegrityError):
+        with daemon_context.engine.begin() as conn:
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snap,
+                    strategy="bull_put_spread",
+                    score=81.0,
+                    rationale="ambiguous duplicate strategy row",
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            )
 
 
 async def test_review_tick_executes_exact_reviewed_score_id(
@@ -148,45 +354,19 @@ async def test_review_tick_executes_exact_reviewed_score_id(
 
     daemon_context.settings.execution.mode = "auto"
     daemon_context.order_client = MagicMock()
-    snap, reviewed_score = _pick(daemon_context)
+    _, reviewed_score = _pick(daemon_context)
     _review(daemon_context, reviewed_score)
-    with daemon_context.engine.begin() as conn:
-        newer_unreviewed_score = int(
-            conn.execute(
-                insert(strategy_scores).values(
-                    snapshot_id=snap,
-                    strategy="bull_put_spread",
-                    score=81.0,
-                    rationale="newer duplicate strategy row",
-                    legs_json=[],
-                    suggestion_json={},
-                )
-            ).inserted_primary_key[0]
-        )
-        conn.execute(
-            insert(orders).values(
-                id=9,
-                intent="open",
-                strategy_score_id=reviewed_score,
-                symbol="SPY",
-                strategy="bull_put_spread",
-                legs_json=[],
-                quantity=1,
-                status="staged",
-                staged_ts=NOW,
-                reprice_count=0,
-            )
-        )
 
     with patch(
         "optionsbot.execution.engine.execute_pick",
-        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="submitted #9", order_id=9)),
+        new=AsyncMock(
+            return_value=ExecuteOutcome(ok=True, message="submitted", order_id=None)
+        ),
     ) as run:
         n = await run_entry_reviews_tick(daemon_context)
 
     assert n == 1
     assert run.await_args.args[1] == reviewed_score
-    assert run.await_args.args[1] != newer_unreviewed_score
 
 
 async def test_review_rejection_becomes_held_and_is_not_retried(
@@ -224,14 +404,11 @@ async def test_review_tick_expires_stale_pick_without_execution(
 
     daemon_context.settings.execution.mode = "auto"
     daemon_context.order_client = MagicMock()
-    snap, score = _pick(daemon_context)
+    _snap, score = _pick(
+        daemon_context,
+        snapshot_ts=NOW - timedelta(minutes=31),
+    )
     _review(daemon_context, score)
-    with daemon_context.engine.begin() as conn:
-        conn.execute(
-            update(snapshots)
-            .where(snapshots.c.id == snap)
-            .values(ts=NOW - timedelta(minutes=31))
-        )
 
     with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
         n = await run_entry_reviews_tick(daemon_context)
@@ -244,7 +421,7 @@ async def test_review_tick_expires_stale_pick_without_execution(
     assert review.processed_at is not None
 
 
-async def test_review_tick_recovers_abandoned_processing_claim(
+async def test_review_tick_does_not_recover_claim_after_any_prior_order_intent(
     daemon_context: DaemonContext,
 ) -> None:
     from optionsbot.daemon.auto_executor import run_entry_reviews_tick
@@ -268,24 +445,123 @@ async def test_review_tick_recovers_abandoned_processing_claim(
                 strategy="bull_put_spread",
                 legs_json=[],
                 quantity=1,
-                status="staged",
+                status="rejected",
                 staged_ts=NOW,
+                terminal_ts=NOW,
                 reprice_count=0,
             )
         )
+        conn.execute(
+            insert(entry_intent_consumptions).values(
+                strategy_score_id=score,
+                first_order_id=9,
+                consumed_at=NOW,
+            )
+        )
+        # Even if a legacy order's nullable attribution is damaged, the
+        # immutable consumption receipt must keep the candidate spent.
+        conn.execute(
+            update(orders).where(orders.c.id == 9).values(strategy_score_id=None)
+        )
 
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        n = await run_entry_reviews_tick(daemon_context)
+
+    assert n == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+    assert review.claimed_at is None
+    assert "prior order intent" in review.decision_reason
+
+
+async def test_review_tick_recovers_unconsumed_abandoned_claim(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    review_id = _review(daemon_context, score)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            update(entry_reviews)
+            .where(entry_reviews.c.id == review_id)
+            .values(status="processing", claimed_at=NOW - timedelta(minutes=11))
+        )
+
+    rejected = ExecuteOutcome(ok=False, message="NO TRADE: final gates refused", order_id=None)
     with patch(
         "optionsbot.execution.engine.execute_pick",
-        new=AsyncMock(return_value=ExecuteOutcome(ok=True, message="submitted #9", order_id=9)),
+        new=AsyncMock(return_value=rejected),
     ) as run:
         n = await run_entry_reviews_tick(daemon_context)
 
-    assert n == 1
+    assert n == 0
     run.assert_awaited_once()
     with daemon_context.engine.connect() as conn:
         review = conn.execute(select(entry_reviews)).one()
-    assert review.status == "submitted"
-    assert review.claimed_at is None
+    assert review.status == "held"
+
+
+async def test_review_completion_race_trips_kill_switch(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    review_id = _review(daemon_context, score)
+
+    async def race_review_state(*_args: object, **_kwargs: object) -> ExecuteOutcome:
+        with daemon_context.engine.begin() as conn:
+            conn.execute(
+                update(entry_reviews)
+                .where(entry_reviews.c.id == review_id)
+                .values(status="held", decision_reason="simulated concurrent mutation")
+            )
+        return ExecuteOutcome(ok=True, message="submitted #9", order_id=None)
+
+    with patch(
+        "optionsbot.execution.engine.execute_pick",
+        new=AsyncMock(side_effect=race_review_state),
+    ):
+        n = await run_entry_reviews_tick(daemon_context)
+
+    assert n == 0
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert "review" in (state.reason or "").lower()
+
+
+async def test_review_completion_exception_after_side_effect_trips_kill_switch(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score = _pick(daemon_context)
+    _review(daemon_context, score)
+
+    with patch(
+        "optionsbot.execution.engine.execute_pick",
+        new=AsyncMock(
+            return_value=ExecuteOutcome(ok=True, message="submitted #9", order_id=None)
+        ),
+    ), patch(
+        "optionsbot.daemon.auto_executor._finish_review",
+        side_effect=RuntimeError("sqlite unavailable"),
+    ):
+        submitted = await run_entry_reviews_tick(daemon_context)
+
+    assert submitted == 0
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert "review" in (state.reason or "").lower()
 
 
 async def test_auto_noop_in_confirm_mode(daemon_context: DaemonContext) -> None:

@@ -25,6 +25,7 @@ from typing import Any
 from sqlalchemy import Engine, Row, delete, insert, select, update
 
 from optionsbot.storage.schema import (
+    entry_intent_consumptions,
     fills,
     order_quotes,
     orders,
@@ -190,6 +191,14 @@ def stage_order(
         ).inserted_primary_key
         assert inserted is not None  # single-row INSERT always returns a PK
         order_id = int(inserted[0])
+        if intent == "open":
+            conn.execute(
+                insert(entry_intent_consumptions).values(
+                    strategy_score_id=row.id,
+                    first_order_id=order_id,
+                    consumed_at=ts,
+                )
+            )
         # Deterministic broker-side tag: stamped into Order.orderRef at submit
         # so reconciliation (IBK-128) can map IBKR orders back to rows.
         conn.execute(

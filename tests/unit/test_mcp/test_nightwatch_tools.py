@@ -96,9 +96,19 @@ def _snapshot_with_score(
                     score=score,
                     status="sent",
                     sent_ts=NOW,
+                    telegram_msg_id=12345,
                 )
             )
     return score_id
+
+
+def _alert_id_for_score(server_context: ServerContext, score_id: int) -> int:
+    with server_context.engine.connect() as conn:
+        return int(
+            conn.execute(
+                select(alerts.c.id).where(alerts.c.strategy_score_id == score_id)
+            ).scalar_one()
+        )
 
 
 def test_pending_picks_returns_grounded_pre_trade_packet(server_context: ServerContext) -> None:
@@ -152,6 +162,7 @@ def test_submit_entry_review_queues_complete_vetted_candidate(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.91,
         sources=["issuer calendar", "independent market-data source"],
@@ -165,6 +176,7 @@ def test_submit_entry_review_queues_complete_vetted_candidate(
     with server_context.engine.connect() as conn:
         row = conn.execute(select(entry_reviews)).one()
     assert row.strategy_score_id == score_id
+    assert row.alert_id == _alert_id_for_score(server_context, score_id)
     assert row.verdict == "vetted_paper_candidate"
     assert row.checks_json == checks
     assert row.status == "requested"
@@ -178,6 +190,7 @@ def test_submit_entry_review_rejects_unalerted_score(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=999_999,
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.91,
         sources=["issuer calendar", "independent market-data source"],
@@ -194,6 +207,40 @@ def test_submit_entry_review_rejects_unalerted_score(
         assert conn.execute(select(entry_reviews)).first() is None
 
 
+def test_submit_entry_review_rejects_alert_for_another_pick(
+    server_context: ServerContext,
+) -> None:
+    score_id = _snapshot_with_score(server_context)
+    other_score_id = _snapshot_with_score(server_context)
+    submit_entry_review = get_tools(register)["submit_entry_review"]
+
+    result = submit_entry_review(
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, other_score_id),
+        verdict="VETTED PAPER CANDIDATE",
+        confidence=0.91,
+        sources=["source A", "source B"],
+        reason="The alert and candidate identities must be inseparable.",
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result == {"ok": False, "error": "alert_pick_mismatch"}
+    with server_context.engine.connect() as conn:
+        assert conn.execute(select(entry_reviews)).first() is None
+
+
 def test_submit_entry_review_rejects_incomplete_vetted_checks(
     server_context: ServerContext,
 ) -> None:
@@ -202,6 +249,7 @@ def test_submit_entry_review_rejects_incomplete_vetted_checks(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.91,
         sources=["source A", "source B"],
@@ -240,6 +288,7 @@ def test_submit_entry_review_rejects_delayed_candidate(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.91,
         sources=["source A", "source B"],
@@ -264,6 +313,7 @@ def test_submit_entry_review_rejects_low_confidence_vetted(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.79,
         sources=["source A", "source B"],
@@ -288,6 +338,7 @@ def test_submit_entry_review_requires_two_sources_for_vetted(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.90,
         sources=["one source only"],
@@ -312,6 +363,7 @@ def test_submit_entry_review_requires_two_distinct_sources_for_vetted(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.90,
         sources=["same source", "same source"],
@@ -350,6 +402,7 @@ def test_submit_entry_review_rejects_non_positive_candidate_economics(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.90,
         sources=["source A", "source B"],
@@ -383,6 +436,7 @@ def test_submit_entry_review_rejects_stale_pick(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.90,
         sources=["source A", "source B"],
@@ -405,6 +459,7 @@ def test_submit_entry_review_requires_reason(server_context: ServerContext) -> N
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="NO TRADE",
         confidence=0.90,
         sources=["source A", "source B"],
@@ -426,6 +481,7 @@ def test_submit_entry_review_persists_no_trade_as_non_executable(
 
     result = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="NO TRADE",
         confidence=0.97,
         sources=["fresh option chain", "issuer calendar"],
@@ -449,6 +505,7 @@ def test_submit_entry_review_does_not_override_existing_no_trade(
     submit_entry_review = get_tools(register)["submit_entry_review"]
     submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="NO TRADE",
         confidence=0.95,
         sources=["source A", "source B"],
@@ -459,6 +516,7 @@ def test_submit_entry_review_does_not_override_existing_no_trade(
 
     second = submit_entry_review(
         pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
         verdict="VETTED PAPER CANDIDATE",
         confidence=0.95,
         sources=["source A", "source B"],

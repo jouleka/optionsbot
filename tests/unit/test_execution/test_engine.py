@@ -294,13 +294,15 @@ async def test_rejects_duplicate_active_order(tmp_db: Engine) -> None:
     assert "already" in outcome.message.lower()
 
 
-async def test_allows_reexecute_after_failed_terminal(tmp_db: Engine) -> None:
+async def test_rejects_reexecute_after_any_terminal_order_intent(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     record = stage_order(tmp_db, score_id, now=NOW)
-    transition(tmp_db, record.id, "skipped", now=NOW)  # earlier attempt failed gates
+    transition(tmp_db, record.id, "skipped", now=NOW)
+    deps = _deps(tmp_db)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
-        outcome = await execute_pick(_deps(tmp_db), score_id, now=NOW)
-    assert outcome.ok
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "authorization is consumed" in outcome.message
 
 
 async def test_rejects_at_max_open_positions(tmp_db: Engine) -> None:

@@ -27,6 +27,7 @@ EXPECTED_TABLES = {
     "walk_state",
     "exit_requests",
     "entry_reviews",
+    "entry_intent_consumptions",
 }
 
 

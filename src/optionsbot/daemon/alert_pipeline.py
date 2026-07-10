@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
-from sqlalchemy import and_, desc, insert, or_, select, update
+from sqlalchemy import and_, insert, or_, select, update
 
 from optionsbot.alerts import format_alert_markdown
 from optionsbot.analysis.types import Direction, IVRegime, MarketView
@@ -46,6 +46,11 @@ async def enqueue_alert(
     strategy_score_id = _strategy_score_id_for(
         context, snapshot_id, scored.strategy_name
     )
+    if strategy_score_id is None:
+        raise RuntimeError(
+            f"missing exact persisted score for snapshot={snapshot_id} "
+            f"strategy={scored.strategy_name}"
+        )
     with context.engine.begin() as conn:
         result = conn.execute(
             insert(alerts).values(
@@ -67,9 +72,7 @@ def _strategy_score_id_for(
             select(strategy_scores.c.id)
             .where(strategy_scores.c.snapshot_id == snapshot_id)
             .where(strategy_scores.c.strategy == strategy)
-            .order_by(strategy_scores.c.id.desc())
-            .limit(1)
-        ).first()
+        ).one_or_none()
     return cast(int, row.id) if row is not None else None
 
 
@@ -89,9 +92,7 @@ def execute_hint_for(
                 select(strategy_scores.c.id)
                 .where(strategy_scores.c.snapshot_id == snapshot_id)
                 .where(strategy_scores.c.strategy == strategy)
-                .order_by(strategy_scores.c.id.desc())
-                .limit(1)
-            ).first()
+            ).one_or_none()
     except Exception:  # noqa: BLE001 -- a hint must never break alert delivery
         log.exception("execute-hint lookup failed for snapshot %s", snapshot_id)
         return None
@@ -251,7 +252,7 @@ def _load_symbol_for_alert(context: DaemonContext, alert_id: int) -> str:
 
 
 def _snapshot_id_for_alert(
-    context: DaemonContext, alert_id: int, symbol: str
+    context: DaemonContext, alert_id: int, _symbol: str
 ) -> int | None:
     with context.engine.connect() as conn:
         row = conn.execute(
@@ -264,22 +265,7 @@ def _snapshot_id_for_alert(
             )
             .where(alerts.c.id == alert_id)
         ).first()
-    if row is not None:
-        return cast(int, row.snapshot_id)
-    return _latest_snapshot_id_for_symbol(context, symbol)
-
-
-def _latest_snapshot_id_for_symbol(
-    context: DaemonContext, symbol: str
-) -> int | None:
-    with context.engine.connect() as conn:
-        row = conn.execute(
-            select(snapshots.c.id)
-            .where(snapshots.c.symbol == symbol)
-            .order_by(desc(snapshots.c.ts))
-            .limit(1)
-        ).fetchone()
-    return cast(int, row.id) if row else None
+    return cast(int, row.snapshot_id) if row is not None else None
 
 
 def _reconstruct_scored(
@@ -300,21 +286,11 @@ def _reconstruct_scored(
             if alert_row is not None and alert_row.strategy_score_id is not None
             else None
         )
-        if linked_score_id is not None:
-            score_row = conn.execute(
-                select(strategy_scores).where(strategy_scores.c.id == linked_score_id)
-            ).fetchone()
-        else:
-            symbol = _load_symbol_for_alert(context, alert_id)
-            snap_id = _latest_snapshot_id_for_symbol(context, symbol)
-            if snap_id is None:
-                return None
-            score_row = conn.execute(
-                select(strategy_scores)
-                .where(strategy_scores.c.snapshot_id == snap_id)
-                .where(strategy_scores.c.strategy == strategy)
-                .limit(1)
-            ).fetchone()
+        if linked_score_id is None:
+            return None
+        score_row = conn.execute(
+            select(strategy_scores).where(strategy_scores.c.id == linked_score_id)
+        ).fetchone()
     if score_row is None:
         return None
     legs_data = score_row.legs_json or []
