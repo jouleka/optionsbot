@@ -46,6 +46,7 @@ from optionsbot.execution.orders import (
     net_premium,
     open_close_for,
     realized_close_pairs,
+    set_order_note,
     stage_close_order,
     transition,
 )
@@ -732,20 +733,44 @@ async def _manage_entry(
             limit_price=limit_price,
             order_ref=close.order_ref or f"obot-{close.id}",
         )
-    except Exception as exc:  # noqa: BLE001 -- a failed close lands in the ledger + retries next tick
-        transition(engine, close.id, "skipped", error=str(exc), now=now)
-        if exit_request_id is not None and exit_decision_reason is not None:
-            _finish_bound_exit_request(
-                engine,
-                exit_request_id,
-                close.id,
-                "failed",
-                f"broker placement failed: {exc}",
-                now,
-            )
-        await _send(context, f"⚠ closing #{entry.id} failed to place: {exc} — will retry")
+    except Exception as exc:  # noqa: BLE001 -- placement outcome may be unknown
+        halt_reason = (
+            f"close #{close.id} broker placement outcome unknown after exception: {exc}"
+        )
+        # Keep the close in `submitting` so the permanent active-close claim
+        # blocks retries until broker/ledger reconciliation determines whether
+        # the order exists. A terminal transition here could stage a duplicate.
+        try:
+            set_order_note(engine, close.id, halt_reason)
+        except Exception:  # noqa: BLE001 -- kill still takes precedence
+            log.exception("failed to annotate uncertain close #%s", close.id)
+        trip_kill(engine, halt_reason, now=now)
+        await _send(
+            context,
+            f"🛑 HALT: {halt_reason}. No retry will be staged; reconcile broker "
+            "and ledger state before re-arming.",
+        )
         return 0
-    transition(engine, close.id, "submitted", ib_order_id=placed.ib_order_id, now=now)
+    try:
+        transition(
+            engine,
+            close.id,
+            "submitted",
+            ib_order_id=placed.ib_order_id,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 -- broker side effect may already exist
+        halt_reason = (
+            f"close #{close.id} broker placement completed but ledger finalization "
+            f"failed: {exc}"
+        )
+        trip_kill(engine, halt_reason, now=now)
+        await _send(
+            context,
+            f"🛑 HALT: {halt_reason}. Treat broker state as unknown and reconcile "
+            "before re-arming.",
+        )
+        return 1
 
     if exit_request_id is not None and exit_decision_reason is not None:
         completed = _finish_bound_exit_request(

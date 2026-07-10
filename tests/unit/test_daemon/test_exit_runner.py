@@ -429,6 +429,64 @@ async def test_request_exit_completion_rowcount_failure_halts_after_placement(
     assert request.close_order_id is not None
 
 
+async def test_close_ledger_failure_after_broker_placement_halts(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon import exit_runner as er
+
+    _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    real_transition = er.transition
+
+    def _fail_submitted(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        new_status = args[2] if len(args) > 2 else kwargs.get("new_status")
+        if new_status == "submitted":
+            raise RuntimeError("simulated post-placement ledger race")
+        return real_transition(*args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch(
+            "optionsbot.daemon.exit_runner._exec_md",
+            return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+        ),
+        patch.object(er, "transition", _fail_submitted),
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert state.reason is not None and "ledger" in state.reason
+
+
+async def test_close_placement_exception_halts_with_claim_preserved(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
+    order_client.place_combo_limit.side_effect = TimeoutError(
+        "broker acknowledgement lost"
+    )
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_awaited_once()
+    state = load_state(daemon_context.engine)
+    assert state.killed is True
+    assert state.reason is not None and "unknown" in state.reason
+    with daemon_context.engine.connect() as conn:
+        close = conn.execute(
+            select(orders).where(orders.c.closes_order_id == entry_id)
+        ).one()
+    assert close.status == "submitting"
+
+
 async def test_request_exit_refuses_winning_headline_without_deterministic_exit(
     daemon_context: DaemonContext,
 ) -> None:
