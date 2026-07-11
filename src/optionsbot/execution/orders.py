@@ -818,7 +818,12 @@ def open_position_exposure(
     """
     with engine.connect() as conn:
         order_rows = conn.execute(
-            select(orders.c.id, orders.c.status, orders.c.legs_json).where(
+            select(
+                orders.c.id,
+                orders.c.status,
+                orders.c.quantity,
+                orders.c.legs_json,
+            ).where(
                 orders.c.intent.in_(("open", "close"))
             )
         ).fetchall()
@@ -854,11 +859,18 @@ def open_position_exposure(
         if order_row is None:
             return None
         leg_specs: dict[int, tuple[str, str, float, str]] = {}
+        expected_fills: dict[tuple[int, str], int] = {}
+        actual_fills: dict[tuple[int, str], int] = {}
+        raw_order_quantity = order_row.quantity
+        if type(raw_order_quantity) is not int or raw_order_quantity <= 0:
+            return None
         for leg in order_row.legs_json or []:
             if leg.get("sec_type", "OPT") != "OPT":
                 continue
             try:
                 raw_con_id = leg["con_id"]
+                raw_leg_quantity = leg.get("quantity", 1)
+                raw_side = leg["side"]
                 con_id = int(raw_con_id)
                 spec = (
                     str(leg["symbol"]),
@@ -868,9 +880,20 @@ def open_position_exposure(
                 )
             except (KeyError, TypeError, ValueError, OverflowError):
                 return None
-            if type(raw_con_id) is not int or con_id <= 0 or con_id in leg_specs:
+            if (
+                type(raw_con_id) is not int
+                or con_id <= 0
+                or con_id in leg_specs
+                or type(raw_leg_quantity) is not int
+                or raw_leg_quantity <= 0
+                or raw_side not in {"buy", "sell"}
+            ):
                 return None
             leg_specs[con_id] = spec
+            expected_side = "BUY" if raw_side == "buy" else "SELL"
+            expected_fills[(con_id, expected_side)] = (
+                raw_leg_quantity * raw_order_quantity
+            )
         for fill in order_fills:
             try:
                 raw_con_id = fill.leg_con_id
@@ -891,6 +914,8 @@ def open_position_exposure(
                 or side not in {"BUY", "SELL"}
             ):
                 return None
+            fill_key = (con_id, side)
+            actual_fills[fill_key] = actual_fills.get(fill_key, 0) + qty
             signed_qty = qty if side == "BUY" else -qty
             prior = exposure.get(con_id)
             if prior is not None and prior[0] != fill_spec:
@@ -899,6 +924,8 @@ def open_position_exposure(
                 fill_spec,
                 (prior[1] if prior else 0) + signed_qty,
             )
+        if order_row.status == "filled" and actual_fills != expected_fills:
+            return None
 
     return {con_id: value for con_id, value in exposure.items() if value[1] != 0}
 

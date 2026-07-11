@@ -317,25 +317,71 @@ class OrderClient:
         self, fill: Fill, *, fallback_ref: str | None = None
     ) -> ExecutionFill:
         execution = fill.execution
-        ts = execution.time if isinstance(execution.time, datetime) else datetime.now(UTC)
+        if not isinstance(execution.time, datetime):
+            raise ValueError("execution timestamp is missing or malformed")
+        ts = execution.time
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
+        raw_shares = execution.shares
+        try:
+            shares = float(raw_shares)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("execution quantity is malformed") from exc
+        if not math.isfinite(shares) or shares <= 0 or not shares.is_integer():
+            raise ValueError("execution quantity must be a positive whole contract count")
+        raw_con_id = fill.contract.conId
+        sec_type = fill.contract.secType
+        if sec_type not in {"OPT", "BAG"}:
+            raise ValueError(f"unknown execution security type {sec_type!r}")
+        if (
+            type(raw_con_id) is not int
+            or raw_con_id < (0 if sec_type == "BAG" else 1)
+        ):
+            raise ValueError("execution contract identity is malformed")
+        side = _IB_SIDE.get(execution.side, execution.side)
+        if side not in {"BUY", "SELL"}:
+            raise ValueError(f"execution side is malformed: {execution.side!r}")
+        try:
+            price = float(execution.price)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("execution price is malformed") from exc
+        if not math.isfinite(price) or price < 0:
+            raise ValueError("execution price must be finite and nonnegative")
+        if not isinstance(execution.execId, str) or not execution.execId.strip():
+            raise ValueError("execution ID is missing")
+        raw_order_id = execution.orderId
+        if type(raw_order_id) is not int or raw_order_id < 0:
+            raise ValueError("execution order identity is malformed")
+        order_ref = execution.orderRef or fallback_ref or None
+        if order_ref is not None and not isinstance(order_ref, str):
+            raise ValueError("execution order reference is malformed")
         report = fill.commissionReport
+        if (
+            report is not None
+            and report.execId
+            and (
+                not isinstance(report.commission, (int, float))
+                or isinstance(report.commission, bool)
+            )
+        ):
+            raise ValueError("execution commission is malformed")
         commission = (
             float(report.commission)
             if report is not None and report.execId
             else None
         )
+        if commission is not None and not math.isfinite(commission):
+            raise ValueError("execution commission is malformed")
         return ExecutionFill(
-            ib_order_id=int(execution.orderId),
-            order_ref=execution.orderRef or fallback_ref or None,
+            ib_order_id=raw_order_id,
+            order_ref=order_ref,
             exec_id=execution.execId,
-            side=_IB_SIDE.get(execution.side, execution.side),
-            price=float(execution.price),
-            qty=round(execution.shares),  # float in ib_async; int contracts for options
+            side=side,
+            price=price,
+            qty=int(shares),
             ts=ts,
-            con_id=int(fill.contract.conId) or None,
-            sec_type=fill.contract.secType,
+            con_id=raw_con_id,
+            sec_type=sec_type,
             commission=commission,
         )
 

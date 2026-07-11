@@ -654,3 +654,71 @@ async def test_walk_resume_failure_halts_reconciliation(tmp_db: Engine) -> None:
 
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
+
+
+async def test_duplicate_live_broker_orders_for_one_ledger_ref_halt(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    ref = f"obot-{order_id}"
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[(11, ref, "Submitted"), (22, ref, "Submitted")],
+            executions=[],
+        ),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_filled_multileg_order_requires_all_expected_leg_fills(
+    tmp_db: Engine,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    from optionsbot.execution.orders import transition
+
+    transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="only-short-leg",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [_portfolio_pos("SPY", strike=580.0, right="P", position=-1.0)]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_unknown_execution_security_type_halts(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    malformed = replace(
+        _fill(f"obot-{order_id}", "wrong-sec-type"),
+        sec_type="bag",
+    )
+
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[(11, f"obot-{order_id}", "Submitted")],
+            executions=[malformed],
+        ),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed

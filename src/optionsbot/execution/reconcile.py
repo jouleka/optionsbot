@@ -199,6 +199,15 @@ async def _reconcile_once(
             )
             continue
         adopted += 1
+        if row_id in at_broker:
+            mismatches += 1
+            reason = (
+                f"reconcile duplicate broker orders claim ledger order #{row_id}: "
+                f"{at_broker[row_id][0]} and {ib_order_id}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
         at_broker[row_id] = (ib_order_id, ib_status)
 
     # Work-stream D1: re-attach any persisted price-walks for orders we just
@@ -288,6 +297,7 @@ async def _reconcile_once(
             return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
         if (
             not isinstance(sec_type, str)
+            or sec_type not in {"OPT", "BAG"}
             or not isinstance(order_ref, str)
             or not isinstance(exec_id, str)
             or not exec_id.strip()

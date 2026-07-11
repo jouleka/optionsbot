@@ -980,12 +980,22 @@ async def assert_no_naked_short_after_close(context: DaemonContext, entry: Order
     from optionsbot.ibkr.positions import PositionsClient
 
     if context.exec_ibkr is None:
-        return True
+        reason = f"post-close broker position verification unavailable for #{entry.id}"
+        trip_kill(context.engine, reason)
+        if entry.id not in context.naked_leg_halted:
+            context.naked_leg_halted.add(entry.id)
+            await _send(context, f"🛑 KILL SWITCH: {reason}")
+        return False
     try:
         positions = await PositionsClient(context.exec_ibkr).get_portfolio()
-    except Exception:  # noqa: BLE001 -- a dead read must not crash the tick
+    except Exception as exc:  # noqa: BLE001 -- unavailable state fails closed
         log.exception("naked-leg check: get_portfolio failed for #%s", entry.id)
-        return True
+        reason = f"post-close broker position verification failed for #{entry.id}: {exc}"
+        trip_kill(context.engine, reason)
+        if entry.id not in context.naked_leg_halted:
+            context.naked_leg_halted.add(entry.id)
+            await _send(context, f"🛑 KILL SWITCH: {reason}")
+        return False
     naked = find_naked_short_legs(entry.legs, positions)
     if not naked:
         context.naked_leg_halted.discard(entry.id)

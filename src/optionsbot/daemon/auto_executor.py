@@ -199,12 +199,15 @@ def _review_authorization_error(
     if (
         reviewed_at < sent_ts
         or sent_ts < alert_ts
-        or reviewed_at > check_now + timedelta(minutes=1)
+        or reviewed_at > check_now
+        or sent_ts > check_now
+        or alert_ts > check_now
+        or snapshot_ts > check_now
     ):
         return "review timestamp is inconsistent with proven alert delivery"
     max_age = timedelta(minutes=context.settings.execution.max_pick_age_minutes)
     age = check_now - snapshot_ts
-    if age > max_age or age < -timedelta(minutes=1):
+    if age > max_age or age < timedelta(0):
         return "candidate is stale or timestamped in the future"
     raw = row.raw_json
     if not isinstance(raw, dict):

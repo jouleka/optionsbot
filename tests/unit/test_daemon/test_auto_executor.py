@@ -113,6 +113,7 @@ def _review(
     confidence: float = 0.90,
     sources: list[str] | None = None,
     checks: dict[str, bool] | None = None,
+    reviewed_at: datetime = NOW,
 ) -> int:
     if alert_id is None and create_alert:
         alert_id = _alert(context, score_id)
@@ -131,7 +132,7 @@ def _review(
             insert(entry_reviews).values(
                 strategy_score_id=score_id,
                 alert_id=alert_id,
-                reviewed_at=NOW,
+                reviewed_at=reviewed_at,
                 verdict="vetted_paper_candidate",
                 confidence=confidence,
                 sources_json=sources or ["source A", "source B"],
@@ -177,6 +178,31 @@ async def test_daemon_rejects_malformed_persisted_review_even_if_ingress_was_byp
         confidence=0.0,
         sources=["one source"],
         checks={},
+    )
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        n = await run_entry_reviews_tick(daemon_context)
+
+    assert n == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+    assert "invalid authorization" in review.decision_reason
+
+
+async def test_daemon_rejects_slightly_future_review_timestamp(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, score_id = _pick(daemon_context)
+    _review(
+        daemon_context,
+        score_id,
+        reviewed_at=datetime.now(UTC) + timedelta(seconds=30),
     )
 
     with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:

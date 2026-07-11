@@ -129,6 +129,14 @@ def test_status_inactive_maps_to_rejected_with_error(tmp_db: Engine) -> None:
     assert record.last_error  # some explanation recorded
 
 
+def test_unknown_live_bot_status_trips_kill(tmp_db: Engine) -> None:
+    from optionsbot.execution.state import load_state
+
+    order_id = _insert_order(tmp_db, "submitted")
+    OrderTracker(tmp_db).handle_status(_status(order_id, "MysteryWorking"))
+    assert load_state(tmp_db).killed is True
+
+
 def test_terminal_redelivery_never_raises(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "filled")
     tracker = OrderTracker(tmp_db)
@@ -136,9 +144,13 @@ def test_terminal_redelivery_never_raises(tmp_db: Engine) -> None:
     assert get_order(tmp_db, order_id).status == "filled"  # type: ignore[union-attr]
 
 
-def test_unknown_and_foreign_refs_ignored(tmp_db: Engine) -> None:
+def test_missing_bot_row_halts_while_foreign_refs_are_ignored(tmp_db: Engine) -> None:
+    from optionsbot.execution.state import load_state
+
     tracker = OrderTracker(tmp_db)
-    tracker.handle_status(_status(999_999, "Submitted"))  # row doesn't exist
+    tracker.handle_status(_status(999_999, "Submitted"))
+    assert load_state(tmp_db).killed is True
+
     update_obj = OrderStatusUpdate(
         ib_order_id=5, perm_id=None, order_ref="manual-trade", status="Submitted",
         filled=0, remaining=1, avg_fill_price=None,

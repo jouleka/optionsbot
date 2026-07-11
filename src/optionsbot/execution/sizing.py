@@ -148,15 +148,16 @@ def _scoreless_order_max_loss(engine: Engine, row: Any) -> float:
             fill.side not in actual_fill_qty
             or not math.isfinite(price)
             or price < 0
+            or type(fill.qty) is not int
             or qty <= 0
             or qty != fill.qty
         ):
             return math.inf
         actual_fill_qty[fill.side] += qty
         if all_legs_have_con_id:
-            if fill.leg_con_id is None:
+            if fill.leg_con_id is None or type(fill.leg_con_id) is not int:
                 return math.inf
-            con_id = int(fill.leg_con_id)
+            con_id = fill.leg_con_id
             expected = expected_by_con_id.get(con_id)
             if expected is None or expected[0] != fill.side:
                 return math.inf

@@ -422,6 +422,39 @@ def test_fill_event_translates_and_normalizes_side(
     assert record.ts.tzinfo is not None
 
 
+@pytest.mark.parametrize(
+    ("shares", "con_id"),
+    [(1.5, 1580), (1.0, 1580.5)],
+)
+def test_execution_adapter_rejects_fractional_quantity_or_contract_identity(
+    order_client: OrderClient,
+    shares: float,
+    con_id: float,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="bad-execution",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=shares,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=con_id),  # type: ignore[arg-type]
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
 def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
     # Order.permId defaults to 0 but the dataclass accepts None; a None must
     # not blow up the handler (the status update would be silently dropped).

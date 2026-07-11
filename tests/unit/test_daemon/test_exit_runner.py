@@ -10,11 +10,15 @@ import pytest
 from sqlalchemy import insert, select, update
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.exit_runner import force_close_entry, run_exits_tick
+from optionsbot.daemon.exit_runner import (
+    assert_no_naked_short_after_close,
+    force_close_entry,
+    run_exits_tick,
+)
 from optionsbot.daemon.market_hours import nyse_session_date
 from optionsbot.execution.equity_guard import capture_day_start_net_liq
 from optionsbot.execution.exit_requests import HermesLossCapDecision
-from optionsbot.execution.orders import record_fill, set_fill_commission
+from optionsbot.execution.orders import get_order, record_fill, set_fill_commission
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import OptionQuote, PlacedOrder, PortfolioPosition
 from optionsbot.storage.schema import exit_requests, orders
@@ -1205,6 +1209,28 @@ async def test_post_close_naked_short_trips_kill_and_alerts_p1(
 
         # No close order was submitted on either tick.
         assert first.closes_submitted == 0
+
+
+async def test_post_close_portfolio_read_failure_trips_kill(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    daemon_context.exec_ibkr = MagicMock()
+
+    with patch(
+        "optionsbot.ibkr.positions.PositionsClient",
+        autospec=True,
+    ) as mock_positions_client:
+        mock_positions_client.return_value.get_portfolio = AsyncMock(
+            side_effect=RuntimeError("portfolio unavailable")
+        )
+        clean = await assert_no_naked_short_after_close(daemon_context, entry)
+
+    assert clean is False
+    assert load_state(daemon_context.engine).killed is True
+    daemon_context.telegram.send_message.assert_awaited()
 
 
 # ---- /close: human-initiated force close (force_close_entry) ----
