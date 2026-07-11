@@ -183,6 +183,8 @@ async def execute_pick(
             f"stale pick — scanned {int(age.total_seconds() // 60)}m ago "
             f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
         )
+    if age < -timedelta(minutes=1):
+        return _reject("future-dated pick — persisted scan time is not trustworthy")
 
     # 4. Defined-risk only. In auto mode, earnings inside the expiry window
     # are skipped — binary jump risk overwhelms theta edge for neutral
@@ -403,6 +405,11 @@ async def execute_pick(
             )
         except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
             return _reject(f"whatIf margin preview failed: {exc}")
+    execution_verdict = can_execute(settings, load_state(engine))
+    if not execution_verdict.allowed:
+        return _reject(
+            f"execution interlock closed after margin preview: {execution_verdict.reason}"
+        )
     available = float(summary.available_funds) if summary.available_funds is not None else None
     # IBK-130: portfolio-wide buying-power deployment cap (auto mode only).
     if settings.execution.mode == "auto":
@@ -473,6 +480,20 @@ async def execute_pick(
             if (q := quotes.get((str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))))
         ],
     )
+    execution_verdict = can_execute(settings, load_state(engine))
+    if not execution_verdict.allowed:
+        transition(
+            engine,
+            record.id,
+            "skipped",
+            error=f"execution interlock closed before placement: {execution_verdict.reason}",
+            now=ts_now,
+        )
+        return ExecuteOutcome(
+            ok=False,
+            message=f"❌ execution interlock closed before placement: {execution_verdict.reason}",
+            order_id=record.id,
+        )
     transition(engine, record.id, "submitting", now=ts_now)
     try:
         placed = await deps.order_client.place_combo_limit(
@@ -501,8 +522,7 @@ async def execute_pick(
             order_id=record.id,
         )
     try:
-        if placed.leg_contracts:
-            set_order_leg_contracts(engine, record.id, placed.leg_contracts)
+        set_order_leg_contracts(engine, record.id, placed.leg_contracts)
         transition(
             engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
         )

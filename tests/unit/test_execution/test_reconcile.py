@@ -294,6 +294,7 @@ def _portfolio_pos(
         strike=strike, right=right, multiplier=100, position=position,  # type: ignore[arg-type]
         avg_cost=120.0, market_price=1.2, market_value=120.0,
         unrealized_pnl=0.0, realized_pnl=0.0,
+        con_id={580.0: 1580, 575.0: 1575}.get(strike, int(strike * 100)),
     )
 
 
@@ -321,6 +322,14 @@ async def test_broker_position_matching_a_filled_ledger_order_is_fine(tmp_db: En
     order_id = _insert_order(tmp_db, "submitted")
     from optionsbot.execution.orders import transition
     transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db, order_id, exec_id="position-short", side="SELL",
+        price=1.60, qty=1, ts=NOW, leg_con_id=1580,
+    )
+    record_fill(
+        tmp_db, order_id, exec_id="position-long", side="BUY",
+        price=0.40, qty=1, ts=NOW, leg_con_id=1575,
+    )
     snapshot = [
         _portfolio_pos("SPY", strike=580.0, right="P", position=-1.0),
         _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
@@ -340,6 +349,51 @@ async def test_broker_position_matching_a_filled_ledger_order_is_fine(tmp_db: En
     assert not any("KILL SWITCH" in m for m in sent)
 
 
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        [
+            _portfolio_pos("SPY", strike=580.0, right="P", position=-2.0),
+            _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
+        ],
+        [],
+    ],
+    ids=["broker-quantity-mismatch", "ledger-position-missing-at-broker"],
+)
+async def test_exact_position_mismatch_kills(
+    tmp_db: Engine,
+    snapshot: list[PortfolioPosition],
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    from optionsbot.execution.orders import transition
+
+    transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db, order_id, exec_id="mismatch-short", side="SELL",
+        price=1.60, qty=1, ts=NOW, leg_con_id=1580,
+    )
+    record_fill(
+        tmp_db, order_id, exec_id="mismatch-long", side="BUY",
+        price=0.40, qty=1, ts=NOW, leg_con_id=1575,
+    )
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return snapshot
+
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        notify=notify,
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.orphan_positions >= 1
+    assert load_state(tmp_db).killed
+    assert any("KILL SWITCH" in message for message in sent)
+
+
 async def test_position_snapshot_failure_does_not_crash_reconcile(tmp_db: Engine) -> None:
     async def positions_snapshot() -> list[PortfolioPosition]:
         raise RuntimeError("gateway down")
@@ -350,6 +404,8 @@ async def test_position_snapshot_failure_does_not_crash_reconcile(tmp_db: Engine
         tmp_db, client, notify=notify, now=NOW,
         positions_snapshot=positions_snapshot,
     )
-    # A dead positions read must not abort reconcile or trip the kill switch.
+    # Broker/account state is uncertain, so reconciliation must fail closed.
     assert summary.orphan_positions == 0
-    assert not load_state(tmp_db).killed
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    assert any("KILL SWITCH" in message for message in sent)

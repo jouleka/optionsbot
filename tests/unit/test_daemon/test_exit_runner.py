@@ -100,6 +100,7 @@ def _wire(
         side_effect=lambda *a, **k: PlacedOrder(
             ib_order_id=99, order_ref=k["order_ref"], action="BUY",
             limit_price=k["limit_price"], quantity=k["quantity"],
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
     )
     context.order_client = order_client
@@ -342,6 +343,7 @@ async def test_request_exit_is_bound_before_broker_placement(
             action="BUY",
             limit_price=1.60,
             quantity=1,
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
 
     order_client.place_combo_limit.side_effect = _place
@@ -498,6 +500,7 @@ async def test_request_exit_completion_rowcount_failure_halts_after_placement(
             action="BUY",
             limit_price=1.60,
             quantity=1,
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
 
     order_client.place_combo_limit.side_effect = _place
@@ -596,6 +599,41 @@ async def test_close_placement_exception_halts_with_claim_preserved(
     state = load_state(daemon_context.engine)
     assert state.killed is True
     assert state.reason is not None and "unknown" in state.reason
+    with daemon_context.engine.connect() as conn:
+        close = conn.execute(
+            select(orders).where(orders.c.closes_order_id == entry_id)
+        ).one()
+    assert close.status == "submitting"
+
+
+async def test_close_ack_without_qualified_contracts_halts(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 0.80, (575.0, "P"): 0.30},
+    )
+    order_client.place_combo_limit.side_effect = None
+    order_client.place_combo_limit.return_value = PlacedOrder(
+        ib_order_id=100,
+        order_ref="obot-empty-close-contracts",
+        action="BUY",
+        limit_price=0.50,
+        quantity=1,
+        leg_contracts=(),
+    )
+    order_client.cancel = AsyncMock()
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    assert load_state(daemon_context.engine).killed is True
+    order_client.cancel.assert_awaited_once_with(100)
     with daemon_context.engine.connect() as conn:
         close = conn.execute(
             select(orders).where(orders.c.closes_order_id == entry_id)

@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import Engine, select
 
+from optionsbot.execution.risk_structure import structural_max_loss_dollars
 from optionsbot.storage.schema import fills, orders, strategy_scores
 
 
@@ -203,6 +204,7 @@ def open_heat_dollars(engine: Engine) -> float:
                 orders.c.id,
                 orders.c.symbol,
                 orders.c.quantity,
+                orders.c.status,
                 orders.c.legs_json,
                 orders.c.limit_price,
                 strategy_scores.c.suggestion_json,
@@ -224,22 +226,50 @@ def open_heat_dollars(engine: Engine) -> float:
         if suggestion is not None and not isinstance(suggestion, dict):
             return math.inf
         max_loss = (suggestion or {}).get("max_loss")
+        try:
+            quantity = int(row.quantity)
+        except (TypeError, ValueError, OverflowError):
+            return math.inf
+        if quantity <= 0:
+            return math.inf
+
+        persisted_total: float | None = None
         if max_loss is not None:
             try:
                 scored_loss = float(max_loss)
-                quantity = int(row.quantity)
             except (TypeError, ValueError, OverflowError):
                 return math.inf
-            if not math.isfinite(scored_loss) or scored_loss <= 0 or quantity <= 0:
+            if not math.isfinite(scored_loss) or scored_loss <= 0:
                 return math.inf
-            heat += scored_loss * quantity
-            if not math.isfinite(heat):
+            persisted_total = scored_loss * quantity
+
+        with engine.connect() as conn:
+            has_fills = conn.execute(
+                select(fills.c.id).where(fills.c.order_id == row.id).limit(1)
+            ).first() is not None
+        if row.status in {"partial", "filled"} or has_fills:
+            reconstructed_total = _scoreless_order_max_loss(engine, row)
+        else:
+            try:
+                entry_net = -float(row.limit_price)
+            except (TypeError, ValueError, OverflowError):
                 return math.inf
-            continue
-        derived = _scoreless_order_max_loss(engine, row)
-        if not math.isfinite(derived):
+            reconstructed_unit = structural_max_loss_dollars(
+                row.legs_json,
+                entry_net_per_share=entry_net,
+            )
+            if reconstructed_unit is None:
+                return math.inf
+            reconstructed_total = reconstructed_unit * quantity
+        if not math.isfinite(reconstructed_total):
             return math.inf
-        heat += derived
+
+        risk = reconstructed_total
+        if persisted_total is not None:
+            risk = max(risk, persisted_total)
+        heat += risk
+        if not math.isfinite(heat):
+            return math.inf
     return heat
 
 

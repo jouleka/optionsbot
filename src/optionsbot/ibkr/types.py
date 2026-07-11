@@ -99,6 +99,7 @@ class PortfolioPosition:
     market_value: float | None
     unrealized_pnl: float | None
     realized_pnl: float | None
+    con_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -30,7 +30,7 @@ from optionsbot.execution.orders import (
     set_order_note,
     upsert_walk_state,
 )
-from optionsbot.execution.state import load_state
+from optionsbot.execution.state import load_state, trip_kill
 
 if TYPE_CHECKING:
     from optionsbot.ibkr.market_data import MarketDataClient
@@ -302,6 +302,16 @@ async def run_price_walk(
                 log.exception("walk %s step %d: quote refresh failed", order_id, step)
                 continue
 
+            if record.intent == "open" and load_state(engine).killed:
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note="kill switch tripped during quote refresh — cancel requested",
+                )
+                return
+
             target = next_walk_target(
                 decision_mid=decision_mid,
                 current_mid=current_mid,
@@ -315,10 +325,43 @@ async def run_price_walk(
                 continue  # no-op step (favorable market or floor reached)
             try:
                 await order_client.modify_price(ib_order_id, new_limit_price=-target)
+            except Exception as exc:  # noqa: BLE001 -- broker outcome is unknown
+                halt_reason = (
+                    f"price-walk modify outcome unknown for order #{order_id}: {exc}"
+                )
+                trip_kill(engine, halt_reason)
+                log.exception("walk %s step %d: modify outcome unknown", order_id, step)
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note=f"{halt_reason}; cancel requested",
+                )
+                return
+            post_modify_record = get_order(engine, order_id)
+            if (
+                post_modify_record is None
+                or post_modify_record.status not in WORKING_STATUSES
+            ):
+                return
+            try:
                 bump_reprice(engine, order_id, new_limit_price=-target)
-            except Exception:  # noqa: BLE001 -- a failed modify must not kill the walk
-                log.exception("walk %s step %d: modify failed", order_id, step)
-                continue
+            except Exception as exc:  # noqa: BLE001 -- broker already mutated
+                halt_reason = (
+                    f"price-walk ledger finalization failed after broker modify for "
+                    f"order #{order_id}: {exc}"
+                )
+                trip_kill(engine, halt_reason)
+                log.exception("walk %s step %d: post-modify ledger failure", order_id, step)
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note=f"{halt_reason}; cancel requested",
+                )
+                return
             prev_target = target
             leg_rows = []
             for leg in option_legs:

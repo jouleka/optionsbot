@@ -808,40 +808,88 @@ def open_orders(engine: Engine) -> list[OrderRecord]:
     return [_to_record(r) for r in rows]
 
 
-def open_position_legs(engine: Engine) -> set[tuple[str, str, float, str]]:
-    """The (symbol, expiry, strike, right) legs the ledger believes are OPEN.
+def open_position_exposure(
+    engine: Engine,
+) -> dict[int, tuple[tuple[str, str, float, str], int]] | None:
+    """Reconstruct exact signed option exposure from every persisted execution.
 
-    An entry is open when its open-intent order is filled and no close order
-    that references it (closes_order_id) has filled. Used by reconcile's
-    position-compare to spot broker positions the ledger lacks."""
+    Returns ``None`` when contract attribution or fill evidence is incomplete;
+    reconciliation must then halt rather than claim broker/ledger agreement.
+    """
     with engine.connect() as conn:
-        entries = conn.execute(
-            select(orders.c.id, orders.c.legs_json).where(
-                (orders.c.intent == "open") & (orders.c.status == "filled")
+        order_rows = conn.execute(
+            select(orders.c.id, orders.c.status, orders.c.legs_json).where(
+                orders.c.intent.in_(("open", "close"))
             )
         ).fetchall()
-        closed_entry_ids = {
-            r.closes_order_id
-            for r in conn.execute(
-                select(orders.c.closes_order_id).where(
-                    (orders.c.intent == "close")
-                    & (orders.c.status == "filled")
-                    & (orders.c.closes_order_id.isnot(None))
-                )
-            ).fetchall()
-        }
-    legs_out: set[tuple[str, str, float, str]] = set()
-    for entry in entries:
-        if entry.id in closed_entry_ids:
-            continue
-        for leg in entry.legs_json or []:
+        fill_rows = conn.execute(
+            select(
+                fills.c.order_id,
+                fills.c.side,
+                fills.c.qty,
+                fills.c.leg_con_id,
+            )
+        ).fetchall()
+
+    orders_by_id = {int(row.id): row for row in order_rows}
+    fills_by_order: dict[int, list[Any]] = {}
+    for fill in fill_rows:
+        fills_by_order.setdefault(int(fill.order_id), []).append(fill)
+
+    for row in order_rows:
+        option_legs = [
+            leg for leg in (row.legs_json or [])
+            if leg.get("sec_type", "OPT") == "OPT"
+        ]
+        if (
+            option_legs
+            and row.status in {"partial", "filled"}
+            and not fills_by_order.get(int(row.id))
+        ):
+            return None
+
+    exposure: dict[int, tuple[tuple[str, str, float, str], int]] = {}
+    for order_id, order_fills in fills_by_order.items():
+        order_row = orders_by_id.get(order_id)
+        if order_row is None:
+            return None
+        leg_specs: dict[int, tuple[str, str, float, str]] = {}
+        for leg in order_row.legs_json or []:
             if leg.get("sec_type", "OPT") != "OPT":
                 continue
-            legs_out.add((
-                str(leg["symbol"]), str(leg["expiry"]),
-                float(leg["strike"]), str(leg["right"]),
-            ))
-    return legs_out
+            try:
+                con_id = int(leg["con_id"])
+                spec = (
+                    str(leg["symbol"]),
+                    str(leg["expiry"]),
+                    float(leg["strike"]),
+                    str(leg["right"]),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            if con_id <= 0 or con_id in leg_specs:
+                return None
+            leg_specs[con_id] = spec
+        for fill in order_fills:
+            try:
+                con_id = int(fill.leg_con_id)
+                qty = int(fill.qty)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            side = str(fill.side).upper()
+            fill_spec = leg_specs.get(con_id)
+            if fill_spec is None or qty <= 0 or side not in {"BUY", "SELL"}:
+                return None
+            signed_qty = qty if side == "BUY" else -qty
+            prior = exposure.get(con_id)
+            if prior is not None and prior[0] != fill_spec:
+                return None
+            exposure[con_id] = (
+                fill_spec,
+                (prior[1] if prior else 0) + signed_qty,
+            )
+
+    return {con_id: value for con_id, value in exposure.items() if value[1] != 0}
 
 
 def working_orders(engine: Engine) -> list[OrderRecord]:

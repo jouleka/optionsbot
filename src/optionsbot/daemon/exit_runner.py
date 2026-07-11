@@ -813,8 +813,7 @@ async def _manage_entry(
         )
         return 0
     try:
-        if placed.leg_contracts:
-            set_order_leg_contracts(engine, close.id, placed.leg_contracts)
+        set_order_leg_contracts(engine, close.id, placed.leg_contracts)
         transition(
             engine,
             close.id,
@@ -828,6 +827,13 @@ async def _manage_entry(
             f"failed: {exc}"
         )
         trip_kill(engine, halt_reason, now=now)
+        try:
+            await order_client.cancel(placed.ib_order_id)
+        except Exception:  # noqa: BLE001 -- halt remains authoritative
+            log.exception(
+                "failed to cancel close #%s after ledger finalization failure",
+                close.id,
+            )
         await _send(
             context,
             f"🛑 HALT: {halt_reason}. Treat broker state as unknown and reconcile "

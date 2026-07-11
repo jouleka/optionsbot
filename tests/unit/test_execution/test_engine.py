@@ -112,6 +112,7 @@ def _deps(
         side_effect=lambda *a, **k: PlacedOrder(
             ib_order_id=11, order_ref=k["order_ref"], action="BUY",
             limit_price=k["limit_price"], quantity=k["quantity"],
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
     )
     order_client.whatif_combo = AsyncMock(
@@ -207,6 +208,16 @@ async def test_rejects_stale_pick(tmp_db: Engine) -> None:
         outcome = await execute_pick(_deps(tmp_db), score_id, now=NOW)
     assert not outcome.ok
     assert "stale" in outcome.message.lower()
+
+
+async def test_rejects_future_dated_pick(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db, ts=NOW + timedelta(minutes=2))
+    deps = _deps(tmp_db)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "future" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -657,6 +668,55 @@ async def test_no_walk_spawned_without_walk_md(tmp_db: Engine) -> None:
     deps.order_client.modify_price.assert_not_awaited()
 
 
+async def test_kill_tripped_during_whatif_blocks_entry_placement(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    async def trip_during_whatif(*args: object, **kwargs: object) -> MarginPreview:
+        trip_kill(tmp_db, "concurrent halt during what-if", now=NOW)
+        return MarginPreview(
+            init_margin_change=380.0,
+            maint_margin_change=380.0,
+            equity_with_loan_change=None,
+            commission=1.30,
+            max_commission=None,
+            warning=None,
+        )
+
+    deps.order_client.whatif_combo.side_effect = trip_during_whatif
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "kill" in outcome.message.lower() or "halt" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_empty_qualified_contract_ack_halts_after_placement(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.order_client.place_combo_limit.side_effect = None
+    deps.order_client.place_combo_limit.return_value = PlacedOrder(
+        ib_order_id=88,
+        order_ref="obot-empty-contracts",
+        action="BUY",
+        limit_price=-1.20,
+        quantity=1,
+        leg_contracts=(),
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert load_state(tmp_db).killed is True
+    deps.order_client.cancel.assert_awaited_once_with(88)
+    record = get_order(tmp_db, outcome.order_id or 0)
+    assert record is not None
+    assert record.status == "submitting"
+    assert all("con_id" not in leg for leg in record.legs)
+
+
 async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
     # Opus C1 backstop: if a reconcile pass resolves the row terminal while
     # place is in flight, the just-placed REAL order must be pulled.
@@ -678,6 +738,7 @@ async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
         return PlacedOrder(
             ib_order_id=77, order_ref=str(kwargs["order_ref"]), action="BUY",
             limit_price=float(kwargs["limit_price"]), quantity=int(kwargs["quantity"]),
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
 
     deps.order_client.place_combo_limit = AsyncMock(side_effect=race_place)

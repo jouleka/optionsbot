@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import Engine, insert, select, update
 
 from optionsbot.config import Settings
 from optionsbot.execution.orders import get_order, record_order_quotes
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
     liquidity_issues,
@@ -511,6 +512,76 @@ async def test_walk_does_not_modify_from_incomplete_live_quotes(tmp_db: Engine) 
 
     order_client.modify_price.assert_not_awaited()
     order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_rechecks_interlock_after_quote_refresh(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+
+    async def snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        trip_kill(tmp_db, "concurrent halt during quote refresh")
+        bid, ask = ({580.0: (1.55, 1.65), 575.0: (0.35, 0.45)})[strike]
+        return _quote(
+            strike,
+            right,
+            bid=bid,
+            ask=ask,
+            ts=datetime.now(UTC),
+            delayed=False,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=snapshot)
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_halts_if_broker_modify_cannot_be_recorded(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+
+    with patch(
+        "optionsbot.execution.walk.bump_reprice",
+        side_effect=RuntimeError("ledger unavailable"),
+    ):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
 
 
 async def test_walk_debit_sends_ascending_positive_limits(tmp_db: Engine) -> None:

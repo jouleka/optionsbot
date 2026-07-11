@@ -15,6 +15,7 @@ types; same import-graph reasoning as tracker.py/engine.py/walk.py).
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,7 +27,7 @@ from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
     get_order,
-    open_position_legs,
+    open_position_exposure,
     record_fill,
     set_fill_commission,
     transition,
@@ -321,33 +322,82 @@ async def reconcile(
     if positions_snapshot is not None:
         try:
             broker_positions = await positions_snapshot()
-        except Exception:  # noqa: BLE001 -- a dead positions read must not abort reconcile
+        except Exception as exc:  # noqa: BLE001 -- unavailable state fails closed
             log.exception("reconcile: positions snapshot failed")
-            broker_positions = []
-        ledger_legs = open_position_legs(engine)
-        for pos in broker_positions:
-            if pos.sec_type != "OPT" or pos.position == 0:
-                continue
-            if pos.expiry is None or pos.strike is None or pos.right is None:
-                continue
-            key = (pos.symbol, pos.expiry, float(pos.strike), pos.right)
-            if key in ledger_legs:
-                continue
-            orphan_positions += 1
-            trip_kill(
-                engine,
-                f"reconcile orphan position: broker holds {pos.position:+g} "
-                f"{pos.symbol} {pos.expiry} {pos.strike:g}{pos.right} with no "
-                "open ledger row",
+            reason = f"reconcile position snapshot unavailable: {exc}"
+            trip_kill(engine, reason)
+            mismatches += 1
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        else:
+            ledger_exposure = open_position_exposure(engine)
+            broker_map: dict[
+                int, tuple[tuple[str, str, float, str], int]
+            ] = {}
+            broker_valid = True
+            for pos in broker_positions:
+                if pos.sec_type != "OPT" or pos.position == 0:
+                    continue
+                if (
+                    pos.con_id is None
+                    or pos.expiry is None
+                    or pos.strike is None
+                    or pos.right is None
+                    or not math.isfinite(pos.position)
+                    or not float(pos.position).is_integer()
+                ):
+                    broker_valid = False
+                    break
+                con_id = int(pos.con_id)
+                quantity = int(pos.position)
+                if con_id <= 0:
+                    broker_valid = False
+                    break
+                spec = (pos.symbol, pos.expiry, float(pos.strike), pos.right)
+                prior = broker_map.get(con_id)
+                if prior is not None and prior[0] != spec:
+                    broker_valid = False
+                    break
+                broker_map[con_id] = (
+                    spec,
+                    (prior[1] if prior else 0) + quantity,
+                )
+            broker_exposure = (
+                {
+                    con_id: value
+                    for con_id, value in broker_map.items()
+                    if value[1] != 0
+                }
+                if broker_valid
+                else None
             )
-            await _send(
-                notify,
-                f"🛑 KILL SWITCH: broker holds an unmanaged position "
-                f"{pos.position:+g} {pos.symbol} {pos.expiry} {pos.strike:g}"
-                f"{pos.right} that the ledger has no open order for — the exit "
-                "engine will NOT manage it. /positions to inspect; flatten or "
-                "adopt manually, then /arm.",
-            )
+
+            if ledger_exposure is None or broker_exposure is None:
+                reason = (
+                    "reconcile position attribution incomplete; exact broker/ledger "
+                    "agreement cannot be proven"
+                )
+                trip_kill(engine, reason)
+                mismatches += 1
+                await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            elif ledger_exposure != broker_exposure:
+                differing = set(ledger_exposure) | set(broker_exposure)
+                differing = {
+                    con_id
+                    for con_id in differing
+                    if ledger_exposure.get(con_id) != broker_exposure.get(con_id)
+                }
+                orphan_positions = len(differing)
+                reason = (
+                    "reconcile exact position mismatch for contract IDs "
+                    f"{sorted(differing)}; broker={broker_exposure!r}, "
+                    f"ledger={ledger_exposure!r}"
+                )
+                trip_kill(engine, reason)
+                await _send(
+                    notify,
+                    "🛑 KILL SWITCH: exact broker/ledger option exposure mismatch — "
+                    "inspect /positions and ledger, reconcile manually, then /arm.",
+                )
 
     if adopted or foreign or replayed or resolved or mismatches or orphan_positions:
         log.info(

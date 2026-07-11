@@ -15,7 +15,10 @@ from optionsbot.execution.orders import (
     realized_close_pairs,
     record_fill,
     record_order_quotes,
+    set_order_leg_contracts,
+    stage_order,
     total_commissions,
+    transition,
 )
 from optionsbot.storage.schema import fills, orders
 from optionsbot.validation.execution_report import execution_report
@@ -235,6 +238,45 @@ def test_open_heat_includes_scoreless_adopted_defined_risk_positions(
     expected_spy = (17.0 - 2.863836) * 100
     expected_tlt = (0.5941991665 + 0.4841991665) * 6 * 100
     assert open_heat_dollars(tmp_db) == pytest.approx(expected_spy + expected_tlt)
+
+
+def test_scored_open_heat_uses_reconstructed_loss_not_forged_suggestion(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    score_id = _insert_pick(tmp_db, max_loss=1.0)
+    order = stage_order(tmp_db, score_id, quantity=1, now=NOW)
+    set_order_leg_contracts(
+        tmp_db,
+        order.id,
+        ((580001, 100, "USD"), (575001, 100, "USD")),
+    )
+    transition(tmp_db, order.id, "submitting", now=NOW)
+    transition(tmp_db, order.id, "submitted", ib_order_id=77, now=NOW)
+    record_fill(
+        tmp_db,
+        order.id,
+        exec_id="scored-short",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580001,
+    )
+    record_fill(
+        tmp_db,
+        order.id,
+        exec_id="scored-long",
+        side="BUY",
+        price=0.40,
+        qty=1,
+        ts=NOW,
+        leg_con_id=575001,
+    )
+    transition(tmp_db, order.id, "filled", now=NOW)
+
+    assert open_heat_dollars(tmp_db) == pytest.approx(380.0)
 
 
 def test_open_heat_fails_closed_for_cross_underlying_adoption(tmp_db: Engine) -> None:

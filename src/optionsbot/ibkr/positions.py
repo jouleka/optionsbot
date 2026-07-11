@@ -108,6 +108,7 @@ def _to_portfolio_position(item: object) -> PortfolioPosition:
         market_value=clean_float(getattr(item, "marketValue", None)),
         unrealized_pnl=clean_float(getattr(item, "unrealizedPNL", None)),
         realized_pnl=clean_float(getattr(item, "realizedPNL", None)),
+        con_id=(int(getattr(c, "conId", 0) or 0) or None),
     )
 
 
