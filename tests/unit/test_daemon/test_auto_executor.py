@@ -590,6 +590,9 @@ def _closed_pair(context: DaemonContext, *, pnl_credit: float, closed_ts: dateti
         "strike": 580.0,
         "right": "P",
         "quantity": 1,
+        "con_id": 580001,
+        "multiplier": 100,
+        "currency": "USD",
     }
     with engine.begin() as conn:
         epk = int(conn.execute(insert(orders).values(
@@ -610,10 +613,10 @@ def _closed_pair(context: DaemonContext, *, pnl_credit: float, closed_ts: dateti
     # entry collects pnl_credit, close costs 0 -> pair pnl = pnl_credit*100 - commissions
     record_fill(engine, epk, exec_id=f"k{epk}", side="SELL",
                 price=max(pnl_credit, 0.01) if pnl_credit > 0 else 0.10,
-                qty=1, ts=closed_ts - timedelta(days=3))
+                qty=1, ts=closed_ts - timedelta(days=3), leg_con_id=580001)
     close_price = 0.01 if pnl_credit > 0 else 0.10 - pnl_credit
     record_fill(engine, cpk, exec_id=f"k{cpk}", side="BUY",
-                price=close_price, qty=1, ts=closed_ts)
+                price=close_price, qty=1, ts=closed_ts, leg_con_id=580001)
     set_fill_commission(engine, f"k{epk}", 0.65)
     set_fill_commission(engine, f"k{cpk}", 0.65)
     return cpk

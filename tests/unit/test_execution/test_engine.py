@@ -614,6 +614,15 @@ async def test_happy_path_spawns_walk_task(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert outcome.ok
     assert deps.walk_tasks
+    assert deps.walk_md is not None
+    deps.walk_md.get_option_snapshot.side_effect = (
+        lambda symbol, expiry, strike, right: _quote(
+            strike,
+            right,
+            QUOTE_MIDS.get((strike, right)),
+            ts=datetime.now(UTC),
+        )
+    )
 
     from sqlalchemy import update as sa_update
 
