@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Engine
@@ -253,10 +253,54 @@ async def run_price_walk(
                     quotes[spec] = await md.get_option_snapshot(
                         symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
                     )
+                if any(quote.delayed is not False for quote in quotes.values()):
+                    log.warning(
+                        "walk %s step %d: delayed or unknown quote delivery; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+                if any(not isinstance(quote.ts, datetime) for quote in quotes.values()):
+                    log.warning(
+                        "walk %s step %d: quote timestamp unknown; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+                quote_now = datetime.now(UTC)
+                quote_max_age = timedelta(seconds=cfg.exit_quote_max_age_seconds)
+                invalid_age = False
+                for quote in quotes.values():
+                    quote_ts = quote.ts
+                    if not isinstance(quote_ts, datetime):  # narrowed above; mypy guard
+                        invalid_age = True
+                        break
+                    if quote_ts.tzinfo is None:
+                        quote_ts = quote_ts.replace(tzinfo=UTC)
+                    quote_age = quote_now - quote_ts.astimezone(UTC)
+                    if quote_age < timedelta(0) or quote_age > quote_max_age:
+                        invalid_age = True
+                        break
+                if invalid_age:
+                    log.warning(
+                        "walk %s step %d: quote age outside exit execution window; "
+                        "not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
                 current_mid = combo_mid(legs, quotes)
                 nbbo = combo_bid_ask(legs, quotes)
-            except Exception:  # noqa: BLE001 -- stale re-anchor beats a dead walk
+                if current_mid is None or nbbo is None:
+                    log.warning(
+                        "walk %s step %d: incomplete quote set; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+            except Exception:  # noqa: BLE001 -- fail closed; the next step retries refresh
                 log.exception("walk %s step %d: quote refresh failed", order_id, step)
+                continue
 
             target = next_walk_target(
                 decision_mid=decision_mid,
