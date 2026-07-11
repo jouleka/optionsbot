@@ -129,8 +129,8 @@ async def execute_pick(
 
     # PHASE 0 B1: stop ADDING risk as the day-start net-liq drawdown approaches
     # the daily-loss cap. The per-tick breaker is the hard kill; this is the
-    # softer "don't pile on while bleeding" entry gate. Fails OPEN if net-liq is
-    # unreadable (the breaker remains the backstop).
+    # softer "don't pile on while bleeding" entry gate. Missing or invalid
+    # net-liq fails closed because the breaker cannot prove safety.
     from optionsbot.execution.equity_guard import new_entry_allowed
 
     try:
@@ -141,7 +141,7 @@ async def execute_pick(
             if _summary.net_liquidation_usd is not None
             else None
         )
-    except Exception:  # noqa: BLE001 -- a flaky read must not hard-block entries
+    except Exception:  # noqa: BLE001 -- unreadable equity fails closed below
         _net_liq = None
     _entry = new_entry_allowed(engine, settings, current_net_liq=_net_liq)
     if not _entry.allowed:
@@ -350,6 +350,11 @@ async def execute_pick(
         return _reject(
             "live equity unavailable — refusing to size off a stale scan-time quantity"
         )
+    final_entry_gate = new_entry_allowed(
+        engine, settings, current_net_liq=equity
+    )
+    if not final_entry_gate.allowed:
+        return _reject(final_entry_gate.reason)
     from optionsbot.execution.orders import RealizedPnLUnavailable, realized_close_pairs
     from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
 

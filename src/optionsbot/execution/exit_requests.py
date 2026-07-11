@@ -144,6 +144,8 @@ def evaluate_exit_request_gate(
     catalyst = request.catalyst_type.strip().lower()
     if catalyst not in ALLOWED_CATALYST_TYPES:
         return ExitRequestGateDecision(False, f"unknown catalyst_type: {request.catalyst_type}")
+    if not isinstance(request.reason, str) or not request.reason.strip():
+        return ExitRequestGateDecision(False, "non-empty reason evidence is required")
     if not math.isfinite(request.confidence) or not 0.0 <= request.confidence <= 1.0:
         return ExitRequestGateDecision(
             False, "confidence evidence must be finite and within [0, 1]"
@@ -157,6 +159,13 @@ def evaluate_exit_request_gate(
         return ExitRequestGateDecision(False, "daily cap: ≤1 close/position/day")
     if request.today_portfolio_requests >= MAX_CLOSES_PER_PORTFOLIO_PER_DAY:
         return ExitRequestGateDecision(False, "daily cap: ≤2 closes/portfolio/day")
+    if not math.isfinite(quote_state.entry_net) or (
+        quote_state.current_net is not None
+        and not math.isfinite(quote_state.current_net)
+    ):
+        return ExitRequestGateDecision(
+            False, "entry/current quote evidence must be finite"
+        )
     deterministic = quote_state.deterministic_exit_reason
     if deterministic:
         return ExitRequestGateDecision(
@@ -167,7 +176,8 @@ def evaluate_exit_request_gate(
         not isinstance(request.sources, list)
         or len(request.sources) < 2
         or any(not isinstance(source, str) or not source.strip() for source in request.sources)
-        or len({source.strip() for source in request.sources}) != len(request.sources)
+        or len({source.strip().casefold() for source in request.sources})
+        != len(request.sources)
     ):
         return ExitRequestGateDecision(
             False, "need at least 2 distinct non-empty corroborating sources"

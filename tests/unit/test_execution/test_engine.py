@@ -702,6 +702,39 @@ async def test_place_failure_halts_and_preserves_submitting_claim(tmp_db: Engine
     assert state.reason is not None and "unknown" in state.reason
 
 
+async def test_execute_pick_rechecks_drawdown_on_final_sizing_summary(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, net_liquidation=100_000.0)
+    deps.positions.get_account_summary = AsyncMock(
+        side_effect=[
+            AccountSummary(
+                net_liquidation=Decimal("100000"),
+                buying_power=None,
+                available_funds=Decimal("50000"),
+                currency="USD",
+                fx_to_usd=Decimal("1"),
+            ),
+            AccountSummary(
+                net_liquidation=Decimal("90000"),
+                buying_power=None,
+                available_funds=Decimal("50000"),
+                currency="USD",
+                fx_to_usd=Decimal("1"),
+            ),
+        ]
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok is False
+    assert "drawdown" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
 async def test_execute_pick_blocks_near_daily_loss_cap(tmp_db: Engine) -> None:
     # PHASE 0 B1: once the day-start drawdown reaches entry_block_loss_frac of the
     # cap, execute_pick rejects BEFORE staging — even with a valid fresh pick.

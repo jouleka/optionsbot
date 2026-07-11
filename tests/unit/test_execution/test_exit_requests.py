@@ -72,6 +72,46 @@ def test_gate_allows_corroborated_adverse_loser() -> None:
     assert "adverse" in gate.reason
 
 
+def test_gate_refuses_non_finite_quote_values() -> None:
+    for entry_net, current_net in (
+        (math.nan, 1.65),
+        (math.inf, 1.65),
+        (-math.inf, 1.65),
+        (1.20, math.nan),
+        (1.20, math.inf),
+        (1.20, -math.inf),
+    ):
+        gate = evaluate_exit_request_gate(
+            _base(),
+            QuoteGateState(
+                entry_net=entry_net,
+                current_net=current_net,
+                dte=30,
+                deterministic_exit_reason=None,
+            ),
+        )
+        assert gate.allowed is False
+        assert "finite" in gate.reason
+
+
+def test_gate_refuses_blank_reason_and_case_duplicate_sources() -> None:
+    quote = QuoteGateState(
+        entry_net=1.20,
+        current_net=1.65,
+        dte=30,
+        deterministic_exit_reason=None,
+    )
+    blank_reason = evaluate_exit_request_gate(_base(reason="   "), quote)
+    duplicate_sources = evaluate_exit_request_gate(
+        _base(sources=["Reuters", " reuters "]), quote
+    )
+
+    assert blank_reason.allowed is False
+    assert "reason" in blank_reason.reason
+    assert duplicate_sources.allowed is False
+    assert "distinct" in duplicate_sources.reason
+
+
 def test_gate_allows_deterministic_exit_even_without_two_news_sources() -> None:
     gate = evaluate_exit_request_gate(
         _base(sources=["bot deterministic exit"], catalyst_type="risk_management"),

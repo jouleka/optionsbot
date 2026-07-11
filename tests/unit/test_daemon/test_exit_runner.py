@@ -272,18 +272,21 @@ async def test_delayed_or_unknown_quote_cannot_corroborate_hermes_exit(
 
 
 @pytest.mark.parametrize(
-    ("confidence", "sources"),
+    ("confidence", "sources", "reason"),
     [
-        (float("inf"), ["source A", "source B"]),
-        (0.90, "ab"),
-        (0.90, ["same", "same"]),
-        (0.90, ["", "source B"]),
+        (float("inf"), ["source A", "source B"], "material adverse move"),
+        (0.90, "ab", "material adverse move"),
+        (0.90, ["same", "same"], "material adverse move"),
+        (0.90, ["", "source B"], "material adverse move"),
+        (0.90, ["Reuters", "reuters"], "material adverse move"),
+        (0.90, ["source A", "source B"], "   "),
     ],
 )
 async def test_persisted_exit_request_evidence_must_be_finite_and_well_formed(
     daemon_context: DaemonContext,
     confidence: float,
     sources: object,
+    reason: str,
 ) -> None:
     entry_id = _filled_entry(daemon_context)
     request_id = _queue_exit_request(daemon_context, entry_id)
@@ -292,7 +295,7 @@ async def test_persisted_exit_request_evidence_must_be_finite_and_well_formed(
         conn.execute(
             update(exit_requests)
             .where(exit_requests.c.id == request_id)
-            .values(confidence=confidence, sources_json=sources)
+            .values(confidence=confidence, sources_json=sources, reason=reason)
         )
     order_client = _wire(daemon_context, {(580.0, "P"): 1.90, (575.0, "P"): 0.30})
 

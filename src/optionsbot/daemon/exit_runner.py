@@ -442,12 +442,19 @@ async def _process_exit_requests(
             and all(isinstance(source, str) for source in raw_sources)
             else []
         )
+        canonical_sources = {source.casefold() for source in sources}
+        reason = row.reason.strip() if isinstance(row.reason, str) else ""
+        catalyst_type = (
+            row.catalyst_type.strip() if isinstance(row.catalyst_type, str) else ""
+        )
         if (
             not math.isfinite(confidence)
             or not 0.0 <= confidence <= 1.0
             or len(sources) < 2
             or any(not source for source in sources)
-            or len(set(sources)) != len(sources)
+            or len(canonical_sources) != len(sources)
+            or not reason
+            or not catalyst_type
         ):
             _mark_exit_request(
                 context.engine,
@@ -465,10 +472,10 @@ async def _process_exit_requests(
         decision = evaluate_exit_request_gate(
             ExitRequestGateInput(
                 position_id=entry.id,
-                catalyst_type=row.catalyst_type,
+                catalyst_type=catalyst_type,
                 confidence=confidence,
                 sources=sources,
-                reason=row.reason,
+                reason=reason,
                 today_position_requests=position_count,
                 today_portfolio_requests=portfolio_count,
             ),
