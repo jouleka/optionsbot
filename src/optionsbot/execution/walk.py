@@ -431,7 +431,16 @@ async def run_price_walk(
         if cfg.walk_final_rest_seconds:
             await asyncio.sleep(cfg.walk_final_rest_seconds)
         record = get_order(engine, order_id)
-        if record is None or record.status not in WORKING_STATUSES:
+        if record is None:
+            if broker_mutated:
+                raise RuntimeError("order row unavailable before final cancellation")
+            return
+        if record.status not in WORKING_STATUSES:
+            if broker_mutated and record.status != "filled":
+                raise RuntimeError(
+                    "order entered an unconfirmed non-working state before final "
+                    f"cancellation: {record.status}"
+                )
             return
         await _request_cancel_and_confirm(
             engine, order_client, order_id, ib_order_id,
@@ -464,15 +473,45 @@ async def run_price_walk(
         # Best-effort: never let cleanup obscure a broker-side uncertainty.
         try:
             record = get_order(engine, order_id)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("price walk cleanup could not read order %s", order_id)
+            if broker_mutated:
+                _trip_walk_kill(
+                    engine,
+                    order_id,
+                    f"price-walk cleanup state unavailable after broker modification: {exc}",
+                )
         else:
-            if record is None or record.status not in WORKING_STATUSES:
-                clear_walk_state(engine, order_id)
+            if record is None:
+                if broker_mutated:
+                    _trip_walk_kill(
+                        engine,
+                        order_id,
+                        "price-walk cleanup lost order row after broker modification",
+                    )
+            elif record.status not in WORKING_STATUSES:
+                try:
+                    clear_walk_state(engine, order_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("price walk cleanup failed for order %s", order_id)
+                    if broker_mutated:
+                        _trip_walk_kill(
+                            engine,
+                            order_id,
+                            f"price-walk cleanup persistence failed after broker "
+                            f"modification: {exc}",
+                        )
 
 
 _CANCEL_CONFIRM_TIMEOUT = 30.0  # seconds; tests may monkeypatch
 _CANCEL_CONFIRM_POLL = 0.5
+
+
+def _trip_walk_kill(engine: Engine, order_id: int, reason: str) -> None:
+    try:
+        trip_kill(engine, reason)
+    except Exception:  # noqa: BLE001 -- best effort when ledger itself is degraded
+        log.exception("walk %s: failed to persist kill switch", order_id)
 
 
 async def _request_cancel_and_confirm(
@@ -489,27 +528,55 @@ async def _request_cancel_and_confirm(
     fate until it says otherwise."""
     try:
         set_order_note(engine, order_id, note)
-    except Exception:  # noqa: BLE001 -- cancellation remains mandatory
+    except Exception as exc:  # noqa: BLE001 -- cancellation remains mandatory
         log.exception("order %s: failed to persist cancel note", order_id)
+        _trip_walk_kill(
+            engine,
+            order_id,
+            f"cancel note persistence failed for order #{order_id}: {exc}",
+        )
     try:
         await order_client.cancel(ib_order_id)
-    except Exception:  # noqa: BLE001 -- TTL watcher retries the cancel
-        log.exception("order %s: cancel request failed — watcher will retry", order_id)
+    except Exception as exc:  # noqa: BLE001 -- broker cancel outcome is unknown
+        log.exception("order %s: cancel request outcome unknown", order_id)
+        _trip_walk_kill(
+            engine,
+            order_id,
+            f"cancel request outcome unknown for order #{order_id}: {exc}",
+        )
         return
     waited = 0.0
     while waited <= _CANCEL_CONFIRM_TIMEOUT:
         try:
             record = get_order(engine, order_id)
-        except Exception:  # noqa: BLE001 -- cancel was already requested
+        except Exception as exc:  # noqa: BLE001 -- cancel was already requested
             log.exception("order %s: cannot confirm cancellation in ledger", order_id)
+            _trip_walk_kill(
+                engine,
+                order_id,
+                f"cancel confirmation unavailable for order #{order_id}: {exc}",
+            )
             return
-        if record is None or record.status not in WORKING_STATUSES:
+        if record is None:
+            _trip_walk_kill(
+                engine,
+                order_id,
+                f"cancel confirmation lost order row #{order_id}",
+            )
+            return
+        if record.status not in WORKING_STATUSES:
             return  # tracker confirmed (cancelled / filled)
         await asyncio.sleep(_CANCEL_CONFIRM_POLL)
         waited += _CANCEL_CONFIRM_POLL
     log.error(
         "order %s: cancel UNCONFIRMED after %.0fs — order may still be working; "
         "TTL watcher keeps retrying", order_id, _CANCEL_CONFIRM_TIMEOUT,
+    )
+    _trip_walk_kill(
+        engine,
+        order_id,
+        f"cancel unconfirmed for order #{order_id} after "
+        f"{_CANCEL_CONFIRM_TIMEOUT:.0f}s",
     )
 
 

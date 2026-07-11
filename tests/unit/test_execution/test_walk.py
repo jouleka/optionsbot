@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -705,6 +706,85 @@ async def test_walk_halts_if_late_post_modify_order_read_fails(tmp_db: Engine) -
         return real_get_order(engine, target_order_id)
 
     with patch("optionsbot.execution.walk.get_order", side_effect=late_failing_get_order):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=settings,
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "late_none",
+        "cancel_note",
+        "cancel_request",
+        "cancel_confirmation",
+        "cleanup_read",
+        "cleanup_none",
+        "cleanup_clear",
+    ],
+)
+async def test_walk_halts_for_every_final_post_modify_uncertainty(
+    tmp_db: Engine,
+    failure_mode: str,
+) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    if failure_mode == "cancel_request":
+        order_client.cancel = AsyncMock(side_effect=RuntimeError("cancel unavailable"))
+    else:
+        order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    settings = _walk_settings()
+    settings.execution.walk_max_steps = 1
+    calls = {"count": 0}
+
+    def injected_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if failure_mode == "late_none" and calls["count"] == 3:
+            return None
+        if failure_mode == "cancel_confirmation" and calls["count"] == 4:
+            raise RuntimeError("cancel confirmation unavailable")
+        if failure_mode == "cleanup_read" and calls["count"] == 5:
+            raise RuntimeError("cleanup read unavailable")
+        if failure_mode == "cleanup_none" and calls["count"] == 5:
+            return None
+        return real_get_order(engine, target_order_id)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("optionsbot.execution.walk.get_order", side_effect=injected_get_order)
+        )
+        if failure_mode == "cancel_note":
+            stack.enter_context(
+                patch(
+                    "optionsbot.execution.walk.set_order_note",
+                    side_effect=RuntimeError("cancel note unavailable"),
+                )
+            )
+        if failure_mode == "cleanup_clear":
+            stack.enter_context(
+                patch(
+                    "optionsbot.execution.walk.clear_walk_state",
+                    side_effect=RuntimeError("cleanup persistence unavailable"),
+                )
+            )
         await run_price_walk(
             engine=tmp_db,
             settings=settings,

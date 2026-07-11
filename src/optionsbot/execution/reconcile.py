@@ -212,20 +212,36 @@ async def _reconcile_once(
                 engine=engine, settings=settings, order_client=order_client,
                 md=walk_md, walk_tasks=walk_tasks, notify=notify,
             )
-        except Exception:  # noqa: BLE001 -- a resume failure must not abort reconcile
+        except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
             log.exception("reconcile: walk resume failed")
+            mismatches += 1
+            reason = f"reconcile persisted price-walk resume failed: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
     # Sync ledger rows that ARE at the broker (e.g. submitting -> submitted).
     for row_id, (ib_order_id, ib_status) in at_broker.items():
         record = get_order(engine, row_id)
         if record is None:
+            mismatches += 1
+            reason = f"reconcile broker order obot-{row_id} has no ledger row"
+            trip_kill(engine, reason, now=ts_now)
             await _send(
                 notify,
-                f"⚠ broker order obot-{row_id} has no ledger row — manual check needed",
+                f"🛑 KILL SWITCH: broker order obot-{row_id} has no ledger row — "
+                "manual reconciliation required",
             )
             continue
         target = map_ib_status(ib_status, 0, 1)  # working ack mapping
-        if target is None or record.status == target:
+        if target is None:
+            mismatches += 1
+            reason = (
+                f"reconcile broker order obot-{row_id} has unknown status {ib_status!r}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        if record.status == target:
             continue
         if record.status == "partial" and target == "submitted":
             # We have no fill counts here; a partially-filled at-broker order
@@ -270,8 +286,6 @@ async def _reconcile_once(
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
-        if sec_type == "BAG":
-            continue
         if (
             not isinstance(sec_type, str)
             or not isinstance(order_ref, str)
@@ -285,7 +299,7 @@ async def _reconcile_once(
             or raw_qty <= 0
             or not isinstance(execution_ts, datetime)
             or type(raw_con_id) is not int
-            or raw_con_id <= 0
+            or raw_con_id < (0 if sec_type == "BAG" else 1)
             or (
                 commission is not None
                 and (
@@ -300,11 +314,17 @@ async def _reconcile_once(
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
+        if sec_type == "BAG":
+            continue
         row_id = row_id_from_ref(order_ref)
         if row_id is None:
             continue
         record = get_order(engine, row_id)
         if record is None:
+            mismatches += 1
+            reason = f"reconcile execution {exec_id!r} references missing order #{row_id}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
         was_new = record_fill(
             engine, row_id, exec_id=execution.exec_id, side=execution.side,
@@ -487,6 +507,7 @@ async def _reconcile_once(
                     if ledger_exposure.get(con_id) != broker_exposure.get(con_id)
                 }
                 orphan_positions = len(differing)
+                mismatches += 1
                 reason = (
                     "reconcile exact position mismatch for contract IDs "
                     f"{sorted(differing)}; broker={broker_exposure!r}, "

@@ -391,6 +391,7 @@ async def test_exact_position_mismatch_kills(
     )
 
     assert summary.orphan_positions >= 1
+    assert summary.mismatches == 1
     assert load_state(tmp_db).killed
     assert any("KILL SWITCH" in message for message in sent)
 
@@ -573,6 +574,82 @@ async def test_fractional_contract_identity_halts(
         _client(open_orders=[], executions=[]),
         now=NOW,
         positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_bot_owned_broker_order_without_ledger_row_halts(tmp_db: Engine) -> None:
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[(11, "obot-999", "Submitted")], executions=[]),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_unknown_bot_owned_broker_status_halts(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[(11, f"obot-{order_id}", "MysteryWorking")], executions=[]),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_bot_execution_without_ledger_row_halts(tmp_db: Engine) -> None:
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[_fill("obot-999", "missing-ledger")]),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_malformed_bag_execution_halts(tmp_db: Engine) -> None:
+    malformed = ExecutionFill(
+        ib_order_id=11,
+        order_ref=None,  # type: ignore[arg-type]
+        exec_id="",
+        side="SELL",
+        price=1.20,
+        qty=1.5,  # type: ignore[arg-type]
+        ts=NOW,
+        con_id=1.5,  # type: ignore[arg-type]
+        sec_type="BAG",
+        commission=0.65,
+    )
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[malformed]),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_walk_resume_failure_halts_reconciliation(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+
+    async def failing_resume(**kwargs: Any) -> int:
+        raise RuntimeError("cannot restore persisted walk")
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[(11, f"obot-{order_id}", "Submitted")], executions=[]),
+        now=NOW,
+        walk_resume=failing_resume,
+        walk_md=MagicMock(),
+        walk_tasks=set(),
     )
 
     assert summary.mismatches == 1
