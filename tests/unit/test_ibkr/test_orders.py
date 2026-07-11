@@ -10,7 +10,7 @@ import pytest
 from optionsbot.config import Settings
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
-from optionsbot.ibkr.orders import OrderClient
+from optionsbot.ibkr.orders import OrderClient, _validated_open_trade
 from optionsbot.ibkr.types import (
     CommissionUpdate,
     ExecutionFill,
@@ -424,6 +424,33 @@ def test_fill_event_translates_and_normalizes_side(
     assert record.ts.tzinfo is not None
 
 
+def test_execution_adapter_rejects_mismatched_commission_identity(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="exec-1",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=CommissionReport(execId="other-exec", commission=0.66),
+        time=execution.time,
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     ("shares", "con_id"),
     [(1.5, 1580), (1.0, 1580.5)],
@@ -459,7 +486,59 @@ def test_execution_adapter_rejects_fractional_quantity_or_contract_identity(
 
 @pytest.mark.parametrize(
     ("field", "malformed_value"),
-    [("conId", 1580.5), ("multiplier", ""), ("currency", "")],
+    [("shares", "1"), ("price", "0.40"), ("orderRef", False)],
+)
+def test_execution_adapter_rejects_wrong_type_provider_values(
+    order_client: OrderClient,
+    field: str,
+    malformed_value: object,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="typed-execution",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    setattr(execution, field, malformed_value)
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
+def test_open_order_adapter_rejects_false_reference() -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=7, orderRef=False),  # type: ignore[arg-type]
+        orderStatus=OrderStatus(orderId=7, status="Submitted"),
+    )
+    with pytest.raises(ValueError):
+        _validated_open_trade(trade)
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [
+        ("conId", 1580.5),
+        ("multiplier", ""),
+        ("multiplier", "50"),
+        ("currency", ""),
+        ("currency", "EUR"),
+    ],
 )
 async def test_placement_rejects_malformed_qualified_contract_before_broker_call(
     order_client: OrderClient,

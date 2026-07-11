@@ -234,8 +234,9 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
     assert "migration 0016" in closes[0].last_error
     assert state.killed == 1
     assert "duplicate active closes" in state.reason
-    assert revision == "0016"
+    assert revision == "0017"
     assert "uq_orders_active_close_per_entry" in indexes
+    assert "uq_orders_ib_order_id" in indexes
 
     command.downgrade(cfg, "0015")
     command.upgrade(cfg, "head")
@@ -253,7 +254,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
         ).scalar_one()
     assert statuses == ["abandoned", "submitted"]
     assert state_after_roundtrip.killed == 1
-    assert revision_after_roundtrip == "0016"
+    assert revision_after_roundtrip == "0017"
 
 
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:

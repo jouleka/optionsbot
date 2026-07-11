@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
@@ -27,6 +29,7 @@ from optionsbot.execution.orders import (
 )
 from optionsbot.execution.state import trip_kill
 from optionsbot.ibkr.types import CommissionUpdate, ExecutionFill, OrderStatusUpdate
+from optionsbot.storage.schema import orders
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
@@ -91,6 +94,21 @@ class OrderTracker:
                 f"live broker status for bot order #{row_id} missing from ledger",
             )
             log.error("KILL: live status for unknown ledger order #%s", row_id)
+            return
+        with self._engine.connect() as conn:
+            existing_owner = conn.execute(
+                select(orders.c.id).where(
+                    orders.c.ib_order_id == update.ib_order_id,
+                    orders.c.id != row_id,
+                )
+            ).first()
+        if existing_owner is not None:
+            trip_kill(
+                self._engine,
+                f"live broker order {update.ib_order_id} already belongs to "
+                f"ledger order #{existing_owner.id}, cannot bind to #{row_id}",
+            )
+            log.error("KILL: duplicate live broker order identity %s", update.ib_order_id)
             return
         if record.ib_order_id is not None and record.ib_order_id != update.ib_order_id:
             trip_kill(

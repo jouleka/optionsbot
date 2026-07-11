@@ -78,6 +78,52 @@ async def _send(notify: Notify | None, text: str) -> None:
         log.exception("reconcile notification failed")
 
 
+def _persisted_order_semantics_valid(record: Any) -> bool:
+    if type(record.quantity) is not int or record.quantity <= 0:
+        return False
+    legs = record.legs
+    if not isinstance(legs, list) or not legs:
+        return False
+    seen_con_ids: set[int] = set()
+    option_count = 0
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return False
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
+            if leg.get("symbol") != record.symbol:
+                return False
+            continue
+        if sec_type != "OPT":
+            return False
+        option_count += 1
+        con_id = leg.get("con_id")
+        strike = leg.get("strike")
+        ratio = leg.get("quantity")
+        if (
+            leg.get("symbol") != record.symbol
+            or leg.get("side") not in {"buy", "sell"}
+            or not isinstance(leg.get("expiry"), str)
+            or len(leg["expiry"]) != 8
+            or not leg["expiry"].isdigit()
+            or not isinstance(strike, (int, float))
+            or isinstance(strike, bool)
+            or not math.isfinite(float(strike))
+            or strike <= 0
+            or leg.get("right") not in {"C", "P"}
+            or type(ratio) is not int
+            or ratio <= 0
+            or type(con_id) is not int
+            or con_id <= 0
+            or con_id in seen_con_ids
+            or leg.get("multiplier") != 100
+            or leg.get("currency") != "USD"
+        ):
+            return False
+        seen_con_ids.add(con_id)
+    return option_count > 0
+
+
 def _fills_complete(
     engine: Engine, order_id: int, quantity: int, legs: list[dict[str, Any]]
 ) -> bool:
@@ -257,6 +303,12 @@ async def _reconcile_once(
                 f"ref={record.order_ref!r}, ledger_ib_id={record.ib_order_id}, "
                 f"broker_ib_id={ib_order_id}"
             )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        if not _persisted_order_semantics_valid(record):
+            mismatches += 1
+            reason = f"reconcile ledger order #{row_id} has invalid persisted semantics"
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue

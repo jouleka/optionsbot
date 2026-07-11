@@ -740,8 +740,8 @@ async def test_unknown_execution_security_type_halts(tmp_db: Engine) -> None:
 
 
 async def test_one_broker_order_id_cannot_claim_two_ledger_rows(tmp_db: Engine) -> None:
-    first = _insert_order(tmp_db, "submitted")
-    second = _insert_order(tmp_db, "submitted")
+    first = _insert_order(tmp_db, "submitted", ib_order_id=11)
+    second = _insert_order(tmp_db, "submitted", ib_order_id=22)
     summary = await reconcile(
         tmp_db,
         _client(
@@ -759,8 +759,8 @@ async def test_one_broker_order_id_cannot_claim_two_ledger_rows(tmp_db: Engine) 
 
 
 async def test_conflicting_duplicate_execution_identity_halts(tmp_db: Engine) -> None:
-    first = _insert_order(tmp_db, "submitted")
-    second = _insert_order(tmp_db, "submitted")
+    first = _insert_order(tmp_db, "submitted", ib_order_id=11)
+    second = _insert_order(tmp_db, "submitted", ib_order_id=22)
     record_fill(
         tmp_db,
         first,
@@ -870,4 +870,36 @@ async def test_broker_identity_mismatch_blocks_walk_resume(tmp_db: Engine) -> No
 
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
+    resume.assert_not_awaited()
+
+
+async def test_malformed_persisted_legs_block_walk_resume(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted", ib_order_id=11)
+    with tmp_db.begin() as conn:
+        row = conn.execute(
+            select(orders.c.legs_json).where(orders.c.id == order_id)
+        ).one()
+        legs = [dict(leg) for leg in row.legs_json]
+        legs[1]["sec_type"] = "opt"
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(legs_json=legs)
+        )
+    resume = AsyncMock(return_value=1)
+
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[(11, f"obot-{order_id}", "Submitted")],
+            executions=[],
+        ),
+        now=NOW,
+        walk_resume=resume,
+        walk_md=MagicMock(),
+        walk_tasks=set(),
+    )
+
+    assert summary.mismatches == 1
+    state = load_state(tmp_db)
+    assert state.killed
+    assert state.reason is not None and "invalid persisted semantics" in state.reason
     resume.assert_not_awaited()

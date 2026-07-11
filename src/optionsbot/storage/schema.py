@@ -281,6 +281,14 @@ entry_intent_consumptions = Table(
 )
 
 Index(
+    "uq_orders_ib_order_id",
+    orders.c.ib_order_id,
+    unique=True,
+    sqlite_where=orders.c.ib_order_id.is_not(None),
+    postgresql_where=orders.c.ib_order_id.is_not(None),
+)
+
+Index(
     "uq_orders_active_close_per_entry",
     orders.c.closes_order_id,
     unique=True,

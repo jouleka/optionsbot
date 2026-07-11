@@ -44,7 +44,8 @@ def _insert_order(
                 intent="open", symbol="SPY", strategy="bull_put_spread",
                 legs_json=[], quantity=1, status=status, staged_ts=NOW,
                 submitted_ts=submitted_ts, terminal_ts=terminal_ts,
-                ib_order_id=ib_order_id, reprice_count=0, last_error=last_error,
+                ib_order_id=None if ib_order_id == 11 else ib_order_id,
+                reprice_count=0, last_error=last_error,
             )
         )
         pk = result.inserted_primary_key
@@ -52,7 +53,10 @@ def _insert_order(
         order_id = int(pk[0])
         conn.execute(
             update(orders).where(orders.c.id == order_id)
-            .values(order_ref=f"obot-{order_id}")
+            .values(
+                order_ref=f"obot-{order_id}",
+                ib_order_id=ib_order_id if ib_order_id != 11 else 10 + order_id,
+            )
         )
     return order_id
 

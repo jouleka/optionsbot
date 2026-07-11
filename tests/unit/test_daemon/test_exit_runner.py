@@ -58,12 +58,12 @@ def _filled_entry(context: DaemonContext, *, expiry: str = FAR) -> int:
         pk = conn.execute(insert(orders).values(
             intent="open", symbol="SPY", strategy="bull_put_spread",
             legs_json=_legs(expiry), quantity=1, status="filled", staged_ts=NOW,
-            submitted_ts=NOW, terminal_ts=NOW, ib_order_id=11, reprice_count=0,
+            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
         )).inserted_primary_key
         assert pk is not None
         order_id = int(pk[0])
         conn.execute(update(orders).where(orders.c.id == order_id)
-                     .values(order_ref=f"obot-{order_id}"))
+                     .values(order_ref=f"obot-{order_id}", ib_order_id=10 + order_id))
     record_fill(engine, order_id, exec_id=f"x{order_id}a", side="SELL",
                 price=1.60, qty=1, ts=NOW, leg_con_id=580001)
     record_fill(engine, order_id, exec_id=f"x{order_id}b", side="BUY",

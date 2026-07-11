@@ -71,9 +71,9 @@ def _validated_open_trade(trade: Any) -> tuple[int, str | None, str]:
         raise ValueError("open-order row is malformed") from exc
     if type(raw_order_id) is not int or raw_order_id < 0:
         raise ValueError("open-order identity must be an exact nonnegative integer")
-    ref = raw_ref or None
-    if ref is not None and not isinstance(ref, str):
+    if raw_ref is not None and not isinstance(raw_ref, str):
         raise ValueError("open-order reference is malformed")
+    ref = raw_ref or None
     if not isinstance(raw_status, str) or not raw_status.strip():
         raise ValueError("open-order status is malformed")
     return raw_order_id, ref, raw_status
@@ -288,8 +288,8 @@ class OrderClient:
                 multiplier = int(raw_multiplier)
             else:
                 raise ValueError(f"{symbol}: qualified multiplier is malformed")
-            if multiplier <= 0:
-                raise ValueError(f"{symbol}: qualified multiplier is malformed")
+            if multiplier != 100:
+                raise ValueError(f"{symbol}: qualified multiplier is unsupported")
             if (
                 contract.secType != "OPT"
                 or contract.symbol != symbol
@@ -299,9 +299,7 @@ class OrderClient:
                 or not math.isfinite(float(contract.strike))
                 or float(contract.strike) != strike
                 or contract.right != right
-                or not isinstance(raw_currency, str)
-                or not raw_currency
-                or raw_currency != raw_currency.upper()
+                or raw_currency != "USD"
             ):
                 raise ValueError(f"{symbol}: qualified contract terms are malformed")
             currencies.add(raw_currency)
@@ -533,10 +531,12 @@ class OrderClient:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
         raw_shares = execution.shares
-        try:
-            shares = float(raw_shares)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("execution quantity is malformed") from exc
+        if (
+            not isinstance(raw_shares, (int, float))
+            or isinstance(raw_shares, bool)
+        ):
+            raise ValueError("execution quantity is malformed")
+        shares = float(raw_shares)
         if not math.isfinite(shares) or shares <= 0 or not shares.is_integer():
             raise ValueError("execution quantity must be a positive whole contract count")
         raw_con_id = fill.contract.conId
@@ -551,10 +551,13 @@ class OrderClient:
         side = _IB_SIDE.get(execution.side, execution.side)
         if side not in {"BUY", "SELL"}:
             raise ValueError(f"execution side is malformed: {execution.side!r}")
-        try:
-            price = float(execution.price)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("execution price is malformed") from exc
+        raw_price = execution.price
+        if (
+            not isinstance(raw_price, (int, float))
+            or isinstance(raw_price, bool)
+        ):
+            raise ValueError("execution price is malformed")
+        price = float(raw_price)
         if not math.isfinite(price) or price < 0:
             raise ValueError("execution price must be finite and nonnegative")
         if not isinstance(execution.execId, str) or not execution.execId.strip():
@@ -562,26 +565,29 @@ class OrderClient:
         raw_order_id = execution.orderId
         if type(raw_order_id) is not int or raw_order_id < 0:
             raise ValueError("execution order identity is malformed")
-        order_ref = execution.orderRef or fallback_ref or None
-        if order_ref is not None and not isinstance(order_ref, str):
+        raw_order_ref = execution.orderRef
+        if raw_order_ref is not None and not isinstance(raw_order_ref, str):
             raise ValueError("execution order reference is malformed")
+        if fallback_ref is not None and not isinstance(fallback_ref, str):
+            raise ValueError("fallback order reference is malformed")
+        order_ref = raw_order_ref or fallback_ref or None
         report = fill.commissionReport
-        if (
-            report is not None
-            and report.execId
-            and (
+        commission: float | None = None
+        if report is not None:
+            if (
+                not isinstance(report.execId, str)
+                or not report.execId.strip()
+                or report.execId != execution.execId
+            ):
+                raise ValueError("execution commission identity is malformed")
+            if (
                 not isinstance(report.commission, (int, float))
                 or isinstance(report.commission, bool)
-            )
-        ):
-            raise ValueError("execution commission is malformed")
-        commission = (
-            float(report.commission)
-            if report is not None and report.execId
-            else None
-        )
-        if commission is not None and not math.isfinite(commission):
-            raise ValueError("execution commission is malformed")
+                or not math.isfinite(float(report.commission))
+                or report.commission < 0
+            ):
+                raise ValueError("execution commission is malformed")
+            commission = float(report.commission)
         return ExecutionFill(
             ib_order_id=raw_order_id,
             order_ref=order_ref,

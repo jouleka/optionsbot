@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import Engine, insert, select
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.execution.orders import (
     LEGAL_TRANSITIONS,
@@ -370,6 +371,12 @@ def test_open_and_working_order_queries(tmp_db: Engine) -> None:
         by_status["submitted"], by_status["partial"],
     }
     assert working_ids == {by_status["submitted"], by_status["partial"]}
+
+
+def test_broker_order_id_has_one_ledger_owner(tmp_db: Engine) -> None:
+    _insert_order(tmp_db, "submitted", ib_order_id=77)
+    with pytest.raises(IntegrityError):
+        _insert_order(tmp_db, "submitted", ib_order_id=77)
 
 
 def test_get_order_unknown_returns_none(tmp_db: Engine) -> None:
