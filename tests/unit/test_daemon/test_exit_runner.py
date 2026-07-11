@@ -387,6 +387,49 @@ async def test_request_exit_rechecks_loss_cap_immediately_before_placement(
     assert close.status == "skipped"
 
 
+async def test_kill_tripped_by_final_hermes_gate_stops_same_tick_deterministic_close(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context, expiry=NEAR)
+    request_id = _queue_exit_request(daemon_context, entry_id)
+    _capture_loss_baseline(daemon_context)
+    order_client = _wire(daemon_context, {(580.0, "P"): 1.90, (575.0, "P"): 0.30})
+    allowed = HermesLossCapDecision(True, True, 0.0, 200.0, "within cap")
+    denied = HermesLossCapDecision(False, True, -250.0, 200.0, "Hermes loss cap breached")
+    calls = 0
+
+    async def _enforce(*args: object, **kwargs: object) -> HermesLossCapDecision:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            trip_kill(daemon_context.engine, denied.reason, now=NOW)
+            return denied
+        return allowed
+
+    with (
+        patch(
+            "optionsbot.daemon.exit_runner._exec_md",
+            return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+        ),
+        patch("optionsbot.daemon.exit_runner._enforce_hermes_loss_cap", _enforce),
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert calls == 2
+    assert load_state(daemon_context.engine).killed is True
+    assert summary.closes_submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        request = conn.execute(
+            select(exit_requests).where(exit_requests.c.id == request_id)
+        ).one()
+        closes = conn.execute(
+            select(orders.c.status).where(orders.c.closes_order_id == entry_id)
+        ).scalars().all()
+    assert request.status == "refused"
+    assert closes == ["skipped"]
+
+
 async def test_request_exit_losing_eligibility_after_binding_is_not_placed(
     daemon_context: DaemonContext,
 ) -> None:

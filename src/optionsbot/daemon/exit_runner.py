@@ -575,6 +575,17 @@ async def _manage_entry(
     order_client = context.order_client
     if order_client is None:
         return 0
+    execution_verdict = can_execute(context.settings, load_state(engine))
+    if not execution_verdict.allowed:
+        if exit_request_id is not None:
+            _mark_exit_request(
+                engine,
+                exit_request_id,
+                "refused",
+                f"execution interlock closed: {execution_verdict.reason}",
+                now,
+            )
+        return 0
     if open_close_for(engine, entry.id) is not None:
         return 0  # a close is already working — never double-exit
     if _half_closed(engine, entry.id):
@@ -757,6 +768,21 @@ async def _manage_entry(
                 now=now,
             )
             return 0
+
+    execution_verdict = can_execute(context.settings, load_state(engine))
+    if not execution_verdict.allowed:
+        reason = f"execution interlock closed before placement: {execution_verdict.reason}"
+        transition(engine, close.id, "skipped", error=reason, now=now)
+        if exit_request_id is not None:
+            _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "refused",
+                reason,
+                now,
+            )
+        return 0
 
     transition(engine, close.id, "submitting", now=now)
     try:
