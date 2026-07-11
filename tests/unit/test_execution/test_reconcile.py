@@ -394,6 +394,49 @@ async def test_exact_position_mismatch_kills(
     assert any("KILL SWITCH" in message for message in sent)
 
 
+async def test_fractional_ledger_fill_quantity_halts(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    from optionsbot.execution.orders import transition
+
+    transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="fractional-short",
+        side="SELL",
+        price=1.60,
+        qty=1.5,  # type: ignore[arg-type]
+        ts=NOW,
+        leg_con_id=1580,
+    )
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="fractional-long",
+        side="BUY",
+        price=0.40,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1575,
+    )
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [
+            _portfolio_pos("SPY", strike=580.0, right="P", position=-1.0),
+            _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
+        ]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
 async def test_position_snapshot_failure_does_not_crash_reconcile(tmp_db: Engine) -> None:
     async def positions_snapshot() -> list[PortfolioPosition]:
         raise RuntimeError("gateway down")
@@ -406,6 +449,36 @@ async def test_position_snapshot_failure_does_not_crash_reconcile(tmp_db: Engine
     )
     # Broker/account state is uncertain, so reconciliation must fail closed.
     assert summary.orphan_positions == 0
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    assert any("KILL SWITCH" in message for message in sent)
+
+
+async def test_open_order_snapshot_failure_halts_reconciliation(tmp_db: Engine) -> None:
+    client = _client(open_orders=[], executions=[])
+    client.adopt_open_orders.side_effect = RuntimeError("open-order snapshot unavailable")
+    notify, sent = _notify()
+
+    summary = await reconcile(tmp_db, client, notify=notify, now=NOW)
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    assert any("KILL SWITCH" in message for message in sent)
+
+
+async def test_none_position_snapshot_halts_reconciliation(tmp_db: Engine) -> None:
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return None  # type: ignore[return-value]
+
+    notify, sent = _notify()
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        notify=notify,
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
     assert any("KILL SWITCH" in message for message in sent)

@@ -872,13 +872,23 @@ def open_position_exposure(
             leg_specs[con_id] = spec
         for fill in order_fills:
             try:
-                con_id = int(fill.leg_con_id)
-                qty = int(fill.qty)
+                raw_con_id = fill.leg_con_id
+                raw_qty = fill.qty
+                con_id = int(raw_con_id)
+                qty = int(raw_qty)
             except (TypeError, ValueError, OverflowError):
                 return None
             side = str(fill.side).upper()
             fill_spec = leg_specs.get(con_id)
-            if fill_spec is None or qty <= 0 or side not in {"BUY", "SELL"}:
+            if (
+                isinstance(raw_con_id, bool)
+                or con_id != raw_con_id
+                or isinstance(raw_qty, bool)
+                or qty != raw_qty
+                or fill_spec is None
+                or qty <= 0
+                or side not in {"BUY", "SELL"}
+            ):
                 return None
             signed_qty = qty if side == "BUY" else -qty
             prior = exposure.get(con_id)

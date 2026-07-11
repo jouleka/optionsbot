@@ -211,7 +211,7 @@ async def test_rejects_stale_pick(tmp_db: Engine) -> None:
 
 
 async def test_rejects_future_dated_pick(tmp_db: Engine) -> None:
-    score_id = _insert_pick(tmp_db, ts=NOW + timedelta(minutes=2))
+    score_id = _insert_pick(tmp_db, ts=NOW + timedelta(seconds=30))
     deps = _deps(tmp_db)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)

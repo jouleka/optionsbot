@@ -183,7 +183,7 @@ async def execute_pick(
             f"stale pick — scanned {int(age.total_seconds() // 60)}m ago "
             f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
         )
-    if age < -timedelta(minutes=1):
+    if age < timedelta(0):
         return _reject("future-dated pick — persisted scan time is not trustworthy")
 
     # 4. Defined-risk only. In auto mode, earnings inside the expiry window

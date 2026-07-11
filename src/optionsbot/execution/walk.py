@@ -339,14 +339,63 @@ async def run_price_walk(
                     note=f"{halt_reason}; cancel requested",
                 )
                 return
-            post_modify_record = get_order(engine, order_id)
-            if (
-                post_modify_record is None
-                or post_modify_record.status not in WORKING_STATUSES
-            ):
-                return
             try:
+                post_modify_record = get_order(engine, order_id)
+                if (
+                    post_modify_record is None
+                    or post_modify_record.status not in WORKING_STATUSES
+                ):
+                    return
                 bump_reprice(engine, order_id, new_limit_price=-target)
+                prev_target = target
+                leg_rows = []
+                for leg in option_legs:
+                    spec = (
+                        str(leg["expiry"]),
+                        float(leg["strike"]),
+                        str(leg["right"]),
+                    )
+                    q = quotes.get(spec)
+                    if q is None:
+                        continue
+                    leg_rows.append(
+                        {
+                            "expiry": leg["expiry"],
+                            "strike": leg["strike"],
+                            "right": leg["right"],
+                            "side": leg["side"],
+                            "bid": q.bid,
+                            "ask": q.ask,
+                            "mid": q.mid,
+                            "delayed": q.delayed,
+                        }
+                    )
+                record_order_quotes(
+                    engine,
+                    order_id,
+                    kind="step",
+                    step=step,
+                    ts=datetime.now(UTC),
+                    combo_bid=nbbo[0] if nbbo else None,
+                    combo_ask=nbbo[1] if nbbo else None,
+                    combo_mid=current_mid,
+                    target_net=target,
+                    limit_price=-target,
+                    legs=leg_rows,
+                )
+                upsert_walk_state(
+                    engine,
+                    order_id,
+                    ib_order_id=ib_order_id,
+                    symbol=symbol,
+                    legs=[dict(leg) for leg in legs],
+                    decision_mid=decision_mid,
+                    budget=budget,
+                    increment=increment,
+                    step=step,
+                    prev_target=prev_target,
+                    ts=datetime.now(UTC),
+                )
             except Exception as exc:  # noqa: BLE001 -- broker already mutated
                 halt_reason = (
                     f"price-walk ledger finalization failed after broker modify for "
@@ -362,34 +411,6 @@ async def run_price_walk(
                     note=f"{halt_reason}; cancel requested",
                 )
                 return
-            prev_target = target
-            leg_rows = []
-            for leg in option_legs:
-                spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
-                q = quotes.get(spec)
-                if q is None:
-                    continue
-                leg_rows.append(
-                    {
-                        "expiry": leg["expiry"], "strike": leg["strike"],
-                        "right": leg["right"], "side": leg["side"],
-                        "bid": q.bid, "ask": q.ask, "mid": q.mid,
-                        "delayed": q.delayed,
-                    }
-                )
-            record_order_quotes(
-                engine, order_id, kind="step", step=step, ts=datetime.now(UTC),
-                combo_bid=nbbo[0] if nbbo else None,
-                combo_ask=nbbo[1] if nbbo else None,
-                combo_mid=current_mid, target_net=target, limit_price=-target,
-                legs=leg_rows,
-            )
-            upsert_walk_state(
-                engine, order_id, ib_order_id=ib_order_id, symbol=symbol,
-                legs=[dict(leg) for leg in legs], decision_mid=decision_mid, budget=budget,
-                increment=increment, step=step, prev_target=prev_target,
-                ts=datetime.now(UTC),
-            )
 
         # Final price rests, then the trade is skipped: request the cancel and
         # let the TRACKER confirm it. Marking the row terminal ourselves while
@@ -436,7 +457,10 @@ async def _request_cancel_and_confirm(
     confirm the terminal state (cancelled — or filled, if a fill won the
     race). Never writes a terminal status itself: the broker owns the order's
     fate until it says otherwise."""
-    set_order_note(engine, order_id, note)
+    try:
+        set_order_note(engine, order_id, note)
+    except Exception:  # noqa: BLE001 -- cancellation remains mandatory
+        log.exception("order %s: failed to persist cancel note", order_id)
     try:
         await order_client.cancel(ib_order_id)
     except Exception:  # noqa: BLE001 -- TTL watcher retries the cancel

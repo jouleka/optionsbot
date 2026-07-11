@@ -584,6 +584,72 @@ async def test_walk_halts_if_broker_modify_cannot_be_recorded(tmp_db: Engine) ->
     assert load_state(tmp_db).killed is True
 
 
+async def test_walk_halts_if_post_modify_ledger_read_fails(tmp_db: Engine) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    calls = {"count": 0}
+
+    def flaky_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("ledger read unavailable after modify")
+        return real_get_order(engine, target_order_id)
+
+    with patch("optionsbot.execution.walk.get_order", side_effect=flaky_get_order):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+async def test_walk_halts_if_post_modify_journal_fails(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+
+    with patch(
+        "optionsbot.execution.walk.record_order_quotes",
+        side_effect=RuntimeError("quote journal unavailable"),
+    ):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
 async def test_walk_debit_sends_ascending_positive_limits(tmp_db: Engine) -> None:
     # Debit structure: decision mid −2.00 (we pay). Walking = paying more, so
     # the BAG limits sent must be POSITIVE and ASCENDING (+2.03, +2.06, +2.09).

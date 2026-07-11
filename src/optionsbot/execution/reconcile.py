@@ -157,9 +157,17 @@ async def reconcile(
     adopted = foreign = replayed = resolved = mismatches = 0
     try:
         broker_orders = await order_client.adopt_open_orders()
-    except Exception:  # noqa: BLE001 -- a dead gateway must not kill the caller
+    except Exception as exc:  # noqa: BLE001 -- unavailable broker state fails closed
         log.exception("reconcile: adopt_open_orders failed")
-        return ReconcileSummary(0, 0, 0, 0, 0)
+        reason = f"reconcile open-order snapshot unavailable: {exc}"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(0, 0, 0, 0, 1)
+    if not isinstance(broker_orders, (list, tuple)):
+        reason = "reconcile open-order snapshot malformed"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(0, 0, 0, 0, 1)
 
     at_broker: dict[int, tuple[int, str]] = {}  # ledger row id -> (ib id, ib status)
     for ib_order_id, ref, ib_status in broker_orders:
@@ -333,8 +341,8 @@ async def reconcile(
             broker_map: dict[
                 int, tuple[tuple[str, str, float, str], int]
             ] = {}
-            broker_valid = True
-            for pos in broker_positions:
+            broker_valid = isinstance(broker_positions, (list, tuple))
+            for pos in broker_positions if broker_valid else ():
                 if pos.sec_type != "OPT" or pos.position == 0:
                     continue
                 if (
