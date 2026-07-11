@@ -279,6 +279,26 @@ def test_scored_open_heat_uses_reconstructed_loss_not_forged_suggestion(
     assert open_heat_dollars(tmp_db) == pytest.approx(380.0)
 
 
+def test_open_heat_rejects_fractional_persisted_order_quantity(tmp_db: Engine) -> None:
+    from optionsbot.execution.sizing import open_heat_dollars
+
+    score_id = _insert_pick(tmp_db, max_loss=380.0)
+    order = stage_order(tmp_db, score_id, quantity=1, now=NOW)
+    set_order_leg_contracts(
+        tmp_db,
+        order.id,
+        ((580001, 100, "USD"), (575001, 100, "USD")),
+    )
+    transition(tmp_db, order.id, "submitting", now=NOW)
+    transition(tmp_db, order.id, "submitted", ib_order_id=77, now=NOW)
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders).where(orders.c.id == order.id).values(quantity=1.5)
+        )
+
+    assert math.isinf(open_heat_dollars(tmp_db))
+
+
 def test_open_heat_fails_closed_for_cross_underlying_adoption(tmp_db: Engine) -> None:
     from optionsbot.execution.sizing import open_heat_dollars
 

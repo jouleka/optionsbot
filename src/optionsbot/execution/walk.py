@@ -228,6 +228,7 @@ async def run_price_walk(
     cfg = settings.execution
     prev_target = prev_target_override if prev_target_override is not None else decision_mid
     option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+    broker_mutated = False
     try:
         for step in range(start_step + 1, cfg.walk_max_steps + 1):
             if cfg.walk_step_seconds:
@@ -325,11 +326,15 @@ async def run_price_walk(
                 continue  # no-op step (favorable market or floor reached)
             try:
                 await order_client.modify_price(ib_order_id, new_limit_price=-target)
+                broker_mutated = True
             except Exception as exc:  # noqa: BLE001 -- broker outcome is unknown
                 halt_reason = (
                     f"price-walk modify outcome unknown for order #{order_id}: {exc}"
                 )
-                trip_kill(engine, halt_reason)
+                try:
+                    trip_kill(engine, halt_reason)
+                except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                    log.exception("walk %s: failed to persist kill switch", order_id)
                 log.exception("walk %s step %d: modify outcome unknown", order_id, step)
                 await _request_cancel_and_confirm(
                     engine,
@@ -341,11 +346,15 @@ async def run_price_walk(
                 return
             try:
                 post_modify_record = get_order(engine, order_id)
-                if (
-                    post_modify_record is None
-                    or post_modify_record.status not in WORKING_STATUSES
-                ):
+                if post_modify_record is None:
+                    raise RuntimeError("order row unavailable after broker modify")
+                if post_modify_record.status == "filled":
                     return
+                if post_modify_record.status not in WORKING_STATUSES:
+                    raise RuntimeError(
+                        "order entered an unconfirmed non-working state after broker modify: "
+                        f"{post_modify_record.status}"
+                    )
                 bump_reprice(engine, order_id, new_limit_price=-target)
                 prev_target = target
                 leg_rows = []
@@ -401,7 +410,10 @@ async def run_price_walk(
                     f"price-walk ledger finalization failed after broker modify for "
                     f"order #{order_id}: {exc}"
                 )
-                trip_kill(engine, halt_reason)
+                try:
+                    trip_kill(engine, halt_reason)
+                except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                    log.exception("walk %s: failed to persist kill switch", order_id)
                 log.exception("walk %s step %d: post-modify ledger failure", order_id, step)
                 await _request_cancel_and_confirm(
                     engine,
@@ -430,15 +442,33 @@ async def run_price_walk(
         )
     except asyncio.CancelledError:
         raise  # daemon shutdown — let it propagate
-    except Exception:  # noqa: BLE001 -- the walk must never crash the daemon
+    except Exception as exc:  # noqa: BLE001 -- the walk must never crash the daemon
         log.exception("price walk for order %s died", order_id)
+        if broker_mutated:
+            halt_reason = (
+                f"price-walk state became unavailable after broker modification for "
+                f"order #{order_id}: {exc}"
+            )
+            try:
+                trip_kill(engine, halt_reason)
+            except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                log.exception("walk %s: failed to persist kill switch", order_id)
+            await _request_cancel_and_confirm(
+                engine,
+                order_client,
+                order_id,
+                ib_order_id,
+                note=f"{halt_reason}; cancel requested",
+            )
     finally:
-        # Best-effort: a CancelledError on shutdown intentionally LEAVES the row
-        # so the next boot re-attaches; every other exit (fill/cancel/exhaustion/
-        # error) clears it. We detect shutdown via the order still being working.
-        record = get_order(engine, order_id)
-        if record is None or record.status not in WORKING_STATUSES:
-            clear_walk_state(engine, order_id)
+        # Best-effort: never let cleanup obscure a broker-side uncertainty.
+        try:
+            record = get_order(engine, order_id)
+        except Exception:  # noqa: BLE001
+            log.exception("price walk cleanup could not read order %s", order_id)
+        else:
+            if record is None or record.status not in WORKING_STATUSES:
+                clear_walk_state(engine, order_id)
 
 
 _CANCEL_CONFIRM_TIMEOUT = 30.0  # seconds; tests may monkeypatch
@@ -468,7 +498,11 @@ async def _request_cancel_and_confirm(
         return
     waited = 0.0
     while waited <= _CANCEL_CONFIRM_TIMEOUT:
-        record = get_order(engine, order_id)
+        try:
+            record = get_order(engine, order_id)
+        except Exception:  # noqa: BLE001 -- cancel was already requested
+            log.exception("order %s: cannot confirm cancellation in ledger", order_id)
+            return
         if record is None or record.status not in WORKING_STATUSES:
             return  # tracker confirmed (cancelled / filled)
         await asyncio.sleep(_CANCEL_CONFIRM_POLL)

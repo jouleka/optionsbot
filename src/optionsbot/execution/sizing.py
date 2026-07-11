@@ -226,11 +226,12 @@ def open_heat_dollars(engine: Engine) -> float:
         if suggestion is not None and not isinstance(suggestion, dict):
             return math.inf
         max_loss = (suggestion or {}).get("max_loss")
+        raw_quantity = row.quantity
         try:
-            quantity = int(row.quantity)
+            quantity = int(raw_quantity)
         except (TypeError, ValueError, OverflowError):
             return math.inf
-        if quantity <= 0:
+        if type(raw_quantity) is not int or quantity <= 0:
             return math.inf
 
         persisted_total: float | None = None

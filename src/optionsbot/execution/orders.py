@@ -858,7 +858,8 @@ def open_position_exposure(
             if leg.get("sec_type", "OPT") != "OPT":
                 continue
             try:
-                con_id = int(leg["con_id"])
+                raw_con_id = leg["con_id"]
+                con_id = int(raw_con_id)
                 spec = (
                     str(leg["symbol"]),
                     str(leg["expiry"]),
@@ -867,7 +868,7 @@ def open_position_exposure(
                 )
             except (KeyError, TypeError, ValueError, OverflowError):
                 return None
-            if con_id <= 0 or con_id in leg_specs:
+            if type(raw_con_id) is not int or con_id <= 0 or con_id in leg_specs:
                 return None
             leg_specs[con_id] = spec
         for fill in order_fills:
@@ -881,9 +882,9 @@ def open_position_exposure(
             side = str(fill.side).upper()
             fill_spec = leg_specs.get(con_id)
             if (
-                isinstance(raw_con_id, bool)
+                type(raw_con_id) is not int
                 or con_id != raw_con_id
-                or isinstance(raw_qty, bool)
+                or type(raw_qty) is not int
                 or qty != raw_qty
                 or fill_spec is None
                 or qty <= 0

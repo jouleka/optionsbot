@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -482,3 +483,97 @@ async def test_none_position_snapshot_halts_reconciliation(tmp_db: Engine) -> No
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
     assert any("KILL SWITCH" in message for message in sent)
+
+
+async def test_malformed_open_order_row_halts_reconciliation(tmp_db: Engine) -> None:
+    client = _client(open_orders=[], executions=[])
+    client.adopt_open_orders.return_value = [(11,)]
+
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_execution_snapshot_failure_halts_reconciliation(tmp_db: Engine) -> None:
+    client = _client(open_orders=[], executions=[])
+    client.recent_executions.side_effect = RuntimeError("execution snapshot unavailable")
+
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_malformed_position_row_halts_reconciliation(tmp_db: Engine) -> None:
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [object()]  # type: ignore[list-item]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+@pytest.mark.parametrize("fractional_source", ["broker", "ledger"])
+async def test_fractional_contract_identity_halts(
+    tmp_db: Engine,
+    fractional_source: str,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    from optionsbot.execution.orders import transition
+
+    if fractional_source == "ledger":
+        fractional_legs = [dict(leg) for leg in LEGS]
+        fractional_legs[0]["con_id"] = 1580.5
+        with tmp_db.begin() as conn:
+            conn.execute(
+                update(orders)
+                .where(orders.c.id == order_id)
+                .values(legs_json=fractional_legs)
+            )
+    transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="identity-short",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="identity-long",
+        side="BUY",
+        price=0.40,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1575,
+    )
+    short = _portfolio_pos("SPY", strike=580.0, right="P", position=-1.0)
+    if fractional_source == "broker":
+        short = replace(short, con_id=1580.5)  # type: ignore[arg-type]
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [
+            short,
+            _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
+        ]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
