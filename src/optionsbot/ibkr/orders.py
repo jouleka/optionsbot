@@ -62,6 +62,84 @@ def _parse_ib_double(value: object) -> float | None:
     return parsed
 
 
+def _validated_open_trade(trade: Any) -> tuple[int, str | None, str]:
+    try:
+        raw_order_id = trade.order.orderId
+        raw_ref = trade.order.orderRef
+        raw_status = trade.orderStatus.status
+    except AttributeError as exc:
+        raise ValueError("open-order row is malformed") from exc
+    if type(raw_order_id) is not int or raw_order_id < 0:
+        raise ValueError("open-order identity must be an exact nonnegative integer")
+    ref = raw_ref or None
+    if ref is not None and not isinstance(ref, str):
+        raise ValueError("open-order reference is malformed")
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        raise ValueError("open-order status is malformed")
+    return raw_order_id, ref, raw_status
+
+
+def _validate_adopted_bot_trade(trade: Any) -> None:
+    contract = trade.contract
+    order = trade.order
+    sec_type = contract.secType
+    if sec_type not in {"OPT", "BAG"}:
+        raise ValueError(f"bot open order has unknown security type {sec_type!r}")
+    if not isinstance(contract.currency, str) or not contract.currency:
+        raise ValueError("bot open-order currency is malformed")
+    if contract.currency != contract.currency.upper():
+        raise ValueError("bot open-order currency is malformed")
+    if sec_type == "OPT":
+        if (
+            type(contract.conId) is not int
+            or contract.conId <= 0
+            or not isinstance(contract.multiplier, str)
+            or not contract.multiplier.isdigit()
+            or int(contract.multiplier) <= 0
+            or not isinstance(contract.lastTradeDateOrContractMonth, str)
+            or len(contract.lastTradeDateOrContractMonth) != 8
+            or not contract.lastTradeDateOrContractMonth.isdigit()
+            or not isinstance(contract.strike, (int, float))
+            or isinstance(contract.strike, bool)
+            or not math.isfinite(float(contract.strike))
+            or contract.strike <= 0
+            or contract.right not in {"C", "P"}
+        ):
+            raise ValueError("bot option open-order contract is malformed")
+    else:
+        combo_legs = contract.comboLegs
+        if not isinstance(combo_legs, (list, tuple)) or not combo_legs:
+            raise ValueError("bot combo open-order legs are malformed")
+        seen: set[int] = set()
+        for leg in combo_legs:
+            if (
+                type(leg.conId) is not int
+                or leg.conId <= 0
+                or leg.conId in seen
+                or type(leg.ratio) is not int
+                or leg.ratio <= 0
+                or leg.action not in {"BUY", "SELL"}
+                or leg.exchange != "SMART"
+            ):
+                raise ValueError("bot combo open-order leg is malformed")
+            seen.add(leg.conId)
+    raw_quantity = order.totalQuantity
+    raw_limit = order.lmtPrice
+    if (
+        not isinstance(raw_quantity, (int, float))
+        or isinstance(raw_quantity, bool)
+        or not math.isfinite(float(raw_quantity))
+        or raw_quantity <= 0
+        or not float(raw_quantity).is_integer()
+        or not isinstance(raw_limit, (int, float))
+        or isinstance(raw_limit, bool)
+        or not math.isfinite(float(raw_limit))
+        or order.orderType != "LMT"
+        or order.tif != "DAY"
+    ):
+        raise ValueError("bot open-order terms are malformed")
+
+
 class OrderClient:
     """Places/modifies/cancels combo orders and fans out order events.
 
@@ -134,44 +212,124 @@ class OrderClient:
         """
         from ib_async import ComboLeg, Contract
 
-        option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("order symbol must be nonblank")
+        if (
+            not isinstance(limit_price, (int, float))
+            or isinstance(limit_price, bool)
+            or not math.isfinite(float(limit_price))
+        ):
+            raise ValueError("order limit price must be finite")
+        option_legs: list[LegMapping] = []
+        specs: list[tuple[str, float, OptionRight]] = []
+        leg_sides: list[str] = []
+        leg_ratios: list[int] = []
+        for leg in legs:
+            sec_type = leg.get("sec_type", "OPT")
+            if sec_type == "STK":
+                continue
+            if sec_type != "OPT":
+                raise ValueError(f"unsupported or malformed security type {sec_type!r}")
+            raw_expiry = leg.get("expiry")
+            raw_strike = leg.get("strike")
+            raw_right = leg.get("right")
+            raw_side = leg.get("side")
+            raw_ratio = leg.get("quantity", 1)
+            leg_symbol = leg.get("symbol")
+            if (
+                not isinstance(raw_expiry, str)
+                or len(raw_expiry) != 8
+                or not raw_expiry.isdigit()
+                or not isinstance(raw_strike, (int, float))
+                or isinstance(raw_strike, bool)
+                or not math.isfinite(float(raw_strike))
+                or raw_strike <= 0
+                or raw_right not in {"C", "P"}
+                or raw_side not in {"buy", "sell"}
+                or type(raw_ratio) is not int
+                or raw_ratio <= 0
+                or leg_symbol != symbol
+            ):
+                raise ValueError(f"{symbol}: malformed option leg evidence")
+            spec = (raw_expiry, float(raw_strike), raw_right)
+            if spec in specs:
+                raise ValueError(f"{symbol}: duplicate option contract specification")
+            option_legs.append(leg)
+            specs.append(spec)
+            leg_sides.append(raw_side.upper())
+            leg_ratios.append(raw_ratio)
         if not option_legs:
             raise ValueError(f"{symbol}: no option leg to order (got {len(legs)} legs)")
-        specs: list[tuple[str, float, OptionRight]] = [
-            (str(leg["expiry"]), float(leg["strike"]), leg["right"])
-            for leg in option_legs
-        ]
         qualified = await self._resolver.qualify_options(symbol, specs)
         missing = [spec for spec in specs if spec not in qualified]
         if missing:
             raise ValueError(f"{symbol}: could not qualify legs {missing}")
-        leg_contracts: tuple[LegContract, ...] = tuple(
-            (
-                int(qualified[spec].conId),
-                int(float(qualified[spec].multiplier or 100)),
-                str(qualified[spec].currency or "USD"),
-            )
-            for spec in specs
-        )
+
+        validated_contracts: list[Contract] = []
+        leg_contracts_list: list[LegContract] = []
+        currencies: set[str] = set()
+        qualified_con_ids: set[int] = set()
+        for spec in specs:
+            contract = qualified[spec]
+            expiry, strike, right = spec
+            raw_con_id = contract.conId
+            raw_multiplier = contract.multiplier
+            raw_currency = contract.currency
+            if type(raw_con_id) is not int or raw_con_id <= 0:
+                raise ValueError(f"{symbol}: qualified contract ID is malformed")
+            if raw_con_id in qualified_con_ids:
+                raise ValueError(f"{symbol}: duplicate qualified contract identity")
+            qualified_con_ids.add(raw_con_id)
+            if (
+                isinstance(raw_multiplier, str)
+                and raw_multiplier
+                and raw_multiplier.isdigit()
+            ):
+                multiplier = int(raw_multiplier)
+            else:
+                raise ValueError(f"{symbol}: qualified multiplier is malformed")
+            if multiplier <= 0:
+                raise ValueError(f"{symbol}: qualified multiplier is malformed")
+            if (
+                contract.secType != "OPT"
+                or contract.symbol != symbol
+                or contract.lastTradeDateOrContractMonth != expiry
+                or not isinstance(contract.strike, (int, float))
+                or isinstance(contract.strike, bool)
+                or not math.isfinite(float(contract.strike))
+                or float(contract.strike) != strike
+                or contract.right != right
+                or not isinstance(raw_currency, str)
+                or not raw_currency
+                or raw_currency != raw_currency.upper()
+            ):
+                raise ValueError(f"{symbol}: qualified contract terms are malformed")
+            currencies.add(raw_currency)
+            validated_contracts.append(contract)
+            leg_contracts_list.append((raw_con_id, multiplier, raw_currency))
+        if len(currencies) != 1:
+            raise ValueError(f"{symbol}: qualified legs have inconsistent currencies")
+        currency = next(iter(currencies))
+        leg_contracts = tuple(leg_contracts_list)
 
         if len(option_legs) == 1:
-            leg = option_legs[0]
-            action = str(leg["side"]).upper()
-            return qualified[specs[0]], action, abs(limit_price), leg_contracts
+            return validated_contracts[0], leg_sides[0], abs(limit_price), leg_contracts
 
         combo_legs = [
             ComboLeg(
-                conId=qualified[spec].conId,
-                ratio=int(leg.get("quantity", 1)),
-                action=str(leg["side"]).upper(),
+                conId=contract.conId,
+                ratio=ratio,
+                action=side,
                 exchange="SMART",
             )
-            for leg, spec in zip(option_legs, specs, strict=True)
+            for contract, ratio, side in zip(
+                validated_contracts, leg_ratios, leg_sides, strict=True
+            )
         ]
         bag = Contract(
             secType="BAG",
             symbol=symbol,
-            currency="USD",
+            currency=currency,
             exchange="SMART",  # guaranteed combo: legs execute atomically
             comboLegs=combo_legs,
         )
@@ -191,6 +349,10 @@ class OrderClient:
     ) -> PlacedOrder:
         """Submit a limit order for the structure. ``limit_price`` is the
         signed net price per unit (negative = net credit)."""
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("order quantity must be a positive exact integer")
+        if not isinstance(order_ref, str) or not order_ref.startswith("obot-"):
+            raise ValueError("order reference must be a deterministic bot reference")
         self._assert_paper()
         await self._client.ensure_connected()
         self._ensure_subscribed()
@@ -203,7 +365,10 @@ class OrderClient:
         order = LimitOrder(action, quantity, price, tif=tif, orderRef=order_ref)
         await self._rate.acquire()
         trade = self._client.ib.placeOrder(contract, order)
-        ib_order_id = int(trade.order.orderId)
+        raw_ib_order_id = trade.order.orderId
+        if type(raw_ib_order_id) is not int or raw_ib_order_id <= 0:
+            raise RuntimeError("broker acknowledgement has malformed order identity")
+        ib_order_id = raw_ib_order_id
         self._registry[ib_order_id] = (contract, trade.order)
         log.info(
             "order placed: ref=%s id=%s %s %sx %s @ %s tif=%s",
@@ -227,6 +392,8 @@ class OrderClient:
         limit_price: float,
     ) -> MarginPreview:
         """Pre-trade margin/commission preview. Read-only — no interlock."""
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("what-if quantity must be a positive exact integer")
         await self._client.ensure_connected()
         contract, action, price, _ = await self._build(symbol, legs, limit_price)
 
@@ -259,6 +426,14 @@ class OrderClient:
     async def modify_price(self, ib_order_id: int, *, new_limit_price: float) -> None:
         """Price-walk step: re-place the SAME order object with a new limit
         (the TWS API modify mechanism; price/size/tif changes only)."""
+        if type(ib_order_id) is not int or ib_order_id <= 0:
+            raise ValueError("modify order identity must be an exact positive integer")
+        if (
+            not isinstance(new_limit_price, (int, float))
+            or isinstance(new_limit_price, bool)
+            or not math.isfinite(float(new_limit_price))
+        ):
+            raise ValueError("modify limit price must be finite")
         self._assert_paper()
         entry = self._registry.get(ib_order_id)
         if entry is None:
@@ -274,6 +449,8 @@ class OrderClient:
         log.info("order modified: id=%s new_limit=%s", ib_order_id, new_limit_price)
 
     async def cancel(self, ib_order_id: int) -> None:
+        if type(ib_order_id) is not int or ib_order_id <= 0:
+            raise ValueError("cancel order identity must be an exact positive integer")
         self._assert_paper()
         entry = self._registry.get(ib_order_id)
         if entry is None:
@@ -289,26 +466,59 @@ class OrderClient:
         Minimal surface for now; IBK-128 reconciliation expands on it."""
         await self._client.ensure_connected()
         trades = await self._client.ib.reqAllOpenOrdersAsync()
-        return [
-            (
-                int(trade.order.orderId),
-                trade.order.orderRef or None,
-                trade.orderStatus.status,
-            )
-            for trade in trades
-        ]
+        if not isinstance(trades, (list, tuple)):
+            raise ValueError("open-order snapshot is malformed")
+        return [_validated_open_trade(trade) for trade in trades]
 
     # -- event translation -----------------------------------------------------------
 
     def _handle_order_status(self, trade: Trade) -> None:
+        raw_order_id = trade.order.orderId
+        raw_perm_id = trade.order.permId
+        raw_ref = trade.order.orderRef
+        raw_status = trade.orderStatus.status
+        raw_filled = trade.orderStatus.filled
+        raw_remaining = trade.orderStatus.remaining
+        raw_avg = trade.orderStatus.avgFillPrice
+        if type(raw_order_id) is not int or raw_order_id < 0:
+            raise ValueError("order-status identity is malformed")
+        if raw_perm_id not in {None, 0} and (
+            type(raw_perm_id) is not int or raw_perm_id <= 0
+        ):
+            raise ValueError("order-status permanent identity is malformed")
+        ref = raw_ref or None
+        if ref is not None and not isinstance(ref, str):
+            raise ValueError("order-status reference is malformed")
+        if not isinstance(raw_status, str) or not raw_status.strip():
+            raise ValueError("order-status value is malformed")
+        numeric = (raw_filled, raw_remaining)
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or value < 0
+            or not float(value).is_integer()
+            for value in numeric
+        ):
+            raise ValueError("order-status quantities are malformed")
+        avg_fill_price: float | None = None
+        if raw_avg not in {None, 0}:
+            if (
+                not isinstance(raw_avg, (int, float))
+                or isinstance(raw_avg, bool)
+                or not math.isfinite(float(raw_avg))
+                or raw_avg < 0
+            ):
+                raise ValueError("order-status average fill price is malformed")
+            avg_fill_price = float(raw_avg)
         update = OrderStatusUpdate(
-            ib_order_id=int(trade.order.orderId),
-            perm_id=int(trade.order.permId) if trade.order.permId else None,
-            order_ref=trade.order.orderRef or None,
-            status=trade.orderStatus.status,
-            filled=float(trade.orderStatus.filled),
-            remaining=float(trade.orderStatus.remaining),
-            avg_fill_price=trade.orderStatus.avgFillPrice or None,
+            ib_order_id=raw_order_id,
+            perm_id=raw_perm_id or None,
+            order_ref=ref,
+            status=raw_status,
+            filled=float(raw_filled),
+            remaining=float(raw_remaining),
+            avg_fill_price=avg_fill_price,
         )
         for callback in self._status_callbacks:
             callback(update)
@@ -396,13 +606,15 @@ class OrderClient:
         await self._client.ensure_connected()
         self._ensure_subscribed()
         trades = await self._client.ib.reqAllOpenOrdersAsync()
+        if not isinstance(trades, (list, tuple)):
+            raise ValueError("open-order snapshot is malformed")
         adopted: list[tuple[int, str | None, str]] = []
         for trade in trades:
-            ref = trade.order.orderRef or None
-            order_id = int(trade.order.orderId)
+            order_id, ref, status = _validated_open_trade(trade)
             if ref is not None and ref.startswith("obot-"):
+                _validate_adopted_bot_trade(trade)
                 self._registry[order_id] = (trade.contract, trade.order)
-            adopted.append((order_id, ref, trade.orderStatus.status))
+            adopted.append((order_id, ref, status))
         return adopted
 
     async def recent_executions(self) -> list[ExecutionFill]:
@@ -432,6 +644,14 @@ class OrderClient:
     def _handle_commission(
         self, trade: Trade, fill: Fill | None, report: CommissionReport
     ) -> None:
+        if not isinstance(report.execId, str) or not report.execId.strip():
+            raise ValueError("commission execution ID is malformed")
+        if (
+            not isinstance(report.commission, (int, float))
+            or isinstance(report.commission, bool)
+            or not math.isfinite(float(report.commission))
+        ):
+            raise ValueError("commission amount is malformed")
         update = CommissionUpdate(
             exec_id=report.execId, commission=float(report.commission)
         )

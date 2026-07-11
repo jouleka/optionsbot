@@ -988,15 +988,17 @@ async def assert_no_naked_short_after_close(context: DaemonContext, entry: Order
         return False
     try:
         positions = await PositionsClient(context.exec_ibkr).get_portfolio()
-    except Exception as exc:  # noqa: BLE001 -- unavailable state fails closed
-        log.exception("naked-leg check: get_portfolio failed for #%s", entry.id)
+        if not isinstance(positions, (list, tuple)):
+            raise ValueError("portfolio snapshot is not a list or tuple")
+        naked = find_naked_short_legs(entry.legs, positions)
+    except Exception as exc:  # noqa: BLE001 -- unavailable/malformed state fails closed
+        log.exception("naked-leg check: portfolio evidence failed for #%s", entry.id)
         reason = f"post-close broker position verification failed for #{entry.id}: {exc}"
         trip_kill(context.engine, reason)
         if entry.id not in context.naked_leg_halted:
             context.naked_leg_halted.add(entry.id)
             await _send(context, f"🛑 KILL SWITCH: {reason}")
         return False
-    naked = find_naked_short_legs(entry.legs, positions)
     if not naked:
         context.naked_leg_halted.discard(entry.id)
         return True

@@ -33,7 +33,7 @@ from optionsbot.execution.orders import (
     set_fill_commission,
     transition,
 )
-from optionsbot.execution.state import trip_kill
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
 from optionsbot.execution.walk import resume_walks
 from optionsbot.storage.schema import fills, orders
@@ -54,6 +54,9 @@ _STALE_STAGED_AFTER = timedelta(minutes=30)
 # and left for the next pass — resolving it as failed would strand a REAL
 # order at the broker under a terminal ledger row (Opus C1).
 _INFLIGHT_GRACE = timedelta(seconds=60)
+_KNOWN_BROKER_SECURITY_TYPES = frozenset(
+    {"OPT", "STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND", "BAG"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,13 +82,18 @@ def _fills_complete(
     engine: Engine, order_id: int, quantity: int, legs: list[dict[str, Any]]
 ) -> bool:
     """Prove exact per-contract, side, and ratio completion for every option leg."""
-    if isinstance(quantity, bool) or quantity <= 0:
+    if type(quantity) is not int or quantity <= 0:
         return False
     expected: dict[tuple[int, str], int] = {}
     seen_contracts: set[int] = set()
     for leg in legs:
-        if leg.get("sec_type", "OPT") != "OPT":
+        if not isinstance(leg, dict):
+            return False
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
             continue
+        if sec_type != "OPT":
+            return False
         try:
             raw_con_id = leg["con_id"]
             raw_ratio = leg.get("quantity", 1)
@@ -171,6 +179,7 @@ async def _reconcile_once(
         return ReconcileSummary(0, 0, 0, 0, 1)
 
     at_broker: dict[int, tuple[int, str]] = {}  # ledger row id -> (ib id, ib status)
+    broker_id_owner: dict[int, int] = {}  # ib order id -> ledger row id
     for broker_row in broker_orders:
         if not isinstance(broker_row, (list, tuple)) or len(broker_row) != 3:
             reason = "reconcile open-order snapshot contains a malformed row"
@@ -208,25 +217,18 @@ async def _reconcile_once(
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
-        at_broker[row_id] = (ib_order_id, ib_status)
-
-    # Work-stream D1: re-attach any persisted price-walks for orders we just
-    # confirmed are still at the broker. The walk's in-memory asyncio task died
-    # with the previous process; resume_walks rebuilds it (resuming from the
-    # persisted step) so the order isn't orphaned at the decision mid until TTL.
-    if walk_md is not None and walk_tasks is not None:
-        resume = walk_resume if walk_resume is not None else resume_walks
-        try:
-            await resume(
-                engine=engine, settings=settings, order_client=order_client,
-                md=walk_md, walk_tasks=walk_tasks, notify=notify,
-            )
-        except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
-            log.exception("reconcile: walk resume failed")
+        owner = broker_id_owner.get(ib_order_id)
+        if owner is not None and owner != row_id:
             mismatches += 1
-            reason = f"reconcile persisted price-walk resume failed: {exc}"
+            reason = (
+                f"reconcile broker order id {ib_order_id} claims multiple ledger rows: "
+                f"#{owner} and #{row_id}"
+            )
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        broker_id_owner[ib_order_id] = row_id
+        at_broker[row_id] = (ib_order_id, ib_status)
 
     # Sync ledger rows that ARE at the broker (e.g. submitting -> submitted).
     for row_id, (ib_order_id, ib_status) in at_broker.items():
@@ -240,6 +242,23 @@ async def _reconcile_once(
                 f"🛑 KILL SWITCH: broker order obot-{row_id} has no ledger row — "
                 "manual reconciliation required",
             )
+            continue
+        expected_ref = f"obot-{row_id}"
+        if (
+            record.order_ref != expected_ref
+            or (
+                record.ib_order_id is not None
+                and record.ib_order_id != ib_order_id
+            )
+        ):
+            mismatches += 1
+            reason = (
+                f"reconcile broker identity conflicts with ledger order #{row_id}: "
+                f"ref={record.order_ref!r}, ledger_ib_id={record.ib_order_id}, "
+                f"broker_ib_id={ib_order_id}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
         target = map_ib_status(ib_status, 0, 1)  # working ack mapping
         if target is None:
@@ -259,11 +278,42 @@ async def _reconcile_once(
         try:
             transition(engine, row_id, target, ib_order_id=ib_order_id, now=ts_now)
             resolved += 1
-        except IllegalOrderTransition:
+        except IllegalOrderTransition as exc:
             log.warning(
                 "reconcile: cannot move order %s %s -> %s",
                 row_id, record.status, target,
             )
+            mismatches += 1
+            reason = f"reconcile illegal broker/ledger state for order #{row_id}: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+
+    # Re-attach persisted walks only after every broker-owned order has valid,
+    # unambiguous ledger identity and semantic status. Never restart an
+    # order-capable task while reconciliation has found a mismatch or execution
+    # is already halted.
+    if (
+        mismatches == 0
+        and not load_state(engine).killed
+        and walk_md is not None
+        and walk_tasks is not None
+    ):
+        resume = walk_resume if walk_resume is not None else resume_walks
+        try:
+            await resume(
+                engine=engine,
+                settings=settings,
+                order_client=order_client,
+                md=walk_md,
+                walk_tasks=walk_tasks,
+                notify=notify,
+            )
+        except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
+            log.exception("reconcile: walk resume failed")
+            mismatches += 1
+            reason = f"reconcile persisted price-walk resume failed: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
     # Replay today's executions (execId dedupe = idempotent).
     try:
@@ -451,6 +501,12 @@ async def _reconcile_once(
                     right = pos.right
                     symbol = pos.symbol
                 except AttributeError:
+                    broker_valid = False
+                    break
+                if (
+                    not isinstance(sec_type, str)
+                    or sec_type not in _KNOWN_BROKER_SECURITY_TYPES
+                ):
                     broker_valid = False
                     break
                 if sec_type != "OPT":

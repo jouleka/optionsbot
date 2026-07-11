@@ -54,6 +54,8 @@ def order_ib(mock_ib: MagicMock) -> MagicMock:
         for c in contracts:
             key = (c.lastTradeDateOrContractMonth, c.strike, c.right)
             c.conId = CONID_BY_SPEC.get(key, 0)
+            c.multiplier = "100"
+            c.currency = "USD"
             out.append(c if c.conId else None)
         return out
 
@@ -455,6 +457,41 @@ def test_execution_adapter_rejects_fractional_quantity_or_contract_identity(
         order_client._to_execution_fill(fill)  # noqa: SLF001
 
 
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [("conId", 1580.5), ("multiplier", ""), ("currency", "")],
+)
+async def test_placement_rejects_malformed_qualified_contract_before_broker_call(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    field: str,
+    malformed_value: object,
+) -> None:
+    from ib_async import Option
+
+    leg = CONDOR_LEGS[0]
+    spec = (leg["expiry"], leg["strike"], leg["right"])
+    malformed = Option("SPY", leg["expiry"], leg["strike"], leg["right"], "SMART")
+    malformed.conId = 1580
+    malformed.multiplier = "100"
+    malformed.currency = "USD"
+    setattr(malformed, field, malformed_value)
+    order_client._resolver.qualify_options = AsyncMock(  # noqa: SLF001
+        return_value={spec: malformed}
+    )
+
+    with pytest.raises(ValueError):
+        await order_client.place_combo_limit(
+            "SPY",
+            [leg],
+            quantity=1,
+            limit_price=1.0,
+            order_ref="obot-7",
+        )
+
+    order_ib.placeOrder.assert_not_called()
+
+
 def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
     # Order.permId defaults to 0 but the dataclass accepts None; a None must
     # not blow up the handler (the status update would be silently dropped).
@@ -475,11 +512,38 @@ def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
 async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:
-    from ib_async import Contract, Order, OrderStatus, Trade
+    from ib_async import ComboLeg, Contract, Order, OrderStatus, Trade
 
     ours = Trade(
-        contract=Contract(secType="BAG", symbol="SPY"),
-        order=Order(orderId=44, permId=99, orderRef="obot-12"),
+        contract=Contract(
+            secType="BAG",
+            symbol="SPY",
+            currency="USD",
+            comboLegs=[
+                ComboLeg(
+                    conId=1580,
+                    ratio=1,
+                    action="SELL",
+                    exchange="SMART",
+                ),
+                ComboLeg(
+                    conId=1575,
+                    ratio=1,
+                    action="BUY",
+                    exchange="SMART",
+                ),
+            ],
+        ),
+        order=Order(
+            orderId=44,
+            permId=99,
+            orderRef="obot-12",
+            action="BUY",
+            totalQuantity=1,
+            orderType="LMT",
+            lmtPrice=-1.0,
+            tif="DAY",
+        ),
         orderStatus=OrderStatus(orderId=44, status="Submitted"),
     )
     manual = Trade(
@@ -496,7 +560,7 @@ async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
     await order_client.modify_price(44, new_limit_price=-1.10)
     order_ib.placeOrder.assert_called_once()
     # ...but a manual TWS order (orderId 0) must never be modifiable.
-    with pytest.raises(ValueError, match="unknown"):
+    with pytest.raises(ValueError, match="unknown|identity"):
         await order_client.modify_price(0, new_limit_price=-1.0)
 
 

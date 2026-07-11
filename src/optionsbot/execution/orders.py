@@ -441,12 +441,53 @@ def record_fill(
     """
     if side not in ("BUY", "SELL"):
         raise ValueError(f"fill side must be 'BUY' or 'SELL', got {side!r}")
+    if not isinstance(exec_id, str) or not exec_id.strip():
+        raise ValueError("fill execution ID must be nonblank")
+    if type(order_id) is not int or order_id <= 0:
+        raise ValueError("fill order ID must be a positive exact integer")
+    if type(qty) is not int or qty <= 0:
+        raise ValueError("fill quantity must be a positive exact integer")
+    if (
+        not isinstance(price, (int, float))
+        or isinstance(price, bool)
+        or not math.isfinite(float(price))
+        or price < 0
+    ):
+        raise ValueError("fill price must be finite and nonnegative")
+    if not isinstance(ts, datetime):
+        raise ValueError("fill timestamp is malformed")
+    if leg_con_id is not None and (type(leg_con_id) is not int or leg_con_id <= 0):
+        raise ValueError("fill contract ID must be an exact positive integer")
     with engine.begin() as conn:
         exists = conn.execute(
-            select(fills.c.id).where(fills.c.ib_exec_id == exec_id)
+            select(
+                fills.c.order_id,
+                fills.c.side,
+                fills.c.price,
+                fills.c.qty,
+                fills.c.ts,
+                fills.c.leg_con_id,
+            ).where(fills.c.ib_exec_id == exec_id)
         ).first()
         if exists is not None:
-            return False
+            existing_ts = exists.ts
+            incoming_ts = ts
+            if existing_ts.tzinfo is not None:
+                existing_ts = existing_ts.astimezone(UTC).replace(tzinfo=None)
+            if incoming_ts.tzinfo is not None:
+                incoming_ts = incoming_ts.astimezone(UTC).replace(tzinfo=None)
+            if (
+                exists.order_id == order_id
+                and exists.side == side
+                and exists.price == price
+                and exists.qty == qty
+                and existing_ts == incoming_ts
+                and exists.leg_con_id == leg_con_id
+            ):
+                return False
+            raise ValueError(
+                f"execution ID {exec_id!r} conflicts with persisted fill identity"
+            )
         conn.execute(
             insert(fills).values(
                 order_id=order_id,
@@ -463,11 +504,28 @@ def record_fill(
 
 def set_fill_commission(engine: Engine, exec_id: str, commission: float) -> bool:
     """Attach a commissionReport amount to its fill (keyed by execId)."""
+    if (
+        not isinstance(commission, (int, float))
+        or isinstance(commission, bool)
+        or not math.isfinite(float(commission))
+    ):
+        raise ValueError("fill commission must be finite")
     with engine.begin() as conn:
-        result = conn.execute(
+        existing = conn.execute(
+            select(fills.c.commission).where(fills.c.ib_exec_id == exec_id)
+        ).first()
+        if existing is None:
+            return False
+        if existing.commission is not None:
+            if existing.commission == commission:
+                return True
+            raise ValueError(
+                f"execution ID {exec_id!r} has conflicting commission evidence"
+            )
+        conn.execute(
             update(fills).where(fills.c.ib_exec_id == exec_id).values(commission=commission)
         )
-    return result.rowcount > 0
+    return True
 
 
 def set_order_note(engine: Engine, order_id: int, note: str) -> None:
@@ -842,10 +900,16 @@ def open_position_exposure(
         fills_by_order.setdefault(int(fill.order_id), []).append(fill)
 
     for row in order_rows:
-        option_legs = [
-            leg for leg in (row.legs_json or [])
-            if leg.get("sec_type", "OPT") == "OPT"
-        ]
+        option_legs: list[dict[str, Any]] = []
+        for leg in row.legs_json or []:
+            if not isinstance(leg, dict):
+                return None
+            sec_type = leg.get("sec_type", "OPT")
+            if sec_type == "STK":
+                continue
+            if sec_type != "OPT":
+                return None
+            option_legs.append(leg)
         if (
             option_legs
             and row.status in {"partial", "filled"}

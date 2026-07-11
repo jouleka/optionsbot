@@ -252,7 +252,16 @@ async def test_reconcile_is_idempotent(tmp_db: Engine) -> None:
 async def test_duplicate_fill_on_already_filled_row_no_kill(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "submitted", quantity=1)
     ref = f"obot-{order_id}"
-    record_fill(tmp_db, order_id, exec_id="x1", side="SELL", price=1.2, qty=1, ts=NOW)
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="x1",
+        side="SELL",
+        price=1.2,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
     client = _client(executions=[_fill(ref, "x1")])
     notify, _ = _notify()
     summary = await reconcile(tmp_db, client, notify=notify, now=NOW)
@@ -407,10 +416,16 @@ async def test_fractional_ledger_fill_quantity_halts(tmp_db: Engine) -> None:
         exec_id="fractional-short",
         side="SELL",
         price=1.60,
-        qty=1.5,  # type: ignore[arg-type]
+        qty=1,
         ts=NOW,
         leg_con_id=1580,
     )
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(fills)
+            .where(fills.c.ib_exec_id == "fractional-short")
+            .values(qty=1.5)
+        )
     record_fill(
         tmp_db,
         order_id,
@@ -722,3 +737,137 @@ async def test_unknown_execution_security_type_halts(tmp_db: Engine) -> None:
 
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
+
+
+async def test_one_broker_order_id_cannot_claim_two_ledger_rows(tmp_db: Engine) -> None:
+    first = _insert_order(tmp_db, "submitted")
+    second = _insert_order(tmp_db, "submitted")
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[
+                (11, f"obot-{first}", "Submitted"),
+                (11, f"obot-{second}", "Submitted"),
+            ],
+            executions=[],
+        ),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_conflicting_duplicate_execution_identity_halts(tmp_db: Engine) -> None:
+    first = _insert_order(tmp_db, "submitted")
+    second = _insert_order(tmp_db, "submitted")
+    record_fill(
+        tmp_db,
+        first,
+        exec_id="same-provider-exec-id",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
+    conflicting = replace(
+        _fill(f"obot-{second}", "same-provider-exec-id"),
+        side="SELL",
+        price=1.60,
+        qty=1,
+        con_id=1580,
+    )
+
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[
+                (11, f"obot-{first}", "Submitted"),
+                (22, f"obot-{second}", "Submitted"),
+            ],
+            executions=[conflicting],
+        ),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_mixed_case_broker_position_security_type_halts(tmp_db: Engine) -> None:
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [
+            replace(
+                _portfolio_pos("SPY", strike=580.0, right="P", position=-1.0),
+                sec_type="opt",
+            )
+        ]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_mixed_case_persisted_leg_security_type_halts(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    with tmp_db.begin() as conn:
+        row = conn.execute(select(orders.c.legs_json).where(orders.c.id == order_id)).one()
+        legs = [dict(leg) for leg in row.legs_json]
+        legs[1]["sec_type"] = "opt"
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(legs_json=legs)
+        )
+    from optionsbot.execution.orders import transition
+
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="only-canonical-leg",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
+    transition(tmp_db, order_id, "filled", now=NOW)
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [_portfolio_pos("SPY", strike=580.0, right="P", position=-1.0)]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+
+
+async def test_broker_identity_mismatch_blocks_walk_resume(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted", ib_order_id=11)
+    resume = AsyncMock(return_value=1)
+
+    summary = await reconcile(
+        tmp_db,
+        _client(
+            open_orders=[(22, f"obot-{order_id}", "Submitted")],
+            executions=[],
+        ),
+        now=NOW,
+        walk_resume=resume,
+        walk_md=MagicMock(),
+        walk_tasks=set(),
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    resume.assert_not_awaited()

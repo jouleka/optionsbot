@@ -194,5 +194,16 @@ class OrderTracker:
             )
 
     def handle_commission(self, update: CommissionUpdate) -> None:
-        if not set_fill_commission(self._engine, update.exec_id, update.commission):
+        try:
+            attached = set_fill_commission(
+                self._engine, update.exec_id, update.commission
+            )
+        except ValueError as exc:
+            trip_kill(
+                self._engine,
+                f"live commission evidence conflicts for {update.exec_id!r}: {exc}",
+            )
+            log.error("KILL: conflicting commission for %s", update.exec_id)
+            return
+        if not attached:
             log.debug("commission for unknown execId %s — ignored", update.exec_id)

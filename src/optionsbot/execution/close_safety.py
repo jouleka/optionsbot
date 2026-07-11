@@ -17,12 +17,16 @@ Two independent checks protect autonomous closes:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from optionsbot.ibkr.types import PortfolioPosition
 
 LegSpec = tuple[str, float, str]  # (expiry, strike, right)
+_KNOWN_BROKER_SECURITY_TYPES = frozenset(
+    {"OPT", "STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND", "BAG"}
+)
 
 
 class NonAtomicCloseError(RuntimeError):
@@ -31,7 +35,17 @@ class NonAtomicCloseError(RuntimeError):
 
 
 def _option_legs(legs: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+    option_legs: list[Mapping[str, Any]] = []
+    for leg in legs:
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
+            continue
+        if sec_type != "OPT":
+            raise NonAtomicCloseError(
+                f"unsupported or malformed security type {sec_type!r}"
+            )
+        option_legs.append(leg)
+    return option_legs
 
 
 def _spec(leg: Mapping[str, Any]) -> LegSpec:
@@ -118,11 +132,41 @@ def find_naked_short_legs(
     symbols = {str(leg["symbol"]) for leg in _option_legs(entry_legs)}
     naked: list[PortfolioPosition] = []
     for pos in broker_positions:
-        if pos.sec_type != "OPT" or pos.symbol not in symbols:
+        try:
+            sec_type = pos.sec_type
+            symbol = pos.symbol
+            expiry = pos.expiry
+            strike = pos.strike
+            right = pos.right
+            position = pos.position
+            con_id = pos.con_id
+        except AttributeError as exc:
+            raise NonAtomicCloseError("broker position evidence is malformed") from exc
+        if sec_type not in _KNOWN_BROKER_SECURITY_TYPES:
+            raise NonAtomicCloseError(
+                f"broker position has unknown security type {sec_type!r}"
+            )
+        if sec_type != "OPT":
             continue
-        if pos.expiry is None or pos.strike is None or pos.right is None:
-            continue
-        spec = (str(pos.expiry), float(pos.strike), str(pos.right))
-        if spec in entry_specs and pos.position < 0:
+        if (
+            not isinstance(symbol, str)
+            or not symbol
+            or not isinstance(expiry, str)
+            or not expiry
+            or not isinstance(strike, (int, float))
+            or isinstance(strike, bool)
+            or not math.isfinite(float(strike))
+            or strike <= 0
+            or right not in {"C", "P"}
+            or not isinstance(position, (int, float))
+            or isinstance(position, bool)
+            or not math.isfinite(float(position))
+            or not float(position).is_integer()
+            or type(con_id) is not int
+            or con_id <= 0
+        ):
+            raise NonAtomicCloseError("broker option position evidence is malformed")
+        spec = (expiry, float(strike), right)
+        if symbol in symbols and spec in entry_specs and position < 0:
             naked.append(pos)
     return naked

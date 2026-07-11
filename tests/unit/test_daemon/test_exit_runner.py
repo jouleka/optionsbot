@@ -1130,6 +1130,7 @@ def _residual_short_position(expiry: str = FAR) -> PortfolioPosition:
         market_value=None,
         unrealized_pnl=None,
         realized_pnl=None,
+        con_id=1580,
     )
 
 
@@ -1231,6 +1232,29 @@ async def test_post_close_portfolio_read_failure_trips_kill(
     assert clean is False
     assert load_state(daemon_context.engine).killed is True
     daemon_context.telegram.send_message.assert_awaited()
+
+
+@pytest.mark.parametrize("snapshot", [None, [object()]])
+async def test_post_close_malformed_portfolio_snapshot_trips_kill(
+    daemon_context: DaemonContext,
+    snapshot: object,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    daemon_context.exec_ibkr = MagicMock()
+
+    with patch(
+        "optionsbot.ibkr.positions.PositionsClient",
+        autospec=True,
+    ) as mock_positions_client:
+        mock_positions_client.return_value.get_portfolio = AsyncMock(
+            return_value=snapshot
+        )
+        clean = await assert_no_naked_short_after_close(daemon_context, entry)
+
+    assert clean is False
+    assert load_state(daemon_context.engine).killed is True
 
 
 # ---- /close: human-initiated force close (force_close_entry) ----
