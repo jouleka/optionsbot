@@ -154,6 +154,10 @@ class PlacedOrder:
     action: str  # 'BUY' | 'SELL'
     limit_price: float
     quantity: int
+    # One immutable tuple per option leg, in submitted-leg order:
+    # (IBKR conId, contract multiplier, currency). Empty only for legacy/mocked
+    # acknowledgements that cannot prove exact fill attribution.
+    leg_contracts: tuple[tuple[int, int, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

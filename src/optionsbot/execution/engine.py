@@ -27,11 +27,15 @@ from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
     record_order_quotes,
+    set_order_leg_contracts,
     set_order_note,
     stage_order,
     transition,
 )
-from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
+from optionsbot.execution.risk_structure import (
+    has_structurally_defined_option_risk,
+    structural_max_loss_dollars,
+)
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
@@ -308,6 +312,15 @@ async def execute_pick(
     # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
     # rejects sub-increment limits with Error 110. Round to the symbol's tick.
     fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
+    structural_max_loss = structural_max_loss_dollars(
+        legs,
+        entry_net_per_share=fresh_net,
+    )
+    if structural_max_loss is None:
+        return _reject("option legs do not prove a finite structural max loss")
+    # Persisted scanner risk is advisory. Never size below the larger of the
+    # scanner estimate and the independently reconstructed expiry loss.
+    max_loss_unit = max(max_loss_unit, structural_max_loss)
     # Economic liquidity gate: combo spread vs the premium we're capturing.
     combo_issue = combo_spread_issue(
         legs, quotes, fresh_net, max_frac=settings.execution.max_combo_spread_frac
@@ -488,6 +501,8 @@ async def execute_pick(
             order_id=record.id,
         )
     try:
+        if placed.leg_contracts:
+            set_order_leg_contracts(engine, record.id, placed.leg_contracts)
         transition(
             engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
         )

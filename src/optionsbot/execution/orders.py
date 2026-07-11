@@ -288,6 +288,60 @@ def get_order(engine: Engine, order_id: int) -> OrderRecord | None:
     return None if row is None else _to_record(row)
 
 
+def set_order_leg_contracts(
+    engine: Engine,
+    order_id: int,
+    leg_contracts: tuple[tuple[int, int, str], ...],
+) -> OrderRecord:
+    """Bind exact qualified IBKR contract identities to a staged order."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(orders.c.legs_json).where(orders.c.id == order_id)
+        ).first()
+        if row is None:
+            raise ValueError(f"no order with id {order_id}")
+        legs = list(row.legs_json or [])
+        option_indexes = [
+            index
+            for index, leg in enumerate(legs)
+            if leg.get("sec_type", "OPT") == "OPT"
+        ]
+        if len(option_indexes) != len(leg_contracts) or not option_indexes:
+            raise ValueError("qualified option contract count does not match order legs")
+        seen: set[int] = set()
+        for index, raw_terms in zip(option_indexes, leg_contracts, strict=True):
+            try:
+                raw_con_id, raw_multiplier, raw_currency = raw_terms
+                con_id = int(raw_con_id)
+                multiplier = int(raw_multiplier)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("malformed qualified option contract terms") from exc
+            if (
+                isinstance(raw_con_id, bool)
+                or con_id <= 0
+                or con_id != raw_con_id
+                or con_id in seen
+                or isinstance(raw_multiplier, bool)
+                or multiplier != 100
+                or multiplier != raw_multiplier
+                or raw_currency != "USD"
+            ):
+                raise ValueError("unsupported or duplicate qualified option contract terms")
+            seen.add(con_id)
+            legs[index] = {
+                **legs[index],
+                "con_id": con_id,
+                "multiplier": multiplier,
+                "currency": raw_currency,
+            }
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(legs_json=legs)
+        )
+    record = get_order(engine, order_id)
+    assert record is not None
+    return record
+
+
 def transition(
     engine: Engine,
     order_id: int,
@@ -595,9 +649,13 @@ def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, fl
             )
         ).first()
         fill_rows = conn.execute(
-            select(fills.c.side, fills.c.price, fills.c.qty, fills.c.commission).where(
-                fills.c.order_id == order_id
-            )
+            select(
+                fills.c.side,
+                fills.c.price,
+                fills.c.qty,
+                fills.c.commission,
+                fills.c.leg_con_id,
+            ).where(fills.c.order_id == order_id)
         ).fetchall()
     if order is None or order.status != "filled":
         raise RealizedPnLUnavailable(f"order {order_id}: filled order unavailable")
@@ -606,27 +664,40 @@ def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, fl
     if quantity <= 0 or not legs:
         raise RealizedPnLUnavailable(f"order {order_id}: expected fill quantity unavailable")
 
-    expected = {"BUY": 0, "SELL": 0}
+    expected: dict[int, tuple[str, int]] = {}
     for leg in legs:
         if leg.get("sec_type", "OPT") != "OPT":
             continue
         side = str(leg.get("side", "")).upper()
         raw_ratio = leg.get("quantity", 1)
+        raw_con_id = leg.get("con_id")
         try:
             ratio = int(raw_ratio)
+            con_id = int(raw_con_id)
         except (TypeError, ValueError, OverflowError) as exc:
             raise RealizedPnLUnavailable(
-                f"order {order_id}: expected fill quantity unavailable"
+                f"order {order_id}: expected contract attribution unavailable"
             ) from exc
-        if side not in expected or isinstance(raw_ratio, bool) or ratio <= 0 or ratio != raw_ratio:
+        if (
+            side not in {"BUY", "SELL"}
+            or isinstance(raw_ratio, bool)
+            or ratio <= 0
+            or ratio != raw_ratio
+            or isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or con_id in expected
+        ):
             raise RealizedPnLUnavailable(
-                f"order {order_id}: expected fill quantity unavailable"
+                f"order {order_id}: expected contract attribution unavailable"
             )
-        expected[side] += ratio * quantity
-    if not any(expected.values()):
-        raise RealizedPnLUnavailable(f"order {order_id}: expected fill quantity unavailable")
+        expected[con_id] = (side, ratio * quantity)
+    if not expected:
+        raise RealizedPnLUnavailable(
+            f"order {order_id}: expected contract attribution unavailable"
+        )
 
-    actual = {"BUY": 0, "SELL": 0}
+    actual: dict[int, tuple[str, int]] = {}
     premium = 0.0
     commissions = 0.0
     for fill in fill_rows:
@@ -634,10 +705,16 @@ def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, fl
             price = float(fill.price)
             qty = int(fill.qty)
             commission = float(fill.commission)
+            con_id = int(fill.leg_con_id)
         except (TypeError, ValueError, OverflowError) as exc:
             raise RealizedPnLUnavailable(f"order {order_id}: fill accounting unavailable") from exc
+        expected_leg = expected.get(con_id)
         if (
-            fill.side not in actual
+            expected_leg is None
+            or expected_leg[0] != fill.side
+            or isinstance(fill.leg_con_id, bool)
+            or con_id <= 0
+            or con_id != fill.leg_con_id
             or isinstance(fill.qty, bool)
             or qty <= 0
             or qty != fill.qty
@@ -645,8 +722,11 @@ def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, fl
             or not math.isfinite(price)
             or not math.isfinite(commission)
         ):
-            raise RealizedPnLUnavailable(f"order {order_id}: fill accounting unavailable")
-        actual[fill.side] += qty
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: fill contract attribution unavailable"
+            )
+        prior = actual.get(con_id, (fill.side, 0))
+        actual[con_id] = (fill.side, prior[1] + qty)
         premium += (
             (1.0 if fill.side == "SELL" else -1.0)
             * price

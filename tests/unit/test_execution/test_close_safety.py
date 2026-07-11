@@ -68,6 +68,20 @@ def test_atomic_assert_rejects_close_not_inverse_of_entry() -> None:
         assert_atomic_close_legs(entry_legs=_entry_legs(), close_legs=wrong)
 
 
+def test_atomic_assert_rejects_duplicate_contract_identity_that_hides_residual_exposure() -> None:
+    duplicate_entry = [
+        {**_entry_legs()[0], "side": "sell"},
+        {**_entry_legs()[0], "side": "buy"},
+    ]
+    duplicate_close = [
+        {**_entry_legs()[0], "side": "sell"},
+        {**_entry_legs()[0], "side": "sell"},
+    ]
+
+    with pytest.raises(NonAtomicCloseError, match="duplicate"):
+        assert_atomic_close_legs(entry_legs=duplicate_entry, close_legs=duplicate_close)
+
+
 def test_find_naked_short_legs_flat_after_full_close() -> None:
     # Position fully flat at the broker -> no naked legs.
     positions = [_pos(580.0, "P", 0.0), _pos(575.0, "P", 0.0)]

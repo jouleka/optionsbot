@@ -39,7 +39,43 @@ def _spec(leg: Mapping[str, Any]) -> LegSpec:
 
 
 def _flip(side: str) -> str:
-    return "buy" if side == "sell" else "sell"
+    if side == "sell":
+        return "buy"
+    if side == "buy":
+        return "sell"
+    raise NonAtomicCloseError(f"unsupported option leg side {side!r}")
+
+
+def _validated_leg_map(
+    legs: Sequence[Mapping[str, Any]], *, label: str, flip_sides: bool
+) -> dict[tuple[str, str, float, str], tuple[str, int]]:
+    normalized: dict[tuple[str, str, float, str], tuple[str, int]] = {}
+    for leg in legs:
+        try:
+            symbol = leg["symbol"]
+            side = leg["side"]
+            raw_quantity = leg.get("quantity", 1)
+            quantity = int(raw_quantity)
+            spec = _spec(leg)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise NonAtomicCloseError(f"{label} contains a malformed option leg") from exc
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or not isinstance(side, str)
+            or side not in {"buy", "sell"}
+            or isinstance(raw_quantity, bool)
+            or quantity <= 0
+            or quantity != raw_quantity
+        ):
+            raise NonAtomicCloseError(f"{label} contains a malformed option leg")
+        identity = (symbol.strip().upper(), *spec)
+        if identity in normalized:
+            raise NonAtomicCloseError(
+                f"{label} contains duplicate option contract identity {identity}"
+            )
+        normalized[identity] = (_flip(side) if flip_sides else side, quantity)
+    return normalized
 
 
 def assert_atomic_close_legs(
@@ -59,14 +95,8 @@ def assert_atomic_close_legs(
             f"close has {len(close_opts)} option legs, entry has "
             f"{len(entry_opts)} — cannot close atomically"
         )
-    expected = {
-        _spec(leg): (_flip(str(leg["side"])), int(leg.get("quantity", 1)))
-        for leg in entry_opts
-    }
-    actual = {
-        _spec(leg): (str(leg["side"]), int(leg.get("quantity", 1)))
-        for leg in close_opts
-    }
+    expected = _validated_leg_map(entry_opts, label="entry", flip_sides=True)
+    actual = _validated_leg_map(close_opts, label="close", flip_sides=False)
     if expected != actual:
         raise NonAtomicCloseError(
             f"close legs are not the inverse of the entry "

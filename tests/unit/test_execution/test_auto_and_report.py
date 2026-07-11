@@ -539,6 +539,52 @@ async def test_engine_uses_dynamic_size_with_live_equity(tmp_db: Engine) -> None
     assert "sized 3x" in outcome.message
 
 
+async def test_engine_persists_qualified_contract_terms_before_finalizing(
+    tmp_db: Engine,
+) -> None:
+    from optionsbot.execution.orders import get_order
+    from optionsbot.ibkr.types import PlacedOrder
+
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.order_client.place_combo_limit.side_effect = None
+    deps.order_client.place_combo_limit.return_value = PlacedOrder(
+        ib_order_id=11,
+        order_ref="obot-qualified",
+        action="BUY",
+        limit_price=-1.20,
+        quantity=1,
+        leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
+    persisted = get_order(tmp_db, outcome.order_id or 0)
+    assert persisted is not None
+    assert [leg["con_id"] for leg in persisted.legs] == [580001, 575001]
+
+
+async def test_structural_max_loss_overrides_persisted_understatement(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(tmp_db, max_loss=1.0)
+    deps = _deps(
+        tmp_db,
+        net_liquidation=1_000.0,
+        available_funds=1_000.0,
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok is False
+    assert "max loss" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
 async def test_engine_rejects_oversized_trade_for_small_account(tmp_db: Engine) -> None:
     # $18,885 max-loss CSP on a $5k account → clear refusal.
     score_id = _insert_pick(tmp_db, credit_or_debit=615.0, max_loss=18_885.0)
@@ -577,6 +623,7 @@ def _pair(
         {
             "symbol": "SPY", "side": "sell", "sec_type": "OPT",
             "expiry": "20260731", "strike": 580.0, "right": "P", "quantity": 1,
+            "con_id": 580001, "multiplier": 100, "currency": "USD",
         }
     ]
     close_legs = [{**entry_legs[0], "side": "buy"}]
@@ -600,9 +647,10 @@ def _pair(
         for oid, ref in ((entry_id, f"obot-{entry_id}"), (close_id, f"obot-{close_id}")):
             conn.execute(update(orders).where(orders.c.id == oid).values(order_ref=ref))
     record_fill(engine, entry_id, exec_id=f"p{entry_id}", side="SELL",
-                price=entry_credit, qty=1, ts=NOW - timedelta(days=5))
+                price=entry_credit, qty=1, ts=NOW - timedelta(days=5),
+                leg_con_id=580001)
     record_fill(engine, close_id, exec_id=f"p{close_id}", side="BUY",
-                price=close_debit, qty=1, ts=closed_ts)
+                price=close_debit, qty=1, ts=closed_ts, leg_con_id=580001)
     from optionsbot.execution.orders import set_fill_commission
 
     set_fill_commission(engine, f"p{entry_id}", commission)
@@ -631,6 +679,21 @@ def test_realized_close_pairs_requires_exact_inverse_structure(tmp_db: Engine) -
         )
 
     with pytest.raises(RealizedPnLUnavailable, match="exact inverse"):
+        realized_close_pairs(tmp_db)
+
+
+def test_realized_close_pairs_rejects_fill_attributed_to_unrelated_contract(
+    tmp_db: Engine,
+) -> None:
+    entry_id, _ = _pair(tmp_db)
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(fills)
+            .where(fills.c.order_id == entry_id)
+            .values(leg_con_id=999999)
+        )
+
+    with pytest.raises(RealizedPnLUnavailable, match="contract attribution"):
         realized_close_pairs(tmp_db)
 
 

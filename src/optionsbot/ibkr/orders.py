@@ -46,6 +46,7 @@ _UNSET_DOUBLE = 1.7976931348623157e308
 _IB_SIDE = {"BOT": "BUY", "SLD": "SELL"}
 
 LegMapping = Mapping[str, Any]
+LegContract = tuple[int, int, str]
 
 
 def _parse_ib_double(value: object) -> float | None:
@@ -123,7 +124,7 @@ class OrderClient:
 
     async def _build(
         self, symbol: str, legs: Sequence[LegMapping], limit_price: float
-    ) -> tuple[Contract, str, float]:
+    ) -> tuple[Contract, str, float, tuple[LegContract, ...]]:
         """legs_json-shaped dicts -> (contract, order action, order price).
 
         STK legs are dropped (Covered Call carries a synthetic existing-shares
@@ -144,11 +145,19 @@ class OrderClient:
         missing = [spec for spec in specs if spec not in qualified]
         if missing:
             raise ValueError(f"{symbol}: could not qualify legs {missing}")
+        leg_contracts: tuple[LegContract, ...] = tuple(
+            (
+                int(qualified[spec].conId),
+                int(float(qualified[spec].multiplier or 100)),
+                str(qualified[spec].currency or "USD"),
+            )
+            for spec in specs
+        )
 
         if len(option_legs) == 1:
             leg = option_legs[0]
             action = str(leg["side"]).upper()
-            return qualified[specs[0]], action, abs(limit_price)
+            return qualified[specs[0]], action, abs(limit_price), leg_contracts
 
         combo_legs = [
             ComboLeg(
@@ -166,7 +175,7 @@ class OrderClient:
             exchange="SMART",  # guaranteed combo: legs execute atomically
             comboLegs=combo_legs,
         )
-        return bag, "BUY", limit_price
+        return bag, "BUY", limit_price, leg_contracts
 
     # -- order lifecycle -----------------------------------------------------------
 
@@ -185,7 +194,9 @@ class OrderClient:
         self._assert_paper()
         await self._client.ensure_connected()
         self._ensure_subscribed()
-        contract, action, price = await self._build(symbol, legs, limit_price)
+        contract, action, price, leg_contracts = await self._build(
+            symbol, legs, limit_price
+        )
 
         from ib_async import LimitOrder
 
@@ -204,6 +215,7 @@ class OrderClient:
             action=action,
             limit_price=price,
             quantity=quantity,
+            leg_contracts=leg_contracts,
         )
 
     async def whatif_combo(
@@ -216,7 +228,7 @@ class OrderClient:
     ) -> MarginPreview:
         """Pre-trade margin/commission preview. Read-only — no interlock."""
         await self._client.ensure_connected()
-        contract, action, price = await self._build(symbol, legs, limit_price)
+        contract, action, price, _ = await self._build(symbol, legs, limit_price)
 
         from ib_async import LimitOrder
 

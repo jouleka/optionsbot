@@ -47,6 +47,7 @@ from optionsbot.execution.orders import (
     net_premium,
     open_close_for,
     realized_close_pairs,
+    set_order_leg_contracts,
     set_order_note,
     stage_close_order,
     transition,
@@ -812,6 +813,8 @@ async def _manage_entry(
         )
         return 0
     try:
+        if placed.leg_contracts:
+            set_order_leg_contracts(engine, close.id, placed.leg_contracts)
         transition(
             engine,
             close.id,

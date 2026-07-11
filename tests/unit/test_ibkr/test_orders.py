@@ -121,6 +121,12 @@ async def test_place_condor_builds_guaranteed_smart_bag(
     assert order.orderRef == "obot-7"
     assert order.tif == "DAY"
     assert placed.ib_order_id == order.orderId
+    assert placed.leg_contracts == (
+        (1580, 100, "USD"),
+        (1575, 100, "USD"),
+        (1620, 100, "USD"),
+        (1625, 100, "USD"),
+    )
 
 
 async def test_stk_legs_are_filtered_out(

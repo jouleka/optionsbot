@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from sqlalchemy import Engine, insert, select, update
 
 from optionsbot.execution.orders import get_order, record_fill
@@ -18,9 +19,11 @@ NOW = datetime(2026, 6, 11, 16, 0, tzinfo=UTC)
 
 LEGS: list[dict[str, Any]] = [
     {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": "20260717",
-     "strike": 580.0, "right": "P", "quantity": 1},
+     "strike": 580.0, "right": "P", "quantity": 1,
+     "con_id": 1580, "multiplier": 100, "currency": "USD"},
     {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": "20260717",
-     "strike": 575.0, "right": "P", "quantity": 1},
+     "strike": 575.0, "right": "P", "quantity": 1,
+     "con_id": 1575, "multiplier": 100, "currency": "USD"},
 ]
 
 
@@ -57,11 +60,17 @@ def _client(
 
 
 def _fill(
-    ref: str, exec_id: str, *, qty: int = 1, commission: float | None = 0.65,
+    ref: str,
+    exec_id: str,
+    *,
+    qty: int = 1,
+    side: str = "SELL",
+    con_id: int = 1580,
+    commission: float | None = 0.65,
 ) -> ExecutionFill:
     return ExecutionFill(
-        ib_order_id=11, order_ref=ref, exec_id=exec_id, side="SELL",
-        price=1.20, qty=qty, ts=NOW, con_id=1580, sec_type="OPT",
+        ib_order_id=11, order_ref=ref, exec_id=exec_id, side=side,
+        price=1.20, qty=qty, ts=NOW, con_id=con_id, sec_type="OPT",
         commission=commission,
     )
 
@@ -121,9 +130,10 @@ async def test_working_row_missing_at_broker_without_fills_is_cancelled(
 async def test_working_row_with_complete_fills_becomes_filled(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "submitted", quantity=1)
     ref = f"obot-{order_id}"
-    # 2 option legs x quantity 1 -> complete when total fill qty >= 2.
+    # Exact conId, side, and per-leg ratio are required for every option leg.
     client = _client(executions=[
-        _fill(ref, "x1", qty=1), _fill(ref, "x2", qty=1),
+        _fill(ref, "x1", qty=1, side="SELL", con_id=1580),
+        _fill(ref, "x2", qty=1, side="BUY", con_id=1575),
     ])
     notify, _ = _notify()
     summary = await reconcile(tmp_db, client, notify=notify, now=NOW)
@@ -135,6 +145,36 @@ async def test_working_row_with_complete_fills_becomes_filled(tmp_db: Engine) ->
         rows = conn.execute(select(fills)).fetchall()
     assert {r.ib_exec_id for r in rows} == {"x1", "x2"}
     assert all(r.commission == 0.65 for r in rows)
+
+
+@pytest.mark.parametrize("bad_shape", ["duplicate_contract", "wrong_side", "overfill"])
+async def test_fill_count_cannot_fake_exact_leg_completion(
+    tmp_db: Engine,
+    bad_shape: str,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted", quantity=1)
+    ref = f"obot-{order_id}"
+    if bad_shape == "duplicate_contract":
+        executions = [
+            _fill(ref, "bad-a", side="SELL", con_id=1580),
+            _fill(ref, "bad-b", side="SELL", con_id=1580),
+        ]
+    elif bad_shape == "wrong_side":
+        executions = [
+            _fill(ref, "bad-a", side="BUY", con_id=1580),
+            _fill(ref, "bad-b", side="SELL", con_id=1575),
+        ]
+    else:
+        executions = [
+            _fill(ref, "bad-a", qty=2, side="SELL", con_id=1580),
+            _fill(ref, "bad-b", side="BUY", con_id=1575),
+        ]
+
+    await reconcile(tmp_db, _client(executions=executions), now=NOW)
+
+    record = get_order(tmp_db, order_id)
+    assert record is not None
+    assert record.status != "filled"
 
 
 async def test_foreign_broker_order_warns_and_is_left_alone(tmp_db: Engine) -> None:
@@ -195,7 +235,10 @@ async def test_stale_staged_row_is_skipped(tmp_db: Engine) -> None:
 async def test_reconcile_is_idempotent(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "submitted", quantity=1)
     ref = f"obot-{order_id}"
-    client = _client(executions=[_fill(ref, "x1"), _fill(ref, "x2")])
+    client = _client(executions=[
+        _fill(ref, "x1", side="SELL", con_id=1580),
+        _fill(ref, "x2", side="BUY", con_id=1575),
+    ])
     notify, sent = _notify()
     first = await reconcile(tmp_db, client, notify=notify, now=NOW)
     second = await reconcile(tmp_db, client, notify=notify, now=NOW)

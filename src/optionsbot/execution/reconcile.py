@@ -76,15 +76,67 @@ async def _send(notify: Notify | None, text: str) -> None:
 def _fills_complete(
     engine: Engine, order_id: int, quantity: int, legs: list[dict[str, Any]]
 ) -> bool:
-    n_option_legs = sum(1 for leg in legs if leg.get("sec_type", "OPT") == "OPT")
-    if n_option_legs == 0:
+    """Prove exact per-contract, side, and ratio completion for every option leg."""
+    if isinstance(quantity, bool) or quantity <= 0:
         return False
+    expected: dict[tuple[int, str], int] = {}
+    seen_contracts: set[int] = set()
+    for leg in legs:
+        if leg.get("sec_type", "OPT") != "OPT":
+            continue
+        try:
+            raw_con_id = leg["con_id"]
+            raw_ratio = leg.get("quantity", 1)
+            con_id = int(raw_con_id)
+            ratio = int(raw_ratio)
+            side = str(leg["side"]).upper()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (
+            isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or con_id in seen_contracts
+            or isinstance(raw_ratio, bool)
+            or ratio <= 0
+            or ratio != raw_ratio
+            or side not in {"BUY", "SELL"}
+        ):
+            return False
+        seen_contracts.add(con_id)
+        expected[(con_id, side)] = ratio * quantity
+    if not expected:
+        return False
+
     with engine.connect() as conn:
-        total = conn.execute(
-            select(fills.c.qty).where(fills.c.order_id == order_id)
+        rows = conn.execute(
+            select(fills.c.leg_con_id, fills.c.side, fills.c.qty).where(
+                fills.c.order_id == order_id
+            )
         ).fetchall()
-    filled_qty = sum(int(r.qty) for r in total)
-    return filled_qty >= quantity * n_option_legs
+    actual: dict[tuple[int, str], int] = {}
+    for row in rows:
+        try:
+            raw_con_id = row.leg_con_id
+            raw_qty = row.qty
+            con_id = int(raw_con_id)
+            fill_qty = int(raw_qty)
+            side = str(row.side).upper()
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or isinstance(raw_qty, bool)
+            or fill_qty <= 0
+            or fill_qty != raw_qty
+            or side not in {"BUY", "SELL"}
+        ):
+            return False
+        key = (con_id, side)
+        actual[key] = actual.get(key, 0) + fill_qty
+    return actual == expected
 
 
 async def reconcile(

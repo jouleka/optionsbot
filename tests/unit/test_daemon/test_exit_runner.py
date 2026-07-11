@@ -40,9 +40,11 @@ def _force_market_open():
 def _legs(expiry: str) -> list[dict[str, object]]:
     return [
         {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": expiry,
-         "strike": 580.0, "right": "P", "quantity": 1},
+         "strike": 580.0, "right": "P", "quantity": 1,
+         "con_id": 580001, "multiplier": 100, "currency": "USD"},
         {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": expiry,
-         "strike": 575.0, "right": "P", "quantity": 1},
+         "strike": 575.0, "right": "P", "quantity": 1,
+         "con_id": 575001, "multiplier": 100, "currency": "USD"},
     ]
 
 
@@ -59,9 +61,9 @@ def _filled_entry(context: DaemonContext, *, expiry: str = FAR) -> int:
         conn.execute(update(orders).where(orders.c.id == order_id)
                      .values(order_ref=f"obot-{order_id}"))
     record_fill(engine, order_id, exec_id=f"x{order_id}a", side="SELL",
-                price=1.60, qty=1, ts=NOW)
+                price=1.60, qty=1, ts=NOW, leg_con_id=580001)
     record_fill(engine, order_id, exec_id=f"x{order_id}b", side="BUY",
-                price=0.40, qty=1, ts=NOW)
+                price=0.40, qty=1, ts=NOW, leg_con_id=575001)
     set_fill_commission(engine, f"x{order_id}a", 0.65)
     set_fill_commission(engine, f"x{order_id}b", 0.65)
     return order_id
@@ -659,8 +661,10 @@ async def test_cumulative_hermes_realized_loss_trips_kill_before_another_exit(
     assert close_pk is not None
     close_id = int(close_pk[0])
     # Entry +$120, close -$370 => Hermes-driven realized P&L -$250.
-    record_fill(engine, close_id, exec_id="hermes-loss-a", side="BUY", price=3.80, qty=1, ts=NOW)
-    record_fill(engine, close_id, exec_id="hermes-loss-b", side="SELL", price=0.10, qty=1, ts=NOW)
+    record_fill(engine, close_id, exec_id="hermes-loss-a", side="BUY", price=3.80,
+                qty=1, ts=NOW, leg_con_id=580001)
+    record_fill(engine, close_id, exec_id="hermes-loss-b", side="SELL", price=0.10,
+                qty=1, ts=NOW, leg_con_id=575001)
     set_fill_commission(engine, "hermes-loss-a", 0.65)
     set_fill_commission(engine, "hermes-loss-b", 0.65)
     with engine.begin() as conn:
@@ -726,9 +730,9 @@ async def test_cumulative_hermes_loss_trips_kill_after_last_position_closes(
     assert close_pk is not None
     close_id = int(close_pk[0])
     record_fill(engine, close_id, exec_id="hermes-final-loss-a", side="BUY",
-                price=3.80, qty=1, ts=NOW)
+                price=3.80, qty=1, ts=NOW, leg_con_id=580001)
     record_fill(engine, close_id, exec_id="hermes-final-loss-b", side="SELL",
-                price=0.10, qty=1, ts=NOW)
+                price=0.10, qty=1, ts=NOW, leg_con_id=575001)
     set_fill_commission(engine, "hermes-final-loss-a", 0.65)
     set_fill_commission(engine, "hermes-final-loss-b", 0.65)
     with engine.begin() as conn:
