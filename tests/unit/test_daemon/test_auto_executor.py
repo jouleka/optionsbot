@@ -245,6 +245,36 @@ async def test_daemon_rejects_review_whose_alert_links_another_score(
     assert review.status == "held"
 
 
+async def test_daemon_rejects_wrong_score_alert_with_identical_metadata(
+    daemon_context: DaemonContext,
+) -> None:
+    """Alert identity, not matching display fields, authorizes the exact score."""
+    from optionsbot.daemon.auto_executor import run_entry_reviews_tick
+
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    _, reviewed_score = _pick(daemon_context, "SPY")
+    _, lookalike_score = _pick(daemon_context, "SPY")
+    wrong_alert = _alert(daemon_context, lookalike_score)
+    with daemon_context.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TRIGGER trg_entry_reviews_validate_insert")
+    _review(
+        daemon_context,
+        reviewed_score,
+        alert_id=wrong_alert,
+        create_alert=False,
+    )
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await run_entry_reviews_tick(daemon_context)
+
+    assert submitted == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+
+
 async def test_daemon_requires_review_after_proven_alert_delivery(
     daemon_context: DaemonContext,
 ) -> None:

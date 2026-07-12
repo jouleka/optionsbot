@@ -115,6 +115,17 @@ async def test_discarded_snapshot_callback_cannot_prove_later_request_live(
     assert second.delayed is True  # prior callback is stale, not request provenance
 
 
+def test_callback_at_request_boundary_cannot_prove_current_delivery(
+    md: MarketDataClient,
+) -> None:
+    ticker = _ticker(market_data_type=1)
+    md._delivered_market_data_types[id(ticker)] = (7, 1)
+
+    observed = md._take_observed_market_data_type(ticker, after_sequence=7)
+
+    assert observed is None
+
+
 @pytest.mark.parametrize("callback_value", [True, 1.0, "1", 2, None])
 async def test_only_exact_integer_live_callback_proves_live_delivery(
     md: MarketDataClient, mock_ib: MagicMock, callback_value: object
