@@ -67,6 +67,7 @@ def upgrade() -> None:
         score_identity_index.get("unique")
         and score_identity_index.get("column_names")
         == ["snapshot_id", "strategy"]
+        and not score_identity_index.get("dialect_options")
     ):
         raise RuntimeError(
             "0015 found an incompatible strategy score identity index"
