@@ -93,6 +93,16 @@ strategy_scores = Table(
     Column("suggestion_json", JSON),
 )
 
+# A scan persists at most one row for each strategy. This turns the
+# (snapshot_id, strategy) lookup used by alerts into an exact identity instead
+# of a "latest matching row" guess.
+Index(
+    "uq_strategy_scores_snapshot_strategy",
+    strategy_scores.c.snapshot_id,
+    strategy_scores.c.strategy,
+    unique=True,
+)
+
 
 alerts = Table(
     "alerts",
@@ -247,6 +257,51 @@ orders = Table(
     ),
 )
 
+# Permanent admission receipt for an exact entry candidate. The receipt is
+# inserted in the same transaction as the first staged open order and is never
+# deleted or retargeted, so terminal outcomes and mutable order status cannot
+# re-authorize the review.
+entry_intent_consumptions = Table(
+    "entry_intent_consumptions",
+    metadata,
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "first_order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("consumed_at", DateTime(timezone=True), nullable=False),
+)
+
+Index(
+    "uq_orders_ib_order_id",
+    orders.c.ib_order_id,
+    unique=True,
+    sqlite_where=orders.c.ib_order_id.is_not(None),
+    postgresql_where=orders.c.ib_order_id.is_not(None),
+)
+
+Index(
+    "uq_orders_active_close_per_entry",
+    orders.c.closes_order_id,
+    unique=True,
+    sqlite_where=(
+        orders.c.closes_order_id.is_not(None)
+        & orders.c.status.in_(["staged", "submitting", "submitted", "partial"])
+    ),
+    postgresql_where=(
+        orders.c.closes_order_id.is_not(None)
+        & orders.c.status.in_(["staged", "submitting", "submitted", "partial"])
+    ),
+)
+
 
 # IBK-138: audited Hermes-originated close requests. MCP writes only a request;
 # the daemon owns the trading-soundness gate and converts at most approved
@@ -297,6 +352,14 @@ entry_reviews = Table(
         Integer,
         ForeignKey("strategy_scores.id", ondelete="CASCADE"),
         nullable=False,
+        unique=True,
+        index=True,
+    ),
+    Column(
+        "alert_id",
+        Integer,
+        ForeignKey("alerts.id", ondelete="CASCADE"),
+        nullable=True,  # legacy unmatched rows are terminalized by migration 0015
         unique=True,
         index=True,
     ),

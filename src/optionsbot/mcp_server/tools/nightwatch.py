@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
 from optionsbot.execution.orders import get_order
+from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
 from optionsbot.execution.state import trip_kill
 from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.serialization import iso_utc
@@ -143,7 +144,10 @@ def _pick_dict(row: Any) -> dict[str, Any]:
 def _is_positive_defined_risk_candidate(row: Any) -> bool:
     legs = row.legs_json
     suggestion = row.suggestion_json
-    if not isinstance(legs, list) or not legs or not isinstance(suggestion, dict):
+    if (
+        not has_structurally_defined_option_risk(legs)
+        or not isinstance(suggestion, dict)
+    ):
         return False
     if suggestion.get("defined_risk") is not True:
         return False
@@ -214,6 +218,7 @@ def register(server: FastMCP) -> None:
                 )
                 .where(strategy_scores.c.score >= float(min_score or 0.0))
                 .where(snapshots.c.ts >= cutoff)
+                .where(alerts.c.status == "sent")
                 .where(entry_reviews.c.id.is_(None))
                 .order_by(desc(strategy_scores.c.score), desc(snapshots.c.ts))
                 .limit(lim)
@@ -235,6 +240,7 @@ def register(server: FastMCP) -> None:
     @server.tool()
     def submit_entry_review(
         pick_id: int,
+        alert_id: int,
         verdict: str,
         confidence: float,
         sources: list[str],
@@ -284,10 +290,20 @@ def register(server: FastMCP) -> None:
             existing = conn.execute(
                 select(entry_reviews).where(entry_reviews.c.strategy_score_id == int(pick_id))
             ).first()
-            alerted = conn.execute(
+            alert = conn.execute(
+                select(
+                    alerts.c.id,
+                    alerts.c.strategy_score_id,
+                    alerts.c.status,
+                    alerts.c.ts,
+                    alerts.c.sent_ts,
+                    alerts.c.telegram_msg_id,
+                )
+                .where(alerts.c.id == int(alert_id))
+            ).first()
+            any_alert = conn.execute(
                 select(alerts.c.id)
                 .where(alerts.c.strategy_score_id == int(pick_id))
-                .order_by(alerts.c.id.desc())
                 .limit(1)
             ).first()
         if pick is None:
@@ -301,8 +317,24 @@ def register(server: FastMCP) -> None:
                 "verdict": existing.verdict,
                 "status": existing.status,
             }
-        if alerted is None:
+        if alert is None and any_alert is None:
             return {"ok": False, "error": "pick_not_alerted"}
+        if alert is None:
+            return {"ok": False, "error": "unknown_alert"}
+        if int(alert.strategy_score_id) != int(pick_id):
+            return {"ok": False, "error": "alert_pick_mismatch"}
+        if alert.status != "sent":
+            return {"ok": False, "error": "alert_not_sent"}
+        if alert.sent_ts is None or alert.telegram_msg_id is None:
+            return {"ok": False, "error": "alert_delivery_unproven"}
+        alert_ts = alert.ts.replace(tzinfo=UTC) if alert.ts.tzinfo is None else alert.ts
+        sent_ts = (
+            alert.sent_ts.replace(tzinfo=UTC)
+            if alert.sent_ts.tzinfo is None
+            else alert.sent_ts
+        )
+        if sent_ts < alert_ts or sent_ts > now + timedelta(minutes=1):
+            return {"ok": False, "error": "alert_delivery_time_invalid"}
         if normalized == "vetted_paper_candidate":
             pick_ts = pick.ts
             if pick_ts.tzinfo is None:
@@ -334,6 +366,7 @@ def register(server: FastMCP) -> None:
                 pk = conn.execute(
                     insert(entry_reviews).values(
                         strategy_score_id=int(pick_id),
+                        alert_id=int(alert_id),
                         reviewed_at=now,
                         verdict=normalized,
                         confidence=normalized_confidence,
@@ -366,6 +399,7 @@ def register(server: FastMCP) -> None:
             "status": status,
             "review_id": int(pk[0]),
             "pick_id": int(pick_id),
+            "alert_id": int(alert_id),
             "note": "queued only; daemon must independently rerun every execution gate",
         }
 

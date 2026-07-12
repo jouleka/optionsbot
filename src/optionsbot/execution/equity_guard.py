@@ -15,6 +15,7 @@ session date (set once, never overwritten downward).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -66,6 +67,8 @@ def capture_day_start_net_liq(
     new session (or a fresh row) overwrites. ``session`` defaults to None for
     tests that don't care about the boundary; B2 passes the NYSE session date.
     """
+    if not math.isfinite(net_liq) or net_liq <= 0:
+        raise ValueError("day-start net liquidation must be finite positive")
     existing_nl, existing_session = _day_start_row(engine)
     if existing_nl is not None and existing_session == session:
         return float(existing_nl)
@@ -88,7 +91,14 @@ def capture_day_start_net_liq(
 
 
 def _drawdown(day_start: float | None, current: float | None) -> float | None:
-    if day_start is None or current is None or day_start <= 0:
+    if (
+        day_start is None
+        or current is None
+        or not math.isfinite(day_start)
+        or not math.isfinite(current)
+        or day_start <= 0
+        or current <= 0
+    ):
         return None
     return (day_start - current) / day_start
 
@@ -107,6 +117,17 @@ def evaluate_net_liq_drawdown(
     if load_state(engine).killed:
         return EquityVerdict(False, True, 0.0, "already killed")
     day_start, _ = _day_start_row(engine)
+    invalid_equity = (
+        day_start is not None
+        and (not math.isfinite(day_start) or day_start <= 0)
+    ) or (
+        current_net_liq is not None
+        and (not math.isfinite(current_net_liq) or current_net_liq <= 0)
+    )
+    if invalid_equity:
+        reason = "non-finite or non-positive net-liq input; drawdown state is unsafe"
+        trip_kill(engine, reason, now=now)
+        return EquityVerdict(True, False, 0.0, reason)
     dd = _drawdown(day_start, current_net_liq)
     if dd is None:
         return EquityVerdict(False, False, 0.0, "net-liq drawdown not evaluable")
@@ -125,13 +146,15 @@ def new_entry_allowed(
     engine: Engine, settings: Settings, *, current_net_liq: float | None
 ) -> EntryDecision:
     """Block NEW entries once the drawdown reaches entry_block_loss_frac of the
-    cap. Fails OPEN when not evaluable: the per-tick breaker is the real
-    backstop, and a single flaky net-liq read shouldn't hard-block trading.
+    cap. Missing baseline/current equity fails closed because the daily-loss
+    guard cannot be proven before adding risk.
     """
     day_start, _ = _day_start_row(engine)
     dd = _drawdown(day_start, current_net_liq)
     if dd is None:
-        return EntryDecision(True, "net-liq drawdown not evaluable (entry allowed)")
+        return EntryDecision(
+            False, "equity/net-liq drawdown not evaluable (entry blocked)"
+        )
     cap = settings.execution.max_daily_loss_pct
     block_at = settings.execution.entry_block_loss_frac * cap
     if dd >= block_at:

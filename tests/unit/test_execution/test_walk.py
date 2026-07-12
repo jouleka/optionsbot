@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import Engine, insert, select, update
 
 from optionsbot.config import Settings
 from optionsbot.execution.orders import get_order, record_order_quotes
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
     liquidity_issues,
@@ -35,6 +37,7 @@ LEGS: list[dict[str, Any]] = [
 def _quote(
     strike: float, right: str, *, bid: float | None, ask: float | None,
     mid: float | None = None, oi: int | None = None,
+    ts: datetime | None = NOW, delayed: bool = True,
 ) -> OptionQuote:
     computed_mid = mid if mid is not None else (
         (bid + ask) / 2 if bid is not None and ask is not None else None
@@ -43,7 +46,7 @@ def _quote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
         bid=bid, ask=ask, last=None, mid=computed_mid, iv=None, delta=None,
         gamma=None, theta=None, vega=None, open_interest=oi, volume=None,
-        ts=NOW, delayed=True,
+        ts=ts, delayed=delayed,
     )
 
 
@@ -263,12 +266,18 @@ def _walk_settings() -> Settings:
     return s
 
 
-def _md(mids: dict[tuple[float, str], tuple[float, float]]) -> MagicMock:
+def _md(
+    mids: dict[tuple[float, str], tuple[float, float]],
+    *,
+    delayed: bool = False,
+) -> MagicMock:
     md = MagicMock()
 
     async def snap(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
         bid, ask = mids[(strike, right)]
-        return _quote(strike, right, bid=bid, ask=ask)
+        return _quote(
+            strike, right, bid=bid, ask=ask, ts=datetime.now(UTC), delayed=delayed
+        )
 
     md.get_option_snapshot = AsyncMock(side_effect=snap)
     return md
@@ -314,6 +323,485 @@ async def test_walk_exhaustion_requests_cancel_tracker_confirms(tmp_db: Engine) 
         journal = conn.execute(select(order_quotes)).fetchall()
     assert len(journal) == 3  # one row per executed step
     assert {r.kind for r in journal} == {"step"}
+
+
+async def test_walk_does_not_modify_from_delayed_quotes(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md(
+        {(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)},
+        delayed=True,
+    )
+
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_does_not_modify_without_quote_timestamps(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+
+    async def snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        bid, ask = ({580.0: (1.55, 1.65), 575.0: (0.35, 0.45)})[strike]
+        return _quote(strike, right, bid=bid, ask=ask, ts=None, delayed=False)
+
+    md.get_option_snapshot = AsyncMock(side_effect=snapshot)
+
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+@pytest.mark.parametrize("clock_offset_seconds", [46, -1])
+async def test_walk_rejects_quotes_outside_exit_window_after_async_refresh(
+    tmp_db: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    clock_offset_seconds: int,
+) -> None:
+    from datetime import timedelta
+
+    import optionsbot.execution.walk as walk_module
+
+    class Clock(datetime):
+        current = datetime(2026, 7, 10, 14, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: object = None) -> Clock:
+            return cls.fromtimestamp(cls.current.timestamp(), tz=UTC)
+
+    quote_ts = Clock(2026, 7, 10, 14, 0, tzinfo=UTC)
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+
+    async def snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        Clock.current = quote_ts + timedelta(seconds=clock_offset_seconds)
+        bid, ask = ({580.0: (1.55, 1.65), 575.0: (0.35, 0.45)})[strike]
+        return _quote(strike, right, bid=bid, ask=ask, ts=quote_ts, delayed=False)
+
+    md.get_option_snapshot = AsyncMock(side_effect=snapshot)
+    monkeypatch.setattr(walk_module, "datetime", Clock)
+    settings = _walk_settings()
+    settings.execution.entry_quote_max_age_seconds = 120
+    settings.execution.exit_quote_max_age_seconds = 45
+
+    await run_price_walk(
+        engine=tmp_db,
+        settings=settings,
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_does_not_modify_when_quote_refresh_fails(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+    md.get_option_snapshot = AsyncMock(side_effect=RuntimeError("quote unavailable"))
+
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_does_not_modify_from_incomplete_live_quotes(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+
+    async def snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        if strike == 580.0:
+            return _quote(
+                strike,
+                right,
+                bid=None,
+                ask=1.65,
+                ts=datetime.now(UTC),
+                delayed=False,
+            )
+        return _quote(
+            strike,
+            right,
+            bid=0.35,
+            ask=0.45,
+            ts=datetime.now(UTC),
+            delayed=False,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=snapshot)
+
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_rechecks_interlock_after_quote_refresh(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = MagicMock()
+
+    async def snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        trip_kill(tmp_db, "concurrent halt during quote refresh")
+        bid, ask = ({580.0: (1.55, 1.65), 575.0: (0.35, 0.45)})[strike]
+        return _quote(
+            strike,
+            right,
+            bid=bid,
+            ask=ask,
+            ts=datetime.now(UTC),
+            delayed=False,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=snapshot)
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+    )
+
+    order_client.modify_price.assert_not_awaited()
+    order_client.cancel.assert_awaited_once_with(11)
+
+
+async def test_walk_halts_if_broker_modify_cannot_be_recorded(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+
+    with patch(
+        "optionsbot.execution.walk.bump_reprice",
+        side_effect=RuntimeError("ledger unavailable"),
+    ):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+async def test_walk_halts_if_post_modify_ledger_read_fails(tmp_db: Engine) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    calls = {"count": 0}
+
+    def flaky_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("ledger read unavailable after modify")
+        return real_get_order(engine, target_order_id)
+
+    with patch("optionsbot.execution.walk.get_order", side_effect=flaky_get_order):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+async def test_walk_halts_if_post_modify_journal_fails(tmp_db: Engine) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+
+    with patch(
+        "optionsbot.execution.walk.record_order_quotes",
+        side_effect=RuntimeError("quote journal unavailable"),
+    ):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+async def test_walk_halts_if_post_modify_order_row_disappears(tmp_db: Engine) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    calls = {"count": 0}
+
+    def disappearing_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 2:
+            return None
+        return real_get_order(engine, target_order_id)
+
+    with patch("optionsbot.execution.walk.get_order", side_effect=disappearing_get_order):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=_walk_settings(),
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+async def test_walk_halts_if_late_post_modify_order_read_fails(tmp_db: Engine) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    settings = _walk_settings()
+    settings.execution.walk_max_steps = 1
+    calls = {"count": 0}
+
+    def late_failing_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise RuntimeError("late ledger read unavailable")
+        return real_get_order(engine, target_order_id)
+
+    with patch("optionsbot.execution.walk.get_order", side_effect=late_failing_get_order):
+        await run_price_walk(
+            engine=tmp_db,
+            settings=settings,
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "late_none",
+        "cancel_note",
+        "cancel_request",
+        "cancel_confirmation",
+        "cleanup_read",
+        "cleanup_none",
+        "cleanup_clear",
+    ],
+)
+async def test_walk_halts_for_every_final_post_modify_uncertainty(
+    tmp_db: Engine,
+    failure_mode: str,
+) -> None:
+    from optionsbot.execution.orders import get_order as real_get_order
+
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    if failure_mode == "cancel_request":
+        order_client.cancel = AsyncMock(side_effect=RuntimeError("cancel unavailable"))
+    else:
+        order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    settings = _walk_settings()
+    settings.execution.walk_max_steps = 1
+    calls = {"count": 0}
+
+    def injected_get_order(engine: Engine, target_order_id: int):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        if failure_mode == "late_none" and calls["count"] == 3:
+            return None
+        if failure_mode == "cancel_confirmation" and calls["count"] == 4:
+            raise RuntimeError("cancel confirmation unavailable")
+        if failure_mode == "cleanup_read" and calls["count"] == 5:
+            raise RuntimeError("cleanup read unavailable")
+        if failure_mode == "cleanup_none" and calls["count"] == 5:
+            return None
+        return real_get_order(engine, target_order_id)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("optionsbot.execution.walk.get_order", side_effect=injected_get_order)
+        )
+        if failure_mode == "cancel_note":
+            stack.enter_context(
+                patch(
+                    "optionsbot.execution.walk.set_order_note",
+                    side_effect=RuntimeError("cancel note unavailable"),
+                )
+            )
+        if failure_mode == "cleanup_clear":
+            stack.enter_context(
+                patch(
+                    "optionsbot.execution.walk.clear_walk_state",
+                    side_effect=RuntimeError("cleanup persistence unavailable"),
+                )
+            )
+        await run_price_walk(
+            engine=tmp_db,
+            settings=settings,
+            order_client=order_client,
+            md=md,
+            symbol="SPY",
+            legs=LEGS,
+            order_id=order_id,
+            ib_order_id=11,
+            decision_mid=1.20,
+            budget=0.09,
+            increment=0.01,
+        )
+
+    order_client.modify_price.assert_awaited_once()
+    order_client.cancel.assert_awaited_once_with(11)
+    assert load_state(tmp_db).killed is True
 
 
 async def test_walk_debit_sends_ascending_positive_limits(tmp_db: Engine) -> None:

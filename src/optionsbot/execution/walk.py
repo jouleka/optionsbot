@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Engine
@@ -30,7 +30,7 @@ from optionsbot.execution.orders import (
     set_order_note,
     upsert_walk_state,
 )
-from optionsbot.execution.state import load_state
+from optionsbot.execution.state import load_state, trip_kill
 
 if TYPE_CHECKING:
     from optionsbot.ibkr.market_data import MarketDataClient
@@ -228,6 +228,7 @@ async def run_price_walk(
     cfg = settings.execution
     prev_target = prev_target_override if prev_target_override is not None else decision_mid
     option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+    broker_mutated = False
     try:
         for step in range(start_step + 1, cfg.walk_max_steps + 1):
             if cfg.walk_step_seconds:
@@ -253,10 +254,64 @@ async def run_price_walk(
                     quotes[spec] = await md.get_option_snapshot(
                         symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
                     )
+                if any(quote.delayed is not False for quote in quotes.values()):
+                    log.warning(
+                        "walk %s step %d: delayed or unknown quote delivery; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+                if any(not isinstance(quote.ts, datetime) for quote in quotes.values()):
+                    log.warning(
+                        "walk %s step %d: quote timestamp unknown; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+                quote_now = datetime.now(UTC)
+                quote_max_age = timedelta(seconds=cfg.exit_quote_max_age_seconds)
+                invalid_age = False
+                for quote in quotes.values():
+                    quote_ts = quote.ts
+                    if not isinstance(quote_ts, datetime):  # narrowed above; mypy guard
+                        invalid_age = True
+                        break
+                    if quote_ts.tzinfo is None:
+                        quote_ts = quote_ts.replace(tzinfo=UTC)
+                    quote_age = quote_now - quote_ts.astimezone(UTC)
+                    if quote_age < timedelta(0) or quote_age > quote_max_age:
+                        invalid_age = True
+                        break
+                if invalid_age:
+                    log.warning(
+                        "walk %s step %d: quote age outside exit execution window; "
+                        "not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
                 current_mid = combo_mid(legs, quotes)
                 nbbo = combo_bid_ask(legs, quotes)
-            except Exception:  # noqa: BLE001 -- stale re-anchor beats a dead walk
+                if current_mid is None or nbbo is None:
+                    log.warning(
+                        "walk %s step %d: incomplete quote set; not repricing",
+                        order_id,
+                        step,
+                    )
+                    continue
+            except Exception:  # noqa: BLE001 -- fail closed; the next step retries refresh
                 log.exception("walk %s step %d: quote refresh failed", order_id, step)
+                continue
+
+            if record.intent == "open" and load_state(engine).killed:
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note="kill switch tripped during quote refresh — cancel requested",
+                )
+                return
 
             target = next_walk_target(
                 decision_mid=decision_mid,
@@ -271,38 +326,103 @@ async def run_price_walk(
                 continue  # no-op step (favorable market or floor reached)
             try:
                 await order_client.modify_price(ib_order_id, new_limit_price=-target)
-                bump_reprice(engine, order_id, new_limit_price=-target)
-            except Exception:  # noqa: BLE001 -- a failed modify must not kill the walk
-                log.exception("walk %s step %d: modify failed", order_id, step)
-                continue
-            prev_target = target
-            leg_rows = []
-            for leg in option_legs:
-                spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
-                q = quotes.get(spec)
-                if q is None:
-                    continue
-                leg_rows.append(
-                    {
-                        "expiry": leg["expiry"], "strike": leg["strike"],
-                        "right": leg["right"], "side": leg["side"],
-                        "bid": q.bid, "ask": q.ask, "mid": q.mid,
-                        "delayed": q.delayed,
-                    }
+                broker_mutated = True
+            except Exception as exc:  # noqa: BLE001 -- broker outcome is unknown
+                halt_reason = (
+                    f"price-walk modify outcome unknown for order #{order_id}: {exc}"
                 )
-            record_order_quotes(
-                engine, order_id, kind="step", step=step, ts=datetime.now(UTC),
-                combo_bid=nbbo[0] if nbbo else None,
-                combo_ask=nbbo[1] if nbbo else None,
-                combo_mid=current_mid, target_net=target, limit_price=-target,
-                legs=leg_rows,
-            )
-            upsert_walk_state(
-                engine, order_id, ib_order_id=ib_order_id, symbol=symbol,
-                legs=[dict(leg) for leg in legs], decision_mid=decision_mid, budget=budget,
-                increment=increment, step=step, prev_target=prev_target,
-                ts=datetime.now(UTC),
-            )
+                try:
+                    trip_kill(engine, halt_reason)
+                except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                    log.exception("walk %s: failed to persist kill switch", order_id)
+                log.exception("walk %s step %d: modify outcome unknown", order_id, step)
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note=f"{halt_reason}; cancel requested",
+                )
+                return
+            try:
+                post_modify_record = get_order(engine, order_id)
+                if post_modify_record is None:
+                    raise RuntimeError("order row unavailable after broker modify")
+                if post_modify_record.status == "filled":
+                    return
+                if post_modify_record.status not in WORKING_STATUSES:
+                    raise RuntimeError(
+                        "order entered an unconfirmed non-working state after broker modify: "
+                        f"{post_modify_record.status}"
+                    )
+                bump_reprice(engine, order_id, new_limit_price=-target)
+                prev_target = target
+                leg_rows = []
+                for leg in option_legs:
+                    spec = (
+                        str(leg["expiry"]),
+                        float(leg["strike"]),
+                        str(leg["right"]),
+                    )
+                    q = quotes.get(spec)
+                    if q is None:
+                        continue
+                    leg_rows.append(
+                        {
+                            "expiry": leg["expiry"],
+                            "strike": leg["strike"],
+                            "right": leg["right"],
+                            "side": leg["side"],
+                            "bid": q.bid,
+                            "ask": q.ask,
+                            "mid": q.mid,
+                            "delayed": q.delayed,
+                        }
+                    )
+                record_order_quotes(
+                    engine,
+                    order_id,
+                    kind="step",
+                    step=step,
+                    ts=datetime.now(UTC),
+                    combo_bid=nbbo[0] if nbbo else None,
+                    combo_ask=nbbo[1] if nbbo else None,
+                    combo_mid=current_mid,
+                    target_net=target,
+                    limit_price=-target,
+                    legs=leg_rows,
+                )
+                upsert_walk_state(
+                    engine,
+                    order_id,
+                    ib_order_id=ib_order_id,
+                    symbol=symbol,
+                    legs=[dict(leg) for leg in legs],
+                    decision_mid=decision_mid,
+                    budget=budget,
+                    increment=increment,
+                    step=step,
+                    prev_target=prev_target,
+                    ts=datetime.now(UTC),
+                )
+            except Exception as exc:  # noqa: BLE001 -- broker already mutated
+                halt_reason = (
+                    f"price-walk ledger finalization failed after broker modify for "
+                    f"order #{order_id}: {exc}"
+                )
+                try:
+                    trip_kill(engine, halt_reason)
+                except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                    log.exception("walk %s: failed to persist kill switch", order_id)
+                log.exception("walk %s step %d: post-modify ledger failure", order_id, step)
+                await _request_cancel_and_confirm(
+                    engine,
+                    order_client,
+                    order_id,
+                    ib_order_id,
+                    note=f"{halt_reason}; cancel requested",
+                )
+                return
 
         # Final price rests, then the trade is skipped: request the cancel and
         # let the TRACKER confirm it. Marking the row terminal ourselves while
@@ -311,7 +431,16 @@ async def run_price_walk(
         if cfg.walk_final_rest_seconds:
             await asyncio.sleep(cfg.walk_final_rest_seconds)
         record = get_order(engine, order_id)
-        if record is None or record.status not in WORKING_STATUSES:
+        if record is None:
+            if broker_mutated:
+                raise RuntimeError("order row unavailable before final cancellation")
+            return
+        if record.status not in WORKING_STATUSES:
+            if broker_mutated and record.status != "filled":
+                raise RuntimeError(
+                    "order entered an unconfirmed non-working state before final "
+                    f"cancellation: {record.status}"
+                )
             return
         await _request_cancel_and_confirm(
             engine, order_client, order_id, ib_order_id,
@@ -322,19 +451,67 @@ async def run_price_walk(
         )
     except asyncio.CancelledError:
         raise  # daemon shutdown — let it propagate
-    except Exception:  # noqa: BLE001 -- the walk must never crash the daemon
+    except Exception as exc:  # noqa: BLE001 -- the walk must never crash the daemon
         log.exception("price walk for order %s died", order_id)
+        if broker_mutated:
+            halt_reason = (
+                f"price-walk state became unavailable after broker modification for "
+                f"order #{order_id}: {exc}"
+            )
+            try:
+                trip_kill(engine, halt_reason)
+            except Exception:  # noqa: BLE001 -- cancellation still mandatory
+                log.exception("walk %s: failed to persist kill switch", order_id)
+            await _request_cancel_and_confirm(
+                engine,
+                order_client,
+                order_id,
+                ib_order_id,
+                note=f"{halt_reason}; cancel requested",
+            )
     finally:
-        # Best-effort: a CancelledError on shutdown intentionally LEAVES the row
-        # so the next boot re-attaches; every other exit (fill/cancel/exhaustion/
-        # error) clears it. We detect shutdown via the order still being working.
-        record = get_order(engine, order_id)
-        if record is None or record.status not in WORKING_STATUSES:
-            clear_walk_state(engine, order_id)
+        # Best-effort: never let cleanup obscure a broker-side uncertainty.
+        try:
+            record = get_order(engine, order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("price walk cleanup could not read order %s", order_id)
+            if broker_mutated:
+                _trip_walk_kill(
+                    engine,
+                    order_id,
+                    f"price-walk cleanup state unavailable after broker modification: {exc}",
+                )
+        else:
+            if record is None:
+                if broker_mutated:
+                    _trip_walk_kill(
+                        engine,
+                        order_id,
+                        "price-walk cleanup lost order row after broker modification",
+                    )
+            elif record.status not in WORKING_STATUSES:
+                try:
+                    clear_walk_state(engine, order_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("price walk cleanup failed for order %s", order_id)
+                    if broker_mutated:
+                        _trip_walk_kill(
+                            engine,
+                            order_id,
+                            f"price-walk cleanup persistence failed after broker "
+                            f"modification: {exc}",
+                        )
 
 
 _CANCEL_CONFIRM_TIMEOUT = 30.0  # seconds; tests may monkeypatch
 _CANCEL_CONFIRM_POLL = 0.5
+
+
+def _trip_walk_kill(engine: Engine, order_id: int, reason: str) -> None:
+    try:
+        trip_kill(engine, reason)
+    except Exception:  # noqa: BLE001 -- best effort when ledger itself is degraded
+        log.exception("walk %s: failed to persist kill switch", order_id)
 
 
 async def _request_cancel_and_confirm(
@@ -349,22 +526,57 @@ async def _request_cancel_and_confirm(
     confirm the terminal state (cancelled — or filled, if a fill won the
     race). Never writes a terminal status itself: the broker owns the order's
     fate until it says otherwise."""
-    set_order_note(engine, order_id, note)
+    try:
+        set_order_note(engine, order_id, note)
+    except Exception as exc:  # noqa: BLE001 -- cancellation remains mandatory
+        log.exception("order %s: failed to persist cancel note", order_id)
+        _trip_walk_kill(
+            engine,
+            order_id,
+            f"cancel note persistence failed for order #{order_id}: {exc}",
+        )
     try:
         await order_client.cancel(ib_order_id)
-    except Exception:  # noqa: BLE001 -- TTL watcher retries the cancel
-        log.exception("order %s: cancel request failed — watcher will retry", order_id)
+    except Exception as exc:  # noqa: BLE001 -- broker cancel outcome is unknown
+        log.exception("order %s: cancel request outcome unknown", order_id)
+        _trip_walk_kill(
+            engine,
+            order_id,
+            f"cancel request outcome unknown for order #{order_id}: {exc}",
+        )
         return
     waited = 0.0
     while waited <= _CANCEL_CONFIRM_TIMEOUT:
-        record = get_order(engine, order_id)
-        if record is None or record.status not in WORKING_STATUSES:
+        try:
+            record = get_order(engine, order_id)
+        except Exception as exc:  # noqa: BLE001 -- cancel was already requested
+            log.exception("order %s: cannot confirm cancellation in ledger", order_id)
+            _trip_walk_kill(
+                engine,
+                order_id,
+                f"cancel confirmation unavailable for order #{order_id}: {exc}",
+            )
+            return
+        if record is None:
+            _trip_walk_kill(
+                engine,
+                order_id,
+                f"cancel confirmation lost order row #{order_id}",
+            )
+            return
+        if record.status not in WORKING_STATUSES:
             return  # tracker confirmed (cancelled / filled)
         await asyncio.sleep(_CANCEL_CONFIRM_POLL)
         waited += _CANCEL_CONFIRM_POLL
     log.error(
         "order %s: cancel UNCONFIRMED after %.0fs — order may still be working; "
         "TTL watcher keeps retrying", order_id, _CANCEL_CONFIRM_TIMEOUT,
+    )
+    _trip_walk_kill(
+        engine,
+        order_id,
+        f"cancel unconfirmed for order #{order_id} after "
+        f"{_CANCEL_CONFIRM_TIMEOUT:.0f}s",
     )
 
 

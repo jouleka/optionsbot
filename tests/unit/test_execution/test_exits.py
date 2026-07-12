@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Engine, insert, update
+import pytest
+from sqlalchemy import Engine, func, insert, select, update
 
 from optionsbot.config import Settings
 from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.orders import (
+    CloseAlreadyClaimed,
     get_order,
     open_close_for,
     record_fill,
@@ -147,3 +149,22 @@ def test_open_close_for_detects_active_close(tmp_db: Engine) -> None:
         conn.execute(update(orders).where(orders.c.id == close.id)
                      .values(status="abandoned", terminal_ts=NOW))
     assert open_close_for(tmp_db, entry_id) is None
+
+
+def test_stage_close_order_claim_is_atomic(tmp_db: Engine) -> None:
+    entry_id = _filled_entry(tmp_db)
+    entry = get_order(tmp_db, entry_id)
+    assert entry is not None
+
+    first = stage_close_order(tmp_db, entry, now=NOW)
+    with pytest.raises(CloseAlreadyClaimed, match=str(first.id)):
+        stage_close_order(tmp_db, entry, now=NOW)
+
+    with tmp_db.connect() as conn:
+        active_count = conn.execute(
+            select(func.count())
+            .select_from(orders)
+            .where(orders.c.closes_order_id == entry_id)
+            .where(orders.c.status.in_(["staged", "submitting", "submitted", "partial"]))
+        ).scalar_one()
+    assert active_count == 1

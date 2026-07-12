@@ -38,6 +38,7 @@ def _pos(strike: float, right: str, position: float) -> PortfolioPosition:
         strike=strike, right=right,  # type: ignore[arg-type]
         multiplier=100, position=position, avg_cost=0.0, market_price=None,
         market_value=None, unrealized_pnl=None, realized_pnl=None,
+        con_id=int(strike * 10),
     )
 
 
@@ -68,6 +69,20 @@ def test_atomic_assert_rejects_close_not_inverse_of_entry() -> None:
         assert_atomic_close_legs(entry_legs=_entry_legs(), close_legs=wrong)
 
 
+def test_atomic_assert_rejects_duplicate_contract_identity_that_hides_residual_exposure() -> None:
+    duplicate_entry = [
+        {**_entry_legs()[0], "side": "sell"},
+        {**_entry_legs()[0], "side": "buy"},
+    ]
+    duplicate_close = [
+        {**_entry_legs()[0], "side": "sell"},
+        {**_entry_legs()[0], "side": "sell"},
+    ]
+
+    with pytest.raises(NonAtomicCloseError, match="duplicate"):
+        assert_atomic_close_legs(entry_legs=duplicate_entry, close_legs=duplicate_close)
+
+
 def test_find_naked_short_legs_flat_after_full_close() -> None:
     # Position fully flat at the broker -> no naked legs.
     positions = [_pos(580.0, "P", 0.0), _pos(575.0, "P", 0.0)]
@@ -89,3 +104,33 @@ def test_find_naked_short_legs_ignores_residual_long() -> None:
     # spent) — only short legs are flagged.
     positions = [_pos(580.0, "P", 0.0), _pos(575.0, "P", 1.0)]
     assert find_naked_short_legs(_entry_legs(), positions) == []
+
+
+def test_close_safety_rejects_mixed_case_security_types() -> None:
+    malformed_entry = _entry_legs()
+    malformed_entry[1]["sec_type"] = "opt"
+    with pytest.raises(NonAtomicCloseError):
+        assert_atomic_close_legs(
+            entry_legs=malformed_entry,
+            close_legs=_close_legs(),
+        )
+
+    malformed_position = _pos(580.0, "P", -1.0)
+    malformed_position = PortfolioPosition(
+        account=malformed_position.account,
+        symbol=malformed_position.symbol,
+        sec_type="opt",
+        expiry=malformed_position.expiry,
+        strike=malformed_position.strike,
+        right=malformed_position.right,
+        multiplier=malformed_position.multiplier,
+        position=malformed_position.position,
+        avg_cost=malformed_position.avg_cost,
+        market_price=None,
+        market_value=None,
+        unrealized_pnl=None,
+        realized_pnl=None,
+        con_id=malformed_position.con_id,
+    )
+    with pytest.raises(NonAtomicCloseError):
+        find_naked_short_legs(_entry_legs(), [malformed_position])

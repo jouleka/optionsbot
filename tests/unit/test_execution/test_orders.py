@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import Engine, insert, select
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.execution.orders import (
     LEGAL_TRANSITIONS,
@@ -18,6 +19,7 @@ from optionsbot.execution.orders import (
     open_orders,
     record_fill,
     set_fill_commission,
+    set_order_leg_contracts,
     stage_order,
     transition,
     working_orders,
@@ -111,6 +113,22 @@ def test_stage_order_quantity_override(tmp_db: Engine) -> None:
     score_id = _insert_score(tmp_db, suggested_quantity=5)
     record = stage_order(tmp_db, score_id, quantity=1, now=NOW)
     assert record.quantity == 1
+
+
+def test_set_order_leg_contracts_persists_exact_qualification(tmp_db: Engine) -> None:
+    score_id = _insert_score(tmp_db)
+    record = stage_order(tmp_db, score_id, now=NOW)
+
+    enriched = set_order_leg_contracts(
+        tmp_db,
+        record.id,
+        ((1580, 100, "USD"), (1575, 100, "USD"),
+         (1620, 100, "USD"), (1625, 100, "USD")),
+    )
+
+    assert [leg["con_id"] for leg in enriched.legs] == [1580, 1575, 1620, 1625]
+    assert all(leg["multiplier"] == 100 for leg in enriched.legs)
+    assert all(leg["currency"] == "USD" for leg in enriched.legs)
 
 
 def test_stage_order_rejects_nonpositive_quantity(tmp_db: Engine) -> None:
@@ -353,6 +371,12 @@ def test_open_and_working_order_queries(tmp_db: Engine) -> None:
         by_status["submitted"], by_status["partial"],
     }
     assert working_ids == {by_status["submitted"], by_status["partial"]}
+
+
+def test_broker_order_id_has_one_ledger_owner(tmp_db: Engine) -> None:
+    _insert_order(tmp_db, "submitted", ib_order_id=77)
+    with pytest.raises(IntegrityError):
+        _insert_order(tmp_db, "submitted", ib_order_id=77)
 
 
 def test_get_order_unknown_returns_none(tmp_db: Engine) -> None:

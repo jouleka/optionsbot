@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from ib_async import Ticker
 
 from optionsbot.config import Settings
 from optionsbot.ibkr.client import IBKRClient
@@ -44,6 +45,118 @@ def md(mock_ib: MagicMock) -> MarketDataClient:
     return MarketDataClient(client)
 
 
+async def test_ticker_live_default_without_callback_is_unknown(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    ticker = Ticker()
+    ticker.bid = 400.0
+    ticker.ask = 400.2
+    ticker.last = 400.1
+    ticker.time = datetime(2026, 5, 26, 14, 30)
+    mock_ib.reqTickersAsync.return_value = [ticker]
+
+    quote = await md.get_stock_snapshot("SPY")
+
+    assert quote.delayed is True
+
+
+async def test_explicit_live_callback_marks_returned_ticker_live(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    ticker = _ticker(market_data_type=1)
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    mock_ib.wrapper.reqId2Ticker = {41: ticker}
+
+    async def _snapshot_with_callback(*contracts: object) -> list[MagicMock]:
+        mock_ib.wrapper.marketDataType(41, 1)
+        return [ticker]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshot_with_callback
+
+    quote = await md.get_stock_snapshot("SPY")
+
+    assert quote.delayed is False
+
+
+async def test_discarded_snapshot_callback_cannot_prove_later_request_live(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    import math
+
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    discarded = _ticker(bid=math.nan, ask=math.nan, last=math.nan)
+    streamed = _ticker(bid=400.0, ask=400.2, last=400.1)
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    mock_ib.wrapper.reqId2Ticker = {46: discarded}
+    calls = 0
+
+    async def _snapshots(*contracts: object) -> list[MagicMock]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            mock_ib.wrapper.marketDataType(46, 1)
+        return [discarded]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshots
+    mock_ib.reqMktData.return_value = streamed
+    mock_ib.cancelMktData = MagicMock()
+
+    first = await md.get_stock_snapshot("SPY")
+    assert first.delayed is True  # streaming ticker received no callback
+
+    discarded.bid = 400.0
+    discarded.ask = 400.2
+    discarded.last = 400.1
+    second = await md.get_stock_snapshot("SPY")
+
+    assert second.delayed is True  # prior callback is stale, not request provenance
+
+
+def test_callback_at_request_boundary_cannot_prove_current_delivery(
+    md: MarketDataClient,
+) -> None:
+    ticker = _ticker(market_data_type=1)
+    md._delivered_market_data_types[id(ticker)] = (7, 1)
+
+    observed = md._take_observed_market_data_type(ticker, after_sequence=7)
+
+    assert observed is None
+
+
+@pytest.mark.parametrize("callback_value", [True, 1.0, "1", 2, None])
+async def test_only_exact_integer_live_callback_proves_live_delivery(
+    md: MarketDataClient, mock_ib: MagicMock, callback_value: object
+) -> None:
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    ticker = _ticker(market_data_type=1)
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    mock_ib.wrapper.reqId2Ticker = {42: ticker}
+
+    async def _snapshot_with_callback(*contracts: object) -> list[MagicMock]:
+        mock_ib.wrapper.marketDataType(42, callback_value)
+        return [ticker]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshot_with_callback
+
+    quote = await md.get_stock_snapshot("SPY")
+
+    assert quote.delayed is True
+
+
+def test_market_data_callback_observer_is_installed_once(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    first_observer = mock_ib.wrapper.marketDataType
+
+    second = MarketDataClient(md.client)
+
+    assert second is not md
+    assert mock_ib.wrapper.marketDataType is first_observer
+
+
 async def test_get_snapshot_stock(md: MarketDataClient, mock_ib: MagicMock) -> None:
     stock_contract = MagicMock(symbol="SPY", secType="STK")
     mock_ib.qualifyContractsAsync.return_value = [stock_contract]
@@ -55,6 +168,26 @@ async def test_get_snapshot_stock(md: MarketDataClient, mock_ib: MagicMock) -> N
     assert quote.ask == 400.2
     assert quote.mid == pytest.approx(400.1)
     assert quote.delayed is True  # paper mode default
+
+
+async def test_option_snapshot_preserves_missing_timestamp_as_unknown(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    opt_contract = MagicMock(
+        symbol="SPY",
+        secType="OPT",
+        lastTradeDateOrContractMonth="20260619",
+        strike=400.0,
+        right="C",
+    )
+    ticker = _ticker(bid=5.0, ask=5.1)
+    ticker.time = None
+    mock_ib.qualifyContractsAsync.return_value = [opt_contract]
+    mock_ib.reqTickersAsync.return_value = [ticker]
+
+    quote = await md.get_option_snapshot("SPY", "20260619", 400.0, "C")
+
+    assert quote.ts is None
 
 
 async def test_get_snapshot_option_extracts_greeks(
@@ -163,7 +296,14 @@ async def test_get_snapshot_records_live_when_not_paper(mock_ib: MagicMock) -> N
     client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
     md = MarketDataClient(client)
     mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
-    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=1)]
+    ticker = _ticker(market_data_type=1)
+    mock_ib.wrapper.reqId2Ticker = {43: ticker}
+
+    async def _snapshot_with_callback(*contracts: object) -> list[MagicMock]:
+        mock_ib.wrapper.marketDataType(43, 1)
+        return [ticker]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshot_with_callback
     quote = await md.get_stock_snapshot("SPY")
     assert quote.delayed is False
 
@@ -178,7 +318,14 @@ async def test_actual_delayed_feed_overrides_live_configuration(
     client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
     md = MarketDataClient(client)
     mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
-    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=3)]
+    ticker = _ticker(market_data_type=3)
+    mock_ib.wrapper.reqId2Ticker = {44: ticker}
+
+    async def _snapshot_with_callback(*contracts: object) -> list[MagicMock]:
+        mock_ib.wrapper.marketDataType(44, 3)
+        return [ticker]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshot_with_callback
 
     quote = await md.get_stock_snapshot("SPY")
 
@@ -195,7 +342,14 @@ async def test_actual_live_feed_overrides_delayed_configuration(
     client = IBKRClient(role="cli", settings=s, ib=mock_ib, backoff_seconds=())
     md = MarketDataClient(client)
     mock_ib.qualifyContractsAsync.return_value = [MagicMock(symbol="SPY", secType="STK")]
-    mock_ib.reqTickersAsync.return_value = [_ticker(market_data_type=1)]
+    ticker = _ticker(market_data_type=1)
+    mock_ib.wrapper.reqId2Ticker = {45: ticker}
+
+    async def _snapshot_with_callback(*contracts: object) -> list[MagicMock]:
+        mock_ib.wrapper.marketDataType(45, 1)
+        return [ticker]
+
+    mock_ib.reqTickersAsync.side_effect = _snapshot_with_callback
 
     quote = await md.get_stock_snapshot("SPY")
 

@@ -1,5 +1,6 @@
 """Tests for the Settings class."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -385,7 +386,23 @@ def test_execution_rejects_single_trade_above_ceiling() -> None:
     from optionsbot.config import ExecutionSettings
 
     with pytest.raises(ValidationError):
-        ExecutionSettings(max_single_trade_risk_pct=1.0)
+        ExecutionSettings(max_single_trade_risk_pct=math.nextafter(0.10, math.inf))
+
+
+def test_execution_rejects_operational_risk_caps_above_hard_ceilings() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    unsafe = (
+        {"max_daily_loss_pct": 0.0500001},
+        {"max_open_positions": 11},
+        {"max_per_symbol": 4},
+        {"max_consecutive_losses": 11},
+    )
+    for override in unsafe:
+        with pytest.raises(ValidationError):
+            ExecutionSettings(**override)  # type: ignore[arg-type]
 
 
 def test_execution_rejects_bp_usage_above_ceiling() -> None:
@@ -397,6 +414,59 @@ def test_execution_rejects_bp_usage_above_ceiling() -> None:
         ExecutionSettings(max_bp_usage_pct=0.95)
 
 
+def test_execution_rejects_freshness_values_above_hard_ceilings() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    unsafe = (
+        {"max_pick_age_minutes": 61},
+        {"entry_quote_max_age_seconds": 121},
+        {"exit_quote_max_age_seconds": 121},
+    )
+    for override in unsafe:
+        with pytest.raises(ValidationError):
+            ExecutionSettings(**override)  # type: ignore[arg-type]
+
+
+def test_execution_rejects_disabled_exit_quote_freshness() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    with pytest.raises(ValidationError):
+        ExecutionSettings(exit_quote_max_age_seconds=0)
+
+
+def test_freshness_bounds_apply_to_toml(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[execution]\nexit_quote_max_age_seconds = 0\n")
+
+    with pytest.raises(ValidationError):
+        load_settings(config_file=cfg)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("OPTIONSBOT_EXECUTION__MAX_PICK_AGE_MINUTES", "61"),
+        ("OPTIONSBOT_EXECUTION__ENTRY_QUOTE_MAX_AGE_SECONDS", "121"),
+        ("OPTIONSBOT_EXECUTION__EXIT_QUOTE_MAX_AGE_SECONDS", "121"),
+    ],
+)
+def test_freshness_bounds_apply_to_env(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    from pydantic import ValidationError
+
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_execution_accepts_values_at_the_ceiling() -> None:
     # The ceilings themselves are valid (<=, not <). Portfolio heat may use
     # up to half of live USD net liquidation, but no single trade gets that cap.
@@ -405,13 +475,19 @@ def test_execution_accepts_values_at_the_ceiling() -> None:
     e = ExecutionSettings(
         base_risk_pct=0.05,
         max_portfolio_heat_pct=0.50,
-        max_single_trade_risk_pct=0.15,
+        max_single_trade_risk_pct=0.10,
         max_bp_usage_pct=0.50,
+        max_pick_age_minutes=60,
+        entry_quote_max_age_seconds=120,
+        exit_quote_max_age_seconds=120,
     )
     assert e.base_risk_pct == 0.05
     assert e.max_portfolio_heat_pct == 0.50
-    assert e.max_single_trade_risk_pct == 0.15
+    assert e.max_single_trade_risk_pct == 0.10
     assert e.max_bp_usage_pct == 0.50
+    assert e.max_pick_age_minutes == 60
+    assert e.entry_quote_max_age_seconds == 120
+    assert e.exit_quote_max_age_seconds == 120
 
 
 def test_execution_rejects_portfolio_heat_above_half_account() -> None:

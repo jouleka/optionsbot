@@ -14,7 +14,9 @@ types; same import-graph reasoning as tracker.py/engine.py/walk.py).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,12 +28,12 @@ from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
     get_order,
-    open_position_legs,
+    open_position_exposure,
     record_fill,
     set_fill_commission,
     transition,
 )
-from optionsbot.execution.state import trip_kill
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
 from optionsbot.execution.walk import resume_walks
 from optionsbot.storage.schema import fills, orders
@@ -52,6 +54,9 @@ _STALE_STAGED_AFTER = timedelta(minutes=30)
 # and left for the next pass — resolving it as failed would strand a REAL
 # order at the broker under a terminal ledger row (Opus C1).
 _INFLIGHT_GRACE = timedelta(seconds=60)
+_KNOWN_BROKER_SECURITY_TYPES = frozenset(
+    {"OPT", "STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND", "BAG"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,21 +78,124 @@ async def _send(notify: Notify | None, text: str) -> None:
         log.exception("reconcile notification failed")
 
 
+def _persisted_order_semantics_valid(record: Any) -> bool:
+    if type(record.quantity) is not int or record.quantity <= 0:
+        return False
+    legs = record.legs
+    if not isinstance(legs, list) or not legs:
+        return False
+    seen_con_ids: set[int] = set()
+    option_count = 0
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return False
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
+            if leg.get("symbol") != record.symbol:
+                return False
+            continue
+        if sec_type != "OPT":
+            return False
+        option_count += 1
+        con_id = leg.get("con_id")
+        strike = leg.get("strike")
+        ratio = leg.get("quantity")
+        if (
+            leg.get("symbol") != record.symbol
+            or leg.get("side") not in {"buy", "sell"}
+            or not isinstance(leg.get("expiry"), str)
+            or len(leg["expiry"]) != 8
+            or not leg["expiry"].isdigit()
+            or not isinstance(strike, (int, float))
+            or isinstance(strike, bool)
+            or not math.isfinite(float(strike))
+            or strike <= 0
+            or leg.get("right") not in {"C", "P"}
+            or type(ratio) is not int
+            or ratio <= 0
+            or type(con_id) is not int
+            or con_id <= 0
+            or con_id in seen_con_ids
+            or leg.get("multiplier") != 100
+            or leg.get("currency") != "USD"
+        ):
+            return False
+        seen_con_ids.add(con_id)
+    return option_count > 0
+
+
 def _fills_complete(
     engine: Engine, order_id: int, quantity: int, legs: list[dict[str, Any]]
 ) -> bool:
-    n_option_legs = sum(1 for leg in legs if leg.get("sec_type", "OPT") == "OPT")
-    if n_option_legs == 0:
+    """Prove exact per-contract, side, and ratio completion for every option leg."""
+    if type(quantity) is not int or quantity <= 0:
         return False
+    expected: dict[tuple[int, str], int] = {}
+    seen_contracts: set[int] = set()
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return False
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
+            continue
+        if sec_type != "OPT":
+            return False
+        try:
+            raw_con_id = leg["con_id"]
+            raw_ratio = leg.get("quantity", 1)
+            con_id = int(raw_con_id)
+            ratio = int(raw_ratio)
+            side = str(leg["side"]).upper()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (
+            isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or con_id in seen_contracts
+            or isinstance(raw_ratio, bool)
+            or ratio <= 0
+            or ratio != raw_ratio
+            or side not in {"BUY", "SELL"}
+        ):
+            return False
+        seen_contracts.add(con_id)
+        expected[(con_id, side)] = ratio * quantity
+    if not expected:
+        return False
+
     with engine.connect() as conn:
-        total = conn.execute(
-            select(fills.c.qty).where(fills.c.order_id == order_id)
+        rows = conn.execute(
+            select(fills.c.leg_con_id, fills.c.side, fills.c.qty).where(
+                fills.c.order_id == order_id
+            )
         ).fetchall()
-    filled_qty = sum(int(r.qty) for r in total)
-    return filled_qty >= quantity * n_option_legs
+    actual: dict[tuple[int, str], int] = {}
+    for row in rows:
+        try:
+            raw_con_id = row.leg_con_id
+            raw_qty = row.qty
+            con_id = int(raw_con_id)
+            fill_qty = int(raw_qty)
+            side = str(row.side).upper()
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or isinstance(raw_qty, bool)
+            or fill_qty <= 0
+            or fill_qty != raw_qty
+            or side not in {"BUY", "SELL"}
+        ):
+            return False
+        key = (con_id, side)
+        actual[key] = actual.get(key, 0) + fill_qty
+    return actual == expected
 
 
-async def reconcile(
+async def _reconcile_once(
     engine: Engine,
     order_client: OrderClient,
     *,
@@ -104,12 +212,38 @@ async def reconcile(
     adopted = foreign = replayed = resolved = mismatches = 0
     try:
         broker_orders = await order_client.adopt_open_orders()
-    except Exception:  # noqa: BLE001 -- a dead gateway must not kill the caller
+    except Exception as exc:  # noqa: BLE001 -- unavailable broker state fails closed
         log.exception("reconcile: adopt_open_orders failed")
-        return ReconcileSummary(0, 0, 0, 0, 0)
+        reason = f"reconcile open-order snapshot unavailable: {exc}"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(0, 0, 0, 0, 1)
+    if not isinstance(broker_orders, (list, tuple)):
+        reason = "reconcile open-order snapshot malformed"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(0, 0, 0, 0, 1)
 
     at_broker: dict[int, tuple[int, str]] = {}  # ledger row id -> (ib id, ib status)
-    for ib_order_id, ref, ib_status in broker_orders:
+    broker_id_owner: dict[int, int] = {}  # ib order id -> ledger row id
+    for broker_row in broker_orders:
+        if not isinstance(broker_row, (list, tuple)) or len(broker_row) != 3:
+            reason = "reconcile open-order snapshot contains a malformed row"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            return ReconcileSummary(adopted, foreign, 0, 0, 1)
+        ib_order_id, ref, ib_status = broker_row
+        if (
+            type(ib_order_id) is not int
+            or ib_order_id < 0
+            or (ref is not None and not isinstance(ref, str))
+            or not isinstance(ib_status, str)
+            or not ib_status.strip()
+        ):
+            reason = "reconcile open-order snapshot contains invalid identity fields"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            return ReconcileSummary(adopted, foreign, 0, 0, 1)
         row_id = row_id_from_ref(ref)
         if row_id is None:
             foreign += 1
@@ -120,33 +254,74 @@ async def reconcile(
             )
             continue
         adopted += 1
-        at_broker[row_id] = (ib_order_id, ib_status)
-
-    # Work-stream D1: re-attach any persisted price-walks for orders we just
-    # confirmed are still at the broker. The walk's in-memory asyncio task died
-    # with the previous process; resume_walks rebuilds it (resuming from the
-    # persisted step) so the order isn't orphaned at the decision mid until TTL.
-    if walk_md is not None and walk_tasks is not None:
-        resume = walk_resume if walk_resume is not None else resume_walks
-        try:
-            await resume(
-                engine=engine, settings=settings, order_client=order_client,
-                md=walk_md, walk_tasks=walk_tasks, notify=notify,
+        if row_id in at_broker:
+            mismatches += 1
+            reason = (
+                f"reconcile duplicate broker orders claim ledger order #{row_id}: "
+                f"{at_broker[row_id][0]} and {ib_order_id}"
             )
-        except Exception:  # noqa: BLE001 -- a resume failure must not abort reconcile
-            log.exception("reconcile: walk resume failed")
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        owner = broker_id_owner.get(ib_order_id)
+        if owner is not None and owner != row_id:
+            mismatches += 1
+            reason = (
+                f"reconcile broker order id {ib_order_id} claims multiple ledger rows: "
+                f"#{owner} and #{row_id}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        broker_id_owner[ib_order_id] = row_id
+        at_broker[row_id] = (ib_order_id, ib_status)
 
     # Sync ledger rows that ARE at the broker (e.g. submitting -> submitted).
     for row_id, (ib_order_id, ib_status) in at_broker.items():
         record = get_order(engine, row_id)
         if record is None:
+            mismatches += 1
+            reason = f"reconcile broker order obot-{row_id} has no ledger row"
+            trip_kill(engine, reason, now=ts_now)
             await _send(
                 notify,
-                f"⚠ broker order obot-{row_id} has no ledger row — manual check needed",
+                f"🛑 KILL SWITCH: broker order obot-{row_id} has no ledger row — "
+                "manual reconciliation required",
             )
             continue
+        expected_ref = f"obot-{row_id}"
+        if (
+            record.order_ref != expected_ref
+            or (
+                record.ib_order_id is not None
+                and record.ib_order_id != ib_order_id
+            )
+        ):
+            mismatches += 1
+            reason = (
+                f"reconcile broker identity conflicts with ledger order #{row_id}: "
+                f"ref={record.order_ref!r}, ledger_ib_id={record.ib_order_id}, "
+                f"broker_ib_id={ib_order_id}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        if not _persisted_order_semantics_valid(record):
+            mismatches += 1
+            reason = f"reconcile ledger order #{row_id} has invalid persisted semantics"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
         target = map_ib_status(ib_status, 0, 1)  # working ack mapping
-        if target is None or record.status == target:
+        if target is None:
+            mismatches += 1
+            reason = (
+                f"reconcile broker order obot-{row_id} has unknown status {ib_status!r}"
+            )
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
+        if record.status == target:
             continue
         if record.status == "partial" and target == "submitted":
             # We have no fill counts here; a partially-filled at-broker order
@@ -155,26 +330,113 @@ async def reconcile(
         try:
             transition(engine, row_id, target, ib_order_id=ib_order_id, now=ts_now)
             resolved += 1
-        except IllegalOrderTransition:
+        except IllegalOrderTransition as exc:
             log.warning(
                 "reconcile: cannot move order %s %s -> %s",
                 row_id, record.status, target,
             )
+            mismatches += 1
+            reason = f"reconcile illegal broker/ledger state for order #{row_id}: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+
+    # Re-attach persisted walks only after every broker-owned order has valid,
+    # unambiguous ledger identity and semantic status. Never restart an
+    # order-capable task while reconciliation has found a mismatch or execution
+    # is already halted.
+    if (
+        mismatches == 0
+        and not load_state(engine).killed
+        and walk_md is not None
+        and walk_tasks is not None
+    ):
+        resume = walk_resume if walk_resume is not None else resume_walks
+        try:
+            await resume(
+                engine=engine,
+                settings=settings,
+                order_client=order_client,
+                md=walk_md,
+                walk_tasks=walk_tasks,
+                notify=notify,
+            )
+        except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
+            log.exception("reconcile: walk resume failed")
+            mismatches += 1
+            reason = f"reconcile persisted price-walk resume failed: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
     # Replay today's executions (execId dedupe = idempotent).
     try:
         executions = await order_client.recent_executions()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- unavailable broker state fails closed
         log.exception("reconcile: recent_executions failed")
-        executions = []
+        reason = f"reconcile execution snapshot unavailable: {exc}"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
+    if not isinstance(executions, (list, tuple)):
+        reason = "reconcile execution snapshot malformed"
+        trip_kill(engine, reason, now=ts_now)
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
     for execution in executions:
-        if execution.sec_type == "BAG":
+        try:
+            sec_type = execution.sec_type
+            order_ref = execution.order_ref
+            exec_id = execution.exec_id
+            side = execution.side
+            price = execution.price
+            raw_qty = execution.qty
+            execution_ts = execution.ts
+            raw_con_id = execution.con_id
+            commission = execution.commission
+        except AttributeError:
+            reason = "reconcile execution snapshot contains a malformed row"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
+        if (
+            not isinstance(sec_type, str)
+            or sec_type not in {"OPT", "BAG"}
+            or not isinstance(order_ref, str)
+            or not isinstance(exec_id, str)
+            or not exec_id.strip()
+            or side not in {"BUY", "SELL"}
+            or not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not math.isfinite(float(price))
+            or type(raw_qty) is not int
+            or raw_qty <= 0
+            or not isinstance(execution_ts, datetime)
+            or type(raw_con_id) is not int
+            or raw_con_id < (0 if sec_type == "BAG" else 1)
+            or (
+                commission is not None
+                and (
+                    not isinstance(commission, (int, float))
+                    or isinstance(commission, bool)
+                    or not math.isfinite(float(commission))
+                    or commission < 0
+                )
+            )
+        ):
+            reason = "reconcile execution snapshot contains invalid evidence"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            return ReconcileSummary(adopted, foreign, replayed, resolved, mismatches + 1)
+        if sec_type == "BAG":
             continue
-        row_id = row_id_from_ref(execution.order_ref)
+        row_id = row_id_from_ref(order_ref)
         if row_id is None:
             continue
         record = get_order(engine, row_id)
         if record is None:
+            mismatches += 1
+            reason = f"reconcile execution {exec_id!r} references missing order #{row_id}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
         was_new = record_fill(
             engine, row_id, exec_id=execution.exec_id, side=execution.side,
@@ -269,33 +531,112 @@ async def reconcile(
     if positions_snapshot is not None:
         try:
             broker_positions = await positions_snapshot()
-        except Exception:  # noqa: BLE001 -- a dead positions read must not abort reconcile
+        except Exception as exc:  # noqa: BLE001 -- unavailable state fails closed
             log.exception("reconcile: positions snapshot failed")
-            broker_positions = []
-        ledger_legs = open_position_legs(engine)
-        for pos in broker_positions:
-            if pos.sec_type != "OPT" or pos.position == 0:
-                continue
-            if pos.expiry is None or pos.strike is None or pos.right is None:
-                continue
-            key = (pos.symbol, pos.expiry, float(pos.strike), pos.right)
-            if key in ledger_legs:
-                continue
-            orphan_positions += 1
-            trip_kill(
-                engine,
-                f"reconcile orphan position: broker holds {pos.position:+g} "
-                f"{pos.symbol} {pos.expiry} {pos.strike:g}{pos.right} with no "
-                "open ledger row",
+            reason = f"reconcile position snapshot unavailable: {exc}"
+            trip_kill(engine, reason)
+            mismatches += 1
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        else:
+            ledger_exposure = open_position_exposure(engine)
+            broker_map: dict[
+                int, tuple[tuple[str, str, float, str], int]
+            ] = {}
+            broker_valid = isinstance(broker_positions, (list, tuple))
+            for pos in broker_positions if broker_valid else ():
+                try:
+                    sec_type = pos.sec_type
+                    raw_position = pos.position
+                    raw_con_id = pos.con_id
+                    expiry = pos.expiry
+                    raw_strike = pos.strike
+                    right = pos.right
+                    symbol = pos.symbol
+                except AttributeError:
+                    broker_valid = False
+                    break
+                if (
+                    not isinstance(sec_type, str)
+                    or sec_type not in _KNOWN_BROKER_SECURITY_TYPES
+                ):
+                    broker_valid = False
+                    break
+                if sec_type != "OPT":
+                    continue
+                if (
+                    not isinstance(raw_position, (int, float))
+                    or isinstance(raw_position, bool)
+                    or not math.isfinite(float(raw_position))
+                    or not float(raw_position).is_integer()
+                ):
+                    broker_valid = False
+                    break
+                if raw_position == 0:
+                    continue
+                if (
+                    type(raw_con_id) is not int
+                    or raw_con_id <= 0
+                    or not isinstance(expiry, str)
+                    or not expiry
+                    or not isinstance(raw_strike, (int, float))
+                    or isinstance(raw_strike, bool)
+                    or not math.isfinite(float(raw_strike))
+                    or raw_strike <= 0
+                    or right not in {"C", "P"}
+                    or not isinstance(symbol, str)
+                    or not symbol
+                ):
+                    broker_valid = False
+                    break
+                con_id = raw_con_id
+                quantity = int(raw_position)
+                spec = (symbol, expiry, float(raw_strike), right)
+                prior = broker_map.get(con_id)
+                if prior is not None and prior[0] != spec:
+                    broker_valid = False
+                    break
+                broker_map[con_id] = (
+                    spec,
+                    (prior[1] if prior else 0) + quantity,
+                )
+            broker_exposure = (
+                {
+                    con_id: value
+                    for con_id, value in broker_map.items()
+                    if value[1] != 0
+                }
+                if broker_valid
+                else None
             )
-            await _send(
-                notify,
-                f"🛑 KILL SWITCH: broker holds an unmanaged position "
-                f"{pos.position:+g} {pos.symbol} {pos.expiry} {pos.strike:g}"
-                f"{pos.right} that the ledger has no open order for — the exit "
-                "engine will NOT manage it. /positions to inspect; flatten or "
-                "adopt manually, then /arm.",
-            )
+
+            if ledger_exposure is None or broker_exposure is None:
+                reason = (
+                    "reconcile position attribution incomplete; exact broker/ledger "
+                    "agreement cannot be proven"
+                )
+                trip_kill(engine, reason)
+                mismatches += 1
+                await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            elif ledger_exposure != broker_exposure:
+                differing = set(ledger_exposure) | set(broker_exposure)
+                differing = {
+                    con_id
+                    for con_id in differing
+                    if ledger_exposure.get(con_id) != broker_exposure.get(con_id)
+                }
+                orphan_positions = len(differing)
+                mismatches += 1
+                reason = (
+                    "reconcile exact position mismatch for contract IDs "
+                    f"{sorted(differing)}; broker={broker_exposure!r}, "
+                    f"ledger={ledger_exposure!r}"
+                )
+                trip_kill(engine, reason)
+                await _send(
+                    notify,
+                    "🛑 KILL SWITCH: exact broker/ledger option exposure mismatch — "
+                    "inspect /positions and ledger, reconcile manually, then /arm.",
+                )
 
     if adopted or foreign or replayed or resolved or mismatches or orphan_positions:
         log.info(
@@ -307,3 +648,41 @@ async def reconcile(
         adopted=adopted, foreign=foreign, fills_replayed=replayed,
         resolved=resolved, mismatches=mismatches, orphan_positions=orphan_positions,
     )
+
+
+async def reconcile(
+    engine: Engine,
+    order_client: OrderClient,
+    *,
+    notify: Notify | None = None,
+    now: datetime | None = None,
+    walk_md: Any = None,
+    walk_tasks: Any = None,
+    walk_resume: Callable[..., Awaitable[int]] | None = None,
+    settings: Any = None,
+    positions_snapshot: Callable[[], Awaitable[list[PortfolioPosition]]] | None = None,
+) -> ReconcileSummary:
+    """Run reconciliation and convert every unexpected defect into a halt."""
+    try:
+        return await _reconcile_once(
+            engine,
+            order_client,
+            notify=notify,
+            now=now,
+            walk_md=walk_md,
+            walk_tasks=walk_tasks,
+            walk_resume=walk_resume,
+            settings=settings,
+            positions_snapshot=positions_snapshot,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- public boundary must fail closed
+        log.exception("reconcile: unexpected processing failure")
+        reason = f"reconcile processing unavailable: {exc}"
+        try:
+            trip_kill(engine, reason, now=now)
+        except Exception:  # noqa: BLE001 -- still alert and report mismatch
+            log.exception("reconcile: failed to persist kill switch")
+        await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        return ReconcileSummary(0, 0, 0, 0, 1)

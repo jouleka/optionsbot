@@ -10,7 +10,7 @@ import pytest
 from optionsbot.config import Settings
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
-from optionsbot.ibkr.orders import OrderClient
+from optionsbot.ibkr.orders import OrderClient, _validated_open_trade
 from optionsbot.ibkr.types import (
     CommissionUpdate,
     ExecutionFill,
@@ -54,6 +54,8 @@ def order_ib(mock_ib: MagicMock) -> MagicMock:
         for c in contracts:
             key = (c.lastTradeDateOrContractMonth, c.strike, c.right)
             c.conId = CONID_BY_SPEC.get(key, 0)
+            c.multiplier = "100"
+            c.currency = "USD"
             out.append(c if c.conId else None)
         return out
 
@@ -121,6 +123,12 @@ async def test_place_condor_builds_guaranteed_smart_bag(
     assert order.orderRef == "obot-7"
     assert order.tif == "DAY"
     assert placed.ib_order_id == order.orderId
+    assert placed.leg_contracts == (
+        (1580, 100, "USD"),
+        (1575, 100, "USD"),
+        (1620, 100, "USD"),
+        (1625, 100, "USD"),
+    )
 
 
 async def test_stk_legs_are_filtered_out(
@@ -320,6 +328,21 @@ async def test_whatif_handles_unparseable_margins(
     assert preview.warning == "check this"
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+async def test_whatif_rejects_non_finite_margins(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    value: float,
+) -> None:
+    from ib_async import OrderState
+
+    order_ib.whatIfOrderAsync.return_value = OrderState(initMarginChange=value)
+    preview = await order_client.whatif_combo(
+        "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.55,
+    )
+    assert preview.init_margin_change is None
+
+
 async def test_whatif_tolerates_list_result(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:
@@ -401,6 +424,153 @@ def test_fill_event_translates_and_normalizes_side(
     assert record.ts.tzinfo is not None
 
 
+def test_execution_adapter_rejects_mismatched_commission_identity(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="exec-1",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=CommissionReport(execId="other-exec", commission=0.66),
+        time=execution.time,
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("shares", "con_id"),
+    [(1.5, 1580), (1.0, 1580.5)],
+)
+def test_execution_adapter_rejects_fractional_quantity_or_contract_identity(
+    order_client: OrderClient,
+    shares: float,
+    con_id: float,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="bad-execution",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=shares,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=con_id),  # type: ignore[arg-type]
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [("shares", "1"), ("price", "0.40"), ("orderRef", False)],
+)
+def test_execution_adapter_rejects_wrong_type_provider_values(
+    order_client: OrderClient,
+    field: str,
+    malformed_value: object,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="typed-execution",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    setattr(execution, field, malformed_value)
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,
+    )
+
+    with pytest.raises(ValueError):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
+def test_open_order_adapter_rejects_false_reference() -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=7, orderRef=False),  # type: ignore[arg-type]
+        orderStatus=OrderStatus(orderId=7, status="Submitted"),
+    )
+    with pytest.raises(ValueError):
+        _validated_open_trade(trade)
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [
+        ("conId", 1580.5),
+        ("multiplier", ""),
+        ("multiplier", "50"),
+        ("currency", ""),
+        ("currency", "EUR"),
+    ],
+)
+async def test_placement_rejects_malformed_qualified_contract_before_broker_call(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    field: str,
+    malformed_value: object,
+) -> None:
+    from ib_async import Option
+
+    leg = CONDOR_LEGS[0]
+    spec = (leg["expiry"], leg["strike"], leg["right"])
+    malformed = Option("SPY", leg["expiry"], leg["strike"], leg["right"], "SMART")
+    malformed.conId = 1580
+    malformed.multiplier = "100"
+    malformed.currency = "USD"
+    setattr(malformed, field, malformed_value)
+    order_client._resolver.qualify_options = AsyncMock(  # noqa: SLF001
+        return_value={spec: malformed}
+    )
+
+    with pytest.raises(ValueError):
+        await order_client.place_combo_limit(
+            "SPY",
+            [leg],
+            quantity=1,
+            limit_price=1.0,
+            order_ref="obot-7",
+        )
+
+    order_ib.placeOrder.assert_not_called()
+
+
 def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
     # Order.permId defaults to 0 but the dataclass accepts None; a None must
     # not blow up the handler (the status update would be silently dropped).
@@ -421,11 +591,38 @@ def test_status_event_tolerates_none_perm_id(order_client: OrderClient) -> None:
 async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:
-    from ib_async import Contract, Order, OrderStatus, Trade
+    from ib_async import ComboLeg, Contract, Order, OrderStatus, Trade
 
     ours = Trade(
-        contract=Contract(secType="BAG", symbol="SPY"),
-        order=Order(orderId=44, permId=99, orderRef="obot-12"),
+        contract=Contract(
+            secType="BAG",
+            symbol="SPY",
+            currency="USD",
+            comboLegs=[
+                ComboLeg(
+                    conId=1580,
+                    ratio=1,
+                    action="SELL",
+                    exchange="SMART",
+                ),
+                ComboLeg(
+                    conId=1575,
+                    ratio=1,
+                    action="BUY",
+                    exchange="SMART",
+                ),
+            ],
+        ),
+        order=Order(
+            orderId=44,
+            permId=99,
+            orderRef="obot-12",
+            action="BUY",
+            totalQuantity=1,
+            orderType="LMT",
+            lmtPrice=-1.0,
+            tif="DAY",
+        ),
         orderStatus=OrderStatus(orderId=44, status="Submitted"),
     )
     manual = Trade(
@@ -442,7 +639,7 @@ async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
     await order_client.modify_price(44, new_limit_price=-1.10)
     order_ib.placeOrder.assert_called_once()
     # ...but a manual TWS order (orderId 0) must never be modifiable.
-    with pytest.raises(ValueError, match="unknown"):
+    with pytest.raises(ValueError, match="unknown|identity"):
         await order_client.modify_price(0, new_limit_price=-1.0)
 
 

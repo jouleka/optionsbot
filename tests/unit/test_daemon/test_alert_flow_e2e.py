@@ -13,7 +13,13 @@ from optionsbot.daemon.scan_runner import run_scan_tick
 from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.scoring.types import FactorBreakdown
-from optionsbot.storage.schema import alerts, scan_runs, snapshots, watchlist
+from optionsbot.storage.schema import (
+    alerts,
+    scan_runs,
+    snapshots,
+    strategy_scores,
+    watchlist,
+)
 
 
 def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
@@ -95,6 +101,33 @@ def _seed_snapshot(daemon_context: DaemonContext, *, symbol: str = "SPY") -> int
         return int(result.inserted_primary_key[0])
 
 
+def _seed_score(
+    daemon_context: DaemonContext,
+    snapshot_id: int,
+    scored: ScoredStrategy,
+) -> int:
+    with daemon_context.engine.begin() as conn:
+        result = conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=snapshot_id,
+                strategy=scored.strategy_name,
+                score=scored.score,
+                rationale=scored.rationale,
+                legs_json=[],
+                suggestion_json={
+                    "defined_risk": True,
+                    "credit_or_debit": 1.25,
+                    "max_loss": 3.75,
+                    "max_profit": 1.25,
+                    "prob_profit": 0.68,
+                    "expected_value": 50.0,
+                    "suggested_quantity": 5,
+                },
+            )
+        )
+        return int(result.inserted_primary_key[0])
+
+
 def _add_watchlist(daemon_context: DaemonContext, symbol: str = "SPY") -> None:
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(watchlist).values(symbol=symbol, added_at=datetime.now(UTC)))
@@ -150,8 +183,10 @@ async def test_full_tick_dispatches_alert_end_to_end(
     Only telegram is faked (mock_telegram fixture returns msg_id 12345)."""
     daemon_context.settings.scan.score_threshold = 70
     snap_id = _seed_snapshot(daemon_context)
+    scored = _scored("iron_condor", 85.0)
+    _seed_score(daemon_context, snap_id, scored)
     _add_watchlist(daemon_context)
-    result = _scan_result(scored=(_scored("iron_condor", 85.0),), snapshot_id=snap_id)
+    result = _scan_result(scored=(scored,), snapshot_id=snap_id)
 
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)
@@ -192,8 +227,10 @@ async def test_full_tick_dedup_suppresses_duplicate_second_tick(
     > rescore delta). No duplicate send, no duplicate alerts row."""
     daemon_context.settings.scan.score_threshold = 70
     snap_id = _seed_snapshot(daemon_context)
+    scored = _scored("iron_condor", 85.0)
+    _seed_score(daemon_context, snap_id, scored)
     _add_watchlist(daemon_context)
-    result = _scan_result(scored=(_scored("iron_condor", 85.0),), snapshot_id=snap_id)
+    result = _scan_result(scored=(scored,), snapshot_id=snap_id)
 
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), patch(
         "optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(return_value=result)

@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     IllegalOrderTransition,
@@ -27,6 +29,7 @@ from optionsbot.execution.orders import (
 )
 from optionsbot.execution.state import trip_kill
 from optionsbot.ibkr.types import CommissionUpdate, ExecutionFill, OrderStatusUpdate
+from optionsbot.storage.schema import orders
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
@@ -84,8 +87,46 @@ class OrderTracker:
         row_id = row_id_from_ref(update.order_ref)
         if row_id is None:
             return  # not one of ours (manual trade or foreign client)
+        record = get_order(self._engine, row_id)
+        if record is None:
+            trip_kill(
+                self._engine,
+                f"live broker status for bot order #{row_id} missing from ledger",
+            )
+            log.error("KILL: live status for unknown ledger order #%s", row_id)
+            return
+        with self._engine.connect() as conn:
+            existing_owner = conn.execute(
+                select(orders.c.id).where(
+                    orders.c.ib_order_id == update.ib_order_id,
+                    orders.c.id != row_id,
+                )
+            ).first()
+        if existing_owner is not None:
+            trip_kill(
+                self._engine,
+                f"live broker order {update.ib_order_id} already belongs to "
+                f"ledger order #{existing_owner.id}, cannot bind to #{row_id}",
+            )
+            log.error("KILL: duplicate live broker order identity %s", update.ib_order_id)
+            return
+        if record.ib_order_id is not None and record.ib_order_id != update.ib_order_id:
+            trip_kill(
+                self._engine,
+                f"live broker order identity mismatch for #{row_id}: "
+                f"ledger={record.ib_order_id}, broker={update.ib_order_id}",
+            )
+            log.error("KILL: live broker identity mismatch for order #%s", row_id)
+            return
+        if update.status in _IGNORED_STATUSES:
+            return
         target = map_ib_status(update.status, update.filled, update.remaining)
         if target is None:
+            trip_kill(
+                self._engine,
+                f"live broker status unknown for order #{row_id}: {update.status!r}",
+            )
+            log.error("KILL: unknown live broker status for order #%s", row_id)
             return
         error = "deactivated/rejected by IBKR (Inactive)" if target == "rejected" else None
         try:
@@ -104,16 +145,35 @@ class OrderTracker:
             log.debug(
                 "ignored status re-delivery for order %s: %s", row_id, update.status
             )
-        except ValueError:
-            log.warning("orderStatus for unknown ledger row %s — ignored", row_id)
+        except ValueError as exc:
+            trip_kill(
+                self._engine,
+                f"live broker status could not be persisted for order #{row_id}: {exc}",
+            )
+            log.error("KILL: orderStatus persistence failed for order %s", row_id)
 
     def handle_fill(self, fill: ExecutionFill) -> None:
+        row_id = row_id_from_ref(fill.order_ref)
+        if row_id is None:
+            return
+        if fill.sec_type not in {"OPT", "BAG"}:
+            trip_kill(
+                self._engine,
+                f"live execution {fill.exec_id!r} has unknown security type "
+                f"{fill.sec_type!r} for order #{row_id}",
+            )
+            return
+        record = get_order(self._engine, row_id)
+        if record is None:
+            trip_kill(
+                self._engine,
+                f"live execution {fill.exec_id!r} references missing order #{row_id}",
+            )
+            log.error("KILL: live fill for unknown ledger order #%s", row_id)
+            return
         if fill.sec_type == "BAG":
             # Per-LEG rows only: a BAG-level summary execution alongside the
             # leg executions would double-count net_premium.
-            return
-        row_id = row_id_from_ref(fill.order_ref)
-        if row_id is None:
             return
         try:
             recorded = record_fill(
@@ -126,8 +186,12 @@ class OrderTracker:
                 ts=fill.ts,
                 leg_con_id=fill.con_id,
             )
-        except ValueError:
-            log.warning("fill with invalid side %r for order %s", fill.side, row_id)
+        except ValueError as exc:
+            trip_kill(
+                self._engine,
+                f"live fill evidence invalid for order #{row_id}: {exc}",
+            )
+            log.error("KILL: invalid live fill for order %s", row_id)
             return
         if not recorded:
             log.debug("duplicate execId %s ignored (replay)", fill.exec_id)
@@ -148,5 +212,16 @@ class OrderTracker:
             )
 
     def handle_commission(self, update: CommissionUpdate) -> None:
-        if not set_fill_commission(self._engine, update.exec_id, update.commission):
+        try:
+            attached = set_fill_commission(
+                self._engine, update.exec_id, update.commission
+            )
+        except ValueError as exc:
+            trip_kill(
+                self._engine,
+                f"live commission evidence conflicts for {update.exec_id!r}: {exc}",
+            )
+            log.error("KILL: conflicting commission for %s", update.exec_id)
+            return
+        if not attached:
             log.debug("commission for unknown execId %s — ignored", update.exec_id)

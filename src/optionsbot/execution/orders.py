@@ -18,13 +18,17 @@ Illegal transitions raise rather than silently corrupting the ledger.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Engine, Row, delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
+from optionsbot.execution.close_safety import NonAtomicCloseError, assert_atomic_close_legs
 from optionsbot.storage.schema import (
+    entry_intent_consumptions,
     fills,
     order_quotes,
     orders,
@@ -84,6 +88,20 @@ _OPTION_MULTIPLIER = 100
 
 class IllegalOrderTransition(RuntimeError):
     """Raised when a status change violates LEGAL_TRANSITIONS."""
+
+
+class RealizedPnLUnavailable(RuntimeError):
+    """Raised when a filled round trip lacks complete, finite accounting."""
+
+
+class CloseAlreadyClaimed(RuntimeError):
+    """Raised when another active close already owns an entry."""
+
+    def __init__(self, entry_id: int, close_id: int | None) -> None:
+        self.entry_id = entry_id
+        self.close_id = close_id
+        winner = f"close order {close_id}" if close_id is not None else "another close order"
+        super().__init__(f"entry {entry_id} is already claimed by {winner}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +208,14 @@ def stage_order(
         ).inserted_primary_key
         assert inserted is not None  # single-row INSERT always returns a PK
         order_id = int(inserted[0])
+        if intent == "open":
+            conn.execute(
+                insert(entry_intent_consumptions).values(
+                    strategy_score_id=row.id,
+                    first_order_id=order_id,
+                    consumed_at=ts,
+                )
+            )
         # Deterministic broker-side tag: stamped into Order.orderRef at submit
         # so reconciliation (IBK-128) can map IBKR orders back to rows.
         conn.execute(
@@ -210,26 +236,34 @@ def stage_close_order(
         {**leg, "side": "buy" if leg.get("side") == "sell" else "sell"}
         for leg in entry.legs
     ]
-    with engine.begin() as conn:
-        inserted = conn.execute(
-            insert(orders).values(
-                strategy_score_id=entry.strategy_score_id,
-                closes_order_id=entry.id,
-                intent="close",
-                symbol=entry.symbol,
-                strategy=entry.strategy,
-                legs_json=flipped,
-                quantity=entry.quantity,
-                status="staged",
-                staged_ts=ts,
-                reprice_count=0,
+    try:
+        with engine.begin() as conn:
+            inserted = conn.execute(
+                insert(orders).values(
+                    strategy_score_id=entry.strategy_score_id,
+                    closes_order_id=entry.id,
+                    intent="close",
+                    symbol=entry.symbol,
+                    strategy=entry.strategy,
+                    legs_json=flipped,
+                    quantity=entry.quantity,
+                    status="staged",
+                    staged_ts=ts,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key
+            assert inserted is not None
+            order_id = int(inserted[0])
+            conn.execute(
+                update(orders)
+                .where(orders.c.id == order_id)
+                .values(order_ref=f"obot-{order_id}")
             )
-        ).inserted_primary_key
-        assert inserted is not None
-        order_id = int(inserted[0])
-        conn.execute(
-            update(orders).where(orders.c.id == order_id).values(order_ref=f"obot-{order_id}")
-        )
+    except IntegrityError as exc:
+        winner = open_close_for(engine, entry.id)
+        if winner is None:
+            raise
+        raise CloseAlreadyClaimed(entry.id, winner.id) from exc
     record = get_order(engine, order_id)
     assert record is not None
     return record
@@ -252,6 +286,60 @@ def get_order(engine: Engine, order_id: int) -> OrderRecord | None:
     with engine.connect() as conn:
         row = conn.execute(select(orders).where(orders.c.id == order_id)).first()
     return None if row is None else _to_record(row)
+
+
+def set_order_leg_contracts(
+    engine: Engine,
+    order_id: int,
+    leg_contracts: tuple[tuple[int, int, str], ...],
+) -> OrderRecord:
+    """Bind exact qualified IBKR contract identities to a staged order."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(orders.c.legs_json).where(orders.c.id == order_id)
+        ).first()
+        if row is None:
+            raise ValueError(f"no order with id {order_id}")
+        legs = list(row.legs_json or [])
+        option_indexes = [
+            index
+            for index, leg in enumerate(legs)
+            if leg.get("sec_type", "OPT") == "OPT"
+        ]
+        if len(option_indexes) != len(leg_contracts) or not option_indexes:
+            raise ValueError("qualified option contract count does not match order legs")
+        seen: set[int] = set()
+        for index, raw_terms in zip(option_indexes, leg_contracts, strict=True):
+            try:
+                raw_con_id, raw_multiplier, raw_currency = raw_terms
+                con_id = int(raw_con_id)
+                multiplier = int(raw_multiplier)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("malformed qualified option contract terms") from exc
+            if (
+                isinstance(raw_con_id, bool)
+                or con_id <= 0
+                or con_id != raw_con_id
+                or con_id in seen
+                or isinstance(raw_multiplier, bool)
+                or multiplier != 100
+                or multiplier != raw_multiplier
+                or raw_currency != "USD"
+            ):
+                raise ValueError("unsupported or duplicate qualified option contract terms")
+            seen.add(con_id)
+            legs[index] = {
+                **legs[index],
+                "con_id": con_id,
+                "multiplier": multiplier,
+                "currency": raw_currency,
+            }
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(legs_json=legs)
+        )
+    record = get_order(engine, order_id)
+    assert record is not None
+    return record
 
 
 def transition(
@@ -353,12 +441,53 @@ def record_fill(
     """
     if side not in ("BUY", "SELL"):
         raise ValueError(f"fill side must be 'BUY' or 'SELL', got {side!r}")
+    if not isinstance(exec_id, str) or not exec_id.strip():
+        raise ValueError("fill execution ID must be nonblank")
+    if type(order_id) is not int or order_id <= 0:
+        raise ValueError("fill order ID must be a positive exact integer")
+    if type(qty) is not int or qty <= 0:
+        raise ValueError("fill quantity must be a positive exact integer")
+    if (
+        not isinstance(price, (int, float))
+        or isinstance(price, bool)
+        or not math.isfinite(float(price))
+        or price < 0
+    ):
+        raise ValueError("fill price must be finite and nonnegative")
+    if not isinstance(ts, datetime):
+        raise ValueError("fill timestamp is malformed")
+    if leg_con_id is not None and (type(leg_con_id) is not int or leg_con_id <= 0):
+        raise ValueError("fill contract ID must be an exact positive integer")
     with engine.begin() as conn:
         exists = conn.execute(
-            select(fills.c.id).where(fills.c.ib_exec_id == exec_id)
+            select(
+                fills.c.order_id,
+                fills.c.side,
+                fills.c.price,
+                fills.c.qty,
+                fills.c.ts,
+                fills.c.leg_con_id,
+            ).where(fills.c.ib_exec_id == exec_id)
         ).first()
         if exists is not None:
-            return False
+            existing_ts = exists.ts
+            incoming_ts = ts
+            if existing_ts.tzinfo is not None:
+                existing_ts = existing_ts.astimezone(UTC).replace(tzinfo=None)
+            if incoming_ts.tzinfo is not None:
+                incoming_ts = incoming_ts.astimezone(UTC).replace(tzinfo=None)
+            if (
+                exists.order_id == order_id
+                and exists.side == side
+                and exists.price == price
+                and exists.qty == qty
+                and existing_ts == incoming_ts
+                and exists.leg_con_id == leg_con_id
+            ):
+                return False
+            raise ValueError(
+                f"execution ID {exec_id!r} conflicts with persisted fill identity"
+            )
         conn.execute(
             insert(fills).values(
                 order_id=order_id,
@@ -375,11 +504,28 @@ def record_fill(
 
 def set_fill_commission(engine: Engine, exec_id: str, commission: float) -> bool:
     """Attach a commissionReport amount to its fill (keyed by execId)."""
+    if (
+        not isinstance(commission, (int, float))
+        or isinstance(commission, bool)
+        or not math.isfinite(float(commission))
+    ):
+        raise ValueError("fill commission must be finite")
     with engine.begin() as conn:
-        result = conn.execute(
+        existing = conn.execute(
+            select(fills.c.commission).where(fills.c.ib_exec_id == exec_id)
+        ).first()
+        if existing is None:
+            return False
+        if existing.commission is not None:
+            if existing.commission == commission:
+                return True
+            raise ValueError(
+                f"execution ID {exec_id!r} has conflicting commission evidence"
+            )
+        conn.execute(
             update(fills).where(fills.c.ib_exec_id == exec_id).values(commission=commission)
         )
-    return result.rowcount > 0
+    return True
 
 
 def set_order_note(engine: Engine, order_id: int, note: str) -> None:
@@ -552,6 +698,105 @@ def total_commissions(engine: Engine, order_id: int) -> float:
     return sum(float(r.commission) for r in rows if r.commission is not None)
 
 
+def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, float]:
+    """Return signed premium and commissions only for a provably complete fill."""
+    with engine.connect() as conn:
+        order = conn.execute(
+            select(orders.c.status, orders.c.quantity, orders.c.legs_json).where(
+                orders.c.id == order_id
+            )
+        ).first()
+        fill_rows = conn.execute(
+            select(
+                fills.c.side,
+                fills.c.price,
+                fills.c.qty,
+                fills.c.commission,
+                fills.c.leg_con_id,
+            ).where(fills.c.order_id == order_id)
+        ).fetchall()
+    if order is None or order.status != "filled":
+        raise RealizedPnLUnavailable(f"order {order_id}: filled order unavailable")
+    quantity = order.quantity
+    legs = list(order.legs_json or [])
+    if quantity <= 0 or not legs:
+        raise RealizedPnLUnavailable(f"order {order_id}: expected fill quantity unavailable")
+
+    expected: dict[int, tuple[str, int]] = {}
+    for leg in legs:
+        if leg.get("sec_type", "OPT") != "OPT":
+            continue
+        side = str(leg.get("side", "")).upper()
+        raw_ratio = leg.get("quantity", 1)
+        raw_con_id = leg.get("con_id")
+        try:
+            ratio = int(raw_ratio)
+            con_id = int(raw_con_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: expected contract attribution unavailable"
+            ) from exc
+        if (
+            side not in {"BUY", "SELL"}
+            or isinstance(raw_ratio, bool)
+            or ratio <= 0
+            or ratio != raw_ratio
+            or isinstance(raw_con_id, bool)
+            or con_id <= 0
+            or con_id != raw_con_id
+            or con_id in expected
+        ):
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: expected contract attribution unavailable"
+            )
+        expected[con_id] = (side, ratio * quantity)
+    if not expected:
+        raise RealizedPnLUnavailable(
+            f"order {order_id}: expected contract attribution unavailable"
+        )
+
+    actual: dict[int, tuple[str, int]] = {}
+    premium = 0.0
+    commissions = 0.0
+    for fill in fill_rows:
+        try:
+            price = float(fill.price)
+            qty = int(fill.qty)
+            commission = float(fill.commission)
+            con_id = int(fill.leg_con_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(f"order {order_id}: fill accounting unavailable") from exc
+        expected_leg = expected.get(con_id)
+        if (
+            expected_leg is None
+            or expected_leg[0] != fill.side
+            or isinstance(fill.leg_con_id, bool)
+            or con_id <= 0
+            or con_id != fill.leg_con_id
+            or isinstance(fill.qty, bool)
+            or qty <= 0
+            or qty != fill.qty
+            or price < 0
+            or not math.isfinite(price)
+            or not math.isfinite(commission)
+        ):
+            raise RealizedPnLUnavailable(
+                f"order {order_id}: fill contract attribution unavailable"
+            )
+        prior = actual.get(con_id, (fill.side, 0))
+        actual[con_id] = (fill.side, prior[1] + qty)
+        premium += (
+            (1.0 if fill.side == "SELL" else -1.0)
+            * price
+            * qty
+            * _OPTION_MULTIPLIER
+        )
+        commissions += commission
+    if actual != expected or not math.isfinite(premium) or not math.isfinite(commissions):
+        raise RealizedPnLUnavailable(f"order {order_id}: incomplete fills")
+    return premium, commissions
+
+
 def realized_close_pairs(
     engine: Engine, *, since: datetime | None = None
 ) -> list[ClosedPair]:
@@ -572,11 +817,31 @@ def realized_close_pairs(
         closed_ts = _aware(close.terminal_ts)
         if since is not None and (closed_ts is None or closed_ts <= since):
             continue
-        entry_premium = net_premium(engine, close.closes_order_id) or 0.0
-        close_premium = net_premium(engine, close.id) or 0.0
-        commissions = total_commissions(engine, close.closes_order_id) + total_commissions(
-            engine, close.id
+        entry_premium, entry_commissions = _complete_order_accounting(
+            engine, close.closes_order_id
         )
+        close_premium, close_commissions = _complete_order_accounting(engine, close.id)
+        entry = get_order(engine, int(close.closes_order_id))
+        if (
+            entry is None
+            or entry.status != "filled"
+            or entry.symbol != close.symbol
+            or entry.quantity != close.quantity
+        ):
+            raise RealizedPnLUnavailable(
+                f"close order {close.id}: exact inverse entry unavailable"
+            )
+        try:
+            assert_atomic_close_legs(
+                entry_legs=entry.legs,
+                close_legs=list(close.legs_json or []),
+            )
+        except (NonAtomicCloseError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(
+                f"close order {close.id}: close is not the exact inverse of entry "
+                f"{entry.id}"
+            ) from exc
+        commissions = entry_commissions + close_commissions
         pairs.append(
             ClosedPair(
                 entry_id=close.closes_order_id,
@@ -601,40 +866,132 @@ def open_orders(engine: Engine) -> list[OrderRecord]:
     return [_to_record(r) for r in rows]
 
 
-def open_position_legs(engine: Engine) -> set[tuple[str, str, float, str]]:
-    """The (symbol, expiry, strike, right) legs the ledger believes are OPEN.
+def open_position_exposure(
+    engine: Engine,
+) -> dict[int, tuple[tuple[str, str, float, str], int]] | None:
+    """Reconstruct exact signed option exposure from every persisted execution.
 
-    An entry is open when its open-intent order is filled and no close order
-    that references it (closes_order_id) has filled. Used by reconcile's
-    position-compare to spot broker positions the ledger lacks."""
+    Returns ``None`` when contract attribution or fill evidence is incomplete;
+    reconciliation must then halt rather than claim broker/ledger agreement.
+    """
     with engine.connect() as conn:
-        entries = conn.execute(
-            select(orders.c.id, orders.c.legs_json).where(
-                (orders.c.intent == "open") & (orders.c.status == "filled")
+        order_rows = conn.execute(
+            select(
+                orders.c.id,
+                orders.c.status,
+                orders.c.quantity,
+                orders.c.legs_json,
+            ).where(
+                orders.c.intent.in_(("open", "close"))
             )
         ).fetchall()
-        closed_entry_ids = {
-            r.closes_order_id
-            for r in conn.execute(
-                select(orders.c.closes_order_id).where(
-                    (orders.c.intent == "close")
-                    & (orders.c.status == "filled")
-                    & (orders.c.closes_order_id.isnot(None))
-                )
-            ).fetchall()
-        }
-    legs_out: set[tuple[str, str, float, str]] = set()
-    for entry in entries:
-        if entry.id in closed_entry_ids:
-            continue
-        for leg in entry.legs_json or []:
+        fill_rows = conn.execute(
+            select(
+                fills.c.order_id,
+                fills.c.side,
+                fills.c.qty,
+                fills.c.leg_con_id,
+            )
+        ).fetchall()
+
+    orders_by_id = {int(row.id): row for row in order_rows}
+    fills_by_order: dict[int, list[Any]] = {}
+    for fill in fill_rows:
+        fills_by_order.setdefault(int(fill.order_id), []).append(fill)
+
+    for row in order_rows:
+        option_legs: list[dict[str, Any]] = []
+        for leg in row.legs_json or []:
+            if not isinstance(leg, dict):
+                return None
+            sec_type = leg.get("sec_type", "OPT")
+            if sec_type == "STK":
+                continue
+            if sec_type != "OPT":
+                return None
+            option_legs.append(leg)
+        if (
+            option_legs
+            and row.status in {"partial", "filled"}
+            and not fills_by_order.get(int(row.id))
+        ):
+            return None
+
+    exposure: dict[int, tuple[tuple[str, str, float, str], int]] = {}
+    for order_id, order_fills in fills_by_order.items():
+        order_row = orders_by_id.get(order_id)
+        if order_row is None:
+            return None
+        leg_specs: dict[int, tuple[str, str, float, str]] = {}
+        expected_fills: dict[tuple[int, str], int] = {}
+        actual_fills: dict[tuple[int, str], int] = {}
+        raw_order_quantity = order_row.quantity
+        if type(raw_order_quantity) is not int or raw_order_quantity <= 0:
+            return None
+        for leg in order_row.legs_json or []:
             if leg.get("sec_type", "OPT") != "OPT":
                 continue
-            legs_out.add((
-                str(leg["symbol"]), str(leg["expiry"]),
-                float(leg["strike"]), str(leg["right"]),
-            ))
-    return legs_out
+            try:
+                raw_con_id = leg["con_id"]
+                raw_leg_quantity = leg.get("quantity", 1)
+                raw_side = leg["side"]
+                con_id = int(raw_con_id)
+                spec = (
+                    str(leg["symbol"]),
+                    str(leg["expiry"]),
+                    float(leg["strike"]),
+                    str(leg["right"]),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            if (
+                type(raw_con_id) is not int
+                or con_id <= 0
+                or con_id in leg_specs
+                or type(raw_leg_quantity) is not int
+                or raw_leg_quantity <= 0
+                or raw_side not in {"buy", "sell"}
+            ):
+                return None
+            leg_specs[con_id] = spec
+            expected_side = "BUY" if raw_side == "buy" else "SELL"
+            expected_fills[(con_id, expected_side)] = (
+                raw_leg_quantity * raw_order_quantity
+            )
+        for fill in order_fills:
+            try:
+                raw_con_id = fill.leg_con_id
+                raw_qty = fill.qty
+                con_id = int(raw_con_id)
+                qty = int(raw_qty)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            side = str(fill.side).upper()
+            fill_spec = leg_specs.get(con_id)
+            if (
+                type(raw_con_id) is not int
+                or con_id != raw_con_id
+                or type(raw_qty) is not int
+                or qty != raw_qty
+                or fill_spec is None
+                or qty <= 0
+                or side not in {"BUY", "SELL"}
+            ):
+                return None
+            fill_key = (con_id, side)
+            actual_fills[fill_key] = actual_fills.get(fill_key, 0) + qty
+            signed_qty = qty if side == "BUY" else -qty
+            prior = exposure.get(con_id)
+            if prior is not None and prior[0] != fill_spec:
+                return None
+            exposure[con_id] = (
+                fill_spec,
+                (prior[1] if prior else 0) + signed_qty,
+            )
+        if order_row.status == "filled" and actual_fills != expected_fills:
+            return None
+
+    return {con_id: value for con_id, value in exposure.items() if value[1] != 0}
 
 
 def working_orders(engine: Engine) -> list[OrderRecord]:

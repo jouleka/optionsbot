@@ -9,14 +9,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import Engine, insert
+from sqlalchemy import Engine, insert, select
 
 from optionsbot.config import Settings
 from optionsbot.execution.engine import ExecutionDeps, combo_mid, execute_pick
 from optionsbot.execution.orders import get_order, stage_order, transition
-from optionsbot.execution.state import trip_kill
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import AccountSummary, MarginPreview, OptionQuote, PlacedOrder
-from optionsbot.storage.schema import snapshots, strategy_scores
+from optionsbot.storage.schema import execution_state, snapshots, strategy_scores
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 
@@ -36,13 +36,14 @@ def _quote(
     mid: float | None,
     *,
     delayed: bool = False,
+    ts: datetime | None = NOW,
 ) -> OptionQuote:
     bid = round(mid - 0.05, 4) if mid is not None else None
     ask = round(mid + 0.05, 4) if mid is not None else None
     return OptionQuote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
         bid=bid, ask=ask, last=None, mid=mid, iv=None, delta=None, gamma=None,
-        theta=None, vega=None, open_interest=None, volume=None, ts=NOW, delayed=delayed,
+        theta=None, vega=None, open_interest=None, volume=None, ts=ts, delayed=delayed,
     )
 
 
@@ -56,7 +57,7 @@ def _insert_pick(
     credit_or_debit: float = 120.0,  # dollars per set; 1.20/unit
     max_loss: float = 380.0,
     legs: list[dict[str, Any]] | None = None,
-    raw_json: dict[str, Any] | None = None,
+    raw_json: Any = None,
 ) -> int:
     with engine.begin() as conn:
         snapshot_id = conn.execute(
@@ -93,15 +94,25 @@ def _deps(
     margin_change: float | None = 380.0,
     walk: bool = False,
     delayed: bool = False,
+    quote_ts: datetime | None = NOW,
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
+    with tmp_db.connect() as conn:
+        day_start = conn.execute(
+            select(execution_state.c.day_start_net_liq).where(execution_state.c.id == 1)
+        ).scalar_one_or_none()
+    if net_liquidation is not None and day_start is None:
+        from optionsbot.execution.equity_guard import capture_day_start_net_liq
+
+        capture_day_start_net_liq(tmp_db, float(net_liquidation))
 
     order_client = MagicMock()
     order_client.place_combo_limit = AsyncMock(
         side_effect=lambda *a, **k: PlacedOrder(
             ib_order_id=11, order_ref=k["order_ref"], action="BUY",
             limit_price=k["limit_price"], quantity=k["quantity"],
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
     )
     order_client.whatif_combo = AsyncMock(
@@ -116,7 +127,7 @@ def _deps(
     md = MagicMock()
     md.get_option_snapshot = AsyncMock(
         side_effect=lambda symbol, expiry, strike, right: _quote(
-            strike, right, mids.get((strike, right)), delayed=delayed
+            strike, right, mids.get((strike, right)), delayed=delayed, ts=quote_ts
         )
     )
 
@@ -199,6 +210,61 @@ async def test_rejects_stale_pick(tmp_db: Engine) -> None:
     assert "stale" in outcome.message.lower()
 
 
+async def test_rejects_future_dated_pick(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db, ts=NOW + timedelta(seconds=30))
+    deps = _deps(tmp_db)
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "future" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        None,
+        {},
+        {"delayed": False},
+        {"warming_up": False},
+        {"delayed": 0, "warming_up": False},
+        {"delayed": False, "warming_up": 0},
+        {"delayed": "false", "warming_up": False},
+        {"delayed": False, "warming_up": "false"},
+        [],
+        "legacy",
+    ],
+)
+async def test_auto_entry_rejects_snapshot_without_exact_ready_flags(
+    tmp_db: Engine, raw_json: Any
+) -> None:
+    score_id = _insert_pick(tmp_db, raw_json=raw_json)
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "snapshot" in outcome.message.lower() or "data" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_auto_entry_accepts_exact_false_ready_flags(tmp_db: Engine) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={"delayed": False, "warming_up": False},
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    deps.order_client.place_combo_limit.assert_awaited_once()  # type: ignore[attr-defined]
+
+
 async def test_rejects_undefined_risk(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db, defined_risk=False)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
@@ -216,6 +282,30 @@ async def test_rejects_non_finite_max_loss(tmp_db: Engine) -> None:
 
     assert not outcome.ok
     assert "defined max loss" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_rejects_option_quote_with_unknown_timestamp(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, quote_ts=None)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "timestamp" in outcome.message.lower() or "quote age" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_rejects_stale_option_quote_timestamp(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, quote_ts=NOW - timedelta(seconds=46))
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "quote age" in outcome.message.lower()
     deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
@@ -294,13 +384,15 @@ async def test_rejects_duplicate_active_order(tmp_db: Engine) -> None:
     assert "already" in outcome.message.lower()
 
 
-async def test_allows_reexecute_after_failed_terminal(tmp_db: Engine) -> None:
+async def test_rejects_reexecute_after_any_terminal_order_intent(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     record = stage_order(tmp_db, score_id, now=NOW)
-    transition(tmp_db, record.id, "skipped", now=NOW)  # earlier attempt failed gates
+    transition(tmp_db, record.id, "skipped", now=NOW)
+    deps = _deps(tmp_db)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
-        outcome = await execute_pick(_deps(tmp_db), score_id, now=NOW)
-    assert outcome.ok
+        outcome = await execute_pick(deps, score_id, now=NOW)
+    assert not outcome.ok
+    assert "authorization is consumed" in outcome.message
 
 
 async def test_rejects_at_max_open_positions(tmp_db: Engine) -> None:
@@ -373,6 +465,36 @@ async def test_rejects_when_available_funds_unknown(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
     assert "margin" in outcome.message.lower() or "funds" in outcome.message.lower()
+
+
+@pytest.mark.parametrize("margin_change", [float("nan"), float("inf"), float("-inf")])
+async def test_rejects_non_finite_final_margin_requirement(
+    tmp_db: Engine, margin_change: float
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, margin_change=margin_change)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("available_funds", [float("nan"), float("inf"), float("-inf")])
+async def test_rejects_non_finite_final_available_funds(
+    tmp_db: Engine, available_funds: float
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, available_funds=available_funds)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "margin" in outcome.message.lower() or "funds" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 async def test_rejects_when_whatif_raises(tmp_db: Engine) -> None:
@@ -503,6 +625,15 @@ async def test_happy_path_spawns_walk_task(tmp_db: Engine) -> None:
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert outcome.ok
     assert deps.walk_tasks
+    assert deps.walk_md is not None
+    deps.walk_md.get_option_snapshot.side_effect = (
+        lambda symbol, expiry, strike, right: _quote(
+            strike,
+            right,
+            QUOTE_MIDS.get((strike, right)),
+            ts=datetime.now(UTC),
+        )
+    )
 
     from sqlalchemy import update as sa_update
 
@@ -537,6 +668,55 @@ async def test_no_walk_spawned_without_walk_md(tmp_db: Engine) -> None:
     deps.order_client.modify_price.assert_not_awaited()
 
 
+async def test_kill_tripped_during_whatif_blocks_entry_placement(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    async def trip_during_whatif(*args: object, **kwargs: object) -> MarginPreview:
+        trip_kill(tmp_db, "concurrent halt during what-if", now=NOW)
+        return MarginPreview(
+            init_margin_change=380.0,
+            maint_margin_change=380.0,
+            equity_with_loan_change=None,
+            commission=1.30,
+            max_commission=None,
+            warning=None,
+        )
+
+    deps.order_client.whatif_combo.side_effect = trip_during_whatif
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "kill" in outcome.message.lower() or "halt" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_empty_qualified_contract_ack_halts_after_placement(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.order_client.place_combo_limit.side_effect = None
+    deps.order_client.place_combo_limit.return_value = PlacedOrder(
+        ib_order_id=88,
+        order_ref="obot-empty-contracts",
+        action="BUY",
+        limit_price=-1.20,
+        quantity=1,
+        leg_contracts=(),
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert load_state(tmp_db).killed is True
+    deps.order_client.cancel.assert_awaited_once_with(88)
+    record = get_order(tmp_db, outcome.order_id or 0)
+    assert record is not None
+    assert record.status == "submitting"
+    assert all("con_id" not in leg for leg in record.legs)
+
+
 async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
     # Opus C1 backstop: if a reconcile pass resolves the row terminal while
     # place is in flight, the just-placed REAL order must be pulled.
@@ -558,6 +738,7 @@ async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
         return PlacedOrder(
             ib_order_id=77, order_ref=str(kwargs["order_ref"]), action="BUY",
             limit_price=float(kwargs["limit_price"]), quantity=int(kwargs["quantity"]),
+            leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
 
     deps.order_client.place_combo_limit = AsyncMock(side_effect=race_place)
@@ -566,23 +747,62 @@ async def test_reconcile_race_cancels_at_broker(tmp_db: Engine) -> None:
     assert not outcome.ok
     assert "race" in outcome.message.lower()
     deps.order_client.cancel.assert_awaited_once_with(77)
+    state = load_state(tmp_db)
+    assert state.killed is True
+    assert state.reason is not None and "broker" in state.reason
 
 
-async def test_place_failure_marks_skipped(tmp_db: Engine) -> None:
+async def test_place_failure_halts_and_preserves_submitting_claim(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db)
     deps.order_client.place_combo_limit = AsyncMock(
-        side_effect=RuntimeError("gateway exploded")
+        side_effect=RuntimeError("gateway acknowledgement lost")
     )
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)
     assert not outcome.ok
-    assert "gateway exploded" in outcome.message
+    assert "outcome unknown" in outcome.message
     assert outcome.order_id is not None
     record = get_order(tmp_db, outcome.order_id)
     assert record is not None
-    assert record.status == "skipped"
-    assert record.last_error == "gateway exploded"
+    assert record.status == "submitting"
+    assert record.last_error is not None and "unknown" in record.last_error
+    state = load_state(tmp_db)
+    assert state.killed is True
+    assert state.reason is not None and "unknown" in state.reason
+
+
+async def test_execute_pick_rechecks_drawdown_on_final_sizing_summary(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, net_liquidation=100_000.0)
+    deps.positions.get_account_summary = AsyncMock(
+        side_effect=[
+            AccountSummary(
+                net_liquidation=Decimal("100000"),
+                buying_power=None,
+                available_funds=Decimal("50000"),
+                currency="USD",
+                fx_to_usd=Decimal("1"),
+            ),
+            AccountSummary(
+                net_liquidation=Decimal("90000"),
+                buying_power=None,
+                available_funds=Decimal("50000"),
+                currency="USD",
+                fx_to_usd=Decimal("1"),
+            ),
+        ]
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok is False
+    assert "drawdown" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
 
 
 async def test_execute_pick_blocks_near_daily_loss_cap(tmp_db: Engine) -> None:

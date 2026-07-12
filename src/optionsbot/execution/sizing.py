@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Engine, select
 
+from optionsbot.execution.risk_structure import structural_max_loss_dollars
 from optionsbot.storage.schema import fills, orders, strategy_scores
 
 
@@ -37,24 +39,43 @@ def _scoreless_order_max_loss(engine: Engine, row: Any) -> float:
     legs = list(row.legs_json or [])
     if not legs or any(leg.get("sec_type", "OPT") != "OPT" for leg in legs):
         return math.inf
-    order_quantity = int(row.quantity or 0)
-    if order_quantity <= 0:
+    raw_order_quantity = row.quantity
+    try:
+        order_quantity = int(raw_order_quantity)
+    except (TypeError, ValueError, OverflowError):
+        return math.inf
+    if (
+        isinstance(raw_order_quantity, bool)
+        or order_quantity <= 0
+        or order_quantity != raw_order_quantity
+    ):
         return math.inf
 
     normalized: list[tuple[str, str, float, int]] = []
     expiries: set[str] = set()
+    underlyings: set[str] = set()
     expected_fill_qty = {"BUY": 0, "SELL": 0}
+    leg_count_by_side = {"BUY": 0, "SELL": 0}
+    expected_by_con_id: dict[int, tuple[str, int]] = {}
+    all_legs_have_con_id = True
     high_spot_call_slope = 0
     for leg in legs:
         side = str(leg.get("side", "")).lower()
         right = str(leg.get("right", "")).upper()
         expiry = str(leg.get("expiry", ""))
+        underlying = str(leg.get("symbol", "")).upper()
+        try:
+            datetime.strptime(expiry, "%Y%m%d")
+        except ValueError:
+            return math.inf
         try:
             strike = float(leg["strike"])
             raw_leg_quantity = leg.get("quantity", 1)
             leg_ratio = int(raw_leg_quantity)
+            raw_multiplier = leg["multiplier"]
+            multiplier = int(raw_multiplier)
             leg_quantity = leg_ratio * order_quantity
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             return math.inf
         if (
             side not in {"buy", "sell"}
@@ -63,28 +84,59 @@ def _scoreless_order_max_loss(engine: Engine, row: Any) -> float:
             or not expiry.isdigit()
             or not math.isfinite(strike)
             or strike <= 0
+            or leg.get("currency") != "USD"
+            or isinstance(raw_multiplier, bool)
+            or multiplier != 100
+            or multiplier != raw_multiplier
+            or isinstance(raw_leg_quantity, bool)
             or leg_ratio <= 0
             or leg_ratio != raw_leg_quantity
         ):
             return math.inf
         sign = 1 if side == "buy" else -1
+        fill_side = "BUY" if side == "buy" else "SELL"
+        raw_con_id = leg.get("con_id")
+        if raw_con_id is None:
+            all_legs_have_con_id = False
+        else:
+            try:
+                con_id = int(raw_con_id)
+            except (TypeError, ValueError, OverflowError):
+                return math.inf
+            if (
+                isinstance(raw_con_id, bool)
+                or con_id <= 0
+                or con_id != raw_con_id
+                or con_id in expected_by_con_id
+            ):
+                return math.inf
+            expected_by_con_id[con_id] = (fill_side, leg_quantity)
         if right == "C":
             high_spot_call_slope += sign * leg_quantity
         expiries.add(expiry)
-        expected_fill_qty["BUY" if side == "buy" else "SELL"] += leg_quantity
+        underlyings.add(underlying)
+        expected_fill_qty[fill_side] += leg_quantity
+        leg_count_by_side[fill_side] += 1
         normalized.append((side, right, strike, leg_quantity))
-    if len(expiries) != 1 or high_spot_call_slope < 0:
+    if (
+        underlyings != {str(row.symbol).upper()}
+        or len(expiries) != 1
+        or high_spot_call_slope < 0
+        or (not all_legs_have_con_id and bool(expected_by_con_id))
+        or (not all_legs_have_con_id and any(count > 1 for count in leg_count_by_side.values()))
+    ):
         return math.inf
 
     with engine.connect() as conn:
         fill_rows = conn.execute(
-            select(fills.c.side, fills.c.price, fills.c.qty).where(
+            select(fills.c.side, fills.c.price, fills.c.qty, fills.c.leg_con_id).where(
                 fills.c.order_id == int(row.id)
             )
         ).fetchall()
     if not fill_rows:
         return math.inf
     actual_fill_qty = {"BUY": 0, "SELL": 0}
+    actual_by_con_id: dict[int, tuple[str, int]] = {}
     premium = 0.0
     for fill in fill_rows:
         try:
@@ -96,13 +148,27 @@ def _scoreless_order_max_loss(engine: Engine, row: Any) -> float:
             fill.side not in actual_fill_qty
             or not math.isfinite(price)
             or price < 0
+            or type(fill.qty) is not int
             or qty <= 0
             or qty != fill.qty
         ):
             return math.inf
         actual_fill_qty[fill.side] += qty
+        if all_legs_have_con_id:
+            if fill.leg_con_id is None or type(fill.leg_con_id) is not int:
+                return math.inf
+            con_id = fill.leg_con_id
+            expected = expected_by_con_id.get(con_id)
+            if expected is None or expected[0] != fill.side:
+                return math.inf
+            prior = actual_by_con_id.get(con_id, (fill.side, 0))
+            actual_by_con_id[con_id] = (fill.side, prior[1] + qty)
         premium += (1.0 if fill.side == "SELL" else -1.0) * price * qty * 100.0
-    if actual_fill_qty != expected_fill_qty or not math.isfinite(premium):
+    if (
+        actual_fill_qty != expected_fill_qty
+        or (all_legs_have_con_id and actual_by_con_id != expected_by_con_id)
+        or not math.isfinite(premium)
+    ):
         return math.inf
 
     spots = {0.0, *(strike for _, _, strike, _ in normalized)}
@@ -137,7 +203,9 @@ def open_heat_dollars(engine: Engine) -> float:
         rows = conn.execute(
             select(
                 orders.c.id,
+                orders.c.symbol,
                 orders.c.quantity,
+                orders.c.status,
                 orders.c.legs_json,
                 orders.c.limit_price,
                 strategy_scores.c.suggestion_json,
@@ -159,22 +227,51 @@ def open_heat_dollars(engine: Engine) -> float:
         if suggestion is not None and not isinstance(suggestion, dict):
             return math.inf
         max_loss = (suggestion or {}).get("max_loss")
+        raw_quantity = row.quantity
+        try:
+            quantity = int(raw_quantity)
+        except (TypeError, ValueError, OverflowError):
+            return math.inf
+        if type(raw_quantity) is not int or quantity <= 0:
+            return math.inf
+
+        persisted_total: float | None = None
         if max_loss is not None:
             try:
                 scored_loss = float(max_loss)
-                quantity = int(row.quantity)
             except (TypeError, ValueError, OverflowError):
                 return math.inf
-            if not math.isfinite(scored_loss) or scored_loss <= 0 or quantity <= 0:
+            if not math.isfinite(scored_loss) or scored_loss <= 0:
                 return math.inf
-            heat += scored_loss * quantity
-            if not math.isfinite(heat):
+            persisted_total = scored_loss * quantity
+
+        with engine.connect() as conn:
+            has_fills = conn.execute(
+                select(fills.c.id).where(fills.c.order_id == row.id).limit(1)
+            ).first() is not None
+        if row.status in {"partial", "filled"} or has_fills:
+            reconstructed_total = _scoreless_order_max_loss(engine, row)
+        else:
+            try:
+                entry_net = -float(row.limit_price)
+            except (TypeError, ValueError, OverflowError):
                 return math.inf
-            continue
-        derived = _scoreless_order_max_loss(engine, row)
-        if not math.isfinite(derived):
+            reconstructed_unit = structural_max_loss_dollars(
+                row.legs_json,
+                entry_net_per_share=entry_net,
+            )
+            if reconstructed_unit is None:
+                return math.inf
+            reconstructed_total = reconstructed_unit * quantity
+        if not math.isfinite(reconstructed_total):
             return math.inf
-        heat += derived
+
+        risk = reconstructed_total
+        if persisted_total is not None:
+            risk = max(risk, persisted_total)
+        heat += risk
+        if not math.isfinite(heat):
+            return math.inf
     return heat
 
 

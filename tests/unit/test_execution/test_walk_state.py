@@ -116,7 +116,7 @@ def _quote(
         symbol="SPY", expiry="20260717", strike=strike, right=right,  # type: ignore[arg-type]
         bid=bid, ask=ask, last=None, mid=(bid + ask) / 2, iv=None, delta=None,
         gamma=None, theta=None, vega=None, open_interest=None, volume=None,
-        ts=NOW, delayed=True,
+        ts=datetime.now(UTC), delayed=False,
     )
 
 

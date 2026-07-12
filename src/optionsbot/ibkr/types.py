@@ -21,7 +21,7 @@ class StockQuote:
     ask: float | None
     last: float | None
     mid: float | None  # (bid + ask) / 2 when both available
-    ts: datetime
+    ts: datetime | None
     delayed: bool  # True when the quote came from delayed market data
 
 
@@ -42,7 +42,7 @@ class OptionQuote:
     vega: float | None
     open_interest: int | None
     volume: int | None
-    ts: datetime
+    ts: datetime | None
     delayed: bool
 
 
@@ -99,6 +99,7 @@ class PortfolioPosition:
     market_value: float | None
     unrealized_pnl: float | None
     realized_pnl: float | None
+    con_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +155,10 @@ class PlacedOrder:
     action: str  # 'BUY' | 'SELL'
     limit_price: float
     quantity: int
+    # One immutable tuple per option leg, in submitted-leg order:
+    # (IBKR conId, contract multiplier, currency). Empty only for legacy/mocked
+    # acknowledgements that cannot prove exact fill attribution.
+    leg_contracts: tuple[tuple[int, int, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

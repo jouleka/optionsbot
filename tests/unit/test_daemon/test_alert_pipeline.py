@@ -50,12 +50,29 @@ def _seed_snapshot(daemon_context: DaemonContext, *, symbol: str = "SPY") -> int
         return result.inserted_primary_key[0]
 
 
+def _seed_score(daemon_context: DaemonContext, snapshot_id: int) -> int:
+    with daemon_context.engine.begin() as conn:
+        return int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="iron_condor",
+                    score=85.0,
+                    rationale="candidate",
+                    legs_json=[],
+                    suggestion_json={"defined_risk": True},
+                )
+            ).inserted_primary_key[0]
+        )
+
+
 # ---- enqueue_alert ---------------------------------------------------------
 
 async def test_enqueue_alert_inserts_pending_row_and_dispatches(
     daemon_context: DaemonContext,
 ) -> None:
     snap_id = _seed_snapshot(daemon_context)
+    _seed_score(daemon_context, snap_id)
     with patch(
         "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
     ):
@@ -165,6 +182,7 @@ async def test_enqueue_alert_returns_true_when_actually_enqueued(
 ) -> None:
     """When dedup allows the alert, enqueue_alert must return True."""
     snap_id = _seed_snapshot(daemon_context)
+    _seed_score(daemon_context, snap_id)
     with patch(
         "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
     ):
@@ -176,6 +194,7 @@ async def test_enqueue_alert_on_send_failure_marks_failed_with_backoff(
     daemon_context: DaemonContext,
 ) -> None:
     snap_id = _seed_snapshot(daemon_context)
+    _seed_score(daemon_context, snap_id)
     daemon_context.telegram.send_message = AsyncMock(
         side_effect=httpx.HTTPStatusError("429", request=MagicMock(), response=MagicMock())
     )
@@ -229,10 +248,12 @@ def test_backoff_minutes_is_strictly_increasing() -> None:
 async def test_sweep_retries_processes_failed_rows_past_next_retry_ts(
     daemon_context: DaemonContext,
 ) -> None:
-    _seed_snapshot(daemon_context)  # snapshot must exist for _latest_snapshot_id_for_symbol
+    snap_id = _seed_snapshot(daemon_context)
+    score_id = _seed_score(daemon_context, snap_id)
     past = datetime.now(UTC) - timedelta(minutes=5)
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(alerts).values(
+            strategy_score_id=score_id,
             ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
             score=85.0, status="failed", retry_count=1,
             next_retry_ts=past, last_error="prev fail",
@@ -352,10 +373,12 @@ async def test_sweep_retries_skips_rows_with_future_next_retry_ts(
 async def test_sweep_retries_drops_after_max_retries(
     daemon_context: DaemonContext,
 ) -> None:
-    _seed_snapshot(daemon_context)
+    snap_id = _seed_snapshot(daemon_context)
+    score_id = _seed_score(daemon_context, snap_id)
     past = datetime.now(UTC) - timedelta(minutes=5)
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(alerts).values(
+            strategy_score_id=score_id,
             ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
             score=85.0, status="failed", retry_count=MAX_RETRIES,
             next_retry_ts=past, last_error="repeated fail",
@@ -392,7 +415,7 @@ async def test_retry_preserves_undefined_risk_warning_via_suggestion_json(
             regime_dir="neutral", regime_iv="high",
         ))
         snap_id = snap_result.inserted_primary_key[0]
-        conn.execute(insert(strategy_scores).values(
+        score_id = int(conn.execute(insert(strategy_scores).values(
             snapshot_id=snap_id, strategy="short_straddle",
             score=85.0, rationale="High IV + neutral",
             legs_json=[{
@@ -408,10 +431,11 @@ async def test_retry_preserves_undefined_risk_warning_via_suggestion_json(
                 "prob_profit": 0.45,
                 "suggested_quantity": 1,
             },
-        ))
+        )).inserted_primary_key[0])
         # Seed a failed alert so sweep_retries finds it.
         past = now - timedelta(minutes=5)
         conn.execute(insert(alerts).values(
+            strategy_score_id=score_id,
             ts=now, symbol="SPY", strategy="short_straddle",
             score=85.0, status="failed", retry_count=1,
             next_retry_ts=past, last_error="prev fail",

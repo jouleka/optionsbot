@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 
 import pytest
@@ -31,6 +32,29 @@ def test_capture_persists_and_is_idempotent(tmp_db: Engine) -> None:
     assert first == 100_000.0
     again = capture_day_start_net_liq(tmp_db, 90_000.0)
     assert again == 100_000.0  # unchanged
+
+
+def test_capture_rejects_non_finite_or_non_positive_baseline(tmp_db: Engine) -> None:
+    for value in (math.nan, math.inf, -math.inf, 0.0, -1.0):
+        with pytest.raises(ValueError, match="finite positive"):
+            capture_day_start_net_liq(tmp_db, value)
+
+
+def test_drawdown_non_finite_current_trips_kill_and_blocks_entry(tmp_db: Engine) -> None:
+    capture_day_start_net_liq(tmp_db, 100_000.0)
+    verdict = evaluate_net_liq_drawdown(
+        tmp_db,
+        _settings(),
+        current_net_liq=math.nan,
+        now=datetime.now(UTC),
+    )
+    decision = new_entry_allowed(tmp_db, _settings(), current_net_liq=math.inf)
+
+    assert verdict.tripped is True
+    assert verdict.evaluable is False
+    assert load_state(tmp_db).killed is True
+    assert decision.allowed is False
+    assert "not evaluable" in decision.reason
 
 
 def test_drawdown_below_cap_does_not_trip(tmp_db: Engine) -> None:
@@ -91,11 +115,12 @@ def test_new_entry_allowed_below_block_frac(tmp_db: Engine) -> None:
     assert ok.allowed is True
 
 
-def test_new_entry_allowed_when_not_evaluable(tmp_db: Engine) -> None:
-    # No baseline or unknown current -> fail OPEN for entries (the per-tick
-    # breaker is the real backstop; entries shouldn't hard-block on a flaky read).
-    ok = new_entry_allowed(tmp_db, _settings(), current_net_liq=None)
-    assert ok.allowed is True
+def test_new_entry_blocked_when_not_evaluable(tmp_db: Engine) -> None:
+    # Missing baseline/current equity cannot prove the daily-loss guard, so new
+    # risk must fail closed even though exits remain available.
+    decision = new_entry_allowed(tmp_db, _settings(), current_net_liq=None)
+    assert decision.allowed is False
+    assert "not evaluable" in decision.reason
 
 
 def test_evaluate_is_idempotent_when_already_killed(tmp_db: Engine) -> None:

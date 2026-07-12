@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -39,11 +40,15 @@ from optionsbot.execution.exits import evaluate_exit
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
+    CloseAlreadyClaimed,
     OrderRecord,
+    RealizedPnLUnavailable,
     get_order,
     net_premium,
     open_close_for,
     realized_close_pairs,
+    set_order_leg_contracts,
+    set_order_note,
     stage_close_order,
     transition,
 )
@@ -134,6 +139,30 @@ def _min_dte(legs: list[dict[str, object]], now: datetime) -> int | None:
     return min(dtes) if dtes else None
 
 
+def _exit_quote_readiness(
+    quotes: dict[tuple[str, float, str], OptionQuote],
+    now: datetime,
+    max_age_seconds: int,
+) -> tuple[dict[tuple[str, float, str], float], str | None]:
+    """Require exact live provenance and known, current timestamps for every quote."""
+    ages: dict[tuple[str, float, str], float] = {}
+    if not quotes:
+        return ages, "quotes unavailable"
+    for spec, quote in quotes.items():
+        if quote.delayed is not False:
+            return ages, "delayed or unknown quote delivery"
+        if not isinstance(quote.ts, datetime):
+            return ages, "quote timestamp unknown"
+        quote_ts = quote.ts if quote.ts.tzinfo is not None else quote.ts.replace(tzinfo=UTC)
+        age = (now - quote_ts.astimezone(UTC)).total_seconds()
+        ages[spec] = age
+        if age < 0:
+            return ages, "quote timestamp is in the future"
+        if max_age_seconds > 0 and age > max_age_seconds:
+            return ages, f"quotes are stale (oldest {age:.0f}s > {max_age_seconds}s)"
+    return ages, None
+
+
 def _day_start(now: datetime) -> datetime:
     return datetime(now.year, now.month, now.day, tzinfo=UTC)
 
@@ -144,18 +173,87 @@ def _mark_exit_request(
     status: str,
     decision_reason: str,
     now: datetime,
-    *,
-    close_order_id: int | None = None,
-) -> None:
-    values = {
-        "status": status,
-        "decision_reason": decision_reason,
-        "processed_at": now,
-    }
-    if close_order_id is not None:
-        values["close_order_id"] = close_order_id
+) -> bool:
+    """Conditionally terminalize an unclaimed request without overwriting races."""
     with engine.begin() as conn:
-        conn.execute(update(exit_requests).where(exit_requests.c.id == request_id).values(**values))
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.status == "requested")
+            .values(
+                status=status,
+                decision_reason=decision_reason,
+                processed_at=now,
+            )
+        )
+    return result.rowcount == 1
+
+
+def _bind_exit_request(
+    engine: Engine,
+    request_id: int,
+    position_id: int,
+    close_order_id: int,
+    decision_reason: str,
+) -> bool:
+    """Persist exact Hermes attribution before any broker mutation."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.position_id == position_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id.is_(None))
+            .values(
+                close_order_id=close_order_id,
+                decision_reason=decision_reason,
+            )
+        )
+    return result.rowcount == 1
+
+
+def _bound_exit_request_is_eligible(
+    engine: Engine,
+    request_id: int,
+    position_id: int,
+    close_order_id: int,
+    decision_reason: str,
+) -> bool:
+    """Re-confirm the bound request after the last awaited safety check."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.position_id == position_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id == close_order_id)
+            .values(decision_reason=decision_reason)
+        )
+    return result.rowcount == 1
+
+
+def _finish_bound_exit_request(
+    engine: Engine,
+    request_id: int,
+    close_order_id: int,
+    status: str,
+    decision_reason: str,
+    now: datetime,
+) -> bool:
+    """Conditionally terminalize the exact request/close binding."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(exit_requests)
+            .where(exit_requests.c.id == request_id)
+            .where(exit_requests.c.status == "requested")
+            .where(exit_requests.c.close_order_id == close_order_id)
+            .values(
+                status=status,
+                decision_reason=decision_reason,
+                processed_at=now,
+            )
+        )
+    return result.rowcount == 1
 
 
 def _request_counts(engine: Engine, position_id: int, now: datetime) -> tuple[int, int]:
@@ -201,13 +299,13 @@ async def _quote_gate_state(
         current_net = combo_mid(entry.legs, quotes)
     except Exception:  # noqa: BLE001 -- request_exit fails closed without quote corroboration
         log.warning("request_exit quote gate failed for entry #%s", entry.id)
-    max_age = context.settings.execution.exit_quote_max_age_seconds
-    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
-    if (
-        max_age > 0
-        and current_net is not None
-        and any(age > max_age for age in quote_ages.values())
-    ):
+        quotes = {}
+    _, quote_issue = _exit_quote_readiness(
+        quotes,
+        datetime.now(UTC),
+        context.settings.execution.exit_quote_max_age_seconds,
+    )
+    if current_net is None or quote_issue is not None:
         current_net = None
     deterministic_reason = None
     if dte is not None:
@@ -239,19 +337,28 @@ def _hermes_loss_cap_decision(
             ).where(execution_state.c.id == 1)
         ).first()
         close_rows = conn.execute(
-            select(exit_requests.c.close_order_id)
-            .where(exit_requests.c.status == "submitted")
-            .where(exit_requests.c.close_order_id.is_not(None))
+            select(exit_requests.c.close_order_id).where(
+                exit_requests.c.close_order_id.is_not(None)
+            )
         ).fetchall()
     baseline = None
     if baseline_row is not None and baseline_row.day_start_session == session:
         baseline = baseline_row.day_start_net_liq
     hermes_close_ids = {int(row.close_order_id) for row in close_rows}
-    cumulative_pnl = sum(
-        pair.pnl
-        for pair in realized_close_pairs(context.engine, since=session_start)
-        if pair.close_id in hermes_close_ids
-    )
+    try:
+        cumulative_pnl = sum(
+            pair.pnl
+            for pair in realized_close_pairs(context.engine, since=session_start)
+            if pair.close_id in hermes_close_ids
+        )
+    except RealizedPnLUnavailable as exc:
+        return HermesLossCapDecision(
+            allowed=False,
+            evaluable=False,
+            cumulative_realized_pnl=0.0,
+            cap_dollars=None,
+            reason=f"Hermes realized P&L accounting unavailable: {exc}",
+        )
     return evaluate_hermes_loss_cap(
         cumulative_realized_pnl=cumulative_pnl,
         day_start_net_liq=None if baseline is None else float(baseline),
@@ -325,6 +432,39 @@ async def _process_exit_requests(
                 context.engine, row.id, "refused", "position is already closing", now
             )
             continue
+        raw_sources = row.sources_json
+        try:
+            confidence = float(row.confidence)
+        except (TypeError, ValueError, OverflowError):
+            confidence = math.nan
+        sources = (
+            [source.strip() for source in raw_sources]
+            if isinstance(raw_sources, list)
+            and all(isinstance(source, str) for source in raw_sources)
+            else []
+        )
+        canonical_sources = {source.casefold() for source in sources}
+        reason = row.reason.strip() if isinstance(row.reason, str) else ""
+        catalyst_type = (
+            row.catalyst_type.strip() if isinstance(row.catalyst_type, str) else ""
+        )
+        if (
+            not math.isfinite(confidence)
+            or not 0.0 <= confidence <= 1.0
+            or len(sources) < 2
+            or any(not source for source in sources)
+            or len(canonical_sources) != len(sources)
+            or not reason
+            or not catalyst_type
+        ):
+            _mark_exit_request(
+                context.engine,
+                row.id,
+                "refused",
+                "persisted exit authorization evidence is invalid",
+                now,
+            )
+            continue
         state, unavailable = await _quote_gate_state(context, md, entry, now)
         if state is None:
             _mark_exit_request(context.engine, row.id, "refused", unavailable or "unavailable", now)
@@ -333,10 +473,10 @@ async def _process_exit_requests(
         decision = evaluate_exit_request_gate(
             ExitRequestGateInput(
                 position_id=entry.id,
-                catalyst_type=row.catalyst_type,
-                confidence=float(row.confidence),
-                sources=list(row.sources_json or []),
-                reason=row.reason,
+                catalyst_type=catalyst_type,
+                confidence=confidence,
+                sources=sources,
+                reason=reason,
                 today_position_requests=position_count,
                 today_portfolio_requests=portfolio_count,
             ),
@@ -351,17 +491,10 @@ async def _process_exit_requests(
             entry,
             now,
             forced_reason=f"Hermes request_exit #{row.id}: {decision.reason}",
+            exit_request_id=int(row.id),
+            exit_decision_reason=decision.reason,
         )
         if placed:
-            close = open_close_for(context.engine, entry.id)
-            _mark_exit_request(
-                context.engine,
-                row.id,
-                "submitted",
-                decision.reason,
-                now,
-                close_order_id=close.id if close is not None else None,
-            )
             submitted += placed
         else:
             _mark_exit_request(context.engine, row.id, "failed", "no close was placed", now)
@@ -430,15 +563,29 @@ async def _manage_entry(
     now: datetime,
     *,
     forced_reason: str | None = None,
+    exit_request_id: int | None = None,
+    exit_decision_reason: str | None = None,
 ) -> int:
     """Evaluate one position; returns 1 if a closing order was submitted.
 
-    ``forced_reason`` (set by the human-initiated ``/close`` path) stands in for
-    ``evaluate_exit`` so the close fires regardless of TP/stop/DTE.
+    ``forced_reason`` bypasses ``evaluate_exit`` for an approved manual or
+    Hermes-triggered close. Hermes requests additionally carry their exact
+    persisted identity so attribution is bound before broker placement.
     """
     engine = context.engine
     order_client = context.order_client
     if order_client is None:
+        return 0
+    execution_verdict = can_execute(context.settings, load_state(engine))
+    if not execution_verdict.allowed:
+        if exit_request_id is not None:
+            _mark_exit_request(
+                engine,
+                exit_request_id,
+                "refused",
+                f"execution interlock closed: {execution_verdict.reason}",
+                now,
+            )
         return 0
     if open_close_for(engine, entry.id) is not None:
         return 0  # a close is already working — never double-exit
@@ -478,37 +625,35 @@ async def _manage_entry(
                 spec[2],  # type: ignore[arg-type]
             )
         current_net = combo_mid(entry.legs, quotes)
-    except Exception:  # noqa: BLE001 -- expiry guard must still work quote-blind
+    except Exception:  # noqa: BLE001 -- deterministic exits must still work quote-blind
         log.warning("exit quotes failed for entry #%s — DTE rules only", entry.id)
+        quotes = {}
 
-    # Quote-freshness gate (IBK-PHASE0-C1). If ANY quote feeding current_net is
-    # older than the threshold, drop current_net to None: evaluate_exit then
-    # takes its quote-blind path (expiry/DTE only), so a TP/soft stop can never
-    # be priced off a stale mid. Always log the timestamps the decision used.
     max_age = context.settings.execution.exit_quote_max_age_seconds
-    quote_ages = {spec: (now - q.ts).total_seconds() for spec, q in quotes.items()}
-    if quotes:
+    quote_ages, quote_issue = _exit_quote_readiness(quotes, datetime.now(UTC), max_age)
+    if quote_issue is None and current_net is None:
+        quote_issue = "quote mid unavailable"
+    if quotes and quote_issue is None:
         log.info(
             "exit quotes for entry #%s: %s",
             entry.id,
             ", ".join(
                 f"{spec[1]}{spec[2]}@{q.ts.isoformat()} (age {quote_ages[spec]:.0f}s)"
                 for spec, q in quotes.items()
+                if q.ts is not None
             ),
         )
-    stale = bool(
-        max_age > 0
-        and current_net is not None
-        and any(age > max_age for age in quote_ages.values())
-    )
-    if stale:
-        oldest = max(quote_ages.values())
-        # Suppress the staleness ALERT on a forced /close: nothing is deferred
-        # there (the close still proceeds priced off entry-net + a walk re-anchor),
-        # so the "TP/stop deferred" message would be false/confusing. The pricing
-        # suppression (current_net=None) below still applies on both paths.
-        if forced_reason is None and entry.id not in context.exit_stale_warned:
+    if quote_issue is not None:
+        # Keep the existing one-shot operator alert for stale delivery. Other
+        # unavailable shapes are logged and fail closed without quote-driven
+        # TP/stop evaluation; deterministic DTE/expiry rules remain active.
+        if (
+            "stale" in quote_issue
+            and forced_reason is None
+            and entry.id not in context.exit_stale_warned
+        ):
             context.exit_stale_warned.add(entry.id)
+            oldest = max(quote_ages.values(), default=0.0)
             await _send(
                 context,
                 f"⚠ exit pricing for #{entry.id} {entry.symbol} {entry.strategy} "
@@ -516,13 +661,12 @@ async def _manage_entry(
                 f"{max_age}s). TP/stop deferred; expiry/DTE rules still active.",
             )
         log.warning(
-            "exit #%s quote-priced exit suppressed (stale: oldest %.0fs > %ss)",
+            "exit #%s quote-priced exit suppressed (%s)",
             entry.id,
-            oldest,
-            max_age,
+            quote_issue,
         )
         current_net = None
-        quotes = {}  # stale quotes must not price the close/walk either
+        quotes = {}  # unusable quotes must not price the close or a walk
     else:
         context.exit_stale_warned.discard(entry.id)
 
@@ -543,8 +687,8 @@ async def _manage_entry(
         return 0
 
     # Price the FLIPPED structure. Closing a credit pays; closing a debit
-    # collects. With no usable quote (expiry guard path) fall back to the
-    # entry net — the walk re-anchors from live quotes immediately anyway.
+    # collects. A deterministic time/DTE close with no usable live quote falls
+    # back to the entry net and does not start a quote-driven price walk.
     # Rounded to the symbol tick: IBKR rejects sub-increment limits (Error 110).
     increment = price_increment_for(entry.symbol)
     close_net = round_to_increment(
@@ -552,12 +696,19 @@ async def _manage_entry(
     )
     limit_price = -close_net  # BAG convention: limit = -net
 
-    close = stage_close_order(engine, entry, now=now)
+    try:
+        close = stage_close_order(engine, entry, now=now)
+    except CloseAlreadyClaimed as exc:
+        if exit_request_id is not None:
+            _mark_exit_request(engine, exit_request_id, "refused", str(exc), now)
+        return 0
     try:
         assert_atomic_close_legs(entry_legs=entry.legs, close_legs=close.legs)
     except NonAtomicCloseError as exc:
         # Fail safe: a close we cannot guarantee atomic must NOT be legged out.
         transition(engine, close.id, "skipped", error=str(exc), now=now)
+        if exit_request_id is not None:
+            _mark_exit_request(engine, exit_request_id, "failed", str(exc), now)
         trip_kill(engine, f"non-atomic close for #{entry.id}: {exc}")
         await _send(
             context,
@@ -566,6 +717,74 @@ async def _manage_entry(
             "Flatten manually and /arm after fixing.",
         )
         return 0
+
+    if exit_request_id is not None:
+        if exit_decision_reason is None:
+            transition(engine, close.id, "skipped", error="missing Hermes decision", now=now)
+            _mark_exit_request(
+                engine,
+                exit_request_id,
+                "failed",
+                "missing Hermes decision attribution",
+                now,
+            )
+            return 0
+        if not _bind_exit_request(
+            engine,
+            exit_request_id,
+            entry.id,
+            close.id,
+            exit_decision_reason,
+        ):
+            transition(engine, close.id, "skipped", error="exit request claim lost", now=now)
+            return 0
+
+        # This is the last awaited gate before placement. Recompute from the
+        # complete bound-close ledger for every Hermes broker mutation, rather
+        # than relying on the once-per-tick value.
+        loss_cap = await _enforce_hermes_loss_cap(context, now)
+        if not loss_cap.allowed:
+            transition(engine, close.id, "skipped", error=loss_cap.reason, now=now)
+            _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "refused",
+                loss_cap.reason,
+                now,
+            )
+            return 0
+        if not _bound_exit_request_is_eligible(
+            engine,
+            exit_request_id,
+            entry.id,
+            close.id,
+            exit_decision_reason,
+        ):
+            transition(
+                engine,
+                close.id,
+                "skipped",
+                error="exit request no longer eligible",
+                now=now,
+            )
+            return 0
+
+    execution_verdict = can_execute(context.settings, load_state(engine))
+    if not execution_verdict.allowed:
+        reason = f"execution interlock closed before placement: {execution_verdict.reason}"
+        transition(engine, close.id, "skipped", error=reason, now=now)
+        if exit_request_id is not None:
+            _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "refused",
+                reason,
+                now,
+            )
+        return 0
+
     transition(engine, close.id, "submitting", now=now)
     try:
         placed = await order_client.place_combo_limit(
@@ -575,15 +794,93 @@ async def _manage_entry(
             limit_price=limit_price,
             order_ref=close.order_ref or f"obot-{close.id}",
         )
-    except Exception as exc:  # noqa: BLE001 -- a failed close lands in the ledger + retries next tick
-        transition(engine, close.id, "skipped", error=str(exc), now=now)
-        await _send(context, f"⚠ closing #{entry.id} failed to place: {exc} — will retry")
+    except Exception as exc:  # noqa: BLE001 -- placement outcome may be unknown
+        halt_reason = (
+            f"close #{close.id} broker placement outcome unknown after exception: {exc}"
+        )
+        # Keep the close in `submitting` so the permanent active-close claim
+        # blocks retries until broker/ledger reconciliation determines whether
+        # the order exists. A terminal transition here could stage a duplicate.
+        try:
+            set_order_note(engine, close.id, halt_reason)
+        except Exception:  # noqa: BLE001 -- kill still takes precedence
+            log.exception("failed to annotate uncertain close #%s", close.id)
+        trip_kill(engine, halt_reason, now=now)
+        await _send(
+            context,
+            f"🛑 HALT: {halt_reason}. No retry will be staged; reconcile broker "
+            "and ledger state before re-arming.",
+        )
         return 0
-    transition(engine, close.id, "submitted", ib_order_id=placed.ib_order_id, now=now)
+    try:
+        set_order_leg_contracts(engine, close.id, placed.leg_contracts)
+        transition(
+            engine,
+            close.id,
+            "submitted",
+            ib_order_id=placed.ib_order_id,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 -- broker side effect may already exist
+        halt_reason = (
+            f"close #{close.id} broker placement completed but ledger finalization "
+            f"failed: {exc}"
+        )
+        trip_kill(engine, halt_reason, now=now)
+        try:
+            await order_client.cancel(placed.ib_order_id)
+        except Exception:  # noqa: BLE001 -- halt remains authoritative
+            log.exception(
+                "failed to cancel close #%s after ledger finalization failure",
+                close.id,
+            )
+        await _send(
+            context,
+            f"🛑 HALT: {halt_reason}. Treat broker state as unknown and reconcile "
+            "before re-arming.",
+        )
+        return 1
 
-    # Walk the close like an entry (IBK-127).
+    if exit_request_id is not None and exit_decision_reason is not None:
+        try:
+            completed = _finish_bound_exit_request(
+                engine,
+                exit_request_id,
+                close.id,
+                "submitted",
+                exit_decision_reason,
+                now,
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker side effect already exists
+            halt_reason = (
+                f"Hermes exit request #{exit_request_id} completion failed after "
+                f"broker placement of close #{close.id}: {exc}"
+            )
+            trip_kill(engine, halt_reason, now=now)
+            await _send(
+                context,
+                f"🛑 HALT: {halt_reason}. The close remains broker-submitted; "
+                "reconcile before re-arming.",
+            )
+            return 1
+        if not completed:
+            halt_reason = (
+                f"Hermes exit request #{exit_request_id} completion lost after "
+                f"broker placement of close #{close.id}"
+            )
+            trip_kill(engine, halt_reason, now=now)
+            await _send(
+                context,
+                f"🛑 HALT: {halt_reason}. The close remains broker-submitted; "
+                "no further automated mutations will be started.",
+            )
+            return 1
+
+    # Walk only when this close was initially priced from a complete live,
+    # current quote set. Quote-blind deterministic closes must never re-anchor
+    # to delayed/unknown data in the generic walk implementation.
     cfg = context.settings.execution
-    if cfg.walk_max_steps > 0:
+    if cfg.walk_max_steps > 0 and current_net is not None:
         flipped_nbbo = combo_bid_ask(close.legs, quotes) if quotes else None
         budget = (
             slippage_budget(
@@ -683,13 +980,25 @@ async def assert_no_naked_short_after_close(context: DaemonContext, entry: Order
     from optionsbot.ibkr.positions import PositionsClient
 
     if context.exec_ibkr is None:
-        return True
+        reason = f"post-close broker position verification unavailable for #{entry.id}"
+        trip_kill(context.engine, reason)
+        if entry.id not in context.naked_leg_halted:
+            context.naked_leg_halted.add(entry.id)
+            await _send(context, f"🛑 KILL SWITCH: {reason}")
+        return False
     try:
         positions = await PositionsClient(context.exec_ibkr).get_portfolio()
-    except Exception:  # noqa: BLE001 -- a dead read must not crash the tick
-        log.exception("naked-leg check: get_portfolio failed for #%s", entry.id)
-        return True
-    naked = find_naked_short_legs(entry.legs, positions)
+        if not isinstance(positions, (list, tuple)):
+            raise ValueError("portfolio snapshot is not a list or tuple")
+        naked = find_naked_short_legs(entry.legs, positions)
+    except Exception as exc:  # noqa: BLE001 -- unavailable/malformed state fails closed
+        log.exception("naked-leg check: portfolio evidence failed for #%s", entry.id)
+        reason = f"post-close broker position verification failed for #{entry.id}: {exc}"
+        trip_kill(context.engine, reason)
+        if entry.id not in context.naked_leg_halted:
+            context.naked_leg_halted.add(entry.id)
+            await _send(context, f"🛑 KILL SWITCH: {reason}")
+        return False
     if not naked:
         context.naked_leg_halted.discard(entry.id)
         return True

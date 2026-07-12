@@ -163,7 +163,10 @@ class ExecutionSettings(BaseModel):
     # fresh mid and rests until the TTL, then auto-cancels (= trade skipped);
     # the reprice ladder arrives in IBK-127. credit_drift_warn_pct flags when
     # the fresh mid drifted from the alerted credit.
-    max_pick_age_minutes: int = Field(default=20, ge=1)
+    max_pick_age_minutes: int = Field(default=20, ge=1, le=60)
+    # Every option leg used to price an entry must carry a recent provider
+    # timestamp. Unknown or stale quote times fail closed before staging.
+    entry_quote_max_age_seconds: int = Field(default=45, ge=1, le=120)
     order_ttl_minutes: int = Field(default=10, ge=1)
     credit_drift_warn_pct: float = Field(default=0.25, gt=0.0)
     # IBK-127 price walk: submit at mid, reprice toward marketable every
@@ -203,10 +206,9 @@ class ExecutionSettings(BaseModel):
     # stop). If the option snapshots driving an exit decision are older than
     # this many seconds, the quote-priced exit is SUPPRESSED for that tick
     # (never price a close off a stale mid / cross a moved spread). The
-    # time-based expiry/DTE guard is unaffected and always fires. 0 disables
-    # the freshness gate (legacy behavior). Sized to the exit cadence and the
-    # delayed-feed latency.
-    exit_quote_max_age_seconds: int = Field(default=45, ge=0)
+    # time-based expiry/DTE guard is unaffected and always fires. A positive
+    # bounded window is mandatory so quote freshness cannot be disabled.
+    exit_quote_max_age_seconds: int = Field(default=45, ge=1, le=120)
     # IBK-130 full-auto gates: reject new auto entries once this fraction of
     # net liquidation is already deployed ((net_liq - available)/net_liq).
     # Confirm-mode /execute is NOT bound by it — the human decides.
@@ -234,11 +236,17 @@ class ExecutionSettings(BaseModel):
         ceilings: tuple[tuple[str, float], ...] = (
             ("base_risk_pct", 0.05),
             # Aggregate defined-risk exposure may use at most half of live
-            # USD net liquidation. The separate 15% single-trade ceiling keeps
-            # one position from consuming the entire account-relative budget.
+            # USD net liquidation.
             ("max_portfolio_heat_pct", 0.50),
-            ("max_single_trade_risk_pct", 0.15),
+            # One unattended trade may risk at most 10% of live net liquidation.
+            ("max_single_trade_risk_pct", 0.10),
             ("max_bp_usage_pct", 0.50),
+            # Operational caps must not be configurable into ineffective
+            # values that disable concentration or drawdown protection.
+            ("max_daily_loss_pct", 0.05),
+            ("max_open_positions", 10),
+            ("max_per_symbol", 3),
+            ("max_consecutive_losses", 10),
         )
         for name, ceiling in ceilings:
             value = getattr(self, name)

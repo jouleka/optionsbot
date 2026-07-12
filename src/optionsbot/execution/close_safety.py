@@ -17,12 +17,16 @@ Two independent checks protect autonomous closes:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from optionsbot.ibkr.types import PortfolioPosition
 
 LegSpec = tuple[str, float, str]  # (expiry, strike, right)
+_KNOWN_BROKER_SECURITY_TYPES = frozenset(
+    {"OPT", "STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND", "BAG"}
+)
 
 
 class NonAtomicCloseError(RuntimeError):
@@ -31,7 +35,17 @@ class NonAtomicCloseError(RuntimeError):
 
 
 def _option_legs(legs: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+    option_legs: list[Mapping[str, Any]] = []
+    for leg in legs:
+        sec_type = leg.get("sec_type", "OPT")
+        if sec_type == "STK":
+            continue
+        if sec_type != "OPT":
+            raise NonAtomicCloseError(
+                f"unsupported or malformed security type {sec_type!r}"
+            )
+        option_legs.append(leg)
+    return option_legs
 
 
 def _spec(leg: Mapping[str, Any]) -> LegSpec:
@@ -39,7 +53,43 @@ def _spec(leg: Mapping[str, Any]) -> LegSpec:
 
 
 def _flip(side: str) -> str:
-    return "buy" if side == "sell" else "sell"
+    if side == "sell":
+        return "buy"
+    if side == "buy":
+        return "sell"
+    raise NonAtomicCloseError(f"unsupported option leg side {side!r}")
+
+
+def _validated_leg_map(
+    legs: Sequence[Mapping[str, Any]], *, label: str, flip_sides: bool
+) -> dict[tuple[str, str, float, str], tuple[str, int]]:
+    normalized: dict[tuple[str, str, float, str], tuple[str, int]] = {}
+    for leg in legs:
+        try:
+            symbol = leg["symbol"]
+            side = leg["side"]
+            raw_quantity = leg.get("quantity", 1)
+            quantity = int(raw_quantity)
+            spec = _spec(leg)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise NonAtomicCloseError(f"{label} contains a malformed option leg") from exc
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or not isinstance(side, str)
+            or side not in {"buy", "sell"}
+            or isinstance(raw_quantity, bool)
+            or quantity <= 0
+            or quantity != raw_quantity
+        ):
+            raise NonAtomicCloseError(f"{label} contains a malformed option leg")
+        identity = (symbol.strip().upper(), *spec)
+        if identity in normalized:
+            raise NonAtomicCloseError(
+                f"{label} contains duplicate option contract identity {identity}"
+            )
+        normalized[identity] = (_flip(side) if flip_sides else side, quantity)
+    return normalized
 
 
 def assert_atomic_close_legs(
@@ -59,14 +109,8 @@ def assert_atomic_close_legs(
             f"close has {len(close_opts)} option legs, entry has "
             f"{len(entry_opts)} — cannot close atomically"
         )
-    expected = {
-        _spec(leg): (_flip(str(leg["side"])), int(leg.get("quantity", 1)))
-        for leg in entry_opts
-    }
-    actual = {
-        _spec(leg): (str(leg["side"]), int(leg.get("quantity", 1)))
-        for leg in close_opts
-    }
+    expected = _validated_leg_map(entry_opts, label="entry", flip_sides=True)
+    actual = _validated_leg_map(close_opts, label="close", flip_sides=False)
     if expected != actual:
         raise NonAtomicCloseError(
             f"close legs are not the inverse of the entry "
@@ -88,11 +132,41 @@ def find_naked_short_legs(
     symbols = {str(leg["symbol"]) for leg in _option_legs(entry_legs)}
     naked: list[PortfolioPosition] = []
     for pos in broker_positions:
-        if pos.sec_type != "OPT" or pos.symbol not in symbols:
+        try:
+            sec_type = pos.sec_type
+            symbol = pos.symbol
+            expiry = pos.expiry
+            strike = pos.strike
+            right = pos.right
+            position = pos.position
+            con_id = pos.con_id
+        except AttributeError as exc:
+            raise NonAtomicCloseError("broker position evidence is malformed") from exc
+        if sec_type not in _KNOWN_BROKER_SECURITY_TYPES:
+            raise NonAtomicCloseError(
+                f"broker position has unknown security type {sec_type!r}"
+            )
+        if sec_type != "OPT":
             continue
-        if pos.expiry is None or pos.strike is None or pos.right is None:
-            continue
-        spec = (str(pos.expiry), float(pos.strike), str(pos.right))
-        if spec in entry_specs and pos.position < 0:
+        if (
+            not isinstance(symbol, str)
+            or not symbol
+            or not isinstance(expiry, str)
+            or not expiry
+            or not isinstance(strike, (int, float))
+            or isinstance(strike, bool)
+            or not math.isfinite(float(strike))
+            or strike <= 0
+            or right not in {"C", "P"}
+            or not isinstance(position, (int, float))
+            or isinstance(position, bool)
+            or not math.isfinite(float(position))
+            or not float(position).is_integer()
+            or type(con_id) is not int
+            or con_id <= 0
+        ):
+            raise NonAtomicCloseError("broker option position evidence is malformed")
+        spec = (expiry, float(strike), right)
+        if symbol in symbols and spec in entry_specs and position < 0:
             naked.append(pos)
     return naked

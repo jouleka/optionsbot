@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import Engine, insert, select, update
 
 from optionsbot.execution.orders import get_order, record_fill
+from optionsbot.execution.state import load_state
 from optionsbot.execution.tracker import OrderTracker, map_ib_status, row_id_from_ref
 from optionsbot.ibkr.types import CommissionUpdate, ExecutionFill, OrderStatusUpdate
 from optionsbot.storage.schema import fills, orders
@@ -129,6 +130,14 @@ def test_status_inactive_maps_to_rejected_with_error(tmp_db: Engine) -> None:
     assert record.last_error  # some explanation recorded
 
 
+def test_unknown_live_bot_status_trips_kill(tmp_db: Engine) -> None:
+    from optionsbot.execution.state import load_state
+
+    order_id = _insert_order(tmp_db, "submitted")
+    OrderTracker(tmp_db).handle_status(_status(order_id, "MysteryWorking"))
+    assert load_state(tmp_db).killed is True
+
+
 def test_terminal_redelivery_never_raises(tmp_db: Engine) -> None:
     order_id = _insert_order(tmp_db, "filled")
     tracker = OrderTracker(tmp_db)
@@ -136,9 +145,13 @@ def test_terminal_redelivery_never_raises(tmp_db: Engine) -> None:
     assert get_order(tmp_db, order_id).status == "filled"  # type: ignore[union-attr]
 
 
-def test_unknown_and_foreign_refs_ignored(tmp_db: Engine) -> None:
+def test_missing_bot_row_halts_while_foreign_refs_are_ignored(tmp_db: Engine) -> None:
+    from optionsbot.execution.state import load_state
+
     tracker = OrderTracker(tmp_db)
-    tracker.handle_status(_status(999_999, "Submitted"))  # row doesn't exist
+    tracker.handle_status(_status(999_999, "Submitted"))
+    assert load_state(tmp_db).killed is True
+
     update_obj = OrderStatusUpdate(
         ib_order_id=5, perm_id=None, order_ref="manual-trade", status="Submitted",
         filled=0, remaining=1, avg_fill_price=None,
@@ -194,3 +207,28 @@ def test_attach_subscribes_all_three(tmp_db: Engine) -> None:
     order_client.on_status.assert_called_once_with(tracker.handle_status)
     order_client.on_fill.assert_called_once_with(tracker.handle_fill)
     order_client.on_commission.assert_called_once_with(tracker.handle_commission)
+
+
+def test_status_rejects_broker_id_already_owned_by_another_row(tmp_db: Engine) -> None:
+    first = _insert_order(tmp_db, "submitted")
+    second = _insert_order(tmp_db, "submitting")
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders).where(orders.c.id == first).values(ib_order_id=77)
+        )
+
+    tracker = OrderTracker(tmp_db)
+    tracker.handle_status(
+        OrderStatusUpdate(
+            ib_order_id=77,
+            perm_id=88,
+            order_ref=f"obot-{second}",
+            status="Submitted",
+            filled=0.0,
+            remaining=1.0,
+            avg_fill_price=None,
+        )
+    )
+
+    assert load_state(tmp_db).killed
+    assert get_order(tmp_db, second).ib_order_id is None  # type: ignore[union-attr]

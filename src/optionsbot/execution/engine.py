@@ -20,17 +20,23 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Engine, select
+from sqlalchemy.exc import IntegrityError
 
 from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
-    IllegalOrderTransition,
     record_order_quotes,
+    set_order_leg_contracts,
+    set_order_note,
     stage_order,
     transition,
 )
-from optionsbot.execution.state import load_state
+from optionsbot.execution.risk_structure import (
+    has_structurally_defined_option_risk,
+    structural_max_loss_dollars,
+)
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
     combo_spread_issue,
@@ -127,8 +133,8 @@ async def execute_pick(
 
     # PHASE 0 B1: stop ADDING risk as the day-start net-liq drawdown approaches
     # the daily-loss cap. The per-tick breaker is the hard kill; this is the
-    # softer "don't pile on while bleeding" entry gate. Fails OPEN if net-liq is
-    # unreadable (the breaker remains the backstop).
+    # softer "don't pile on while bleeding" entry gate. Missing or invalid
+    # net-liq fails closed because the breaker cannot prove safety.
     from optionsbot.execution.equity_guard import new_entry_allowed
 
     try:
@@ -139,7 +145,7 @@ async def execute_pick(
             if _summary.net_liquidation_usd is not None
             else None
         )
-    except Exception:  # noqa: BLE001 -- a flaky read must not hard-block entries
+    except Exception:  # noqa: BLE001 -- unreadable equity fails closed below
         _net_liq = None
     _entry = new_entry_allowed(engine, settings, current_net_liq=_net_liq)
     if not _entry.allowed:
@@ -177,23 +183,36 @@ async def execute_pick(
             f"stale pick — scanned {int(age.total_seconds() // 60)}m ago "
             f"(max {settings.execution.max_pick_age_minutes}m). /scan {symbol} for a fresh one."
         )
+    if age < timedelta(0):
+        return _reject("future-dated pick — persisted scan time is not trustworthy")
 
     # 4. Defined-risk only. In auto mode, earnings inside the expiry window
     # are skipped — binary jump risk overwhelms theta edge for neutral
     # structures (the human can still /execute deliberately in confirm mode).
     if settings.execution.mode == "auto":
-        snapshot_raw: dict[str, Any] = pick.raw_json or {}
+        snapshot_raw = pick.raw_json
+        if not isinstance(snapshot_raw, dict):
+            return _reject(
+                "snapshot data readiness unavailable — auto mode requires audited live data"
+            )
+        if (
+            snapshot_raw.get("delayed") is not False
+            or snapshot_raw.get("warming_up") is not False
+        ):
+            return _reject(
+                "snapshot data not explicitly live and ready — auto mode requires "
+                "delayed=false and warming up=false"
+            )
         if snapshot_raw.get("earnings_in_window"):
             return _reject(
                 "earnings inside the expiry window — auto mode skips "
                 "(use /execute to override deliberately)"
             )
-        if snapshot_raw.get("delayed"):
-            return _reject("delayed snapshot data — auto mode requires a live delivered feed")
-        if snapshot_raw.get("warming_up"):
-            return _reject("snapshot history is warming up — auto mode requires mature data")
-    if not suggestion.get("defined_risk", False):
-        return _reject("undefined risk strategies are not executable")
+    if (
+        suggestion.get("defined_risk") is not True
+        or not has_structurally_defined_option_risk(legs)
+    ):
+        return _reject("undefined risk: option legs do not independently prove a bound")
     max_loss_unit = float(suggestion.get("max_loss") or 0.0)
     if not math.isfinite(max_loss_unit) or max_loss_unit <= 0:
         return _reject("pick carries no defined max loss — not sizeable")
@@ -256,10 +275,23 @@ async def execute_pick(
                 )
             except Exception as exc:  # noqa: BLE001 -- per-leg quote failure = reject
                 return _reject(f"no usable quote for {symbol} {spec[0]} {spec[1]}{spec[2]}: {exc}")
-    if any(quote.delayed for quote in quotes.values()):
+    if any(quote.delayed is not False for quote in quotes.values()):
         return _reject(
             "delayed or unknown option quote feed — refusing to price an entry without live data"
         )
+    quote_max_age = timedelta(seconds=settings.execution.entry_quote_max_age_seconds)
+    quote_now = ts_now if now is not None else datetime.now(UTC)
+    for quote in quotes.values():
+        if not isinstance(quote.ts, datetime):
+            return _reject("option quote timestamp unknown — refusing to price an entry blind")
+        quote_ts = quote.ts if quote.ts.tzinfo is not None else quote.ts.replace(tzinfo=UTC)
+        quote_age = quote_now - quote_ts.astimezone(UTC)
+        if quote_age < timedelta(0) or quote_age > quote_max_age:
+            return _reject(
+                "option quote age outside execution window "
+                f"({quote_age.total_seconds():.0f}s; max "
+                f"{settings.execution.entry_quote_max_age_seconds}s)"
+            )
     issues = liquidity_issues(
         legs, quotes,
         leg_spread_frac=settings.execution.max_leg_spread_frac,
@@ -282,6 +314,15 @@ async def execute_pick(
     # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
     # rejects sub-increment limits with Error 110. Round to the symbol's tick.
     fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
+    structural_max_loss = structural_max_loss_dollars(
+        legs,
+        entry_net_per_share=fresh_net,
+    )
+    if structural_max_loss is None:
+        return _reject("option legs do not prove a finite structural max loss")
+    # Persisted scanner risk is advisory. Never size below the larger of the
+    # scanner estimate and the independently reconstructed expiry loss.
+    max_loss_unit = max(max_loss_unit, structural_max_loss)
     # Economic liquidity gate: combo spread vs the premium we're capturing.
     combo_issue = combo_spread_issue(
         legs, quotes, fresh_net, max_frac=settings.execution.max_combo_spread_frac
@@ -324,8 +365,18 @@ async def execute_pick(
         return _reject(
             "live equity unavailable — refusing to size off a stale scan-time quantity"
         )
-    from optionsbot.execution.orders import realized_close_pairs
+    final_entry_gate = new_entry_allowed(
+        engine, settings, current_net_liq=equity
+    )
+    if not final_entry_gate.allowed:
+        return _reject(final_entry_gate.reason)
+    from optionsbot.execution.orders import RealizedPnLUnavailable, realized_close_pairs
     from optionsbot.execution.sizing import dynamic_quantity, open_heat_dollars
+
+    try:
+        recent_pnls = [p.pnl for p in realized_close_pairs(engine)[-5:]]
+    except RealizedPnLUnavailable as exc:
+        return _reject(f"realized P&L accounting unavailable — refusing new risk: {exc}")
 
     decision = dynamic_quantity(
         equity=equity,
@@ -337,7 +388,7 @@ async def execute_pick(
             float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
         ),
         open_heat=open_heat_dollars(engine),
-        recent_pnls=[p.pnl for p in realized_close_pairs(engine)[-5:]],
+        recent_pnls=recent_pnls,
         base_risk_pct=settings.execution.base_risk_pct,
         heat_cap_pct=settings.execution.max_portfolio_heat_pct,
         single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,
@@ -354,6 +405,11 @@ async def execute_pick(
             )
         except Exception as exc:  # noqa: BLE001 -- broker errors become a clean reject
             return _reject(f"whatIf margin preview failed: {exc}")
+    execution_verdict = can_execute(settings, load_state(engine))
+    if not execution_verdict.allowed:
+        return _reject(
+            f"execution interlock closed after margin preview: {execution_verdict.reason}"
+        )
     available = float(summary.available_funds) if summary.available_funds is not None else None
     # IBK-130: portfolio-wide buying-power deployment cap (auto mode only).
     if settings.execution.mode == "auto":
@@ -377,6 +433,11 @@ async def execute_pick(
             "margin preview incomplete (init-margin or available funds unknown) "
             "— refusing to place blind"
         )
+    if not math.isfinite(needed) or not math.isfinite(available):
+        return _reject(
+            "margin preview invalid (init-margin or available funds non-finite) "
+            "— refusing to place blind"
+        )
     if needed > available:
         return _reject(
             f"margin Δ ${needed:,.0f} exceeds available funds ${available:,.0f}"
@@ -398,7 +459,12 @@ async def execute_pick(
         if nbbo is not None
         else increment
     )
-    record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
+    try:
+        record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
+    except IntegrityError:
+        return _reject(
+            f"pick {score_id} already has an order intent; its authorization is consumed"
+        )
     record_order_quotes(
         engine, record.id, kind="decision", step=0, ts=ts_now,
         combo_bid=nbbo[0] if nbbo else None,
@@ -414,6 +480,20 @@ async def execute_pick(
             if (q := quotes.get((str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))))
         ],
     )
+    execution_verdict = can_execute(settings, load_state(engine))
+    if not execution_verdict.allowed:
+        transition(
+            engine,
+            record.id,
+            "skipped",
+            error=f"execution interlock closed before placement: {execution_verdict.reason}",
+            now=ts_now,
+        )
+        return ExecuteOutcome(
+            ok=False,
+            message=f"❌ execution interlock closed before placement: {execution_verdict.reason}",
+            order_id=record.id,
+        )
     transition(engine, record.id, "submitting", now=ts_now)
     try:
         placed = await deps.order_client.place_combo_limit(
@@ -423,33 +503,49 @@ async def execute_pick(
             limit_price=limit_price,
             order_ref=record.order_ref or f"obot-{record.id}",
         )
-    except Exception as exc:  # noqa: BLE001 -- a failed place must land in the ledger
-        transition(engine, record.id, "skipped", error=str(exc), now=ts_now)
+    except Exception as exc:  # noqa: BLE001 -- broker outcome may be unknown
+        halt_reason = (
+            f"entry order #{record.id} broker placement outcome unknown after "
+            f"exception: {exc}"
+        )
+        try:
+            set_order_note(engine, record.id, halt_reason)
+        except Exception:  # noqa: BLE001 -- kill still takes precedence
+            log.exception("failed to annotate uncertain entry order #%s", record.id)
+        trip_kill(engine, halt_reason, now=ts_now)
         return ExecuteOutcome(
             ok=False,
-            message=f"❌ order #{record.id} not placed: {exc}",
+            message=(
+                f"🛑 HALT: order #{record.id} placement outcome unknown: {exc}. "
+                "Reconcile broker and ledger state before re-arming."
+            ),
             order_id=record.id,
         )
     try:
+        set_order_leg_contracts(engine, record.id, placed.leg_contracts)
         transition(
             engine, record.id, "submitted", ib_order_id=placed.ib_order_id, now=ts_now
         )
-    except IllegalOrderTransition:
-        # A reconcile pass raced the place and resolved this row terminal
-        # while we were awaiting the broker. The order is REAL at IBKR — pull
-        # it immediately rather than leave a position the ledger denies.
-        log.error(
-            "order #%s went terminal during place — cancelling at broker", record.id
+    except Exception as exc:  # noqa: BLE001 -- broker order is already real
+        # A reconcile or persistence race resolved/prevented this transition
+        # while we were awaiting the broker. The order may be live at IBKR;
+        # halt even if cancellation appears to succeed because its final state
+        # is not yet reconciled.
+        halt_reason = (
+            f"entry order #{record.id} broker/ledger completion race after "
+            f"placement of IB order {placed.ib_order_id}: {exc}"
         )
+        trip_kill(engine, halt_reason, now=ts_now)
+        log.error("%s — cancelling at broker", halt_reason)
         try:
             await deps.order_client.cancel(placed.ib_order_id)
-        except Exception:  # noqa: BLE001 -- reconcile/kill-switch is the backstop
+        except Exception:  # noqa: BLE001 -- persisted kill switch is the backstop
             log.exception("race-cancel failed for order #%s", record.id)
         return ExecuteOutcome(
             ok=False,
             message=(
-                f"❌ order #{record.id} hit a reconcile race — cancelled at the "
-                "broker; /execute again"
+                f"🛑 HALT: order #{record.id} hit a broker/ledger race after "
+                "placement; cancellation requested. Reconcile before re-arming."
             ),
             order_id=record.id,
         )
