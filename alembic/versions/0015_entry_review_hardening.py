@@ -49,12 +49,28 @@ def upgrade() -> None:
             "0015 requires one strategy_scores row per snapshot and strategy"
         )
 
-    op.create_index(
-        "uq_strategy_scores_snapshot_strategy",
-        "strategy_scores",
-        ["snapshot_id", "strategy"],
-        unique=True,
+    score_indexes = {
+        index["name"]: index
+        for index in sa.inspect(op.get_bind()).get_indexes("strategy_scores")
+    }
+    score_identity_index = score_indexes.get(
+        "uq_strategy_scores_snapshot_strategy"
     )
+    if score_identity_index is None:
+        op.create_index(
+            "uq_strategy_scores_snapshot_strategy",
+            "strategy_scores",
+            ["snapshot_id", "strategy"],
+            unique=True,
+        )
+    elif not (
+        score_identity_index.get("unique")
+        and score_identity_index.get("column_names")
+        == ["snapshot_id", "strategy"]
+    ):
+        raise RuntimeError(
+            "0015 found an incompatible strategy score identity index"
+        )
     with op.batch_alter_table("entry_reviews") as batch_op:
         batch_op.add_column(sa.Column("alert_id", sa.Integer(), nullable=True))
         batch_op.create_foreign_key(

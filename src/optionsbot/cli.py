@@ -111,7 +111,7 @@ def _write_default_config(cfg_dir: Path, non_interactive: bool) -> Path:
     return cfg_path
 
 
-def _run_migrations() -> None:
+def _run_migrations(config_file: Path | None = None) -> None:
     """Run alembic upgrade head against the configured DB path."""
     from alembic.config import Config
 
@@ -120,7 +120,7 @@ def _run_migrations() -> None:
 
     # Use load_settings so a freshly-written config.toml is read.
     get_settings.cache_clear()
-    settings = load_settings()
+    settings = load_settings(config_file=config_file)
     db_path = settings.storage.db_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -187,7 +187,7 @@ async def _configure_telegram(
     from optionsbot.config import get_settings, load_settings
 
     get_settings.cache_clear()
-    settings = load_settings()
+    settings = load_settings(config_file=cfg_path)
     token = settings.telegram.bot_token
     chat_id = settings.telegram.chat_id
 
@@ -247,7 +247,7 @@ async def _run_init(
     typer.secho("optionsbot setup", fg=typer.colors.GREEN, bold=True)
     cfg_dir = _ensure_config_dir(config_dir)
     cfg_path = _write_default_config(cfg_dir, non_interactive)
-    _run_migrations()
+    _run_migrations(cfg_path)
     if not skip_telegram:
         await _configure_telegram(cfg_path, non_interactive, skip_test)
     typer.echo("\n" + _final_summary(cfg_dir))

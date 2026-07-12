@@ -11,6 +11,16 @@ from typer.testing import CliRunner
 from optionsbot.cli import app
 
 
+@pytest.fixture(autouse=True)
+def _isolate_init_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every init invocation must migrate only its test-owned SQLite database."""
+    monkeypatch.setenv(
+        "OPTIONSBOT_STORAGE__DB_PATH", str(tmp_path / "init-optionsbot.db")
+    )
+
+
 @pytest.fixture()
 def runner() -> CliRunner:
     return CliRunner()
@@ -34,6 +44,33 @@ def test_init_creates_config_dir_and_writes_default_toml(
     assert "[ibkr]" in body
     assert "[telegram]" in body
     assert "[scan]" in body
+
+
+def test_init_uses_custom_config_for_database_settings(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_dir = tmp_path / "custom-config"
+    cfg_dir.mkdir()
+    db_path = tmp_path / "custom-data" / "optionsbot.db"
+    (cfg_dir / "config.toml").write_text(
+        f'[storage]\ndb_path = "{db_path}"\n'
+    )
+    monkeypatch.delenv("OPTIONSBOT_STORAGE__DB_PATH")
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--non-interactive",
+            "--config-dir",
+            str(cfg_dir),
+            "--skip-telegram",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert db_path.exists()
 
 
 def test_init_runs_alembic_migrations(

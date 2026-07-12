@@ -306,6 +306,39 @@ def test_upgrade_reconciles_duplicate_terminal_legacy_entry_intents(
     downgraded.dispose()
 
 
+def test_upgrade_resumes_after_correct_unique_score_index_prefix(
+    tmp_path: Path,
+) -> None:
+    """A SQLite DDL interruption after the first 0015 statement is healable."""
+    db_path = tmp_path / "partial-score-index.db"
+    cfg = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, "0014")
+
+    engine = create_engine_for_path(db_path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX uq_strategy_scores_snapshot_strategy "
+            "ON strategy_scores (snapshot_id, strategy)"
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    upgraded = create_engine_for_path(db_path)
+    inspector = inspect(upgraded)
+    assert "entry_intent_consumptions" in inspector.get_table_names()
+    assert "alert_id" in {
+        column["name"] for column in inspector.get_columns("entry_reviews")
+    }
+    with upgraded.connect() as conn:
+        assert conn.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one() == "0017"
+        assert conn.exec_driver_sql("PRAGMA integrity_check").scalar_one() == "ok"
+    upgraded.dispose()
+
+
 def test_upgrade_preflights_ambiguous_scores_before_any_sqlite_ddl(
     tmp_path: Path,
 ) -> None:
