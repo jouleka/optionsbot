@@ -84,7 +84,9 @@ def order_ib(mock_ib: MagicMock) -> MagicMock:
 def order_client(order_settings: Settings, order_ib: MagicMock) -> OrderClient:
     client = IBKRClient(role="exec", settings=order_settings, ib=order_ib)
     resolver = ContractResolver(client)
-    return OrderClient(client, resolver)
+    order_client = OrderClient(client, resolver)
+    order_client.on_callback_error(lambda _kind, _error: None)
+    return order_client
 
 
 # --- role / config -----------------------------------------------------------
@@ -166,6 +168,31 @@ async def test_single_long_leg_buys_at_positive_price(
     assert contract.secType == "OPT"
     assert order.action == "BUY"
     assert order.lmtPrice == 2.30
+
+
+async def test_single_leg_ratio_multiplies_broker_quantity(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    ratio_leg = [{
+        "symbol": "SPY", "side": "sell", "sec_type": "OPT",
+        "expiry": "20260717", "strike": 580.0, "right": "P", "quantity": 2,
+    }]
+    await order_client.place_combo_limit(
+        "SPY", ratio_leg, quantity=3, limit_price=-1.0, order_ref="obot-9",
+    )
+    _, order = order_ib.placeOrder.call_args.args
+    assert order.totalQuantity == 6
+
+
+@pytest.mark.parametrize("ref", ["obot-01", "obot-٠١", "obot-0", "obot-manual"])
+async def test_placement_rejects_noncanonical_order_ref(
+    order_client: OrderClient, order_ib: MagicMock, ref: str
+) -> None:
+    with pytest.raises(ValueError, match="canonical"):
+        await order_client.place_combo_limit(
+            "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.0, order_ref=ref,
+        )
+    order_ib.placeOrder.assert_not_called()
 
 
 async def test_unqualified_leg_raises(
@@ -290,6 +317,23 @@ async def test_cancel_uses_registered_order(
 # --- whatIf ---------------------------------------------------------------------
 
 
+async def test_whatif_single_leg_ratio_uses_total_contract_quantity(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from ib_async import OrderState
+
+    order_ib.whatIfOrderAsync.return_value = OrderState(initMarginChange="100")
+    ratio_leg = [{
+        "symbol": "SPY", "side": "sell", "sec_type": "OPT",
+        "expiry": "20260717", "strike": 580.0, "right": "P", "quantity": 2,
+    }]
+    await order_client.whatif_combo(
+        "SPY", ratio_leg, quantity=3, limit_price=-1.0,
+    )
+    _, order = order_ib.whatIfOrderAsync.call_args.args
+    assert order.totalQuantity == 6
+
+
 async def test_whatif_parses_order_state(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:
@@ -393,6 +437,92 @@ def test_status_event_translates(order_client: OrderClient) -> None:
     assert update.avg_fill_price == 1.5
 
 
+def test_malformed_status_event_reports_callback_error_without_raising(
+    order_client: OrderClient,
+) -> None:
+    errors: list[tuple[str, Exception]] = []
+    order_client._callback_error_handler = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda kind, error: errors.append((kind, error))
+    )
+    trade = _make_trade()
+    trade.orderStatus.filled = "one"
+
+    order_client._handle_order_status(trade)  # noqa: SLF001
+
+    [(kind, error)] = errors
+    assert kind == "orderStatus"
+    assert isinstance(error, ValueError)
+
+
+def test_failing_status_subscriber_does_not_block_later_subscriber(
+    order_client: OrderClient,
+) -> None:
+    errors: list[tuple[str, Exception]] = []
+    seen: list[OrderStatusUpdate] = []
+    order_client._callback_error_handler = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda kind, error: errors.append((kind, error))
+    )
+
+    def fail(_update: OrderStatusUpdate) -> None:
+        raise RuntimeError("subscriber failed")
+
+    order_client.on_status(fail)
+    order_client.on_status(seen.append)
+    order_client._handle_order_status(_make_trade())  # noqa: SLF001
+
+    assert len(seen) == 1
+    [(kind, error)] = errors
+    assert kind == "orderStatus"
+    assert isinstance(error, RuntimeError)
+
+
+def test_malformed_execution_event_reports_callback_error_without_raising(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    errors: list[tuple[str, Exception]] = []
+    order_client._callback_error_handler = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda kind, error: errors.append((kind, error))
+    )
+    execution = Execution(
+        execId="exec-bad", time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT", shares="one", price=0.40, orderId=7, orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1575),
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,  # type: ignore[arg-type]
+    )
+
+    order_client._handle_exec_details(_make_trade(), fill)  # noqa: SLF001
+
+    [(kind, error)] = errors
+    assert kind == "execDetails"
+    assert isinstance(error, ValueError)
+
+
+def test_malformed_commission_event_reports_callback_error_without_raising(
+    order_client: OrderClient,
+) -> None:
+    from ib_async import CommissionReport
+
+    errors: list[tuple[str, Exception]] = []
+    order_client._callback_error_handler = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda kind, error: errors.append((kind, error))
+    )
+    report = CommissionReport(execId="exec-bad", commission="many")
+
+    order_client._handle_commission(_make_trade(), None, report)  # noqa: SLF001
+
+    [(kind, error)] = errors
+    assert kind == "commissionReport"
+    assert isinstance(error, ValueError)
+
+
 def test_fill_event_translates_and_normalizes_side(
     order_client: OrderClient,
 ) -> None:
@@ -449,6 +579,34 @@ def test_execution_adapter_rejects_mismatched_commission_identity(
 
     with pytest.raises(ValueError):
         order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
+def test_execution_adapter_treats_empty_commission_report_as_unbundled(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="exec-1",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=CommissionReport(),
+        time=execution.time,
+    )
+
+    translated = order_client._to_execution_fill(fill)  # noqa: SLF001
+
+    assert translated.commission is None
 
 
 @pytest.mark.parametrize(
@@ -598,6 +756,7 @@ async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
             secType="BAG",
             symbol="SPY",
             currency="USD",
+            exchange="SMART",
             comboLegs=[
                 ComboLeg(
                     conId=1580,
@@ -633,14 +792,310 @@ async def test_adopt_open_orders_rebinds_registry_for_our_orders_only(
     order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[ours, manual])
 
     adopted = await order_client.adopt_open_orders()
-    assert (44, "obot-12", "Submitted") in adopted
-    assert (0, None, "Submitted") in adopted  # reported for classification
-    # Registry holds OURS only — modify works again after a restart...
+    ours_snapshot = next(row for row in adopted if row.order_ref == "obot-12")
+    assert ours_snapshot.ib_order_id == 44
+    assert ours_snapshot.status == "Submitted"
+    assert ours_snapshot.sec_type == "BAG"
+    assert ours_snapshot.symbol == "SPY"
+    assert ours_snapshot.currency == "USD"
+    assert ours_snapshot.exchange == "SMART"
+    assert ours_snapshot.combo_legs == (
+        (1580, 1, "SELL", "SMART"),
+        (1575, 1, "BUY", "SMART"),
+    )
+    assert ours_snapshot.order_action == "BUY"
+    assert ours_snapshot.total_quantity == 1
+    assert ours_snapshot.order_type == "LMT"
+    assert ours_snapshot.tif == "DAY"
+    assert ours_snapshot.limit_price == pytest.approx(-1.0)
+    manual_snapshot = next(row for row in adopted if row.order_ref is None)
+    assert manual_snapshot.ib_order_id == 0
+    # Snapshot collection alone is not authorization to mutate the order.
+    with pytest.raises(ValueError, match="unknown"):
+        await order_client.modify_price(44, new_limit_price=-1.10)
+    order_client.authorize_adoptions((ours_snapshot,))
+    # Exact reconciliation has now authorized this order for mutation.
     await order_client.modify_price(44, new_limit_price=-1.10)
     order_ib.placeOrder.assert_called_once()
     # ...but a manual TWS order (orderId 0) must never be modifiable.
     with pytest.raises(ValueError, match="unknown|identity"):
         await order_client.modify_price(0, new_limit_price=-1.0)
+
+
+@pytest.mark.parametrize(
+    ("owner", "field", "value"),
+    [
+        ("contract", "symbol", "QQQ"),
+        ("contract", "currency", "EUR"),
+        ("contract", "exchange", "CBOE"),
+        ("contract", "conId", 9991),
+        ("contract", "multiplier", "50"),
+        ("contract", "lastTradeDateOrContractMonth", "20260821"),
+        ("contract", "strike", 590.0),
+        ("contract", "right", "C"),
+        ("order", "orderId", 56),
+        ("order", "orderRef", "obot-2"),
+        ("order", "action", "BUY"),
+        ("order", "totalQuantity", 99),
+        ("order", "orderType", "MKT"),
+        ("order", "lmtPrice", 2.0),
+        ("order", "tif", "GTC"),
+        ("status", "status", "PreSubmitted"),
+    ],
+)
+async def test_authorization_resnapshots_all_mutable_broker_terms(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    owner: str,
+    field: str,
+    value: object,
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(
+            secType="OPT", symbol="SPY", currency="USD", exchange="SMART",
+            conId=1580, multiplier="100", lastTradeDateOrContractMonth="20260717",
+            strike=580.0, right="P",
+        ),
+        order=Order(
+            orderId=55, orderRef="obot-1", action="SELL", totalQuantity=1,
+            orderType="LMT", lmtPrice=1.0, tif="DAY",
+        ),
+        orderStatus=OrderStatus(orderId=55, status="Submitted"),
+    )
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[trade])
+    [snapshot] = await order_client.adopt_open_orders()
+    target = {
+        "contract": trade.contract,
+        "order": trade.order,
+        "status": trade.orderStatus,
+    }[owner]
+    setattr(target, field, value)
+
+    with pytest.raises(ValueError):
+        order_client.authorize_adoptions((snapshot,))
+    with pytest.raises(ValueError, match="unknown"):
+        await order_client.modify_price(55, new_limit_price=2.0)
+
+
+async def test_authorization_is_atomic_when_later_snapshot_drifts(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    def trade(order_id: int, row_id: int, con_id: int) -> Trade:
+        return Trade(
+            contract=Contract(
+                secType="OPT", symbol="SPY", currency="USD", exchange="SMART",
+                conId=con_id, multiplier="100",
+                lastTradeDateOrContractMonth="20260717", strike=580.0, right="P",
+            ),
+            order=Order(
+                orderId=order_id, orderRef=f"obot-{row_id}", action="SELL",
+                totalQuantity=1, orderType="LMT", lmtPrice=1.0, tif="DAY",
+            ),
+            orderStatus=OrderStatus(orderId=order_id, status="Submitted"),
+        )
+
+    first = trade(55, 1, 1580)
+    second = trade(56, 2, 1581)
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[first, second])
+    snapshots = tuple(await order_client.adopt_open_orders())
+    pending_before = dict(order_client._pending_adoptions)  # noqa: SLF001
+    second.order.totalQuantity = 99
+
+    with pytest.raises(ValueError):
+        order_client.authorize_adoptions(snapshots)
+
+    assert not order_client._registry  # noqa: SLF001
+    assert order_client._pending_adoptions == pending_before  # noqa: SLF001
+
+
+@pytest.mark.parametrize("mutation", ["modify", "cancel"])
+async def test_authorized_order_drift_blocks_later_mutation(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    mutation: str,
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(
+            secType="OPT", symbol="SPY", currency="USD", exchange="SMART",
+            conId=1580, multiplier="100", lastTradeDateOrContractMonth="20260717",
+            strike=580.0, right="P",
+        ),
+        order=Order(
+            orderId=55, orderRef="obot-1", action="SELL", totalQuantity=1,
+            orderType="LMT", lmtPrice=1.0, tif="DAY",
+        ),
+        orderStatus=OrderStatus(orderId=55, status="Submitted"),
+    )
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[trade])
+    [snapshot] = await order_client.adopt_open_orders()
+    order_client.authorize_adoptions((snapshot,))
+    trade.order.totalQuantity = 99
+
+    with pytest.raises(ValueError, match="drifted"):
+        if mutation == "modify":
+            await order_client.modify_price(55, new_limit_price=2.0)
+        else:
+            await order_client.cancel(55)
+
+    order_ib.placeOrder.assert_not_called()
+    order_ib.cancelOrder.assert_not_called()
+
+
+async def test_later_malformed_open_order_leaves_no_partial_pending_batch(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    def trade(order_id: int, row_id: int, *, currency: str = "USD") -> Trade:
+        return Trade(
+            contract=Contract(
+                secType="OPT", symbol="SPY", currency=currency, exchange="SMART",
+                conId=1580 + row_id, multiplier="100",
+                lastTradeDateOrContractMonth="20260717", strike=580.0, right="P",
+            ),
+            order=Order(
+                orderId=order_id, orderRef=f"obot-{row_id}", action="SELL",
+                totalQuantity=1, orderType="LMT", lmtPrice=1.0, tif="DAY",
+            ),
+            orderStatus=OrderStatus(orderId=order_id, status="Submitted"),
+        )
+
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[trade(55, 1), trade(56, 2, currency="usd")]
+    )
+
+    with pytest.raises(ValueError, match="currency"):
+        await order_client.adopt_open_orders()
+
+    assert not order_client._pending_adoptions  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("multiplier", "１００"),
+        ("lastTradeDateOrContractMonth", "２０２６０７１７"),
+    ],
+)
+async def test_unicode_numeric_option_terms_are_not_adopted(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+    field: str,
+    value: str,
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    contract = Contract(
+        secType="OPT", symbol="SPY", currency="USD", exchange="SMART",
+        conId=1580, multiplier="100", lastTradeDateOrContractMonth="20260717",
+        strike=580.0, right="P",
+    )
+    setattr(contract, field, value)
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[Trade(
+        contract=contract,
+        order=Order(
+            orderId=55, orderRef="obot-1", action="SELL", totalQuantity=1,
+            orderType="LMT", lmtPrice=1.0, tif="DAY",
+        ),
+        orderStatus=OrderStatus(orderId=55, status="Submitted"),
+    )])
+
+    with pytest.raises(ValueError, match="contract"):
+        await order_client.adopt_open_orders()
+
+    assert not order_client._pending_adoptions  # noqa: SLF001
+
+
+async def test_fresh_snapshot_revokes_stale_registry_authority(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    placed = await order_client.place_combo_limit(
+        "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.0, order_ref="obot-1",
+    )
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=placed.ib_order_id, orderRef="manual-x"),
+        orderStatus=OrderStatus(orderId=placed.ib_order_id, status="Submitted"),
+    )])
+    await order_client.adopt_open_orders()
+
+    with pytest.raises(ValueError, match="unknown"):
+        await order_client.cancel(placed.ib_order_id)
+
+
+async def test_noncanonical_obot_reference_never_becomes_mutable(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=55, orderRef="obot-manual"),
+        orderStatus=OrderStatus(orderId=55, status="Submitted"),
+    )
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[trade])
+
+    [snapshot] = await order_client.adopt_open_orders()
+    assert snapshot.order_ref == "obot-manual"
+    with pytest.raises(ValueError, match="not pending"):
+        order_client.authorize_adoptions((snapshot,))
+    with pytest.raises(ValueError, match="unknown"):
+        await order_client.modify_price(55, new_limit_price=1.0)
+
+
+@pytest.mark.parametrize("ref", ["obot-01", "obot-٠١", "obot-１２", "obot-0"])
+async def test_numeric_alias_reference_never_becomes_pending(
+    order_client: OrderClient, order_ib: MagicMock, ref: str
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    trade = Trade(
+        contract=Contract(secType="OPT", symbol="SPY"),
+        order=Order(orderId=55, orderRef=ref),
+        orderStatus=OrderStatus(orderId=55, status="Submitted"),
+    )
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[trade])
+
+    [snapshot] = await order_client.adopt_open_orders()
+    assert snapshot.order_ref == ref
+    with pytest.raises(ValueError, match="not pending"):
+        order_client.authorize_adoptions((snapshot,))
+
+
+async def test_duplicate_broker_identity_is_not_pending(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    def trade(con_id: int) -> Any:
+        return Trade(
+            contract=Contract(
+                secType="OPT", symbol="SPY", currency="USD", exchange="SMART",
+                conId=con_id, multiplier="100", lastTradeDateOrContractMonth="20260717",
+                strike=580.0, right="P",
+            ),
+            order=Order(
+                orderId=55, orderRef="obot-1", action="SELL", totalQuantity=1,
+                orderType="LMT", lmtPrice=1.0, tif="DAY",
+            ),
+            orderStatus=OrderStatus(orderId=55, status="Submitted"),
+        )
+
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[trade(1580), trade(9991)])
+
+    with pytest.raises(ValueError, match="duplicate"):
+        await order_client.adopt_open_orders()
+    assert not order_client._pending_adoptions  # noqa: SLF001
 
 
 async def test_recent_executions_translates_with_commission(

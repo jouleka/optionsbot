@@ -19,8 +19,9 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from optionsbot.config import PAPER_PORTS
 from optionsbot.ibkr.client import IBKRClient
@@ -30,9 +31,11 @@ from optionsbot.ibkr.types import (
     CommissionUpdate,
     ExecutionFill,
     MarginPreview,
+    OpenOrderSnapshot,
     OptionRight,
     OrderStatusUpdate,
     PlacedOrder,
+    ledger_row_id_from_ref,
 )
 
 if TYPE_CHECKING:
@@ -47,6 +50,9 @@ _IB_SIDE = {"BOT": "BUY", "SLD": "SELL"}
 
 LegMapping = Mapping[str, Any]
 LegContract = tuple[int, int, str]
+BrokerCallbackKind = Literal["orderStatus", "execDetails", "commissionReport"]
+BrokerCallbackErrorHandler = Callable[[BrokerCallbackKind, Exception], None]
+_CallbackPayload = TypeVar("_CallbackPayload")
 
 
 def _parse_ib_double(value: object) -> float | None:
@@ -60,6 +66,25 @@ def _parse_ib_double(value: object) -> float | None:
     if not math.isfinite(parsed) or abs(parsed) >= _UNSET_DOUBLE:
         return None
     return parsed
+
+
+def _empty_commission_placeholder(report: Any) -> bool:
+    """True only for ib_async's exact default reqExecutions placeholder."""
+    return (
+        report.execId == ""
+        and isinstance(report.commission, (int, float))
+        and not isinstance(report.commission, bool)
+        and report.commission == 0
+        and report.currency == ""
+        and isinstance(report.realizedPNL, (int, float))
+        and not isinstance(report.realizedPNL, bool)
+        and report.realizedPNL == 0
+        and isinstance(report.yield_, (int, float))
+        and not isinstance(report.yield_, bool)
+        and report.yield_ == 0
+        and type(report.yieldRedemptionDate) is int
+        and report.yieldRedemptionDate == 0
+    )
 
 
 def _validated_open_trade(trade: Any) -> tuple[int, str | None, str]:
@@ -79,9 +104,7 @@ def _validated_open_trade(trade: Any) -> tuple[int, str | None, str]:
     return raw_order_id, ref, raw_status
 
 
-def _validate_adopted_bot_trade(trade: Any) -> None:
-    contract = trade.contract
-    order = trade.order
+def _validate_bot_contract_order(contract: Any, order: Any) -> None:
     sec_type = contract.secType
     if sec_type not in {"OPT", "BAG"}:
         raise ValueError(f"bot open order has unknown security type {sec_type!r}")
@@ -89,16 +112,20 @@ def _validate_adopted_bot_trade(trade: Any) -> None:
         raise ValueError("bot open-order currency is malformed")
     if contract.currency != contract.currency.upper():
         raise ValueError("bot open-order currency is malformed")
+    if not isinstance(contract.symbol, str) or not contract.symbol.strip():
+        raise ValueError("bot open-order symbol is malformed")
     if sec_type == "OPT":
         if (
             type(contract.conId) is not int
             or contract.conId <= 0
             or not isinstance(contract.multiplier, str)
-            or not contract.multiplier.isdigit()
+            or not contract.multiplier.isascii()
+            or not contract.multiplier.isdecimal()
             or int(contract.multiplier) <= 0
             or not isinstance(contract.lastTradeDateOrContractMonth, str)
             or len(contract.lastTradeDateOrContractMonth) != 8
-            or not contract.lastTradeDateOrContractMonth.isdigit()
+            or not contract.lastTradeDateOrContractMonth.isascii()
+            or not contract.lastTradeDateOrContractMonth.isdecimal()
             or not isinstance(contract.strike, (int, float))
             or isinstance(contract.strike, bool)
             or not math.isfinite(float(contract.strike))
@@ -136,8 +163,105 @@ def _validate_adopted_bot_trade(trade: Any) -> None:
         or not math.isfinite(float(raw_limit))
         or order.orderType != "LMT"
         or order.tif != "DAY"
+        or order.action not in {"BUY", "SELL"}
     ):
         raise ValueError("bot open-order terms are malformed")
+
+
+def _validate_adopted_bot_trade(trade: Any) -> None:
+    try:
+        contract = trade.contract
+        order = trade.order
+    except AttributeError as exc:
+        raise ValueError("bot open-order row is malformed") from exc
+    _validate_bot_contract_order(contract, order)
+
+
+def _snapshot_bot_order(contract: Any, order: Any, *, status: str) -> OpenOrderSnapshot:
+    raw_order_id = order.orderId
+    raw_ref = order.orderRef
+    if type(raw_order_id) is not int or raw_order_id <= 0:
+        raise ValueError("bot open-order identity must be an exact positive integer")
+    if ledger_row_id_from_ref(raw_ref) is None:
+        raise ValueError("bot open-order reference is not canonical")
+    if not isinstance(status, str) or not status.strip():
+        raise ValueError("bot open-order status is malformed")
+    _validate_bot_contract_order(contract, order)
+    sec_type = contract.secType
+    combo_legs: tuple[tuple[int, int, str, str], ...] = ()
+    contract_con_id: int | None = None
+    multiplier: int | None = None
+    expiry: str | None = None
+    strike: float | None = None
+    right: OptionRight | None = None
+    if sec_type == "BAG":
+        combo_legs = tuple(
+            (leg.conId, leg.ratio, leg.action, leg.exchange)
+            for leg in contract.comboLegs
+        )
+    else:
+        contract_con_id = contract.conId
+        multiplier = int(contract.multiplier)
+        expiry = contract.lastTradeDateOrContractMonth
+        strike = float(contract.strike)
+        right = contract.right
+    return OpenOrderSnapshot(
+        ib_order_id=raw_order_id,
+        order_ref=raw_ref,
+        status=status,
+        sec_type=sec_type,
+        symbol=contract.symbol,
+        currency=contract.currency,
+        exchange=contract.exchange,
+        contract_con_id=contract_con_id,
+        multiplier=multiplier,
+        expiry=expiry,
+        strike=strike,
+        right=right,
+        combo_legs=combo_legs,
+        order_action=order.action,
+        total_quantity=int(order.totalQuantity),
+        order_type=order.orderType,
+        tif=order.tif,
+        limit_price=float(order.lmtPrice),
+    )
+
+
+def _snapshot_open_trade(trade: Any) -> OpenOrderSnapshot:
+    order_id, ref, status = _validated_open_trade(trade)
+    if ledger_row_id_from_ref(ref) is None:
+        return OpenOrderSnapshot(order_id, ref, status)
+    return _snapshot_bot_order(trade.contract, trade.order, status=status)
+
+
+def _mutation_authority(snapshot: OpenOrderSnapshot) -> tuple[Any, ...]:
+    """Immutable broker-mutation terms; status is evidence, not authority."""
+    return (
+        snapshot.ib_order_id,
+        snapshot.order_ref,
+        snapshot.sec_type,
+        snapshot.symbol,
+        snapshot.currency,
+        snapshot.exchange,
+        snapshot.contract_con_id,
+        snapshot.multiplier,
+        snapshot.expiry,
+        snapshot.strike,
+        snapshot.right,
+        snapshot.combo_legs,
+        snapshot.order_action,
+        snapshot.total_quantity,
+        snapshot.order_type,
+        snapshot.tif,
+        snapshot.limit_price,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredOrder:
+    contract: Contract
+    order: Order
+    authority: tuple[Any, ...]
 
 
 class OrderClient:
@@ -153,12 +277,14 @@ class OrderClient:
         self._resolver = resolver
         # Registry for modify/cancel: TWS API modifies by re-placing the SAME
         # order object (price/size/tif only).
-        self._registry: dict[int, tuple[Contract, Order]] = {}
+        self._registry: dict[int, _RegisteredOrder] = {}
+        self._pending_adoptions: dict[int, tuple[OpenOrderSnapshot, Any]] = {}
         # Order mutations are paced well under IBKR's 50 msg/s budget.
         self._rate = RateLimiter(max_calls=10, window_seconds=1.0)
         self._status_callbacks: list[Callable[[OrderStatusUpdate], None]] = []
         self._fill_callbacks: list[Callable[[ExecutionFill], None]] = []
         self._commission_callbacks: list[Callable[[CommissionUpdate], None]] = []
+        self._callback_error_handler: BrokerCallbackErrorHandler | None = None
         self._subscribed = False
 
     # -- subscriptions ---------------------------------------------------------
@@ -172,9 +298,19 @@ class OrderClient:
     def on_commission(self, callback: Callable[[CommissionUpdate], None]) -> None:
         self._commission_callbacks.append(callback)
 
+    def on_callback_error(self, callback: BrokerCallbackErrorHandler) -> None:
+        """Install the one fail-closed boundary for raw broker callbacks."""
+        if self._subscribed:
+            raise RuntimeError("callback error handler must be installed before subscription")
+        if self._callback_error_handler is not None:
+            raise RuntimeError("callback error handler is already installed")
+        self._callback_error_handler = callback
+
     def _ensure_subscribed(self) -> None:
         if self._subscribed:
             return
+        if self._callback_error_handler is None:
+            raise RuntimeError("broker callback error handler is not installed")
         # IB-level events (not per-Trade) so re-bound orders after a reconnect
         # still reach the callbacks.
         self._client.ib.orderStatusEvent += self._handle_order_status
@@ -349,8 +485,8 @@ class OrderClient:
         signed net price per unit (negative = net credit)."""
         if type(quantity) is not int or quantity <= 0:
             raise ValueError("order quantity must be a positive exact integer")
-        if not isinstance(order_ref, str) or not order_ref.startswith("obot-"):
-            raise ValueError("order reference must be a deterministic bot reference")
+        if ledger_row_id_from_ref(order_ref) is None:
+            raise ValueError("order reference must be canonical obot-<positive-int>")
         self._assert_paper()
         await self._client.ensure_connected()
         self._ensure_subscribed()
@@ -360,14 +496,29 @@ class OrderClient:
 
         from ib_async import LimitOrder
 
-        order = LimitOrder(action, quantity, price, tif=tif, orderRef=order_ref)
+        option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+        broker_quantity = (
+            quantity * int(option_legs[0].get("quantity", 1))
+            if len(option_legs) == 1
+            else quantity
+        )
+        order = LimitOrder(action, broker_quantity, price, tif=tif, orderRef=order_ref)
         await self._rate.acquire()
         trade = self._client.ib.placeOrder(contract, order)
         raw_ib_order_id = trade.order.orderId
         if type(raw_ib_order_id) is not int or raw_ib_order_id <= 0:
             raise RuntimeError("broker acknowledgement has malformed order identity")
         ib_order_id = raw_ib_order_id
-        self._registry[ib_order_id] = (contract, trade.order)
+        registered_snapshot = _snapshot_bot_order(
+            contract,
+            trade.order,
+            status="Registered",
+        )
+        self._registry[ib_order_id] = _RegisteredOrder(
+            contract,
+            trade.order,
+            _mutation_authority(registered_snapshot),
+        )
         log.info(
             "order placed: ref=%s id=%s %s %sx %s @ %s tif=%s",
             order_ref, ib_order_id, action, quantity, symbol, price, tif,
@@ -397,7 +548,13 @@ class OrderClient:
 
         from ib_async import LimitOrder
 
-        order = LimitOrder(action, quantity, price)
+        option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
+        broker_quantity = (
+            quantity * int(option_legs[0].get("quantity", 1))
+            if len(option_legs) == 1
+            else quantity
+        )
+        order = LimitOrder(action, broker_quantity, price)
         result = await self._client.ib.whatIfOrderAsync(contract, order)
         # ib_async 2.1.0 returns a LIST of OrderState despite the annotation
         # (observed against a live paper Gateway); tolerate both shapes.
@@ -433,31 +590,86 @@ class OrderClient:
         ):
             raise ValueError("modify limit price must be finite")
         self._assert_paper()
-        entry = self._registry.get(ib_order_id)
-        if entry is None:
+        if ib_order_id not in self._registry:
             raise ValueError(f"unknown order id {ib_order_id} (not placed by this client)")
-        contract, order = entry
+        await self._client.ensure_connected()
+        await self._rate.acquire()
+        self._assert_paper()
+        entry = self._registered_order(ib_order_id)
+        contract = entry.contract
+        order = entry.order
         # Same normalization as placement: only BAG combos use signed net
         # limits; a single-leg option's premium is always positive (a signed
         # walk target sent raw produced lmtPrice=-6.14 → IBKR Error 201).
         order.lmtPrice = new_limit_price if contract.secType == "BAG" else abs(new_limit_price)
-        await self._client.ensure_connected()
-        await self._rate.acquire()
         self._client.ib.placeOrder(contract, order)
+        changed = _snapshot_bot_order(contract, order, status="Registered")
+        self._registry[ib_order_id] = _RegisteredOrder(
+            contract,
+            order,
+            _mutation_authority(changed),
+        )
         log.info("order modified: id=%s new_limit=%s", ib_order_id, new_limit_price)
 
     async def cancel(self, ib_order_id: int) -> None:
         if type(ib_order_id) is not int or ib_order_id <= 0:
             raise ValueError("cancel order identity must be an exact positive integer")
         self._assert_paper()
+        if ib_order_id not in self._registry:
+            raise ValueError(f"unknown order id {ib_order_id} (not placed by this client)")
+        await self._client.ensure_connected()
+        await self._rate.acquire()
+        self._assert_paper()
+        entry = self._registered_order(ib_order_id)
+        self._client.ib.cancelOrder(entry.order)
+        log.info("order cancel requested: id=%s", ib_order_id)
+
+    def _registered_order(self, ib_order_id: int) -> _RegisteredOrder:
         entry = self._registry.get(ib_order_id)
         if entry is None:
             raise ValueError(f"unknown order id {ib_order_id} (not placed by this client)")
-        _, order = entry
-        await self._client.ensure_connected()
-        await self._rate.acquire()
-        self._client.ib.cancelOrder(order)
-        log.info("order cancel requested: id=%s", ib_order_id)
+        current = _snapshot_bot_order(
+            entry.contract,
+            entry.order,
+            status="Registered",
+        )
+        if _mutation_authority(current) != entry.authority:
+            raise ValueError(
+                f"order id {ib_order_id} broker mutation authority drifted"
+            )
+        return entry
+
+    def authorize_adoptions(self, snapshots: tuple[OpenOrderSnapshot, ...]) -> None:
+        """Atomically authorize the exact snapshots validated by reconciliation."""
+        approved: dict[int, _RegisteredOrder] = {}
+        seen: set[int] = set()
+        for snapshot in snapshots:
+            if snapshot.ib_order_id in seen:
+                raise ValueError("adoption authorization contains duplicate order identity")
+            seen.add(snapshot.ib_order_id)
+            pending = self._pending_adoptions.get(snapshot.ib_order_id)
+            if pending is None or pending[0] != snapshot:
+                raise ValueError(
+                    f"order id {snapshot.ib_order_id} is not pending exact adoption"
+                )
+            trade = pending[1]
+            if _snapshot_open_trade(trade) != snapshot:
+                raise ValueError(
+                    f"order id {snapshot.ib_order_id} broker terms drifted before adoption"
+                )
+            approved[snapshot.ib_order_id] = _RegisteredOrder(
+                trade.contract,
+                trade.order,
+                _mutation_authority(snapshot),
+            )
+        self._registry.update(approved)
+        for order_id in approved:
+            self._pending_adoptions.pop(order_id, None)
+
+    def revoke_adoptions(self) -> None:
+        """Remove all mutation authority after any failed reconciliation pass."""
+        self._registry.clear()
+        self._pending_adoptions.clear()
 
     async def open_order_refs(self) -> list[tuple[int, str | None, str]]:
         """(ib_order_id, orderRef, status) for every open order at IBKR.
@@ -470,7 +682,39 @@ class OrderClient:
 
     # -- event translation -----------------------------------------------------------
 
-    def _handle_order_status(self, trade: Trade) -> None:
+    def _report_callback_error(
+        self, kind: BrokerCallbackKind, error: Exception
+    ) -> None:
+        handler = self._callback_error_handler
+        if handler is None:
+            log.critical(
+                "broker %s callback failed without a safety handler",
+                kind,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            return
+        try:
+            handler(kind, error)
+        except Exception:
+            log.critical(
+                "broker %s callback safety handler also failed",
+                kind,
+                exc_info=True,
+            )
+
+    def _emit_callbacks(
+        self,
+        kind: BrokerCallbackKind,
+        callbacks: Sequence[Callable[[_CallbackPayload], None]],
+        payload: _CallbackPayload,
+    ) -> None:
+        for callback in tuple(callbacks):
+            try:
+                callback(payload)
+            except Exception as exc:  # noqa: BLE001 -- broker boundary never raises
+                self._report_callback_error(kind, exc)
+
+    def _to_order_status_update(self, trade: Trade) -> OrderStatusUpdate:
         raw_order_id = trade.order.orderId
         raw_perm_id = trade.order.permId
         raw_ref = trade.order.orderRef
@@ -480,13 +724,13 @@ class OrderClient:
         raw_avg = trade.orderStatus.avgFillPrice
         if type(raw_order_id) is not int or raw_order_id < 0:
             raise ValueError("order-status identity is malformed")
-        if raw_perm_id not in {None, 0} and (
-            type(raw_perm_id) is not int or raw_perm_id <= 0
+        if raw_perm_id is not None and (
+            type(raw_perm_id) is not int or raw_perm_id < 0
         ):
             raise ValueError("order-status permanent identity is malformed")
-        ref = raw_ref or None
-        if ref is not None and not isinstance(ref, str):
+        if raw_ref is not None and not isinstance(raw_ref, str):
             raise ValueError("order-status reference is malformed")
+        ref = raw_ref or None
         if not isinstance(raw_status, str) or not raw_status.strip():
             raise ValueError("order-status value is malformed")
         numeric = (raw_filled, raw_remaining)
@@ -499,27 +743,33 @@ class OrderClient:
             for value in numeric
         ):
             raise ValueError("order-status quantities are malformed")
+        if raw_avg is not None and (
+            not isinstance(raw_avg, (int, float))
+            or isinstance(raw_avg, bool)
+            or not math.isfinite(float(raw_avg))
+            or raw_avg < 0
+        ):
+            raise ValueError("order-status average fill price is malformed")
         avg_fill_price: float | None = None
-        if raw_avg not in {None, 0}:
-            if (
-                not isinstance(raw_avg, (int, float))
-                or isinstance(raw_avg, bool)
-                or not math.isfinite(float(raw_avg))
-                or raw_avg < 0
-            ):
-                raise ValueError("order-status average fill price is malformed")
+        if raw_avg not in (None, 0):
             avg_fill_price = float(raw_avg)
-        update = OrderStatusUpdate(
+        return OrderStatusUpdate(
             ib_order_id=raw_order_id,
-            perm_id=raw_perm_id or None,
+            perm_id=None if raw_perm_id in (None, 0) else raw_perm_id,
             order_ref=ref,
             status=raw_status,
             filled=float(raw_filled),
             remaining=float(raw_remaining),
             avg_fill_price=avg_fill_price,
         )
-        for callback in self._status_callbacks:
-            callback(update)
+
+    def _handle_order_status(self, trade: Trade) -> None:
+        try:
+            update = self._to_order_status_update(trade)
+        except Exception as exc:  # noqa: BLE001 -- broker boundary never raises
+            self._report_callback_error("orderStatus", exc)
+            return
+        self._emit_callbacks("orderStatus", self._status_callbacks, update)
 
     def _to_execution_fill(
         self, fill: Fill, *, fallback_ref: str | None = None
@@ -573,7 +823,7 @@ class OrderClient:
         order_ref = raw_order_ref or fallback_ref or None
         report = fill.commissionReport
         commission: float | None = None
-        if report is not None:
+        if report is not None and not _empty_commission_placeholder(report):
             if (
                 not isinstance(report.execId, str)
                 or not report.execId.strip()
@@ -601,26 +851,35 @@ class OrderClient:
             commission=commission,
         )
 
-    async def adopt_open_orders(self) -> list[tuple[int, str | None, str]]:
-        """Re-register OUR open orders after a restart; report all of them.
+    async def adopt_open_orders(self) -> list[OpenOrderSnapshot]:
+        """Snapshot every open order and stage canonical bot rows for review.
 
-        Only orders carrying an "obot-" orderRef enter the modify/cancel
-        registry — manual TWS orders arrive with orderId 0 and must never be
-        modifiable through this client. Returns (orderId, orderRef, status)
-        for every open order so the reconciler can classify foreign ones.
+        All prior mutation authority is revoked before the first await. Exact
+        reconciliation must later authorize a snapshot batch atomically.
         """
+        self.revoke_adoptions()
         await self._client.ensure_connected()
         self._ensure_subscribed()
         trades = await self._client.ib.reqAllOpenOrdersAsync()
         if not isinstance(trades, (list, tuple)):
             raise ValueError("open-order snapshot is malformed")
-        adopted: list[tuple[int, str | None, str]] = []
+        adopted: list[OpenOrderSnapshot] = []
+        pending: dict[int, tuple[OpenOrderSnapshot, Any]] = {}
+        seen_order_ids: set[int] = set()
+        seen_row_ids: set[int] = set()
         for trade in trades:
-            order_id, ref, status = _validated_open_trade(trade)
-            if ref is not None and ref.startswith("obot-"):
-                _validate_adopted_bot_trade(trade)
-                self._registry[order_id] = (trade.contract, trade.order)
-            adopted.append((order_id, ref, status))
+            snapshot = _snapshot_open_trade(trade)
+            order_id = snapshot.ib_order_id
+            ref = snapshot.order_ref
+            row_id = ledger_row_id_from_ref(ref)
+            if order_id in seen_order_ids or (row_id is not None and row_id in seen_row_ids):
+                raise ValueError("open-order snapshot contains duplicate broker identity")
+            seen_order_ids.add(order_id)
+            if row_id is not None:
+                seen_row_ids.add(row_id)
+                pending[order_id] = (snapshot, trade)
+            adopted.append(snapshot)
+        self._pending_adoptions = pending
         return adopted
 
     async def recent_executions(self) -> list[ExecutionFill]:
@@ -643,23 +902,32 @@ class OrderClient:
         return [self._to_execution_fill(f) for f in fills_]
 
     def _handle_exec_details(self, trade: Trade, fill: Fill) -> None:
-        record = self._to_execution_fill(fill, fallback_ref=trade.order.orderRef or None)
-        for callback in self._fill_callbacks:
-            callback(record)
+        try:
+            record = self._to_execution_fill(
+                fill,
+                fallback_ref=trade.order.orderRef,
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker boundary never raises
+            self._report_callback_error("execDetails", exc)
+            return
+        self._emit_callbacks("execDetails", self._fill_callbacks, record)
 
     def _handle_commission(
         self, trade: Trade, fill: Fill | None, report: CommissionReport
     ) -> None:
-        if not isinstance(report.execId, str) or not report.execId.strip():
-            raise ValueError("commission execution ID is malformed")
-        if (
-            not isinstance(report.commission, (int, float))
-            or isinstance(report.commission, bool)
-            or not math.isfinite(float(report.commission))
-        ):
-            raise ValueError("commission amount is malformed")
-        update = CommissionUpdate(
-            exec_id=report.execId, commission=float(report.commission)
-        )
-        for callback in self._commission_callbacks:
-            callback(update)
+        try:
+            if not isinstance(report.execId, str) or not report.execId.strip():
+                raise ValueError("commission execution ID is malformed")
+            if (
+                not isinstance(report.commission, (int, float))
+                or isinstance(report.commission, bool)
+                or not math.isfinite(float(report.commission))
+            ):
+                raise ValueError("commission amount is malformed")
+            update = CommissionUpdate(
+                exec_id=report.execId, commission=float(report.commission)
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker boundary never raises
+            self._report_callback_error("commissionReport", exc)
+            return
+        self._emit_callbacks("commissionReport", self._commission_callbacks, update)

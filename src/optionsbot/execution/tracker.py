@@ -28,13 +28,18 @@ from optionsbot.execution.orders import (
     transition,
 )
 from optionsbot.execution.state import trip_kill
-from optionsbot.ibkr.types import CommissionUpdate, ExecutionFill, OrderStatusUpdate
+from optionsbot.ibkr.types import (
+    CommissionUpdate,
+    ExecutionFill,
+    OrderStatusUpdate,
+    ledger_row_id_from_ref,
+)
 from optionsbot.storage.schema import orders
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
-    from optionsbot.ibkr.orders import OrderClient
+    from optionsbot.ibkr.orders import BrokerCallbackKind, OrderClient
 
 log = logging.getLogger(__name__)
 
@@ -66,10 +71,7 @@ def map_ib_status(status: str, filled: float, remaining: float) -> str | None:
 
 def row_id_from_ref(order_ref: str | None) -> int | None:
     """'obot-123' -> 123; anything else (manual trades, None) -> None."""
-    if not order_ref or not order_ref.startswith(_ORDER_REF_PREFIX):
-        return None
-    suffix = order_ref[len(_ORDER_REF_PREFIX):]
-    return int(suffix) if suffix.isdigit() else None
+    return ledger_row_id_from_ref(order_ref)
 
 
 class OrderTracker:
@@ -79,9 +81,24 @@ class OrderTracker:
         self._engine = engine
 
     def attach(self, order_client: OrderClient) -> None:
+        order_client.on_callback_error(self.handle_callback_error)
         order_client.on_status(self.handle_status)
         order_client.on_fill(self.handle_fill)
         order_client.on_commission(self.handle_commission)
+
+    def handle_callback_error(
+        self, kind: BrokerCallbackKind, error: Exception
+    ) -> None:
+        reason = f"live broker {kind} callback failed validation or handling"
+        try:
+            trip_kill(self._engine, reason)
+        except Exception:
+            log.critical(
+                "failed to persist kill switch after broker %s callback failure",
+                kind,
+                exc_info=True,
+            )
+        log.error(reason, exc_info=(type(error), error, error.__traceback__))
 
     def handle_status(self, update: OrderStatusUpdate) -> None:
         row_id = row_id_from_ref(update.order_ref)

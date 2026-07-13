@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,7 +14,7 @@ from sqlalchemy import Engine, insert, select, update
 from optionsbot.execution.orders import get_order, record_fill
 from optionsbot.execution.reconcile import reconcile
 from optionsbot.execution.state import load_state
-from optionsbot.ibkr.types import ExecutionFill, PortfolioPosition
+from optionsbot.ibkr.types import ExecutionFill, OpenOrderSnapshot, PortfolioPosition
 from optionsbot.storage.schema import fills, orders
 
 NOW = datetime(2026, 6, 11, 16, 0, tzinfo=UTC)
@@ -34,12 +35,13 @@ OLD = NOW - timedelta(minutes=5)  # past the in-flight grace window
 def _insert_order(
     engine: Engine, status: str, *, quantity: int = 1,
     staged_ts: datetime | None = None, submitted_ts: datetime | None = OLD,
-    ib_order_id: int | None = 11,
+    ib_order_id: int | None = 11, limit_price: float = -1.0,
 ) -> int:
     with engine.begin() as conn:
         pk = conn.execute(insert(orders).values(
             intent="open", symbol="SPY", strategy="bull_put_spread",
             legs_json=LEGS, quantity=quantity, status=status,
+            limit_price=limit_price,
             staged_ts=staged_ts or OLD, submitted_ts=submitted_ts,
             ib_order_id=ib_order_id, reprice_count=0,
         )).inserted_primary_key
@@ -50,12 +52,60 @@ def _insert_order(
     return order_id
 
 
+def _broker_order(
+    order_id: int,
+    *,
+    ib_order_id: int = 11,
+    status: str = "Submitted",
+    con_ids: tuple[int, int] = (1580, 1575),
+    quantity: int = 1,
+    limit_price: float = -1.0,
+) -> OpenOrderSnapshot:
+    return OpenOrderSnapshot(
+        ib_order_id=ib_order_id,
+        order_ref=f"obot-{order_id}",
+        status=status,
+        sec_type="BAG",
+        symbol="SPY",
+        currency="USD",
+        exchange="SMART",
+        combo_legs=(
+            (con_ids[0], 1, "SELL", "SMART"),
+            (con_ids[1], 1, "BUY", "SMART"),
+        ),
+        order_action="BUY",
+        total_quantity=quantity,
+        order_type="LMT",
+        tif="DAY",
+        limit_price=limit_price,
+    )
+
+
 def _client(
-    open_orders: list[tuple[int, str | None, str]] | None = None,
+    open_orders: list[Any] | None = None,
     executions: list[ExecutionFill] | None = None,
 ) -> MagicMock:
+    normalized: list[Any] = []
+    for row in open_orders or []:
+        if isinstance(row, OpenOrderSnapshot):
+            normalized.append(row)
+            continue
+        if isinstance(row, tuple) and len(row) == 3:
+            ib_order_id, ref, status = row
+            if isinstance(ref, str) and ref.startswith("obot-") and ref[5:].isdigit():
+                normalized.append(
+                    _broker_order(
+                        int(ref[5:]),
+                        ib_order_id=ib_order_id,
+                        status=status,
+                    )
+                )
+            else:
+                normalized.append(OpenOrderSnapshot(ib_order_id, ref, status))
+            continue
+        normalized.append(row)
     client = MagicMock()
-    client.adopt_open_orders = AsyncMock(return_value=open_orders or [])
+    client.adopt_open_orders = AsyncMock(return_value=normalized)
     client.recent_executions = AsyncMock(return_value=executions or [])
     return client
 
@@ -93,6 +143,127 @@ async def test_working_row_still_at_broker_stays_working(tmp_db: Engine) -> None
     assert summary.adopted == 1
     assert get_order(tmp_db, order_id).status == "submitted"  # type: ignore[union-attr]
     assert not sent
+
+
+async def test_exact_broker_terms_matching_ledger_are_accepted(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    client = _client(open_orders=[_broker_order(order_id)])
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 0
+    assert not load_state(tmp_db).killed
+    client.authorize_adoptions.assert_called_once_with((_broker_order(order_id),))
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        replace(_broker_order(1), total_quantity=True),  # type: ignore[arg-type]
+        replace(_broker_order(1), ib_order_id=0),
+        replace(
+            _broker_order(1),
+            combo_legs=((1580, True, "SELL", "SMART"), (1575, 1, "BUY", "SMART")),  # type: ignore[arg-type]
+        ),
+        replace(_broker_order(1), order_ref="obot-01"),
+    ],
+)
+async def test_malformed_or_noncanonical_snapshot_never_authorizes(
+    tmp_db: Engine, snapshot: OpenOrderSnapshot
+) -> None:
+    _insert_order(tmp_db, "submitted")
+    client = _client(open_orders=[snapshot])
+
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
+
+
+async def test_later_snapshot_failure_prevents_authorization_and_walk_resume(
+    tmp_db: Engine,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    client = _client(open_orders=[_broker_order(order_id)])
+    client.recent_executions.side_effect = RuntimeError("snapshot unavailable")
+    resume = AsyncMock(return_value=1)
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW,
+        walk_resume=resume,
+        walk_md=MagicMock(),
+        walk_tasks=set(),
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
+    resume.assert_not_awaited()
+
+
+async def test_broker_contract_mismatch_halts_before_walk_resume(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    resume = AsyncMock(return_value=1)
+    client = _client(
+        open_orders=[_broker_order(order_id, con_ids=(9991, 9992))],
+    )
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW,
+        walk_resume=resume,
+        walk_md=MagicMock(),
+        walk_tasks=set(),
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    resume.assert_not_awaited()
+    client.authorize_adoptions.assert_not_called()
+
+
+async def test_single_leg_ratio_requires_total_contract_quantity(tmp_db: Engine) -> None:
+    single_leg = [dict(LEGS[0], quantity=2)]
+    order_id = _insert_order(tmp_db, "submitted", quantity=3)
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders).where(orders.c.id == order_id).values(legs_json=single_leg)
+        )
+    exact = OpenOrderSnapshot(
+        ib_order_id=11, order_ref=f"obot-{order_id}", status="Submitted",
+        sec_type="OPT", symbol="SPY", currency="USD", exchange="SMART",
+        contract_con_id=1580, multiplier=100, expiry="20260717", strike=580.0,
+        right="P", order_action="SELL", total_quantity=6, order_type="LMT",
+        tif="DAY", limit_price=1.0,
+    )
+    client = _client(open_orders=[exact])
+
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 0
+    client.authorize_adoptions.assert_called_once_with((exact,))
+
+
+async def test_missing_broker_transition_race_blocks_authorization(
+    tmp_db: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from optionsbot.execution.orders import IllegalOrderTransition
+
+    _insert_order(tmp_db, "submitted")
+
+    def race(*args: Any, **kwargs: Any) -> None:
+        raise IllegalOrderTransition("concurrent state change")
+
+    monkeypatch.setattr("optionsbot.execution.reconcile.transition", race)
+    client = _client(open_orders=[])
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
 
 
 async def test_submitting_row_at_broker_becomes_submitted(tmp_db: Engine) -> None:
@@ -293,6 +464,53 @@ async def test_reconcile_resumes_persisted_walks(tmp_db: Engine, monkeypatch: An
     )
     assert summary.adopted == 1
     assert resumed == [True]  # resume_walks was invoked with walk_tasks
+
+
+async def test_walk_resume_failure_revokes_new_authority(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    client = _client(open_orders=[_broker_order(order_id)])
+    resume = AsyncMock(side_effect=RuntimeError("resume failed"))
+
+    summary = await reconcile(
+        tmp_db, client, now=NOW,
+        walk_resume=resume, walk_md=MagicMock(), walk_tasks=set(),
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_called_once()
+    client.revoke_adoptions.assert_called_once()
+
+
+async def test_cancelled_walk_resume_revokes_new_authority(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    client = _client(open_orders=[_broker_order(order_id)])
+    resume_started = asyncio.Event()
+    keep_resuming = asyncio.Event()
+
+    async def suspended_resume(**kwargs: Any) -> int:
+        resume_started.set()
+        await keep_resuming.wait()
+        return 1
+
+    task = asyncio.create_task(
+        reconcile(
+            tmp_db,
+            client,
+            now=NOW,
+            walk_resume=suspended_resume,
+            walk_md=MagicMock(),
+            walk_tasks=set(),
+        )
+    )
+    await resume_started.wait()
+    client.authorize_adoptions.assert_called_once()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    client.revoke_adoptions.assert_called_once()
 
 
 def _portfolio_pos(
@@ -593,6 +811,78 @@ async def test_fractional_contract_identity_halts(
 
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed", "broker_symbol", "broker_expiry"),
+    [
+        ("symbol", 123, "123", "20260717"),
+        ("expiry", 20260717, "SPY", "20260717"),
+    ],
+)
+async def test_coercible_malformed_persisted_position_leg_halts(
+    tmp_db: Engine,
+    field: str,
+    malformed: object,
+    broker_symbol: str,
+    broker_expiry: str,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    malformed_legs = [dict(leg) for leg in LEGS]
+    malformed_legs[0][field] = malformed
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == order_id)
+            .values(legs_json=malformed_legs)
+        )
+    from optionsbot.execution.orders import transition
+
+    transition(tmp_db, order_id, "filled", now=NOW)
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="malformed-short",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1580,
+    )
+    record_fill(
+        tmp_db,
+        order_id,
+        exec_id="malformed-long",
+        side="BUY",
+        price=0.40,
+        qty=1,
+        ts=NOW,
+        leg_con_id=1575,
+    )
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [
+            _portfolio_pos(
+                broker_symbol,
+                strike=580.0,
+                right="P",
+                position=-1.0,
+                expiry=broker_expiry,
+            ),
+            _portfolio_pos("SPY", strike=575.0, right="P", position=1.0),
+        ]
+
+    client = _client(open_orders=[], executions=[])
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 1
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
 
 
 async def test_bot_owned_broker_order_without_ledger_row_halts(tmp_db: Engine) -> None:
