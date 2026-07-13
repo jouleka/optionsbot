@@ -1,7 +1,7 @@
 # optionsbot
 
-Personal IBKR options-analysis + alerting tool, with an opt-in
-paper-only automated-execution mode (in progress, IBK-122..131).
+Personal IBKR options-analysis, alerting, and opt-in paper-only
+automated-execution tool.
 
 ## ⚠ Safety disclaimer
 
@@ -37,12 +37,13 @@ and survives restarts.
 - Exposes the watchlist + analysis as MCP tools so Claude Code can
   query the data interactively ("show me the top picks for AAPL").
 
-Order execution is an opt-in epic in progress (IBK-122..131): with
-`execution.enabled=true` the bot may place orders on the IBKR PAPER
-account only — confirm-first via Telegram `/execute` before any full-auto
-mode — behind the paper-only interlock and the `/kill` switch. As of
-IBK-123 only the safety substrate exists; there is no order-placement
-code yet.
+Order execution is implemented but opt-in. With `execution.enabled=true`,
+the bot can submit atomic limit orders to the IBKR PAPER account in either
+Telegram-confirmed or automatic mode. Entries pass freshness, market-hours,
+risk, paper-account, and kill-switch gates; orders and executions are written
+to a durable ledger; restart reconciliation compares exact broker orders,
+executions, and positions before granting modify/cancel authority. The default
+remains disabled, and live-account routing is refused.
 
 ## Architecture
 
@@ -60,9 +61,9 @@ modules rather than packages, hence "units" rather than strictly
 | `optionsbot.scoring` | composite score + top-K selector + rationale |
 | `optionsbot.scan` | end-to-end single-symbol scan helper |
 | `optionsbot.alerts` | markdown alert formatter |
-| `optionsbot.mcp_server` | FastMCP stdio server (7 tools for Claude) |
+| `optionsbot.mcp_server` | FastMCP stdio server (14 analysis, watchlist, position, and supervised-control tools) |
 | `optionsbot.daemon` | APScheduler-driven scan loop + Telegram dispatch |
-| `optionsbot.execution` | arming gate + persisted kill switch (no order code yet) |
+| `optionsbot.execution` | execution gates, order ledger, sizing, reconciliation, price walking, and exits |
 | `optionsbot.observability` | structlog configuration + contextvars |
 
 Async at the top (IBKR + Telegram + APScheduler are async). Analysis,
@@ -121,10 +122,11 @@ uv run optionsbot-daemon
 For production -- auto-restart, journald logs, etc. -- run under
 systemd-user. See [docs/systemd.md](docs/systemd.md).
 
-### Claude Code integration
+### MCP integration
 
-The MCP server exposes 7 tools (4 watchlist + analyze + latest_snapshot
-+ score_breakdown) so Claude can query the data interactively. See
+The MCP server exposes 14 tools for watchlists, analysis, snapshots, positions,
+track record, daily briefing, candidate review, close requests, and monotonic
+halting. Broker mutation remains in the daemon rather than the MCP process. See
 [docs/mcp-claude-code.md](docs/mcp-claude-code.md) for the
 `mcpServers` config snippet.
 
@@ -217,10 +219,10 @@ uv run mypy src              # type-check (strict mode on src/)
 
 v1: paper trading only, personal use. The scope is intentionally small
 -- one user, one IBKR account, one Telegram chat. Multi-account and
-live trading are explicitly out of scope for v1 (and v1 is the current
-target). The auto-execution epic (IBK-122..IBK-131) is in progress:
-paper-only automated order placement, off by default, semi-auto
-(Telegram-confirmed) before any full-auto mode.
+live trading are explicitly out of scope. Paper execution, durable order
+tracking, broker reconciliation, risk gates, deterministic exits, and the
+Hermes supervision endpoints are implemented; execution remains off by
+default and requires operational acceptance before re-enablement.
 
 Implementation is tracked in YouTrack project
 [IBK](https://tracker.example.invalid/projects/0-2); implementation
