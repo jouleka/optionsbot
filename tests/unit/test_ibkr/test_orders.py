@@ -581,6 +581,34 @@ def test_execution_adapter_rejects_mismatched_commission_identity(
         order_client._to_execution_fill(fill)  # noqa: SLF001
 
 
+def test_execution_adapter_treats_empty_commission_report_as_unbundled(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="exec-1",
+        time=datetime(2026, 6, 10, 15, 30, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=0.40,
+        orderId=7,
+        orderRef="obot-7",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=CommissionReport(),
+        time=execution.time,
+    )
+
+    translated = order_client._to_execution_fill(fill)  # noqa: SLF001
+
+    assert translated.commission is None
+
+
 @pytest.mark.parametrize(
     ("shares", "con_id"),
     [(1.5, 1580), (1.0, 1580.5)],

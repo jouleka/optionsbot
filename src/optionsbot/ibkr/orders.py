@@ -68,6 +68,25 @@ def _parse_ib_double(value: object) -> float | None:
     return parsed
 
 
+def _empty_commission_placeholder(report: Any) -> bool:
+    """True only for ib_async's exact default reqExecutions placeholder."""
+    return (
+        report.execId == ""
+        and isinstance(report.commission, (int, float))
+        and not isinstance(report.commission, bool)
+        and report.commission == 0
+        and report.currency == ""
+        and isinstance(report.realizedPNL, (int, float))
+        and not isinstance(report.realizedPNL, bool)
+        and report.realizedPNL == 0
+        and isinstance(report.yield_, (int, float))
+        and not isinstance(report.yield_, bool)
+        and report.yield_ == 0
+        and type(report.yieldRedemptionDate) is int
+        and report.yieldRedemptionDate == 0
+    )
+
+
 def _validated_open_trade(trade: Any) -> tuple[int, str | None, str]:
     try:
         raw_order_id = trade.order.orderId
@@ -804,7 +823,7 @@ class OrderClient:
         order_ref = raw_order_ref or fallback_ref or None
         report = fill.commissionReport
         commission: float | None = None
-        if report is not None:
+        if report is not None and not _empty_commission_placeholder(report):
             if (
                 not isinstance(report.execId, str)
                 or not report.execId.strip()
