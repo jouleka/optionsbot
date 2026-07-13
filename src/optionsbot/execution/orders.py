@@ -935,25 +935,44 @@ def open_position_exposure(
                 raw_con_id = leg["con_id"]
                 raw_leg_quantity = leg.get("quantity", 1)
                 raw_side = leg["side"]
-                con_id = int(raw_con_id)
-                spec = (
-                    str(leg["symbol"]),
-                    str(leg["expiry"]),
-                    float(leg["strike"]),
-                    str(leg["right"]),
-                )
+                raw_symbol = leg["symbol"]
+                raw_expiry = leg["expiry"]
+                raw_strike = leg["strike"]
+                raw_right = leg["right"]
+                raw_multiplier = leg["multiplier"]
+                raw_currency = leg["currency"]
             except (KeyError, TypeError, ValueError, OverflowError):
                 return None
             if (
                 type(raw_con_id) is not int
-                or con_id <= 0
-                or con_id in leg_specs
+                or raw_con_id <= 0
+                or raw_con_id in leg_specs
                 or type(raw_leg_quantity) is not int
                 or raw_leg_quantity <= 0
                 or raw_side not in {"buy", "sell"}
+                or not isinstance(raw_symbol, str)
+                or not raw_symbol.strip()
+                or not isinstance(raw_expiry, str)
+                or len(raw_expiry) != 8
+                or not raw_expiry.isascii()
+                or not raw_expiry.isdecimal()
+                or not isinstance(raw_strike, (int, float))
+                or isinstance(raw_strike, bool)
+                or not math.isfinite(float(raw_strike))
+                or raw_strike <= 0
+                or raw_right not in {"C", "P"}
+                or type(raw_multiplier) is not int
+                or raw_multiplier != 100
+                or raw_currency != "USD"
             ):
                 return None
-            leg_specs[con_id] = spec
+            con_id = raw_con_id
+            leg_specs[con_id] = (
+                raw_symbol,
+                raw_expiry,
+                float(raw_strike),
+                raw_right,
+            )
             expected_side = "BUY" if raw_side == "buy" else "SELL"
             expected_fills[(con_id, expected_side)] = (
                 raw_leg_quantity * raw_order_quantity

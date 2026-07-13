@@ -88,6 +88,7 @@ def test_map_ib_status(
         ("obot-x", None),
         ("obot-", None),
         ("manual-3", None),
+        ("obot-" + "9" * 10_000, None),
         ("", None),
         (None, None),
     ],
@@ -204,9 +205,27 @@ def test_attach_subscribes_all_three(tmp_db: Engine) -> None:
     tracker = OrderTracker(tmp_db)
     order_client = MagicMock()
     tracker.attach(order_client)
+    order_client.on_callback_error.assert_called_once_with(
+        tracker.handle_callback_error
+    )
+    assert order_client.method_calls[0] == (
+        "on_callback_error",
+        (tracker.handle_callback_error,),
+        {},
+    )
     order_client.on_status.assert_called_once_with(tracker.handle_status)
     order_client.on_fill.assert_called_once_with(tracker.handle_fill)
     order_client.on_commission.assert_called_once_with(tracker.handle_commission)
+
+
+def test_broker_callback_error_trips_kill_without_raising(tmp_db: Engine) -> None:
+    tracker = OrderTracker(tmp_db)
+
+    tracker.handle_callback_error("execDetails", ValueError("malformed raw fill"))
+
+    state = load_state(tmp_db)
+    assert state.killed
+    assert state.reason == "live broker execDetails callback failed validation or handling"
 
 
 def test_status_rejects_broker_id_already_owned_by_another_row(tmp_db: Engine) -> None:

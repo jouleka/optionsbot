@@ -14,6 +14,24 @@ from typing import Literal
 OptionRight = Literal["C", "P"]
 
 
+def ledger_row_id_from_ref(order_ref: str | None) -> int | None:
+    """Return the row ID only for canonical ASCII ``obot-<positive-int>`` refs."""
+    if not isinstance(order_ref, str) or not order_ref.startswith("obot-"):
+        return None
+    suffix = order_ref[5:]
+    if (
+        not suffix
+        or len(suffix) > 19
+        or not suffix.isascii()
+        or not suffix.isdecimal()
+    ):
+        return None
+    row_id = int(suffix)
+    if row_id <= 0 or row_id > (1 << 63) - 1 or order_ref != f"obot-{row_id}":
+        return None
+    return row_id
+
+
 @dataclass(frozen=True, slots=True)
 class StockQuote:
     symbol: str
@@ -159,6 +177,35 @@ class PlacedOrder:
     # (IBKR conId, contract multiplier, currency). Empty only for legacy/mocked
     # acknowledgements that cannot prove exact fill attribution.
     leg_contracts: tuple[tuple[int, int, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OpenOrderSnapshot:
+    """Exact broker terms for one open order used during reconciliation.
+
+    Contract/order fields are populated for bot-owned ``obot-*`` rows. Foreign
+    rows retain identity/status only because they are reported but never adopted
+    or mutated by the bot.
+    """
+
+    ib_order_id: int
+    order_ref: str | None
+    status: str
+    sec_type: str | None = None
+    symbol: str | None = None
+    currency: str | None = None
+    exchange: str | None = None
+    contract_con_id: int | None = None
+    multiplier: int | None = None
+    expiry: str | None = None
+    strike: float | None = None
+    right: OptionRight | None = None
+    combo_legs: tuple[tuple[int, int, str, str], ...] = ()
+    order_action: str | None = None
+    total_quantity: int | None = None
+    order_type: str | None = None
+    tif: str | None = None
+    limit_price: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

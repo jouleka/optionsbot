@@ -36,6 +36,7 @@ from optionsbot.execution.orders import (
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
 from optionsbot.execution.walk import resume_walks
+from optionsbot.ibkr.types import OpenOrderSnapshot, ledger_row_id_from_ref
 from optionsbot.storage.schema import fills, orders
 
 if TYPE_CHECKING:
@@ -122,6 +123,151 @@ def _persisted_order_semantics_valid(record: Any) -> bool:
             return False
         seen_con_ids.add(con_id)
     return option_count > 0
+
+
+def _broker_order_matches_ledger(snapshot: OpenOrderSnapshot, record: Any) -> bool:
+    """Require the exact broker contract/order terms persisted for this intent."""
+    if not _persisted_order_semantics_valid(record):
+        return False
+    raw_limit = record.limit_price
+    if (
+        not isinstance(raw_limit, (int, float))
+        or isinstance(raw_limit, bool)
+        or not math.isfinite(float(raw_limit))
+    ):
+        return False
+    option_legs = [leg for leg in record.legs if leg.get("sec_type", "OPT") == "OPT"]
+    common = (
+        snapshot.symbol == record.symbol
+        and snapshot.currency == "USD"
+        and snapshot.exchange == "SMART"
+        and snapshot.order_type == "LMT"
+        and snapshot.tif == "DAY"
+    )
+    if not common:
+        return False
+    if len(option_legs) == 1:
+        leg = option_legs[0]
+        return (
+            snapshot.sec_type == "OPT"
+            and snapshot.contract_con_id == leg["con_id"]
+            and snapshot.multiplier == leg["multiplier"]
+            and snapshot.expiry == leg["expiry"]
+            and snapshot.strike == float(leg["strike"])
+            and snapshot.right == leg["right"]
+            and snapshot.combo_legs == ()
+            and snapshot.order_action == str(leg["side"]).upper()
+            and snapshot.total_quantity == record.quantity * leg["quantity"]
+            and snapshot.limit_price is not None
+            and math.isclose(
+                snapshot.limit_price,
+                abs(float(raw_limit)),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        )
+    expected_combo = tuple(
+        (leg["con_id"], leg["quantity"], str(leg["side"]).upper(), "SMART")
+        for leg in option_legs
+    )
+    return (
+        snapshot.sec_type == "BAG"
+        and snapshot.contract_con_id is None
+        and snapshot.multiplier is None
+        and snapshot.expiry is None
+        and snapshot.strike is None
+        and snapshot.right is None
+        and snapshot.combo_legs == expected_combo
+        and snapshot.order_action == "BUY"
+        and snapshot.total_quantity == record.quantity
+        and snapshot.limit_price is not None
+        and math.isclose(
+            snapshot.limit_price,
+            float(raw_limit),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    )
+
+
+def _open_order_snapshot_valid(snapshot: OpenOrderSnapshot) -> bool:
+    """Validate exact runtime types at the reconciliation trust boundary."""
+    if (
+        type(snapshot.ib_order_id) is not int
+        or snapshot.ib_order_id < 0
+        or (snapshot.order_ref is not None and not isinstance(snapshot.order_ref, str))
+        or not isinstance(snapshot.status, str)
+        or not snapshot.status.strip()
+    ):
+        return False
+    row_id = ledger_row_id_from_ref(snapshot.order_ref)
+    if row_id is None:
+        return not (
+            isinstance(snapshot.order_ref, str)
+            and snapshot.order_ref.startswith("obot-")
+        )
+    if (
+        snapshot.ib_order_id <= 0
+        or
+        snapshot.order_ref != f"obot-{row_id}"
+        or snapshot.sec_type not in {"OPT", "BAG"}
+        or not isinstance(snapshot.symbol, str)
+        or not snapshot.symbol.strip()
+        or snapshot.currency != "USD"
+        or snapshot.exchange != "SMART"
+        or snapshot.order_action not in {"BUY", "SELL"}
+        or type(snapshot.total_quantity) is not int
+        or snapshot.total_quantity <= 0
+        or snapshot.order_type != "LMT"
+        or snapshot.tif != "DAY"
+        or not isinstance(snapshot.limit_price, (int, float))
+        or isinstance(snapshot.limit_price, bool)
+        or not math.isfinite(float(snapshot.limit_price))
+    ):
+        return False
+    if snapshot.sec_type == "BAG":
+        if (
+            snapshot.contract_con_id is not None
+            or snapshot.multiplier is not None
+            or snapshot.expiry is not None
+            or snapshot.strike is not None
+            or snapshot.right is not None
+            or not isinstance(snapshot.combo_legs, tuple)
+            or len(snapshot.combo_legs) < 2
+        ):
+            return False
+        seen: set[int] = set()
+        for leg in snapshot.combo_legs:
+            if (
+                not isinstance(leg, tuple)
+                or len(leg) != 4
+                or type(leg[0]) is not int
+                or leg[0] <= 0
+                or leg[0] in seen
+                or type(leg[1]) is not int
+                or leg[1] <= 0
+                or leg[2] not in {"BUY", "SELL"}
+                or leg[3] != "SMART"
+            ):
+                return False
+            seen.add(leg[0])
+        return True
+    return (
+        type(snapshot.contract_con_id) is int
+        and snapshot.contract_con_id > 0
+        and type(snapshot.multiplier) is int
+        and snapshot.multiplier > 0
+        and isinstance(snapshot.expiry, str)
+        and len(snapshot.expiry) == 8
+        and snapshot.expiry.isascii()
+        and snapshot.expiry.isdecimal()
+        and isinstance(snapshot.strike, (int, float))
+        and not isinstance(snapshot.strike, bool)
+        and math.isfinite(float(snapshot.strike))
+        and snapshot.strike > 0
+        and snapshot.right in {"C", "P"}
+        and snapshot.combo_legs == ()
+    )
 
 
 def _fills_complete(
@@ -224,15 +370,21 @@ async def _reconcile_once(
         await _send(notify, f"🛑 KILL SWITCH: {reason}")
         return ReconcileSummary(0, 0, 0, 0, 1)
 
-    at_broker: dict[int, tuple[int, str]] = {}  # ledger row id -> (ib id, ib status)
+    at_broker: dict[int, OpenOrderSnapshot] = {}
+    authorization_candidates: list[OpenOrderSnapshot] = []
     broker_id_owner: dict[int, int] = {}  # ib order id -> ledger row id
     for broker_row in broker_orders:
-        if not isinstance(broker_row, (list, tuple)) or len(broker_row) != 3:
+        if (
+            not isinstance(broker_row, OpenOrderSnapshot)
+            or not _open_order_snapshot_valid(broker_row)
+        ):
             reason = "reconcile open-order snapshot contains a malformed row"
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             return ReconcileSummary(adopted, foreign, 0, 0, 1)
-        ib_order_id, ref, ib_status = broker_row
+        ib_order_id = broker_row.ib_order_id
+        ref = broker_row.order_ref
+        ib_status = broker_row.status
         if (
             type(ib_order_id) is not int
             or ib_order_id < 0
@@ -258,7 +410,7 @@ async def _reconcile_once(
             mismatches += 1
             reason = (
                 f"reconcile duplicate broker orders claim ledger order #{row_id}: "
-                f"{at_broker[row_id][0]} and {ib_order_id}"
+                f"{at_broker[row_id].ib_order_id} and {ib_order_id}"
             )
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
@@ -274,10 +426,12 @@ async def _reconcile_once(
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
         broker_id_owner[ib_order_id] = row_id
-        at_broker[row_id] = (ib_order_id, ib_status)
+        at_broker[row_id] = broker_row
 
     # Sync ledger rows that ARE at the broker (e.g. submitting -> submitted).
-    for row_id, (ib_order_id, ib_status) in at_broker.items():
+    for row_id, broker_row in at_broker.items():
+        ib_order_id = broker_row.ib_order_id
+        ib_status = broker_row.status
         record = get_order(engine, row_id)
         if record is None:
             mismatches += 1
@@ -312,6 +466,12 @@ async def _reconcile_once(
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
+        if not _broker_order_matches_ledger(broker_row, record):
+            mismatches += 1
+            reason = f"reconcile broker terms conflict with ledger order #{row_id}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+            continue
         target = map_ib_status(ib_status, 0, 1)  # working ack mapping
         if target is None:
             mismatches += 1
@@ -322,14 +482,17 @@ async def _reconcile_once(
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
             continue
         if record.status == target:
+            authorization_candidates.append(broker_row)
             continue
         if record.status == "partial" and target == "submitted":
             # We have no fill counts here; a partially-filled at-broker order
             # is already correctly "working" — nothing to sync.
+            authorization_candidates.append(broker_row)
             continue
         try:
             transition(engine, row_id, target, ib_order_id=ib_order_id, now=ts_now)
             resolved += 1
+            authorization_candidates.append(broker_row)
         except IllegalOrderTransition as exc:
             log.warning(
                 "reconcile: cannot move order %s %s -> %s",
@@ -337,33 +500,6 @@ async def _reconcile_once(
             )
             mismatches += 1
             reason = f"reconcile illegal broker/ledger state for order #{row_id}: {exc}"
-            trip_kill(engine, reason, now=ts_now)
-            await _send(notify, f"🛑 KILL SWITCH: {reason}")
-
-    # Re-attach persisted walks only after every broker-owned order has valid,
-    # unambiguous ledger identity and semantic status. Never restart an
-    # order-capable task while reconciliation has found a mismatch or execution
-    # is already halted.
-    if (
-        mismatches == 0
-        and not load_state(engine).killed
-        and walk_md is not None
-        and walk_tasks is not None
-    ):
-        resume = walk_resume if walk_resume is not None else resume_walks
-        try:
-            await resume(
-                engine=engine,
-                settings=settings,
-                order_client=order_client,
-                md=walk_md,
-                walk_tasks=walk_tasks,
-                notify=notify,
-            )
-        except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
-            log.exception("reconcile: walk resume failed")
-            mismatches += 1
-            reason = f"reconcile persisted price-walk resume failed: {exc}"
             trip_kill(engine, reason, now=ts_now)
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
@@ -519,8 +655,12 @@ async def _reconcile_once(
                         now=ts_now,
                     )
                     resolved += 1
-        except IllegalOrderTransition:
+        except IllegalOrderTransition as exc:
             log.warning("reconcile: race resolving order %s (%s)", row.id, row.status)
+            mismatches += 1
+            reason = f"reconcile ledger transition race for order #{row.id}: {exc}"
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
     # Work-stream D2: position-level compare. Beyond orders, ask the broker for
     # OPEN POSITIONS and confirm every one maps to a leg the ledger believes is
@@ -637,6 +777,44 @@ async def _reconcile_once(
                     "🛑 KILL SWITCH: exact broker/ledger option exposure mismatch — "
                     "inspect /positions and ledger, reconcile manually, then /arm.",
                 )
+
+    # Mutation authority and walk resumption are the final commit point: no
+    # broker order becomes mutable until every order, execution, and position
+    # check in this reconciliation pass has succeeded.
+    if mismatches == 0 and not load_state(engine).killed:
+        try:
+            order_client.authorize_adoptions(tuple(authorization_candidates))
+        except Exception as exc:  # noqa: BLE001 -- mutation authority must fail closed
+            mismatches += 1
+            reason = f"reconcile could not authorize exact broker orders: {exc}"
+            order_client.revoke_adoptions()
+            trip_kill(engine, reason, now=ts_now)
+            await _send(notify, f"🛑 KILL SWITCH: {reason}")
+        if (
+            mismatches == 0
+            and walk_md is not None
+            and walk_tasks is not None
+        ):
+            resume = walk_resume if walk_resume is not None else resume_walks
+            try:
+                await resume(
+                    engine=engine,
+                    settings=settings,
+                    order_client=order_client,
+                    md=walk_md,
+                    walk_tasks=walk_tasks,
+                    notify=notify,
+                )
+            except asyncio.CancelledError:
+                order_client.revoke_adoptions()
+                raise
+            except Exception as exc:  # noqa: BLE001 -- unmanaged working order halts
+                log.exception("reconcile: walk resume failed")
+                mismatches += 1
+                reason = f"reconcile persisted price-walk resume failed: {exc}"
+                order_client.revoke_adoptions()
+                trip_kill(engine, reason, now=ts_now)
+                await _send(notify, f"🛑 KILL SWITCH: {reason}")
 
     if adopted or foreign or replayed or resolved or mismatches or orphan_positions:
         log.info(

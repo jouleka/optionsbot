@@ -48,6 +48,10 @@ async def test_live_place_modify_cancel_deep_otm_spread() -> None:
     order_client = OrderClient(client, resolver)
 
     statuses: list[OrderStatusUpdate] = []
+    callback_errors: list[tuple[str, Exception]] = []
+    order_client.on_callback_error(
+        lambda kind, error: callback_errors.append((kind, error))
+    )
     order_client.on_status(statuses.append)
 
     try:
@@ -107,7 +111,7 @@ async def test_live_place_modify_cancel_deep_otm_spread() -> None:
         placed = await order_client.place_combo_limit(
             "SPY", legs, quantity=1,
             limit_price=-unfillable_credit,  # negative = net credit
-            order_ref="obot-livetest",
+            order_ref="obot-999999999",
         )
         assert placed.action == "BUY"
         assert placed.limit_price < 0
@@ -145,5 +149,6 @@ async def test_live_place_modify_cancel_deep_otm_spread() -> None:
             if p.contract.conId in leg_con_ids and p.position != 0
         }
         assert not held, f"unexpected position in test legs: {held}"
+        assert not callback_errors
     finally:
         await client.disconnect()
