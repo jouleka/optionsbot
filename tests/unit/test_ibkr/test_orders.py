@@ -554,6 +554,62 @@ def test_fill_event_translates_and_normalizes_side(
     assert record.ts.tzinfo is not None
 
 
+def test_execution_adapter_accepts_negative_bag_credit_price(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="combo-credit",
+        time=datetime(2026, 7, 14, 13, 42, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=-1.95,
+        orderId=171,
+        orderRef="obot-12",
+    )
+    fill = Fill(
+        contract=Contract(secType="BAG", symbol="SPY", conId=0),
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,
+    )
+
+    translated = order_client._to_execution_fill(fill)  # noqa: SLF001
+
+    assert translated.sec_type == "BAG"
+    assert translated.price == pytest.approx(-1.95)
+
+
+def test_execution_adapter_rejects_negative_option_leg_price(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import Contract, Execution, Fill
+
+    execution = Execution(
+        execId="negative-option-leg",
+        time=datetime(2026, 7, 14, 13, 42, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=-1.95,
+        orderId=171,
+        orderRef="obot-12",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="SPY", conId=1580),
+        execution=execution,
+        commissionReport=None,
+        time=execution.time,
+    )
+
+    with pytest.raises(ValueError, match="nonnegative for option legs"):
+        order_client._to_execution_fill(fill)  # noqa: SLF001
+
+
 def test_execution_adapter_rejects_mismatched_commission_identity(
     order_client: OrderClient,
 ) -> None:

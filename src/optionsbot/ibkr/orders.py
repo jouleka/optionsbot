@@ -808,8 +808,10 @@ class OrderClient:
         ):
             raise ValueError("execution price is malformed")
         price = float(raw_price)
-        if not math.isfinite(price) or price < 0:
-            raise ValueError("execution price must be finite and nonnegative")
+        if not math.isfinite(price) or (sec_type == "OPT" and price < 0):
+            raise ValueError(
+                "execution price must be finite and nonnegative for option legs"
+            )
         if not isinstance(execution.execId, str) or not execution.execId.strip():
             raise ValueError("execution ID is missing")
         raw_order_id = execution.orderId

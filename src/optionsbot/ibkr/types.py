@@ -224,7 +224,9 @@ class OrderStatusUpdate:
 @dataclass(frozen=True, slots=True)
 class ExecutionFill:
     """One execution event (IBK-125). Combo orders report one execution per
-    LEG; ``sec_type`` lets consumers skip any BAG-level summary row."""
+    LEG; ``sec_type`` lets consumers skip any BAG-level summary row. IBKR can
+    report a negative price for a BAG credit, while individual option-leg
+    prices remain nonnegative."""
 
     ib_order_id: int
     order_ref: str | None
