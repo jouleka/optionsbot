@@ -64,7 +64,7 @@ class HermesWebhookSettings(BaseModel):
     enabled: bool = False
     url: str = "http://127.0.0.1:8644/webhooks/optionsbot-events"
     secret: SecretStr | None = None
-    timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
+    timeout_seconds: float = Field(default=15.0, gt=0.0, le=30.0)
     retries: int = Field(default=2, ge=0, le=5)
 
     @model_validator(mode="after")

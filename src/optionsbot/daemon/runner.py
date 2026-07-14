@@ -227,6 +227,12 @@ class Daemon:
         new = load_settings()
         self._settings = new
         self._context.settings = new
+        old_events = self._context.events
+        from optionsbot.daemon.event_webhook import EventWebhookPublisher
+
+        self._context.events = EventWebhookPublisher(new.hermes_webhook)
+        if old_events is not None:
+            await old_events.flush()
         old_telegram = self._context.telegram
         self._context.telegram = TelegramClient(
             new.telegram.bot_token, new.telegram.chat_id
