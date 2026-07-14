@@ -918,6 +918,13 @@ async def _manage_entry(
         f"📤 closing #{entry.id} {entry.symbol} {entry.strategy} "
         f"{entry.quantity}x — {reason} (close order #{close.id})",
     )
+    if reason.startswith("soft stop") and context.events is not None:
+        context.events.emit(
+            "stop-hit",
+            f"Soft stop submitted for #{entry.id} {entry.symbol} {entry.strategy}",
+            severity="warning",
+            details={"entry_order_id": entry.id, "close_order_id": close.id, "reason": reason},
+        )
     return 1
 
 

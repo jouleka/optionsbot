@@ -161,6 +161,19 @@ class Daemon:
                     summary.adopted, summary.foreign, summary.fills_replayed,
                     summary.resolved, summary.mismatches, summary.orphan_positions,
                 )
+                if (
+                    (summary.mismatches or summary.orphan_positions)
+                    and self._context.events is not None
+                ):
+                    self._context.events.emit(
+                        "reconcile-mismatch",
+                        "Startup reconciliation found broker/ledger differences",
+                        severity="critical",
+                        details={
+                            "mismatches": summary.mismatches,
+                            "orphan_positions": summary.orphan_positions,
+                        },
+                    )
                 self._context.last_reconcile_ts = datetime.now(UTC)
             except Exception:
                 log.exception("startup reconciliation failed; periodic pass will retry")
@@ -228,6 +241,7 @@ class Daemon:
         log.info("config reloaded: %s", _config_summary(new))
 
     def _build_context(self) -> DaemonContext:
+        from optionsbot.daemon.event_webhook import EventWebhookPublisher
         from optionsbot.execution.tracker import OrderTracker
         from optionsbot.ibkr.orders import OrderClient
 
@@ -245,12 +259,14 @@ class Daemon:
         exec_ibkr = IBKRClient(role="exec", settings=self._settings)
         order_client = OrderClient(exec_ibkr, resolver)
         OrderTracker(engine).attach(order_client)
+        events = EventWebhookPublisher(self._settings.hermes_webhook)
         return DaemonContext(
             settings=self._settings,
             engine=engine,
             ibkr=ibkr,
             resolver=resolver,
             telegram=telegram,
+            events=events,
             exec_ibkr=exec_ibkr,
             order_client=order_client,
         )
@@ -258,6 +274,8 @@ class Daemon:
     async def _shutdown_context(self) -> None:
         if self._context is None:
             return
+        if self._context.events is not None:
+            await self._context.events.flush()
         try:
             await self._context.ibkr.disconnect()
         except Exception:

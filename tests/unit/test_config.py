@@ -19,6 +19,7 @@ def test_default_settings_are_valid() -> None:
     s = Settings()
     assert isinstance(s.ibkr, IBKRSettings)
     assert isinstance(s.telegram, TelegramSettings)
+    assert s.hermes_webhook.enabled is False
     assert isinstance(s.scan, ScanSettings)
     assert isinstance(s.storage, StorageSettings)
 

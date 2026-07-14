@@ -145,6 +145,7 @@ async def test_ttl_registry_miss_warns_once_and_leaves_row(
 
 async def test_notifies_new_terminals_once(daemon_context: DaemonContext) -> None:
     _wire_exec(daemon_context)
+    daemon_context.events = MagicMock()
     daemon_context.orders_notified_through = NOW - timedelta(hours=1)
     filled = _insert_order(
         daemon_context.engine, "filled", terminal_ts=datetime.now(UTC),
@@ -168,6 +169,8 @@ async def test_notifies_new_terminals_once(daemon_context: DaemonContext) -> Non
     sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
     assert any("filled" in m.lower() for m in sent)
     assert any("insufficient margin" in m for m in sent)
+    daemon_context.events.emit.assert_called_once()
+    assert daemon_context.events.emit.call_args.args[0] == "fill"
 
 
 def _make_context(tmp_path: Path | None = None) -> DaemonContext:
@@ -230,6 +233,27 @@ async def test_reconcile_runs_on_fixed_cadence_with_no_open_orders(
 
     await _order_watcher_module.run_orders_tick(context)
     assert called == [True]  # reconcile ran AND was given a positions snapshot
+
+
+async def test_reconcile_mismatch_emits_critical_event(monkeypatch: Any) -> None:
+    context = _make_context()
+    context.order_client = MagicMock()
+    context.events = MagicMock()
+    context.last_reconcile_ts = datetime.now(UTC) - timedelta(minutes=10)
+    context.settings.execution.reconcile_minutes = 5
+
+    async def fake_reconcile(engine: Any, client: Any, **kwargs: Any) -> Any:
+        return ReconcileSummary(0, 0, 0, 0, 2, 1)
+
+    monkeypatch.setattr("optionsbot.execution.reconcile.reconcile", fake_reconcile)
+    await _order_watcher_module.run_orders_tick(context)
+
+    context.events.emit.assert_called_once_with(
+        "reconcile-mismatch",
+        "Periodic reconciliation found broker/ledger differences",
+        severity="critical",
+        details={"mismatches": 2, "orphan_positions": 1},
+    )
 
 
 async def test_net_liq_returns_usd_for_eur_account(

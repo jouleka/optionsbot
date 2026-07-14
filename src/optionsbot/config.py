@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -56,6 +56,27 @@ class TelegramSettings(BaseModel):
     # IBK-102: post a periodic "alive + last tick" summary to Telegram during
     # market hours. 0 disables.
     heartbeat_minutes: int = Field(default=60, ge=0)
+
+
+class HermesWebhookSettings(BaseModel):
+    """Signed, loopback-only operational event delivery to Hermes."""
+
+    enabled: bool = False
+    url: str = "http://127.0.0.1:8644/webhooks/optionsbot-events"
+    secret: SecretStr | None = None
+    timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
+    retries: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def _validate_delivery(self) -> HermesWebhookSettings:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self.url)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("hermes_webhook.url must be an HTTP loopback URL")
+        if self.enabled and (self.secret is None or not self.secret.get_secret_value()):
+            raise ValueError("hermes_webhook.secret is required when delivery is enabled")
+        return self
 
 
 class ScanSettings(BaseModel):
@@ -297,6 +318,7 @@ class Settings(BaseSettings):
 
     ibkr: IBKRSettings = IBKRSettings()
     telegram: TelegramSettings = TelegramSettings()
+    hermes_webhook: HermesWebhookSettings = HermesWebhookSettings()
     scan: ScanSettings = ScanSettings()
     screener: ScreenerSettings = ScreenerSettings()
     storage: StorageSettings = StorageSettings()

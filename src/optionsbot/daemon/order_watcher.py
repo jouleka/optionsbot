@@ -87,13 +87,26 @@ async def run_orders_tick(
                 async with context.ibkr_lock:
                     return await PositionsClient(context.ibkr).get_portfolio()
 
-            await reconcile(
+            reconcile_summary = await reconcile(
                 engine, context.order_client, notify=_notify, now=now,
                 walk_md=_walk_md_for(context),
                 walk_tasks=context.walk_tasks,
                 settings=context.settings,
                 positions_snapshot=_positions,
             )
+            if (
+                (reconcile_summary.mismatches or reconcile_summary.orphan_positions)
+                and context.events is not None
+            ):
+                context.events.emit(
+                    "reconcile-mismatch",
+                    "Periodic reconciliation found broker/ledger differences",
+                    severity="critical",
+                    details={
+                        "mismatches": reconcile_summary.mismatches,
+                        "orphan_positions": reconcile_summary.orphan_positions,
+                    },
+                )
             context.last_reconcile_ts = now
 
     # --- TTL sweep: cancel at the broker FIRST, only then mark abandoned.
@@ -149,6 +162,19 @@ async def run_orders_tick(
         notified += 1
         if row.status == "filled" and row.intent == "close":
             close_filled = True
+        if row.status == "filled" and context.events is not None:
+            context.events.emit(
+                "fill",
+                f"{row.intent} order #{row.id} filled: {row.symbol} {row.strategy} {row.quantity}x",
+                details={
+                    "order_id": row.id,
+                    "intent": row.intent,
+                    "symbol": row.symbol,
+                    "strategy": row.strategy,
+                    "quantity": row.quantity,
+                    "net_premium": premium,
+                },
+            )
         row_ts = row.terminal_ts if row.terminal_ts.tzinfo else row.terminal_ts.replace(tzinfo=UTC)
         watermark = max(watermark, row_ts)
     context.orders_notified_through = watermark

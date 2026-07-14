@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine
 
@@ -14,6 +15,9 @@ from optionsbot.daemon.telegram_client import TelegramClient
 from optionsbot.ibkr import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.orders import OrderClient
+
+if TYPE_CHECKING:
+    from optionsbot.daemon.event_webhook import EventWebhookPublisher
 
 
 @dataclass
@@ -30,6 +34,7 @@ class DaemonContext:
     ibkr: IBKRClient
     resolver: ContractResolver
     telegram: TelegramClient
+    events: EventWebhookPublisher | None = None
     # IBK-102: serialize all IBKR market-data work (scheduled tick + on-demand
     # /scan, /screen) so the single market-data line is never used concurrently.
     ibkr_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

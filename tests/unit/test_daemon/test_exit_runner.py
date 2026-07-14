@@ -223,6 +223,29 @@ async def test_delayed_or_unknown_quote_never_triggers_soft_stop(
     order_client.place_combo_limit.assert_not_awaited()
 
 
+async def test_soft_stop_submission_emits_operational_event(
+    daemon_context: DaemonContext,
+) -> None:
+    _filled_entry(daemon_context)
+    daemon_context.settings.execution.exit_stop_enabled = True
+    daemon_context.events = MagicMock()
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 4.00, (575.0, "P"): 0.30},
+    )
+
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
+    daemon_context.events.emit.assert_called_once()
+    assert daemon_context.events.emit.call_args.args[0] == "stop-hit"
+
+
 async def test_request_exit_adverse_loser_submits_audited_close(
     daemon_context: DaemonContext,
 ) -> None:
