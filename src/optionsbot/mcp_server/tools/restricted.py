@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -13,7 +14,10 @@ from sqlalchemy import desc, func, select
 from optionsbot.mcp_server.intent_queue import control_intents, recent_intents
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.storage.schema import (
+    entry_reviews,
     execution_state,
+    exit_requests,
+    orders,
     pick_outcomes,
     scan_runs,
     snapshots,
@@ -256,6 +260,126 @@ def register(server: FastMCP) -> None:
         }
 
     @server.tool()
+    def hermes_metrics(ctx: Context[ServerSession, Any]) -> dict[str, Any]:
+        """Measure judgeable Hermes review correctness and request churn."""
+        lifespan = ctx.request_context.lifespan_context
+        close_orders = orders.alias("close_orders")
+        with lifespan.engine.connect() as conn:
+            review_rows = conn.execute(
+                select(
+                    entry_reviews.c.verdict,
+                    entry_reviews.c.status,
+                    entry_reviews.c.reviewed_at,
+                    pick_outcomes.c.win,
+                    pick_outcomes.c.evaluated_at,
+                ).select_from(
+                    entry_reviews.outerjoin(
+                        pick_outcomes,
+                        entry_reviews.c.strategy_score_id
+                        == pick_outcomes.c.strategy_score_id,
+                    )
+                )
+            ).fetchall()
+            exit_rows = conn.execute(
+                select(
+                    exit_requests.c.status,
+                    exit_requests.c.close_order_id,
+                    close_orders.c.status.label("close_order_status"),
+                ).select_from(
+                    exit_requests.outerjoin(
+                        close_orders,
+                        exit_requests.c.close_order_id == close_orders.c.id,
+                    )
+                )
+            ).fetchall()
+
+        verdicts = ("no_trade", "vetted_paper_candidate", "watch_only")
+        by_verdict: dict[str, dict[str, int | float | None]] = {}
+        judgeable = 0
+        useful = 0
+        for verdict in verdicts:
+            matching = [row for row in review_rows if row.verdict == verdict]
+            judged = [row for row in matching if row.win is not None]
+            verdict_useful = sum(
+                1
+                for row in judged
+                if bool(row.win) == (verdict == "vetted_paper_candidate")
+            )
+            judgeable += len(judged)
+            useful += verdict_useful
+            by_verdict[verdict] = {
+                "calls": len(matching),
+                "judgeable": len(judged),
+                "useful": verdict_useful,
+                "accuracy": verdict_useful / len(judged) if judged else None,
+            }
+
+        threshold = 0.5
+        accuracy = useful / judgeable if judgeable else None
+        if accuracy is None:
+            recommendation = "CHANGE"
+        elif accuracy < threshold:
+            recommendation = "DISABLE"
+        else:
+            recommendation = "KEEP"
+
+        entry_statuses = _count_values(row.status for row in review_rows)
+        exit_statuses = _count_values(row.status for row in exit_rows)
+        close_statuses = _count_values(
+            row.close_order_status
+            for row in exit_rows
+            if row.close_order_status is not None
+        )
+        reviewed_at = [row.reviewed_at for row in review_rows]
+        evaluated_at = [
+            row.evaluated_at for row in review_rows if row.evaluated_at is not None
+        ]
+        return {
+            "ok": True,
+            "entry_overlay_correctness": {
+                "calls": len(review_rows),
+                "judgeable": judgeable,
+                "useful": useful,
+                "accuracy": accuracy,
+                "threshold": threshold,
+                "recommendation": recommendation,
+                "small_sample": judgeable < 20,
+                "unmatched_calls": len(review_rows) - judgeable,
+                "by_verdict": by_verdict,
+            },
+            "request_churn": {
+                "entry_reviews_by_status": entry_statuses,
+                "exit_requests_by_status": exit_statuses,
+                "linked_close_orders": sum(
+                    1 for row in exit_rows if row.close_order_id is not None
+                ),
+                "linked_close_orders_by_status": close_statuses,
+            },
+            "evidence_window": {
+                "first_reviewed_at": iso_utc(min(reviewed_at)) if reviewed_at else None,
+                "last_reviewed_at": iso_utc(max(reviewed_at)) if reviewed_at else None,
+                "last_evaluated_at": (
+                    iso_utc(max(evaluated_at)) if evaluated_at else None
+                ),
+            },
+            "method": {
+                "judgeable": (
+                    "a persisted entry review joined to its later paper pick outcome"
+                ),
+                "useful": (
+                    "vetted_paper_candidate with a winning outcome, or "
+                    "no_trade/watch_only with a losing outcome"
+                ),
+                "zero_denominator": "N/A; recommend CHANGE, never coerce to 0%",
+                "exit_requests": (
+                    "reported as churn only; no correctness credit without a "
+                    "counterfactual outcome"
+                ),
+            },
+            "source": "persisted_audit_ledger",
+        }
+
+    @server.tool()
     def health(ctx: Context[ServerSession, Any]) -> dict[str, Any]:
         """Read-only persisted daemon health suitable for zero-LLM watchdogs."""
         lifespan = ctx.request_context.lifespan_context
@@ -311,3 +435,11 @@ def register(server: FastMCP) -> None:
                 for row in rows
             ],
         }
+
+
+def _count_values(values: Iterable[object]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
