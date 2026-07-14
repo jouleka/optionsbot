@@ -21,12 +21,45 @@ one scheduler tick.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Literal
 
 import structlog
+
+_TELEGRAM_API_TOKEN_RE = re.compile(
+    r"(?i)(https://api\.telegram\.org/bot)[^/\s?]+"
+)
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b")
+
+
+def _redact_log_secrets(
+    _logger: Any, _method_name: str, event_dict: structlog.typing.EventDict
+) -> structlog.typing.EventDict:
+    """Remove Telegram bot credentials from rendered log values.
+
+    Both httpx request logs and ``HTTPStatusError`` strings include the full
+    request URL. Telegram embeds the bot credential in that URL, so ordinary
+    request/error logging would otherwise publish the credential to journald.
+    """
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, str):
+            value = _TELEGRAM_API_TOKEN_RE.sub(r"\1<redacted>", value)
+            return _TELEGRAM_BOT_TOKEN_RE.sub("<telegram-token-redacted>", value)
+        if isinstance(value, dict):
+            return {key: redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(redact(item) for item in value)
+        return value
+
+    for key, value in event_dict.items():
+        event_dict[key] = redact(value)
+    return event_dict
 
 
 def configure_logging(
@@ -50,6 +83,7 @@ def configure_logging(
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.stdlib.add_logger_name,
         structlog.processors.format_exc_info,
+        _redact_log_secrets,
     ]
 
     if env == "prod":

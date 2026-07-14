@@ -92,6 +92,26 @@ def test_stdlib_logging_is_routed_through_structlog(
     assert parsed["logger"] == "optionsbot.test"
 
 
+def test_telegram_bot_token_is_redacted_from_stdlib_log(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """HTTP client logs must not publish Telegram's URL-embedded credential."""
+    configure_logging("INFO", env="prod")
+    token = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    # Use an application-owned logger: other tests are allowed to raise the
+    # process-global ``httpx`` logger level and must not make this test order
+    # dependent.
+    logging.getLogger("optionsbot.test.telegram").info(
+        "HTTP Request: POST https://api.telegram.org/bot%s/getUpdates 409 Conflict",
+        token,
+    )
+    captured = capsys.readouterr()
+    rendered = captured.err.strip()
+    assert token not in rendered
+    parsed = json.loads(rendered)
+    assert "https://api.telegram.org/bot<redacted>/getUpdates" in parsed["event"]
+
+
 def test_log_exception_renders_traceback_in_prod_json(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
