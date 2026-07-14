@@ -87,13 +87,24 @@ async def run_orders_tick(
                 async with context.ibkr_lock:
                     return await PositionsClient(context.ibkr).get_portfolio()
 
-            reconcile_summary = await reconcile(
-                engine, context.order_client, notify=_notify, now=now,
-                walk_md=_walk_md_for(context),
-                walk_tasks=context.walk_tasks,
-                settings=context.settings,
-                positions_snapshot=_positions,
-            )
+            try:
+                reconcile_summary = await reconcile(
+                    engine, context.order_client, notify=_notify, now=now,
+                    walk_md=_walk_md_for(context),
+                    walk_tasks=context.walk_tasks,
+                    settings=context.settings,
+                    positions_snapshot=_positions,
+                )
+            except Exception as exc:
+                from optionsbot.daemon.operational_state import record_reconcile_failure
+
+                record_reconcile_failure(
+                    phase="periodic", error_type=type(exc).__name__, now=now
+                )
+                raise
+            from optionsbot.daemon.operational_state import record_reconcile
+
+            record_reconcile(reconcile_summary, phase="periodic", now=now)
             if (
                 (reconcile_summary.mismatches or reconcile_summary.orphan_positions)
                 and context.events is not None

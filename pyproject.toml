@@ -32,6 +32,7 @@ optionsbot-fred-mcp = "optionsbot.market_context.__main__:fred_main"
 optionsbot-finnhub-mcp = "optionsbot.market_context.__main__:finnhub_main"
 optionsbot-event = "optionsbot.daemon.event_webhook:main"
 optionsbot-rth-acceptance = "optionsbot.daemon.rth_acceptance:main"
+optionsbot-soak-report = "optionsbot.daemon.soak_reporter:main"
 
 [build-system]
 requires = ["hatchling"]

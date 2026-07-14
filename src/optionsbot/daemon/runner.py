@@ -112,6 +112,10 @@ class Daemon:
             await self._shutdown_context()
             return 1
 
+        from optionsbot.daemon.operational_state import record_daemon_started
+
+        record_daemon_started()
+
         try:
             self._scheduler = build_scheduler(self._context, self._scan_tick)
             self._scheduler.start()
@@ -161,6 +165,9 @@ class Daemon:
                     summary.adopted, summary.foreign, summary.fills_replayed,
                     summary.resolved, summary.mismatches, summary.orphan_positions,
                 )
+                from optionsbot.daemon.operational_state import record_reconcile
+
+                record_reconcile(summary, phase="startup")
                 if (
                     (summary.mismatches or summary.orphan_positions)
                     and self._context.events is not None
@@ -175,7 +182,10 @@ class Daemon:
                         },
                     )
                 self._context.last_reconcile_ts = datetime.now(UTC)
-            except Exception:
+            except Exception as exc:
+                from optionsbot.daemon.operational_state import record_reconcile_failure
+
+                record_reconcile_failure(phase="startup", error_type=type(exc).__name__)
                 log.exception("startup reconciliation failed; periodic pass will retry")
 
         log.info("Daemon started; waiting for stop signal")
