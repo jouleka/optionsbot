@@ -1,0 +1,107 @@
+"""Narrow SQLite queue between the untrusted MCP process and trusted daemon.
+
+The restricted MCP identity can read the trading ledger but cannot write it.
+Its only writable state is this queue.  The daemon validates and translates
+known intent types; arbitrary rows can never directly become broker orders.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Engine,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    event,
+    insert,
+    select,
+)
+
+IntentKind = Literal["entry_review", "request_exit", "halt"]
+
+metadata = MetaData()
+
+control_intents = Table(
+    "control_intents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("intent_uid", String, nullable=False, unique=True),
+    Column("kind", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("payload_json", JSON, nullable=False),
+    Column("status", String, nullable=False, default="pending"),
+    Column("processed_at", DateTime(timezone=True), nullable=True),
+    Column("result_text", Text, nullable=True),
+)
+
+
+def create_intent_engine(path: Path | str) -> Engine:
+    """Open/create the isolated intent queue and keep group access intact."""
+    db_path = Path(path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+
+    @event.listens_for(engine, "connect")
+    def _set_pragmas(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    metadata.create_all(engine)
+    if db_path.exists():
+        try:
+            os.chmod(db_path, 0o660)
+        except PermissionError:
+            # The daemon normally opens a queue owned by the MCP identity via
+            # their shared control group. Group members may use but not chmod
+            # the file; deployment sets the mode/umask authoritatively.
+            pass
+    return engine
+
+
+def enqueue_intent(
+    engine: Engine,
+    kind: IntentKind,
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, str]:
+    """Append one typed intent and return its local id and opaque uid."""
+    created_at = now if now is not None else datetime.now(UTC)
+    intent_uid = uuid.uuid4().hex
+    with engine.begin() as conn:
+        pk = conn.execute(
+            insert(control_intents).values(
+                intent_uid=intent_uid,
+                kind=kind,
+                created_at=created_at,
+                payload_json=payload,
+                status="pending",
+            )
+        ).inserted_primary_key
+    assert pk is not None
+    return int(pk[0]), intent_uid
+
+
+def recent_intents(engine: Engine, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent audit rows without exposing mutable database handles."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(control_intents)
+            .order_by(control_intents.c.id.desc())
+            .limit(max(1, min(int(limit), 100)))
+        ).fetchall()
+    return [dict(row._mapping) for row in rows]

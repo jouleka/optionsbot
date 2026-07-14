@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -352,6 +353,21 @@ class Daemon:
         except Exception:
             log.exception("entry-review tick failed")
 
+    async def _control_intents_tick(self) -> None:
+        """Import bounded requests from the unprivileged Hermes queue."""
+        path = os.environ.get("OPTIONSBOT_MCP_INTENT_DB_PATH")
+        if not path:
+            return
+        assert self._context is not None
+        try:
+            from optionsbot.daemon.control_intents import consume_control_intents
+
+            consumed = consume_control_intents(self._context, path)
+            if consumed:
+                log.info("restricted MCP intents consumed=%d", consumed)
+        except Exception:
+            log.exception("restricted MCP intent consumer failed")
+
     async def _orders_tick(self) -> None:
         from optionsbot.daemon.order_watcher import run_orders_tick
 
@@ -400,3 +416,13 @@ class Daemon:
             trigger=IntervalTrigger(minutes=1),
             id="entry_reviews", max_instances=1, coalesce=True, replace_existing=True,
         )
+        # The MCP process cannot touch the trading DB. It appends only typed
+        # intents to a separate queue; this trusted daemon translates them and
+        # all downstream entry/exit gates independently revalidate the request.
+        if os.environ.get("OPTIONSBOT_MCP_INTENT_DB_PATH"):
+            self._scheduler.add_job(
+                self._control_intents_tick,
+                trigger=IntervalTrigger(seconds=10),
+                id="control_intents", max_instances=1, coalesce=True,
+                replace_existing=True,
+            )

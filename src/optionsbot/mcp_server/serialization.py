@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from optionsbot.analysis.types import MarketView
-from optionsbot.scoring import ScoredStrategy
-from optionsbot.strategies import Leg
+if TYPE_CHECKING:
+    from optionsbot.analysis.types import MarketView
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.strategies import Leg
 
 
 def iso_utc(dt: datetime | None) -> str | None:

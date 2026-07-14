@@ -16,10 +16,16 @@ from sqlalchemy import desc, select
 from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.serialization import dump_scored, dump_view, iso_utc
-from optionsbot.scan import scan_symbol
 from optionsbot.scoring import DEFAULT_THRESHOLD, DEFAULT_TOP_K, top_k
 from optionsbot.scoring.composite import has_positive_edge
 from optionsbot.storage.schema import snapshots, strategy_scores, watchlist
+
+
+async def scan_symbol(*args: Any, **kwargs: Any) -> Any:
+    """Lazy compatibility seam; keeps broker code out of restricted imports."""
+    from optionsbot.scan import scan_symbol as implementation
+
+    return await implementation(*args, **kwargs)
 
 
 def register(server: FastMCP) -> None:
@@ -38,6 +44,14 @@ def register(server: FastMCP) -> None:
         symbol = symbol.upper().strip()
         lifespan = ctx.request_context.lifespan_context
         if fresh:
+            if not getattr(lifespan, "broker_access", True):
+                return {
+                    "ok": False,
+                    "error": "broker_access_disabled",
+                    "message": "restricted MCP can only read persisted snapshots",
+                    "hint": "the trusted daemon owns all live IBKR scans",
+                    "symbol": symbol,
+                }
             return await _analyze_fresh(symbol, lifespan)
         return _analyze_cached(symbol, lifespan)
 

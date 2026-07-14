@@ -16,11 +16,12 @@ from typing import TYPE_CHECKING
 from sqlalchemy import Engine
 
 from optionsbot.config import Settings, get_settings
-from optionsbot.ibkr import IBKRClient
 from optionsbot.storage.db import create_engine_for_path
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+
+    from optionsbot.ibkr import IBKRClient
 
 
 @dataclass
@@ -31,6 +32,7 @@ class ServerContext:
     engine: Engine
     _ibkr: IBKRClient | None = field(default=None, repr=False)
     _ibkr_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    broker_access: bool = field(default=True, init=False)
 
     async def ibkr(self) -> IBKRClient:
         """Return the shared IBKRClient, constructing it on first call.
@@ -44,6 +46,8 @@ class ServerContext:
         """
         async with self._ibkr_lock:
             if self._ibkr is None:
+                from optionsbot.ibkr import IBKRClient
+
                 self._ibkr = IBKRClient(role="mcp", settings=self.settings)
             return self._ibkr
 

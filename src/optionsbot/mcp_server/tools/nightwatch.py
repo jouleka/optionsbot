@@ -18,12 +18,10 @@ from mcp.server.session import ServerSession
 from sqlalchemy import desc, insert, select
 from sqlalchemy.exc import IntegrityError
 
-from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
-from optionsbot.execution.orders import get_order
-from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
-from optionsbot.execution.state import trip_kill
 from optionsbot.mcp_server.context import ServerContext
+from optionsbot.mcp_server.intent_queue import enqueue_intent
 from optionsbot.mcp_server.serialization import iso_utc
+from optionsbot.risk_structure import has_structurally_defined_option_risk
 from optionsbot.storage.schema import (
     alerts,
     entry_reviews,
@@ -66,6 +64,19 @@ ENTRY_VERDICT_STATUS = {
     "watch_only": "held",
     "no_trade": "refused",
 }
+ALLOWED_CATALYST_TYPES = frozenset(
+    {
+        "headline_news",
+        "downgrade_upgrade",
+        "earnings_guidance",
+        "sec_filing",
+        "macro_rate",
+        "volatility_shock",
+        "price_action",
+        "risk_management",
+        "broker_reconcile",
+    }
+)
 
 
 def _raw(row: Any) -> dict[str, Any]:
@@ -361,6 +372,33 @@ def register(server: FastMCP) -> None:
             clean_sources.append(source)
         if normalized == "vetted_paper_candidate" and len(clean_sources) < 2:
             return {"ok": False, "error": "two_distinct_sources_required"}
+        intent_engine = getattr(lifespan, "intent_engine", None)
+        if intent_engine is not None:
+            intent_id, intent_uid = enqueue_intent(
+                intent_engine,
+                "entry_review",
+                {
+                    "pick_id": int(pick_id),
+                    "alert_id": int(alert_id),
+                    "reviewed_at": now.isoformat(),
+                    "verdict": normalized,
+                    "confidence": normalized_confidence,
+                    "sources": clean_sources,
+                    "reason": clean_reason,
+                    "checks": dict(checks),
+                    "status": status,
+                },
+                now=now,
+            )
+            return {
+                "ok": True,
+                "status": "queued_for_daemon_validation",
+                "intent_id": intent_id,
+                "intent_uid": intent_uid,
+                "pick_id": int(pick_id),
+                "alert_id": int(alert_id),
+                "note": "restricted MCP cannot write the trading ledger",
+            }
         try:
             with lifespan.engine.begin() as conn:
                 pk = conn.execute(
@@ -438,9 +476,47 @@ def register(server: FastMCP) -> None:
             return {"ok": False, "error": "position_not_open"}
         if _pending_open_close(lifespan, int(position_id)):
             return {"ok": False, "error": "position_already_closing"}
-        position = get_order(lifespan.engine, int(position_id))
+        with lifespan.engine.connect() as conn:
+            position = conn.execute(
+                select(
+                    orders.c.id,
+                    orders.c.symbol,
+                    orders.c.strategy,
+                    orders.c.quantity,
+                ).where(orders.c.id == int(position_id))
+            ).first()
         now = datetime.now(UTC)
         clean_sources = [str(s).strip() for s in sources if str(s).strip()]
+        intent_engine = getattr(lifespan, "intent_engine", None)
+        if intent_engine is not None:
+            intent_id, intent_uid = enqueue_intent(
+                intent_engine,
+                "request_exit",
+                {
+                    "position_id": int(position_id),
+                    "requested_at": now.isoformat(),
+                    "catalyst_type": catalyst,
+                    "confidence": float(confidence),
+                    "sources": clean_sources,
+                    "reason": reason.strip(),
+                },
+                now=now,
+            )
+            return {
+                "ok": True,
+                "status": "queued_for_daemon_validation",
+                "intent_id": intent_id,
+                "intent_uid": intent_uid,
+                "position": None
+                if position is None
+                else {
+                    "id": int(position.id),
+                    "symbol": position.symbol,
+                    "strategy": position.strategy,
+                    "quantity": position.quantity,
+                },
+                "note": "restricted MCP cannot write the trading ledger or submit orders",
+            }
         with lifespan.engine.begin() as conn:
             pk = conn.execute(
                 insert(exit_requests).values(
@@ -489,6 +565,22 @@ def register(server: FastMCP) -> None:
             }
         lifespan = ctx.request_context.lifespan_context
         msg = reason.strip() or "Hermes MCP halt"
+        intent_engine = getattr(lifespan, "intent_engine", None)
+        if intent_engine is not None:
+            intent_id, intent_uid = enqueue_intent(
+                intent_engine,
+                "halt",
+                {"reason": msg},
+            )
+            return {
+                "ok": True,
+                "killed": "pending_daemon_consumption",
+                "intent_id": intent_id,
+                "intent_uid": intent_uid,
+                "reason": msg,
+            }
+        from optionsbot.execution.state import trip_kill
+
         state = trip_kill(lifespan.engine, msg)
         return {
             "ok": True,
