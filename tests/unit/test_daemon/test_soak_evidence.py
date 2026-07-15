@@ -108,7 +108,7 @@ def test_rth_evaluate_collects_clean_soak_evidence(
                 finished=NOW - timedelta(minutes=5),
                 tickers_scanned=3,
                 alerts_fired=0,
-                errors_json=[],
+                errors_json=None,
             )
         )
         conn.execute(
@@ -166,7 +166,48 @@ def test_rth_evaluate_collects_clean_soak_evidence(
     assert result["passed"] is True
     assert result["checks"]["gateway_restart"]["survived"] is True
     assert result["checks"]["reconcile"]["clean"] is True
+    assert result["checks"]["scan"]["error_count"] == 0
     assert result["checks"]["orders"]["orders"] == 0
+
+
+def test_rth_journal_live_data_matcher_ignores_fractional_timestamps(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        rth_acceptance,
+        "_run_output",
+        lambda command: "\n".join(
+            (
+                '2026-07-15T05:02:49.100891Z Job "tick" executed successfully',
+                '2026-07-15T05:58:39.101975Z Job "tick" executed successfully',
+                "Warning 2108, reqId -1: Market data farm is inactive on demand",
+            )
+        ),
+    )
+
+    metrics = rth_acceptance._journal_metrics(NOW)
+
+    assert metrics["live_data_errors"] == []
+
+
+def test_rth_journal_live_data_matcher_requires_ibkr_error_context(
+    monkeypatch: Any,
+) -> None:
+    actual_errors = (
+        "Error 10197, reqId 7: No market data during competing live session",
+        "Warning 10089, reqId 8: Requested market data requires subscription",
+        "ErrorCode=162 historical market data service error",
+        "Requested market data is not subscribed. Delayed market data is available.",
+    )
+    monkeypatch.setattr(
+        rth_acceptance,
+        "_run_output",
+        lambda command: "\n".join(actual_errors),
+    )
+
+    metrics = rth_acceptance._journal_metrics(NOW)
+
+    assert metrics["live_data_errors"] == list(actual_errors)
 
 
 def test_reporter_posts_idempotency_marked_digest(

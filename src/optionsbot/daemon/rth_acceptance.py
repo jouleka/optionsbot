@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -32,14 +33,16 @@ REQUIRED_SERVICES = (
     "optionsbot-daemon.service",
     "hermes-gateway-optionsbot.service",
 )
-LIVE_DATA_ERROR_MARKERS = (
-    "10197",
-    "10089",
-    "error 162",
-    "warning 162",
-    "errorcode=162",
-    "requested market data is not subscribed",
+LIVE_DATA_ERROR_PATTERNS = (
+    re.compile(r"\b(?:error|warning)\s*[:=]?\s*(?:10197|10089|162)\b", re.IGNORECASE),
+    re.compile(r"\berrorcode\s*=\s*(?:10197|10089|162)\b", re.IGNORECASE),
+    re.compile(r"\brequested market data is not subscribed\b", re.IGNORECASE),
 )
+
+
+def _is_live_data_error(value: object) -> bool:
+    text = str(value)
+    return any(pattern.search(text) for pattern in LIVE_DATA_ERROR_PATTERNS)
 
 
 def _run_output(command: list[str]) -> str:
@@ -104,7 +107,7 @@ def _journal_metrics(since: datetime) -> dict[str, Any]:
     live_error_lines = [
         line[:500]
         for line in output.splitlines()
-        if any(marker in line.lower() for marker in LIVE_DATA_ERROR_MARKERS)
+        if _is_live_data_error(line)
     ]
     return {
         "gateway_connections": lowered.count("connected to ib gateway"),
@@ -199,11 +202,16 @@ def evaluate(now: datetime | None = None) -> dict[str, Any]:
     scan_recent = bool(scan and _utc(scan.finished) >= cutoff)
     snapshot_recent = bool(snapshot and _utc(snapshot.ts) >= cutoff)
     raw_errors = scan.errors_json if scan else []
-    scan_errors = list(raw_errors) if isinstance(raw_errors, list) else [raw_errors]
+    if raw_errors is None:
+        scan_errors: list[Any] = []
+    elif isinstance(raw_errors, list):
+        scan_errors = list(raw_errors)
+    else:
+        scan_errors = [raw_errors]
     scan_live_errors = [
         str(error)[:500]
         for error in scan_errors
-        if any(marker in str(error).lower() for marker in LIVE_DATA_ERROR_MARKERS)
+        if _is_live_data_error(error)
     ]
     journal = _journal_metrics(session_start)
     live_errors = scan_live_errors + list(journal["live_data_errors"])
