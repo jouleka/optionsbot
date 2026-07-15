@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
 from optionsbot.execution.state import trip_kill
+from optionsbot.hermes_overlay import load_overlay_state
 from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
 from optionsbot.storage.schema import entry_reviews, exit_requests
 
@@ -55,6 +56,14 @@ def _consume_entry_review(context: DaemonContext, payload: dict[str, Any]) -> st
         "watch_only": "held",
         "no_trade": "refused",
     }[verdict]
+    decision_reason = None
+    if verdict == "vetted_paper_candidate":
+        overlay = load_overlay_state(context.engine)
+        if not overlay.enabled:
+            status = "held"
+            decision_reason = "overlay breaker: " + (
+                overlay.reason or "Hermes overlay correctness breaker is disabled"
+            )
     try:
         with context.engine.begin() as conn:
             pk = conn.execute(
@@ -68,20 +77,21 @@ def _consume_entry_review(context: DaemonContext, payload: dict[str, Any]) -> st
                     reason=reason,
                     checks_json=checks,
                     status=status,
+                    decision_reason=decision_reason,
+                    processed_at=datetime.now(UTC) if status == "held" else None,
                 )
             ).inserted_primary_key
     except IntegrityError:
         with context.engine.connect() as conn:
             existing = conn.execute(
-                select(entry_reviews.c.id).where(
-                    entry_reviews.c.strategy_score_id == pick_id
-                )
+                select(entry_reviews.c.id).where(entry_reviews.c.strategy_score_id == pick_id)
             ).scalar_one_or_none()
         if existing is None:
             raise
         return f"entry review already existed as #{int(existing)}"
     assert pk is not None
-    return f"entry review imported as #{int(pk[0])}"
+    suffix = " and held by the overlay breaker" if status == "held" else ""
+    return f"entry review imported as #{int(pk[0])}{suffix}"
 
 
 def _consume_exit_request(context: DaemonContext, payload: dict[str, Any]) -> str:

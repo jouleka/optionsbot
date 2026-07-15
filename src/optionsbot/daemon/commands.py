@@ -25,6 +25,13 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import is_market_open
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.state import clear_kill, load_state, trip_kill
+from optionsbot.hermes_overlay import (
+    ACCURACY_THRESHOLD,
+    MIN_JUDGEABLE,
+    correctness_report,
+    load_overlay_state,
+    reset_overlay,
+)
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
@@ -62,6 +69,8 @@ _HELP = (
     "/close ID — close an open position now (paper; id from /orders)\n"
     "/kill [reason] — trip the execution kill switch (no orders until /arm)\n"
     "/arm — clear the execution kill switch\n"
+    "/overlay — Hermes entry-overlay correctness status\n"
+    "/overlayreset — explicitly re-enable the Hermes entry overlay\n"
     "/watchlist list|add SYM|remove SYM\n"
     "/help — this message"
 )
@@ -81,9 +90,7 @@ async def _cmd_help(context: DaemonContext, args: list[str]) -> list[CommandRepl
 async def _cmd_status(context: DaemonContext, args: list[str]) -> list[CommandReply]:
     now = datetime.now(UTC)
     with context.engine.connect() as conn:
-        last = conn.execute(
-            select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)
-        ).first()
+        last = conn.execute(select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)).first()
         wl = conn.execute(select(func.count()).select_from(watchlist)).scalar() or 0
     lines = [
         f"daemon up {_fmt_duration(now - context.started_at)}",
@@ -106,14 +113,11 @@ async def _cmd_last(context: DaemonContext, args: list[str]) -> list[CommandRepl
     n = int(args[0]) if args and args[0].isdigit() else 5
     n = max(1, min(n, 20))
     with context.engine.connect() as conn:
-        rows = conn.execute(
-            select(alerts).order_by(alerts.c.id.desc()).limit(n)
-        ).fetchall()
+        rows = conn.execute(select(alerts).order_by(alerts.c.id.desc()).limit(n)).fetchall()
     if not rows:
         return [CommandReply("no alerts yet")]
     lines = [
-        f"{r.symbol} {r.strategy} score {r.score:.0f} [{r.status}] {r.ts:%m-%d %H:%M}"
-        for r in rows
+        f"{r.symbol} {r.strategy} score {r.score:.0f} [{r.status}] {r.ts:%m-%d %H:%M}" for r in rows
     ]
     return [CommandReply("recent alerts:\n" + "\n".join(lines))]
 
@@ -134,7 +138,10 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     symbol = args[0].upper()
     async with context.ibkr_lock:
         result = await scan_symbol(
-            symbol, context.ibkr, context.engine, context.settings,
+            symbol,
+            context.ibkr,
+            context.engine,
+            context.settings,
             resolver=context.resolver,
         )
     ranked = sorted(result.scored, key=lambda s: edge_sort_key(s.suggestion), reverse=True)
@@ -152,9 +159,9 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     cap = context.settings.execution.max_single_trade_risk_pct
     top = [s for s in ranked if is_proposable(s.suggestion, equity_usd, cap)][:3]
     if not top:
-        return [CommandReply(
-            f"{symbol}: no affordable defined-risk strategies at the current bankroll"
-        )]
+        return [
+            CommandReply(f"{symbol}: no affordable defined-risk strategies at the current bankroll")
+        ]
     # IBK-126/130: /scan is the on-demand test surface — picks carry the same
     # ➤ /execute hint as scheduled alerts when execution is armed. No hint on
     # picks the execute gates would refuse anyway (undefined risk / size 0).
@@ -163,7 +170,10 @@ async def _cmd_scan(context: DaemonContext, args: list[str]) -> list[CommandRepl
     replies = [
         CommandReply(
             format_alert_markdown(
-                result.symbol, result.view, s, result.snapshot_ts,
+                result.symbol,
+                result.view,
+                s,
+                result.snapshot_ts,
                 execute_hint=(
                     execute_hint_for(context, result.snapshot_id, s.strategy_name)
                     if s.suggestion.defined_risk and s.suggestion.suggested_quantity > 0
@@ -192,8 +202,7 @@ async def _cmd_screen(context: DaemonContext, args: list[str]) -> list[CommandRe
         return [CommandReply("screen: no candidates passed the liquidity gate")]
     lines = ["top screened:"]
     lines += [
-        f"{c.symbol}: hv_rank {c.hv_rank:.2f}, $vol {c.dollar_volume / 1e6:.0f}M"
-        for c in cands[:n]
+        f"{c.symbol}: hv_rank {c.hv_rank:.2f}, $vol {c.dollar_volume / 1e6:.0f}M" for c in cands[:n]
     ]
     return [CommandReply("\n".join(lines))]
 
@@ -202,9 +211,7 @@ async def _cmd_watchlist(context: DaemonContext, args: list[str]) -> list[Comman
     sub = args[0].lower() if args else "list"
     if sub == "list":
         with context.engine.connect() as conn:
-            rows = conn.execute(
-                select(watchlist.c.symbol).order_by(watchlist.c.symbol)
-            ).fetchall()
+            rows = conn.execute(select(watchlist.c.symbol).order_by(watchlist.c.symbol)).fetchall()
         if not rows:
             return [CommandReply("watchlist is empty — /watchlist add SYM")]
         return [CommandReply("watchlist:\n" + "\n".join(r.symbol for r in rows))]
@@ -292,11 +299,7 @@ async def _cmd_arm(context: DaemonContext, args: list[str]) -> list[CommandReply
     verdict = can_execute(context.settings, state)
     # Distinguish the two switches: /arm clears the kill switch, but execution
     # may still be off via config — say so instead of a bare "not armed".
-    status = (
-        "execution: ✅ armed"
-        if verdict.allowed
-        else f"execution still off — {verdict.reason}"
-    )
+    status = "execution: ✅ armed" if verdict.allowed else f"execution still off — {verdict.reason}"
     return [CommandReply(f"kill switch cleared.\n{status}")]
 
 
@@ -306,6 +309,8 @@ async def _cmd_exec(context: DaemonContext, args: list[str]) -> list[CommandRepl
     verdict = can_execute(context.settings, state)
     kill_line = f"TRIPPED ({state.reason})" if state.killed else "clear"
     verdict_line = ("✅ " if verdict.allowed else "❌ ") + verdict.reason
+    overlay = load_overlay_state(context.engine)
+    overlay_line = "enabled" if overlay.enabled else f"DISABLED ({overlay.reason})"
     lines = [
         "execution status:",
         f"enabled: {str(ex.enabled).lower()}",
@@ -314,9 +319,44 @@ async def _cmd_exec(context: DaemonContext, args: list[str]) -> list[CommandRepl
         f"(ibkr.paper={str(context.settings.ibkr.paper).lower()}, "
         f"port={context.settings.ibkr.port})",
         f"kill switch: {kill_line}",
+        f"Hermes entry overlay: {overlay_line}",
         f"verdict: {verdict_line}",
     ]
     return [CommandReply("\n".join(lines))]
+
+
+def _overlay_status_text(context: DaemonContext) -> str:
+    state = load_overlay_state(context.engine)
+    report = correctness_report(context.engine)
+    accuracy = report["accuracy"]
+    accuracy_text = "N/A" if accuracy is None else f"{float(accuracy):.1%}"
+    lines = [
+        "Hermes entry overlay:",
+        f"state: {'✅ enabled' if state.enabled else '🛑 DISABLED'}",
+        f"evidence: {report['judgeable']} judgeable outcome(s); accuracy {accuracy_text}",
+        f"trip rule: at least {MIN_JUDGEABLE} outcomes and accuracy below {ACCURACY_THRESHOLD:.0%}",
+    ]
+    if state.reason:
+        lines.append(f"reason: {state.reason}")
+    if not state.enabled:
+        lines.append("human reset required: /overlayreset")
+    return "\n".join(lines)
+
+
+async def _cmd_overlay(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    return [CommandReply(_overlay_status_text(context))]
+
+
+async def _cmd_overlayreset(context: DaemonContext, args: list[str]) -> list[CommandReply]:
+    async with context.hermes_overlay_lock:
+        reset_overlay(context.engine)
+    return [
+        CommandReply(
+            "Hermes entry overlay explicitly reset. Current evidence was acknowledged; "
+            "a newly judgeable outcome will trigger the rule again if accuracy remains "
+            f"below {ACCURACY_THRESHOLD:.0%}.\n\n{_overlay_status_text(context)}"
+        )
+    ]
 
 
 async def _cmd_execute(context: DaemonContext, args: list[str]) -> list[CommandReply]:
@@ -370,8 +410,7 @@ async def _cmd_orders(context: DaemonContext, args: list[str]) -> list[CommandRe
         net_part = f" net ${net:,.0f}" if net is not None else ""
         limit_part = f" lmt {r.limit_price:+.2f}" if r.limit_price is not None else ""
         lines.append(
-            f"#{r.id} {r.symbol} {r.strategy} {r.quantity}x [{r.status}]"
-            f"{limit_part}{net_part}"
+            f"#{r.id} {r.symbol} {r.strategy} {r.quantity}x [{r.status}]{limit_part}{net_part}"
         )
     return [CommandReply("orders (newest first):\n" + "\n".join(lines))]
 
@@ -429,6 +468,8 @@ _REGISTRY: dict[str, Handler] = {
     "exec": _cmd_exec,
     "kill": _cmd_kill,
     "arm": _cmd_arm,
+    "overlay": _cmd_overlay,
+    "overlayreset": _cmd_overlayreset,
     "execute": _cmd_execute,
     "orders": _cmd_orders,
     "cancelorder": _cmd_cancelorder,

@@ -211,6 +211,29 @@ execution_state = Table(
 )
 
 
+# Hermes is an advisory entry overlay, so its correctness breaker is kept
+# separate from the global execution kill switch.  A disabled overlay blocks
+# only Hermes-vetted entries and survives daemon restarts until an operator
+# explicitly resets it.
+hermes_overlay_state = Table(
+    "hermes_overlay_state",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("enabled", Integer, nullable=False, server_default="1"),
+    Column("reason", Text),
+    Column("ts", DateTime(timezone=True)),
+    Column("judgeable", Integer, nullable=False, server_default="0"),
+    Column("accuracy", Float),
+    CheckConstraint("id = 1", name="ck_hermes_overlay_state_singleton"),
+    CheckConstraint("enabled IN (0, 1)", name="ck_hermes_overlay_state_enabled"),
+    CheckConstraint("judgeable >= 0", name="ck_hermes_overlay_state_judgeable"),
+    CheckConstraint(
+        "accuracy IS NULL OR (accuracy >= 0.0 AND accuracy <= 1.0)",
+        name="ck_hermes_overlay_state_accuracy",
+    ),
+)
+
+
 # IBK-124: the order ledger. One row per order INTENT (entry or exit), staged
 # before any network call so a crash mid-submit is recoverable (IBK-128
 # resolves `submitting` rows against the broker). order_ref ("obot-{id}") is

@@ -38,6 +38,10 @@ class DaemonContext:
     # IBK-102: serialize all IBKR market-data work (scheduled tick + on-demand
     # /scan, /screen) so the single market-data line is never used concurrently.
     ibkr_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes Hermes outcome accrual/breaker evaluation with Hermes-vetted
+    # entry execution. This closes the last check-to-broker race without
+    # delaying deterministic exits, which do not use this lock.
+    hermes_overlay_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # In-memory alerting pause (/pause, /resume). Resets to on at restart.
     alerting_paused: bool = False
     # For /status uptime.

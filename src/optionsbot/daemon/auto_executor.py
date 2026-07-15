@@ -17,6 +17,7 @@ from sqlalchemy import exists, or_, select, update
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
 from optionsbot.execution.state import trip_kill
+from optionsbot.hermes_overlay import hold_pending_reviews, load_overlay_state
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.scoring import ScoredStrategy
@@ -150,11 +151,7 @@ def _review_authorization_error(
         return "exact alert identity is missing"
     if int(row.alert_score_id) != score_id:
         return "alert does not authorize this strategy score"
-    if (
-        row.alert_status != "sent"
-        or row.sent_ts is None
-        or row.telegram_msg_id is None
-    ):
+    if row.alert_status != "sent" or row.sent_ts is None or row.telegram_msg_id is None:
         return "alert delivery is not proven"
     if row.alert_symbol != row.symbol or row.alert_strategy != row.strategy:
         return "alert candidate metadata does not match persisted score"
@@ -177,9 +174,7 @@ def _review_authorization_error(
     if not isinstance(sources, list):
         return "review sources are malformed"
     clean_sources = [
-        source.strip()
-        for source in sources
-        if isinstance(source, str) and source.strip()
+        source.strip() for source in sources if isinstance(source, str) and source.strip()
     ]
     if len({source.casefold() for source in clean_sources}) < 2:
         return "review lacks two distinct corroborating sources"
@@ -312,6 +307,11 @@ async def _execute_reviewed_score(
     if context.order_client is None:
         log.warning("auto-execute hold score_id=%s: order client unavailable", score_id)
         return False
+    overlay = load_overlay_state(context.engine)
+    if not overlay.enabled:
+        held = hold_pending_reviews(context.engine, overlay)
+        log.warning("Hermes overlay disabled; held %d pending review(s)", held)
+        return False
     review_id = _requested_review_id_for(context, score_id)
     if review_id is None:
         log.info(
@@ -346,6 +346,13 @@ async def _execute_reviewed_score(
     if authorization_error is not None:
         _hold_invalid_review(context, review_id, authorization_error)
         return False
+    # Close the race with an outcomes tick tripping the persisted breaker after
+    # this review was claimed but before any broker-facing execution begins.
+    overlay = load_overlay_state(context.engine)
+    if not overlay.enabled:
+        hold_pending_reviews(context.engine, overlay)
+        log.warning("Hermes overlay disabled during execution handoff")
+        return False
 
     try:
         # Imported lazily because the engine pulls daemon.market_hours; a
@@ -367,7 +374,16 @@ async def _execute_reviewed_score(
             walk_md=walk_md,
             walk_tasks=context.walk_tasks,
         )
-        outcome = await execution_engine.execute_pick(deps, score_id)
+        # Outcome accrual + breaker evaluation uses this same lock. Therefore
+        # the persisted state cannot trip between this final check and the
+        # broker-facing execution pipeline.
+        async with context.hermes_overlay_lock:
+            overlay = load_overlay_state(context.engine)
+            if not overlay.enabled:
+                hold_pending_reviews(context.engine, overlay)
+                log.warning("Hermes overlay disabled during broker handoff")
+                return False
+            outcome = await execution_engine.execute_pick(deps, score_id)
         try:
             finished = _finish_review(
                 context,
@@ -427,6 +443,10 @@ async def auto_execute_candidates(
     """Execute only alerted candidates with an exact requested Hermes review."""
     if context.settings.execution.mode != "auto" or context.order_client is None:
         return 0
+    overlay = load_overlay_state(context.engine)
+    if not overlay.enabled:
+        hold_pending_reviews(context.engine, overlay)
+        return 0
     submitted = 0
     log.info("auto-execute pass: %d candidate(s)", len(candidates))
     for symbol, scored, snapshot_id in candidates:
@@ -453,6 +473,12 @@ async def run_entry_reviews_tick(context: DaemonContext) -> int:
     """Consume delayed Hermes reviews through the normal auto-execution path."""
     if context.settings.execution.mode != "auto" or context.order_client is None:
         return 0
+    overlay = load_overlay_state(context.engine)
+    if not overlay.enabled:
+        held = hold_pending_reviews(context.engine, overlay)
+        if held:
+            log.warning("Hermes overlay disabled; held %d pending review(s)", held)
+        return 0
     now = datetime.now(UTC)
     cutoff = now - timedelta(minutes=context.settings.execution.max_pick_age_minutes)
     stale_score_ids = (
@@ -466,8 +492,7 @@ async def run_entry_reviews_tick(context: DaemonContext) -> int:
     )
     prior_order = exists(
         select(entry_intent_consumptions.c.strategy_score_id).where(
-            entry_intent_consumptions.c.strategy_score_id
-            == entry_reviews.c.strategy_score_id
+            entry_intent_consumptions.c.strategy_score_id == entry_reviews.c.strategy_score_id
         )
     )
     with context.engine.begin() as conn:

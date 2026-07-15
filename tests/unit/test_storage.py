@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "symbol_news",
     "position_alerts",
     "execution_state",
+    "hermes_overlay_state",
     "orders",
     "fills",
     "order_quotes",
@@ -234,7 +235,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
     assert "migration 0016" in closes[0].last_error
     assert state.killed == 1
     assert "duplicate active closes" in state.reason
-    assert revision == "0017"
+    assert revision == "0018"
     assert "uq_orders_active_close_per_entry" in indexes
     assert "uq_orders_ib_order_id" in indexes
 
@@ -254,7 +255,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
         ).scalar_one()
     assert statuses == ["abandoned", "submitted"]
     assert state_after_roundtrip.killed == 1
-    assert revision_after_roundtrip == "0017"
+    assert revision_after_roundtrip == "0018"
 
 
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:

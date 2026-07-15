@@ -11,6 +11,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from sqlalchemy import desc, func, select
 
+from optionsbot.hermes_overlay import breaker_report, correctness_report
 from optionsbot.mcp_server.intent_queue import control_intents, recent_intents
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.storage.schema import (
@@ -264,6 +265,7 @@ def register(server: FastMCP) -> None:
         """Measure judgeable Hermes review correctness and request churn."""
         lifespan = ctx.request_context.lifespan_context
         close_orders = orders.alias("close_orders")
+        correctness = correctness_report(lifespan.engine)
         with lifespan.engine.connect() as conn:
             review_rows = conn.execute(
                 select(
@@ -293,36 +295,6 @@ def register(server: FastMCP) -> None:
                 )
             ).fetchall()
 
-        verdicts = ("no_trade", "vetted_paper_candidate", "watch_only")
-        by_verdict: dict[str, dict[str, int | float | None]] = {}
-        judgeable = 0
-        useful = 0
-        for verdict in verdicts:
-            matching = [row for row in review_rows if row.verdict == verdict]
-            judged = [row for row in matching if row.win is not None]
-            verdict_useful = sum(
-                1
-                for row in judged
-                if bool(row.win) == (verdict == "vetted_paper_candidate")
-            )
-            judgeable += len(judged)
-            useful += verdict_useful
-            by_verdict[verdict] = {
-                "calls": len(matching),
-                "judgeable": len(judged),
-                "useful": verdict_useful,
-                "accuracy": verdict_useful / len(judged) if judged else None,
-            }
-
-        threshold = 0.5
-        accuracy = useful / judgeable if judgeable else None
-        if accuracy is None:
-            recommendation = "CHANGE"
-        elif accuracy < threshold:
-            recommendation = "DISABLE"
-        else:
-            recommendation = "KEEP"
-
         entry_statuses = _count_values(row.status for row in review_rows)
         exit_statuses = _count_values(row.status for row in exit_rows)
         close_statuses = _count_values(
@@ -336,17 +308,8 @@ def register(server: FastMCP) -> None:
         ]
         return {
             "ok": True,
-            "entry_overlay_correctness": {
-                "calls": len(review_rows),
-                "judgeable": judgeable,
-                "useful": useful,
-                "accuracy": accuracy,
-                "threshold": threshold,
-                "recommendation": recommendation,
-                "small_sample": judgeable < 20,
-                "unmatched_calls": len(review_rows) - judgeable,
-                "by_verdict": by_verdict,
-            },
+            "entry_overlay_correctness": correctness,
+            "overlay_breaker": breaker_report(lifespan.engine),
             "request_churn": {
                 "entry_reviews_by_status": entry_statuses,
                 "exit_requests_by_status": exit_statuses,

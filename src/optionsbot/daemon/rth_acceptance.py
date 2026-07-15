@@ -22,6 +22,7 @@ from optionsbot.daemon.market_hours import (
 )
 from optionsbot.daemon.operational_state import DEFAULT_PATH as OPERATIONAL_STATE_PATH
 from optionsbot.daemon.soak_evidence import append_result
+from optionsbot.hermes_overlay import breaker_report, correctness_report
 from optionsbot.storage.db import create_engine_for_path
 from optionsbot.storage.schema import fills, orders, scan_runs, snapshots
 
@@ -66,9 +67,7 @@ def _service_details(name: str) -> dict[str, Any]:
             "--no-pager",
         ]
     )
-    values = dict(
-        line.split("=", 1) for line in output.splitlines() if "=" in line
-    )
+    values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     return {
         "active": values.get("ActiveState") == "active",
         "sub_state": values.get("SubState"),
@@ -192,6 +191,8 @@ def evaluate(now: datetime | None = None) -> dict[str, Any]:
                 .limit(1)
             ).first()
             order_metrics = _order_metrics(conn, session_start)
+        overlay = breaker_report(engine)
+        overlay["correctness"] = correctness_report(engine)
     finally:
         engine.dispose()
 
@@ -220,6 +221,7 @@ def evaluate(now: datetime | None = None) -> dict[str, Any]:
         "spot": snapshot.spot if snapshot else None,
     }
     checks["orders"] = order_metrics
+    checks["hermes_overlay"] = overlay
     checks["journal"] = journal
 
     operational = _load_json(OPERATIONAL_STATE_PATH)
@@ -246,9 +248,7 @@ def evaluate(now: datetime | None = None) -> dict[str, Any]:
     gateway_started = _parse_systemd_timestamp(
         services["optionsbot-gateway.service"].get("started_at")
     )
-    restart_observed = bool(
-        gateway_started and session_start <= gateway_started <= now
-    )
+    restart_observed = bool(gateway_started and session_start <= gateway_started <= now)
     restart_survived = bool(
         restart_observed
         and services["optionsbot-daemon.service"]["active"]

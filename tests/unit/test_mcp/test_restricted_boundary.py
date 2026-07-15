@@ -10,12 +10,12 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from sqlalchemy import Engine, insert, select
+from sqlalchemy import Engine, insert, select, update
 from sqlalchemy.exc import OperationalError
 
 from optionsbot.config import Settings
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.control_intents import consume_control_intents
+from optionsbot.daemon.control_intents import _consume_entry_review, consume_control_intents
 from optionsbot.execution.state import load_state
 from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
 from optionsbot.mcp_server.restricted_context import RestrictedServerContext
@@ -26,6 +26,7 @@ from optionsbot.storage.schema import (
     alerts,
     entry_reviews,
     exit_requests,
+    hermes_overlay_state,
     orders,
     pick_outcomes,
     snapshots,
@@ -216,6 +217,86 @@ def test_hermes_metrics_zero_denominator_is_not_zero_percent(
     assert correctness["judgeable"] == 0
     assert correctness["accuracy"] is None
     assert correctness["recommendation"] == "CHANGE"
+
+
+def test_disabled_overlay_holds_newly_imported_vetted_review(
+    mcp_engine: Engine,
+) -> None:
+    daemon_context = cast(
+        DaemonContext,
+        SimpleNamespace(engine=mcp_engine),
+    )
+    now = datetime.now(UTC)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(symbol="SPY", ts=now, spot=600.0, raw_json={})
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        alert_id = int(
+            conn.execute(
+                insert(alerts).values(
+                    strategy_score_id=score_id,
+                    ts=now,
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    status="sent",
+                    sent_ts=now,
+                    telegram_msg_id=123,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            update(hermes_overlay_state)
+            .where(hermes_overlay_state.c.id == 1)
+            .values(
+                enabled=0,
+                reason="test correctness trip",
+                ts=now,
+                judgeable=20,
+                accuracy=0.45,
+            )
+        )
+
+    result = _consume_entry_review(
+        daemon_context,
+        {
+            "pick_id": score_id,
+            "alert_id": alert_id,
+            "reviewed_at": now.isoformat(),
+            "verdict": "vetted_paper_candidate",
+            "confidence": 0.9,
+            "sources": ["source A", "source B"],
+            "reason": "test review",
+            "checks": {
+                "bot_health": True,
+                "candidate": True,
+                "microstructure": True,
+                "greeks": True,
+                "regime_history": True,
+                "catalysts": True,
+                "account_risk": True,
+            },
+        },
+    )
+
+    assert "held by the overlay breaker" in result
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "held"
+    assert "test correctness trip" in review.decision_reason
 
 
 def test_restricted_server_imports_no_broker_or_execution_modules() -> None:

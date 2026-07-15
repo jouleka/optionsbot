@@ -20,7 +20,14 @@ from optionsbot.config import HermesWebhookSettings, load_settings
 log = logging.getLogger(__name__)
 
 ALLOWED_EVENT_TYPES = frozenset(
-    {"fill", "stop-hit", "reconcile-mismatch", "daemon-down", "rth-acceptance"}
+    {
+        "fill",
+        "stop-hit",
+        "reconcile-mismatch",
+        "daemon-down",
+        "rth-acceptance",
+        "overlay-disabled",
+    }
 )
 
 

@@ -20,6 +20,7 @@ from optionsbot.storage.schema import (
     alerts,
     entry_intent_consumptions,
     entry_reviews,
+    hermes_overlay_state,
     orders,
     snapshots,
     strategy_scores,
@@ -158,6 +159,42 @@ async def test_auto_does_not_execute_unreviewed_candidate(
 
     assert n == 0
     run.assert_not_awaited()
+
+
+async def test_auto_holds_review_when_hermes_overlay_is_disabled(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.order_client = MagicMock()
+    snap, score = _pick(daemon_context)
+    review_id = _review(daemon_context, score)
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            update(hermes_overlay_state)
+            .where(hermes_overlay_state.c.id == 1)
+            .values(
+                enabled=0,
+                reason="test correctness trip",
+                ts=NOW,
+                judgeable=20,
+                accuracy=0.45,
+            )
+        )
+    scored = MagicMock(strategy_name="bull_put_spread")
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await auto_execute_candidates(
+            daemon_context, [("SPY", scored, snap)]
+        )
+
+    assert submitted == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(
+            select(entry_reviews).where(entry_reviews.c.id == review_id)
+        ).one()
+    assert review.status == "held"
+    assert "test correctness trip" in review.decision_reason
 
 
 async def test_daemon_rejects_malformed_persisted_review_even_if_ingress_was_bypassed(

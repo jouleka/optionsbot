@@ -28,15 +28,10 @@ from optionsbot.storage.schema import scan_runs
 log = logging.getLogger(__name__)
 
 
-def format_heartbeat(
-    scanned: int | None, alerts: int | None, finished: datetime | None
-) -> str:
+def format_heartbeat(scanned: int | None, alerts: int | None, finished: datetime | None) -> str:
     if finished is None:
         return "✅ optionsbot alive — no scan ticks yet"
-    return (
-        f"✅ optionsbot alive — last tick {finished:%H:%M}Z: "
-        f"scanned {scanned}, {alerts} alerts"
-    )
+    return f"✅ optionsbot alive — last tick {finished:%H:%M}Z: scanned {scanned}, {alerts} alerts"
 
 
 def _config_summary(settings: Settings) -> str:
@@ -91,9 +86,7 @@ class Daemon:
         # than stalling until SIGKILL.
         connect_task = asyncio.create_task(self._context.ibkr.connect(forever=True))
         stop_task = asyncio.create_task(self._stop_event.wait())
-        await asyncio.wait(
-            {connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        await asyncio.wait({connect_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if not connect_task.done():
             # Stop won the race (Gateway never came up): abort startup cleanly.
             connect_task.cancel()
@@ -162,16 +155,19 @@ class Daemon:
                 log.info(
                     "startup reconcile: adopted=%d foreign=%d fills=%d "
                     "resolved=%d mismatches=%d orphan_positions=%d",
-                    summary.adopted, summary.foreign, summary.fills_replayed,
-                    summary.resolved, summary.mismatches, summary.orphan_positions,
+                    summary.adopted,
+                    summary.foreign,
+                    summary.fills_replayed,
+                    summary.resolved,
+                    summary.mismatches,
+                    summary.orphan_positions,
                 )
                 from optionsbot.daemon.operational_state import record_reconcile
 
                 record_reconcile(summary, phase="startup")
                 if (
-                    (summary.mismatches or summary.orphan_positions)
-                    and self._context.events is not None
-                ):
+                    summary.mismatches or summary.orphan_positions
+                ) and self._context.events is not None:
                     self._context.events.emit(
                         "reconcile-mismatch",
                         "Startup reconciliation found broker/ledger differences",
@@ -187,6 +183,11 @@ class Daemon:
 
                 record_reconcile_failure(phase="startup", error_type=type(exc).__name__)
                 log.exception("startup reconciliation failed; periodic pass will retry")
+
+        # Evaluate persisted Hermes evidence before the daemon advertises
+        # readiness. This is separate from broker reconciliation and can only
+        # disable Hermes-vetted entries, never exits or deterministic scans.
+        await self._overlay_guard_tick()
 
         log.info("Daemon started; waiting for stop signal")
         log.info("daemon config: %s", _config_summary(self._settings))
@@ -244,9 +245,7 @@ class Daemon:
         if old_events is not None:
             await old_events.flush()
         old_telegram = self._context.telegram
-        self._context.telegram = TelegramClient(
-            new.telegram.bot_token, new.telegram.chat_id
-        )
+        self._context.telegram = TelegramClient(new.telegram.bot_token, new.telegram.chat_id)
         try:
             await old_telegram.aclose()
         except Exception:  # noqa: BLE001 -- closing the old client must not abort reload
@@ -354,9 +353,7 @@ class Daemon:
         if not is_market_open(datetime.now(UTC)):
             return
         with self._context.engine.connect() as conn:
-            last = conn.execute(
-                select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)
-            ).first()
+            last = conn.execute(select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)).first()
         if last is None:
             msg = format_heartbeat(None, None, None)
         else:
@@ -370,11 +367,52 @@ class Daemon:
         from optionsbot.daemon.outcomes_runner import run_outcomes_tick
 
         assert self._context is not None
+        async with self._context.hermes_overlay_lock:
+            try:
+                n = await run_outcomes_tick(self._context)
+                log.info("outcomes tick: evaluated %d newly-expired pick(s)", n)
+            except Exception:
+                log.exception("outcomes tick failed")
+            await self._evaluate_overlay_guard()
+
+    async def _overlay_guard_tick(self) -> None:
+        assert self._context is not None
+        async with self._context.hermes_overlay_lock:
+            await self._evaluate_overlay_guard()
+
+    async def _evaluate_overlay_guard(self) -> None:
+        """Persist and announce a newly-tripped Hermes correctness breaker."""
+        assert self._context is not None
         try:
-            n = await run_outcomes_tick(self._context)
-            log.info("outcomes tick: evaluated %d newly-expired pick(s)", n)
+            from optionsbot.hermes_overlay import evaluate_overlay, hold_pending_reviews
+
+            state, tripped = evaluate_overlay(self._context.engine)
+            if not tripped:
+                return
+            held = hold_pending_reviews(self._context.engine, state)
+            message = (
+                "🛑 Hermes entry overlay DISABLED\n"
+                f"{state.reason}\n"
+                f"Held {held} pending review(s). Scans and exits continue. "
+                "Use /overlayreset only after human review."
+            )
+            await self._context.telegram.send_message(message, parse_mode=None)
+            if self._context.events is not None:
+                self._context.events.emit(
+                    "overlay-disabled",
+                    state.reason or "Hermes entry overlay disabled",
+                    severity="critical",
+                    details={
+                        "judgeable": state.judgeable,
+                        "accuracy": state.accuracy,
+                        "held_reviews": held,
+                    },
+                )
+            log.critical("%s; held_reviews=%d", state.reason, held)
         except Exception:
-            log.exception("outcomes tick failed")
+            # A failed correctness evaluation must not affect exits/scans. The
+            # entry path independently reads the last persisted breaker state.
+            log.exception("Hermes overlay guard evaluation failed")
 
     async def _entry_reviews_tick(self) -> None:
         from optionsbot.daemon.auto_executor import run_entry_reviews_tick
@@ -421,7 +459,10 @@ class Daemon:
             self._scheduler.add_job(
                 self._heartbeat_tick,
                 trigger=IntervalTrigger(minutes=hb),
-                id="heartbeat", max_instances=1, coalesce=True, replace_existing=True,
+                id="heartbeat",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
             )
         # IBK-117: daily outcome accrual (evaluate newly-expired picks). First run a couple
         # minutes after start so the ledger updates without waiting a full day.
@@ -430,7 +471,10 @@ class Daemon:
             self._scheduler.add_job(
                 self._outcomes_tick,
                 trigger=IntervalTrigger(hours=oeh),
-                id="outcomes", max_instances=1, coalesce=True, replace_existing=True,
+                id="outcomes",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
                 next_run_time=datetime.now(UTC) + timedelta(minutes=2),
             )
         # IBK-126: order watcher — TTL sweep on working orders + terminal-state
@@ -440,7 +484,10 @@ class Daemon:
         self._scheduler.add_job(
             self._orders_tick,
             trigger=IntervalTrigger(minutes=1),
-            id="orders", max_instances=1, coalesce=True, replace_existing=True,
+            id="orders",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
         )
         # Hermes entry reviews are advisory requests, never direct orders. This
         # consumer feeds fresh vetted requests back through execute_pick once a
@@ -448,7 +495,10 @@ class Daemon:
         self._scheduler.add_job(
             self._entry_reviews_tick,
             trigger=IntervalTrigger(minutes=1),
-            id="entry_reviews", max_instances=1, coalesce=True, replace_existing=True,
+            id="entry_reviews",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
         )
         # The MCP process cannot touch the trading DB. It appends only typed
         # intents to a separate queue; this trusted daemon translates them and
@@ -457,6 +507,8 @@ class Daemon:
             self._scheduler.add_job(
                 self._control_intents_tick,
                 trigger=IntervalTrigger(seconds=10),
-                id="control_intents", max_instances=1, coalesce=True,
+                id="control_intents",
+                max_instances=1,
+                coalesce=True,
                 replace_existing=True,
             )

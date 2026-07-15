@@ -3,17 +3,48 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 
 from optionsbot.daemon.commands import dispatch
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.storage.schema import alerts, scan_runs, watchlist
+from optionsbot.storage.schema import alerts, hermes_overlay_state, scan_runs, watchlist
 
 
 async def test_help_lists_commands(daemon_context: DaemonContext) -> None:
     [reply] = await dispatch(daemon_context, "/help")
     assert "/status" in reply.text and "/scan" in reply.text
     assert reply.parse_mode is None
+    assert "/overlay" in reply.text
+    assert "/overlayreset" in reply.text
+
+
+async def test_overlay_status_and_explicit_reset(
+    daemon_context: DaemonContext,
+) -> None:
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            update(hermes_overlay_state)
+            .where(hermes_overlay_state.c.id == 1)
+            .values(
+                enabled=0,
+                reason="test correctness trip",
+                ts=datetime.now(UTC),
+                judgeable=20,
+                accuracy=0.45,
+            )
+        )
+
+    [status] = await dispatch(daemon_context, "/overlay")
+    assert "DISABLED" in status.text
+    assert "test correctness trip" in status.text
+    assert "/overlayreset" in status.text
+
+    [reset] = await dispatch(daemon_context, "/overlayreset")
+    assert "explicitly reset" in reset.text
+    assert "enabled" in reset.text
+
+    [execution] = await dispatch(daemon_context, "/exec")
+    assert "Hermes entry overlay: enabled" in execution.text
 
 
 async def test_unknown_command(daemon_context: DaemonContext) -> None:

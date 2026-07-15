@@ -60,6 +60,10 @@ def _format_digest(result: dict[str, Any], ledger: dict[str, Any], marker: str) 
     restart = checks.get("gateway_restart", {})
     reconcile = checks.get("reconcile", {})
     orders = checks.get("orders", {})
+    overlay = checks.get("hermes_overlay", {})
+    correctness = overlay.get("correctness", {})
+    overlay_accuracy = correctness.get("accuracy")
+    overlay_accuracy_text = "N/A" if overlay_accuracy is None else f"{float(overlay_accuracy):.1%}"
     status = "PASS" if result.get("passed") else "FAIL"
     reasons = "; ".join(result.get("reasons", [])) or "none"
     return (
@@ -76,6 +80,10 @@ def _format_digest(result: dict[str, Any], ledger: dict[str, Any], marker: str) 
         f"- Paper lifecycle: orders={orders.get('orders', 0)}; "
         f"fills={orders.get('execution_fills', 0)}; "
         f"statuses={json.dumps(orders.get('by_status', {}), sort_keys=True)}\n"
+        f"- Hermes entry overlay: enabled={overlay.get('enabled', True)}; "
+        f"judgeable={correctness.get('judgeable', 0)}; "
+        f"accuracy={overlay_accuracy_text}; "
+        f"reason={overlay.get('reason') or 'none'}\n"
         f"- Failure reasons: {reasons}\n\n"
         f"Cumulative: {summary.get('passed_sessions', 0)}/"
         f"{summary.get('target_pass_sessions', 10)} passed sessions; "
@@ -87,10 +95,7 @@ def _format_digest(result: dict[str, Any], ledger: dict[str, Any], marker: str) 
 
 
 def run() -> int:
-    token = (
-        os.getenv("YOUTRACK_API_TOKEN", "").strip()
-        or os.getenv("YOUTRACK_TOKEN", "").strip()
-    )
+    token = os.getenv("YOUTRACK_API_TOKEN", "").strip() or os.getenv("YOUTRACK_TOKEN", "").strip()
     if not token:
         raise RuntimeError("YouTrack token is not configured")
     base = os.getenv("YOUTRACK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
