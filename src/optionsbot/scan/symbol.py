@@ -248,6 +248,7 @@ async def scan_symbol(
         "delayed": stock.delayed,
         "n_chain_legs": len(chain),
         "warming_up": view.warming_up,
+        "iv_rank_is_proxy": view.iv_rank_is_proxy,
         "earnings_in_window": view.earnings_in_window,
         "relative_strength": relative_strength_value,
     }

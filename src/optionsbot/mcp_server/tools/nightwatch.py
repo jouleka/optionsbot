@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.intent_queue import enqueue_intent
 from optionsbot.mcp_server.serialization import iso_utc
+from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.risk_structure import has_structurally_defined_option_risk
 from optionsbot.storage.schema import (
     alerts,
@@ -135,6 +136,7 @@ def _pick_dict(row: Any) -> dict[str, Any]:
             "relative_strength": raw.get("relative_strength"),
             "volume": raw.get("volume"),
             "average_volume": raw.get("average_volume"),
+            "iv_rank_is_proxy": raw.get("iv_rank_is_proxy"),
         },
         "suggestion": {
             "defined_risk": suggestion.get("defined_risk"),
@@ -147,6 +149,7 @@ def _pick_dict(row: Any) -> dict[str, Any]:
             "suggested_quantity": suggestion.get("suggested_quantity"),
             "risk_tier": suggestion.get("risk_tier"),
         },
+        "review_evidence": suggestion.get("review_evidence"),
         "legs": list(row.legs_json or []),
         "rationale": row.rationale,
     }
@@ -355,7 +358,7 @@ def register(server: FastMCP) -> None:
             if age > max_age or age < -timedelta(minutes=1):
                 return {"ok": False, "error": "stale_pick"}
             raw = dict(pick.raw_json or {})
-            if raw.get("delayed") is not False or raw.get("warming_up") is not False:
+            if not snapshot_ready_for_auto(raw):
                 return {"ok": False, "error": "candidate_data_unready"}
             if not _is_positive_defined_risk_candidate(pick):
                 return {"ok": False, "error": "candidate_not_positive_defined_risk"}
@@ -372,6 +375,13 @@ def register(server: FastMCP) -> None:
             clean_sources.append(source)
         if normalized == "vetted_paper_candidate" and len(clean_sources) < 2:
             return {"ok": False, "error": "two_distinct_sources_required"}
+        if normalized == "vetted_paper_candidate" and not review_evidence_ready(
+            dict(pick.suggestion_json or {}).get("review_evidence"),
+            score_id=int(pick_id),
+            now=now,
+            max_age_minutes=lifespan.settings.execution.max_pick_age_minutes,
+        ):
+            return {"ok": False, "error": "candidate_evidence_unready"}
         intent_engine = getattr(lifespan, "intent_engine", None)
         if intent_engine is not None:
             intent_id, intent_uid = enqueue_intent(

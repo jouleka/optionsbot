@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from optionsbot.ibkr._util import clean_float, clean_int
+from optionsbot.ibkr._util import clean_float, option_open_interest, option_volume
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg, OptionRight
@@ -248,7 +248,7 @@ class ChainClient:
                 # greeks only on the streaming feed. reqMktData returns a live
                 # Ticker synchronously; it fills in over the next seconds.
                 try:
-                    ticker = self._client.ib.reqMktData(contract, "", False, False)
+                    ticker = self._client.ib.reqMktData(contract, "100,101", False, False)
                 except Exception:  # noqa: BLE001 -- one bad leg must not kill the chunk
                     log.warning(
                         "reqMktData failed for %s %s %.2f %s; skipping leg",
@@ -308,6 +308,6 @@ class ChainClient:
             gamma=clean_float(getattr(g, "gamma", None)) if g is not None else None,
             theta=clean_float(getattr(g, "theta", None)) if g is not None else None,
             vega=clean_float(getattr(g, "vega", None)) if g is not None else None,
-            open_interest=clean_int(getattr(ticker, "openInterest", None)),
-            volume=clean_int(getattr(ticker, "volume", None)),
+            open_interest=option_open_interest(ticker, right),
+            volume=option_volume(ticker, right),
         )

@@ -73,6 +73,27 @@ async def test_auto_mode_rejects_unready_snapshot(
     deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
 
 
+async def test_auto_mode_accepts_explicit_hv_rank_proxy_during_iv_warmup(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={
+            "delayed": False,
+            "warming_up": True,
+            "iv_rank_is_proxy": True,
+            "earnings_in_window": False,
+        },
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
+
+
 async def test_confirm_mode_allows_earnings_window(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db, raw_json={"earnings_in_window": True})
     deps = _deps(tmp_db)  # mode=confirm default

@@ -20,6 +20,7 @@ from optionsbot.execution.state import trip_kill
 from optionsbot.hermes_overlay import hold_pending_reviews, load_overlay_state
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
+from optionsbot.review_evidence import snapshot_ready_for_auto
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.storage.schema import (
     alerts,
@@ -207,7 +208,7 @@ def _review_authorization_error(
     raw = row.raw_json
     if not isinstance(raw, dict):
         return "candidate readiness evidence is missing"
-    if raw.get("delayed") is not False or raw.get("warming_up") is not False:
+    if not snapshot_ready_for_auto(raw):
         return "candidate market data is delayed, unknown, or warming"
     if not _positive_defined_risk(row):
         return "candidate is not positive-expectancy defined risk"

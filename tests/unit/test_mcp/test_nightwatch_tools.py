@@ -86,6 +86,39 @@ def _snapshot_with_score(
             )
         ).inserted_primary_key
         score_id = int(score_pk[0])
+        suggestion = {
+            "defined_risk": True,
+            "credit_or_debit": 120.0,
+            "max_loss": 380.0,
+            "max_profit": 120.0,
+            "prob_profit": 0.68,
+            "expected_value": 14.5,
+            "suggested_quantity": 1,
+            "review_evidence": {
+                "schema_version": 1,
+                "source": "trusted_daemon",
+                "score_id": score_id,
+                "captured_at": NOW.isoformat(),
+                "ready": True,
+                "readiness_issues": [],
+                "option_quotes": [{"expiry": "20260717", "strike": 580.0}],
+                "account": {
+                    "net_liquidation_usd": 100_000.0,
+                    "buying_power": 100_000.0,
+                    "available_funds": 100_000.0,
+                },
+                "risk": {
+                    "execution_allowed": True,
+                    "paper_only": True,
+                    "entry_loss_guard_allowed": True,
+                },
+            },
+        }
+        conn.execute(
+            update(strategy_scores)
+            .where(strategy_scores.c.id == score_id)
+            .values(suggestion_json=suggestion)
+        )
         if alerted:
             conn.execute(
                 insert(alerts).values(
@@ -126,6 +159,7 @@ def test_pending_picks_returns_grounded_pre_trade_packet(server_context: ServerC
     assert pick["suggestion"]["expected_value"] == 14.5
     assert pick["market"]["iv_rank"] == 0.62
     assert pick["market"]["relative_strength"] == 0.03
+    assert pick["review_evidence"]["source"] == "trusted_daemon"
     assert "news/catalyst corroboration" in result["rubric"]["must_check"]
 
 
@@ -303,6 +337,93 @@ def test_submit_entry_review_rejects_delayed_candidate(
     assert result == {"ok": False, "error": "candidate_data_unready"}
     with server_context.engine.connect() as conn:
         assert conn.execute(select(entry_reviews)).first() is None
+
+
+def test_submit_entry_review_accepts_explicit_hv_proxy_during_iv_warmup(
+    server_context: ServerContext,
+) -> None:
+    score_id = _snapshot_with_score(server_context)
+    with server_context.engine.begin() as conn:
+        snapshot_id = conn.execute(
+            select(strategy_scores.c.snapshot_id).where(strategy_scores.c.id == score_id)
+        ).scalar_one()
+        conn.execute(
+            update(snapshots)
+            .where(snapshots.c.id == snapshot_id)
+            .values(
+                raw_json={
+                    "delayed": False,
+                    "warming_up": True,
+                    "iv_rank_is_proxy": True,
+                }
+            )
+        )
+    submit_entry_review = get_tools(register)["submit_entry_review"]
+
+    result = submit_entry_review(
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
+        verdict="VETTED PAPER CANDIDATE",
+        confidence=0.91,
+        sources=["source A", "source B"],
+        reason="Live evidence passes and the explicit long-history HV proxy backs IV regime.",
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result["ok"] is True
+
+
+def test_submit_entry_review_rejects_missing_daemon_evidence(
+    server_context: ServerContext,
+) -> None:
+    score_id = _snapshot_with_score(server_context)
+    with server_context.engine.begin() as conn:
+        suggestion = conn.execute(
+            select(strategy_scores.c.suggestion_json).where(strategy_scores.c.id == score_id)
+        ).scalar_one()
+        suggestion = dict(suggestion)
+        suggestion.pop("review_evidence")
+        conn.execute(
+            update(strategy_scores)
+            .where(strategy_scores.c.id == score_id)
+            .values(suggestion_json=suggestion)
+        )
+
+    result = get_tools(register)["submit_entry_review"](
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
+        verdict="VETTED PAPER CANDIDATE",
+        confidence=0.91,
+        sources=["source A", "source B"],
+        reason="Claims pass without the daemon packet.",
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result == {"ok": False, "error": "candidate_evidence_unready"}
 
 
 def test_submit_entry_review_rejects_low_confidence_vetted(

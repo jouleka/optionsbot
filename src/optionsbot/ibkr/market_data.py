@@ -12,7 +12,11 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from optionsbot.ibkr._util import clean_float, clean_int
+from optionsbot.ibkr._util import (
+    clean_float,
+    option_open_interest,
+    option_volume,
+)
 from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionQuote, OptionRight, StockQuote
@@ -174,8 +178,8 @@ class MarketDataClient:
         gamma = _greek(greeks, "gamma") if greeks is not None else None
         theta = _greek(greeks, "theta") if greeks is not None else None
         vega = _greek(greeks, "vega") if greeks is not None else None
-        open_interest = clean_int(getattr(ticker, "openInterest", None))
-        volume = clean_int(getattr(ticker, "volume", None))
+        open_interest = option_open_interest(ticker, right)
+        volume = option_volume(ticker, right)
         return OptionQuote(
             symbol=symbol,
             expiry=expiry,
@@ -194,6 +198,69 @@ class MarketDataClient:
             volume=volume,
             ts=_ticker_ts(ticker),
             delayed=_market_data_type_delayed(observed_market_data_type),
+        )
+
+    async def get_option_review_snapshot(
+        self,
+        symbol: str,
+        expiry: str,
+        strike: float,
+        right: OptionRight,
+    ) -> OptionQuote:
+        """Fetch a review quote including option volume and open interest.
+
+        Execution pricing only needs NBBO/Greeks and uses the faster snapshot
+        path above.  Hermes also audits OI/volume, which IBKR exposes through
+        generic ticks 100/101, so alerted candidates use this bounded stream.
+        """
+        contract = await self._resolver.option(symbol, expiry, strike, right)
+        await self._client.ensure_connected()
+        start_sequence = self._market_data_type_sequence()
+        ticker = self._client.ib.reqMktData(contract, "100,101,106", False, False)
+        try:
+            waited = 0.0
+            while waited < _STREAM_TIMEOUT_S:
+                greeks = getattr(ticker, "modelGreeks", None)
+                complete = (
+                    _has_quote(ticker)
+                    and greeks is not None
+                    and all(
+                        _greek(greeks, name) is not None
+                        for name in ("impliedVol", "delta", "gamma", "theta", "vega")
+                    )
+                    and option_open_interest(ticker, right) is not None
+                    and option_volume(ticker, right) is not None
+                )
+                if complete:
+                    break
+                await asyncio.sleep(_STREAM_POLL_S)
+                waited += _STREAM_POLL_S
+        finally:
+            self._client.ib.cancelMktData(contract)
+        observed = self._take_observed_market_data_type(
+            ticker, after_sequence=start_sequence
+        )
+        bid = clean_float(getattr(ticker, "bid", None))
+        ask = clean_float(getattr(ticker, "ask", None))
+        greeks = getattr(ticker, "modelGreeks", None)
+        return OptionQuote(
+            symbol=symbol,
+            expiry=expiry,
+            strike=strike,
+            right=right,
+            bid=bid,
+            ask=ask,
+            last=clean_float(getattr(ticker, "last", None)),
+            mid=_mid(bid, ask),
+            iv=_greek(greeks, "impliedVol") if greeks is not None else None,
+            delta=_greek(greeks, "delta") if greeks is not None else None,
+            gamma=_greek(greeks, "gamma") if greeks is not None else None,
+            theta=_greek(greeks, "theta") if greeks is not None else None,
+            vega=_greek(greeks, "vega") if greeks is not None else None,
+            open_interest=option_open_interest(ticker, right),
+            volume=option_volume(ticker, right),
+            ts=_ticker_ts(ticker),
+            delayed=_market_data_type_delayed(observed),
         )
 
     async def _fetch_ticker(self, contract: Contract) -> tuple[Ticker, object | None]:

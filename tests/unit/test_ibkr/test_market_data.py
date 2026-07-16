@@ -220,6 +220,48 @@ async def test_get_snapshot_option_extracts_greeks(
     assert quote.volume == 42
 
 
+async def test_option_review_snapshot_requests_volume_and_open_interest(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    contract = MagicMock(
+        symbol="SPY",
+        secType="OPT",
+        lastTradeDateOrContractMonth="20260619",
+        strike=400.0,
+        right="C",
+    )
+    greeks = MagicMock(
+        impliedVol=0.18,
+        delta=0.5,
+        gamma=0.02,
+        theta=-0.04,
+        vega=0.6,
+    )
+    ticker = _ticker(
+        bid=5.0,
+        ask=5.1,
+        modelGreeks=greeks,
+        openInterest=1000,
+        volume=42,
+    )
+    mock_ib.qualifyContractsAsync.return_value = [contract]
+    mock_ib.wrapper.reqId2Ticker = {46: ticker}
+
+    def _stream(*args: object) -> MagicMock:
+        mock_ib.wrapper.marketDataType(46, 1)
+        return ticker
+
+    mock_ib.reqMktData.side_effect = _stream
+
+    quote = await md.get_option_review_snapshot("SPY", "20260619", 400.0, "C")
+
+    mock_ib.reqMktData.assert_called_once_with(contract, "100,101,106", False, False)
+    mock_ib.cancelMktData.assert_called_once_with(contract)
+    assert quote.delayed is False
+    assert quote.open_interest == 1000
+    assert quote.volume == 42
+
+
 async def test_get_snapshot_handles_missing_fields(
     md: MarketDataClient, mock_ib: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

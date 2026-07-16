@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import math
 
-from optionsbot.ibkr._util import clean_float, clean_int
+from ib_async import Ticker
+
+from optionsbot.ibkr._util import (
+    clean_float,
+    clean_int,
+    option_open_interest,
+    option_volume,
+)
 
 
 def test_clean_float_passes_through_normal_floats() -> None:
@@ -55,3 +62,18 @@ def test_clean_int_returns_none_for_infinity() -> None:
     """int(math.inf) raises OverflowError; the helper must catch it."""
     assert clean_int(math.inf) is None
     assert clean_int(-math.inf) is None
+
+
+def test_option_activity_prefers_right_specific_generic_ticks() -> None:
+    ticker = Ticker()
+    ticker.openInterest = 999
+    ticker.volume = 888
+    ticker.callOpenInterest = 123
+    ticker.putOpenInterest = 456
+    ticker.callVolume = 12
+    ticker.putVolume = 34
+
+    assert option_open_interest(ticker, "C") == 123
+    assert option_open_interest(ticker, "P") == 456
+    assert option_volume(ticker, "C") == 12
+    assert option_volume(ticker, "P") == 34

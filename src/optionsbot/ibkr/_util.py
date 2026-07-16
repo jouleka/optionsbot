@@ -45,3 +45,19 @@ def clean_int(value: float | int | None) -> int | None:
         # OverflowError: int(math.inf) raises; treat as missing per the
         # function's documented "or unconvertible -> None" contract.
         return None
+
+
+def option_open_interest(ticker: object, right: str) -> int | None:
+    """Return the right-specific option OI tick, with legacy fallback."""
+    specific = "callOpenInterest" if right == "C" else "putOpenInterest"
+    raw = getattr(ticker, specific, None)
+    value = clean_int(raw) if type(raw) in (int, float) else None
+    return value if value is not None else clean_int(getattr(ticker, "openInterest", None))
+
+
+def option_volume(ticker: object, right: str) -> int | None:
+    """Return the right-specific option-volume tick, with aggregate fallback."""
+    specific = "callVolume" if right == "C" else "putVolume"
+    raw = getattr(ticker, specific, None)
+    value = clean_int(raw) if type(raw) in (int, float) else None
+    return value if value is not None else clean_int(getattr(ticker, "volume", None))

@@ -50,6 +50,7 @@ from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.orders import OrderClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.ibkr.types import OptionQuote
+from optionsbot.review_evidence import snapshot_ready_for_auto
 from optionsbot.storage.schema import orders, snapshots, strategy_scores
 
 log = logging.getLogger(__name__)
@@ -195,13 +196,10 @@ async def execute_pick(
             return _reject(
                 "snapshot data readiness unavailable — auto mode requires audited live data"
             )
-        if (
-            snapshot_raw.get("delayed") is not False
-            or snapshot_raw.get("warming_up") is not False
-        ):
+        if not snapshot_ready_for_auto(snapshot_raw):
             return _reject(
                 "snapshot data not explicitly live and ready — auto mode requires "
-                "delayed=false and warming up=false"
+                "delayed=false; warming up requires an explicit HV-rank proxy"
             )
         if snapshot_raw.get("earnings_in_window"):
             return _reject(
