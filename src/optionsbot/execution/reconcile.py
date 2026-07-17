@@ -33,7 +33,7 @@ from optionsbot.execution.orders import (
     set_fill_commission,
     transition,
 )
-from optionsbot.execution.state import load_state, trip_kill
+from optionsbot.execution.state import clear_kill, load_state, trip_kill
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
 from optionsbot.execution.walk import resume_walks
 from optionsbot.ibkr.types import OpenOrderSnapshot, ledger_row_id_from_ref
@@ -55,6 +55,9 @@ _STALE_STAGED_AFTER = timedelta(minutes=30)
 # and left for the next pass — resolving it as failed would strand a REAL
 # order at the broker under a terminal ledger row (Opus C1).
 _INFLIGHT_GRACE = timedelta(seconds=60)
+_TRANSIENT_GATEWAY_DISCONNECT_KILL = (
+    "reconcile open-order snapshot unavailable: Socket disconnect"
+)
 _KNOWN_BROKER_SECURITY_TYPES = frozenset(
     {"OPT", "STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND", "BAG"}
 )
@@ -778,10 +781,29 @@ async def _reconcile_once(
                     "inspect /positions and ledger, reconcile manually, then /arm.",
                 )
 
+    # A scheduled Gateway recycle can interrupt the opening snapshot and trip
+    # the persistent switch. Re-arm only this exact transient reason, and only
+    # after a later pass has proved all broker orders, executions, and positions
+    # agree. Every other kill reason remains manual.
+    state = load_state(engine)
+    if (
+        mismatches == 0
+        and positions_snapshot is not None
+        and state.killed
+        and state.reason == _TRANSIENT_GATEWAY_DISCONNECT_KILL
+    ):
+        state = clear_kill(engine, now=ts_now)
+        log.info("reconcile: auto-rearmed after clean post-disconnect snapshot")
+        await _send(
+            notify,
+            "✅ execution re-armed after a complete clean broker reconciliation "
+            "following the transient Gateway disconnect",
+        )
+
     # Mutation authority and walk resumption are the final commit point: no
     # broker order becomes mutable until every order, execution, and position
     # check in this reconciliation pass has succeeded.
-    if mismatches == 0 and not load_state(engine).killed:
+    if mismatches == 0 and not state.killed:
         try:
             order_client.authorize_adoptions(tuple(authorization_candidates))
         except Exception as exc:  # noqa: BLE001 -- mutation authority must fail closed

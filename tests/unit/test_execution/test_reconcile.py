@@ -13,7 +13,7 @@ from sqlalchemy import Engine, insert, select, update
 
 from optionsbot.execution.orders import get_order, record_fill
 from optionsbot.execution.reconcile import reconcile
-from optionsbot.execution.state import load_state
+from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import ExecutionFill, OpenOrderSnapshot, PortfolioPosition
 from optionsbot.storage.schema import fills, orders
 
@@ -699,6 +699,76 @@ async def test_open_order_snapshot_failure_halts_reconciliation(tmp_db: Engine) 
     assert summary.mismatches == 1
     assert load_state(tmp_db).killed
     assert any("KILL SWITCH" in message for message in sent)
+
+
+async def test_clean_full_reconcile_rearms_transient_gateway_disconnect(
+    tmp_db: Engine,
+) -> None:
+    trip_kill(
+        tmp_db,
+        "reconcile open-order snapshot unavailable: Socket disconnect",
+        now=NOW,
+    )
+    client = _client(open_orders=[], executions=[])
+    notify, sent = _notify()
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return []
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        notify=notify,
+        now=NOW + timedelta(minutes=1),
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 0
+    assert not load_state(tmp_db).killed
+    client.authorize_adoptions.assert_called_once_with(())
+    assert any("re-armed" in message for message in sent)
+
+
+async def test_transient_disconnect_kill_needs_full_position_proof(
+    tmp_db: Engine,
+) -> None:
+    trip_kill(
+        tmp_db,
+        "reconcile open-order snapshot unavailable: Socket disconnect",
+        now=NOW,
+    )
+    client = _client(open_orders=[], executions=[])
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert summary.mismatches == 0
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
+
+
+async def test_clean_reconcile_never_clears_an_unrelated_kill_reason(
+    tmp_db: Engine,
+) -> None:
+    trip_kill(tmp_db, "manual emergency halt", now=NOW)
+    client = _client(open_orders=[], executions=[])
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return []
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW + timedelta(minutes=1),
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 0
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
 
 
 async def test_none_position_snapshot_halts_reconciliation(tmp_db: Engine) -> None:
