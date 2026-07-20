@@ -140,6 +140,24 @@ class MarketDataClient:
             return None
         return observation[1]
 
+    def _has_current_market_data_type_observation(
+        self, ticker: Ticker, *, after_sequence: int
+    ) -> bool:
+        """Whether IBKR identified the feed for this subscription request.
+
+        ``reqMktData`` may return an already-populated cached ``Ticker``. Its
+        fields prove neither that this request is live nor that its quote is
+        fresh, so review snapshots must wait for a new marketDataType callback
+        instead of treating the cached fields as a completed request.
+        """
+        observation = self._delivered_market_data_types.get(id(ticker))
+        return (
+            isinstance(observation, tuple)
+            and len(observation) == 2
+            and type(observation[0]) is int
+            and observation[0] > after_sequence
+        )
+
     @property
     def client(self) -> IBKRClient:
         return self._client
@@ -223,6 +241,9 @@ class MarketDataClient:
                 greeks = getattr(ticker, "modelGreeks", None)
                 complete = (
                     _has_quote(ticker)
+                    and self._has_current_market_data_type_observation(
+                        ticker, after_sequence=start_sequence
+                    )
                     and greeks is not None
                     and all(
                         _greek(greeks, name) is not None

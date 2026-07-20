@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -260,6 +260,58 @@ async def test_option_review_snapshot_requests_volume_and_open_interest(
     assert quote.delayed is False
     assert quote.open_interest == 1000
     assert quote.volume == 42
+
+
+async def test_option_review_snapshot_waits_past_cached_ticker_for_current_callback(
+    md: MarketDataClient, mock_ib: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A populated ticker cached by an earlier chain request is not evidence
+    that the new review subscription is live or fresh."""
+    from optionsbot.ibkr import market_data
+
+    contract = MagicMock(
+        symbol="SPY",
+        secType="OPT",
+        lastTradeDateOrContractMonth="20260619",
+        strike=400.0,
+        right="C",
+    )
+    greeks = MagicMock(
+        impliedVol=0.18,
+        delta=0.5,
+        gamma=0.02,
+        theta=-0.04,
+        vega=0.6,
+    )
+    stale_time = datetime(2026, 5, 26, 14, 29)
+    fresh_time = datetime(2026, 5, 26, 14, 30)
+    ticker = _ticker(
+        bid=5.0,
+        ask=5.1,
+        time=stale_time,
+        modelGreeks=greeks,
+        openInterest=1000,
+        volume=42,
+    )
+    mock_ib.qualifyContractsAsync.return_value = [contract]
+    mock_ib.reqMktData.return_value = ticker
+    mock_ib.wrapper.reqId2Ticker = {47: ticker}
+
+    sleep_calls = 0
+
+    async def _deliver_current_subscription(_delay: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        ticker.time = fresh_time
+        mock_ib.wrapper.marketDataType(47, 1)
+
+    monkeypatch.setattr(market_data.asyncio, "sleep", _deliver_current_subscription)
+
+    quote = await md.get_option_review_snapshot("SPY", "20260619", 400.0, "C")
+
+    assert sleep_calls == 1
+    assert quote.delayed is False
+    assert quote.ts == fresh_time.replace(tzinfo=UTC)
 
 
 async def test_get_snapshot_handles_missing_fields(
