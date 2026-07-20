@@ -98,6 +98,12 @@ class ScanSettings(BaseModel):
     # pull the full ladder (~497 strikes for SPY) x every in-window expiry.
     strike_band_pct: float = Field(default=0.15, gt=0.0, le=1.0)
     max_strikes_per_side: int = Field(default=40, ge=1)
+    # Select the front expiry nearest dte_target from expiries within this
+    # window. Keeping these configurable lets paper profiles tune opportunity
+    # frequency without changing strategy code.
+    dte_target: int = Field(default=45, ge=0, le=365)
+    dte_window_min: int = Field(default=25, ge=0, le=365)
+    dte_window_max: int = Field(default=55, ge=0, le=365)
     # Per scan, fetch a near-target front expiry + the nearest back-month at
     # least this many DTE beyond it (so Calendar/Diagonal spreads stay viable;
     # matches strategies.calendar._MIN_BACK_OVER_FRONT_DTE).
@@ -118,6 +124,15 @@ class ScanSettings(BaseModel):
     scan_symbol_timeout_s: float = Field(default=30.0, gt=0.0)
     screen_timeout_s: float = Field(default=60.0, gt=0.0)
     external_data_timeout_s: float = Field(default=5.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _validate_dte_window(self) -> ScanSettings:
+        if not self.dte_window_min <= self.dte_target <= self.dte_window_max:
+            raise ValueError(
+                "scan DTE settings must satisfy "
+                "dte_window_min <= dte_target <= dte_window_max"
+            )
+        return self
 
 
 class ManageSettings(BaseModel):

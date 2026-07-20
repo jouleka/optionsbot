@@ -142,6 +142,8 @@ async def scan_symbol(
             underlying_price=spot,
             strike_band_pct=settings.scan.strike_band_pct,
             max_strikes_per_side=settings.scan.max_strikes_per_side,
+            dte_window=(settings.scan.dte_window_min, settings.scan.dte_window_max),
+            dte_target=settings.scan.dte_target,
             back_dte_gap=settings.scan.back_month_dte_gap,
         ),
         positions_client.get_positions(),
@@ -195,7 +197,7 @@ async def scan_symbol(
         iv_rank=view.iv_rank_value,
         chain=tuple(chain),
         view=view,
-        dte_target=45,
+        dte_target=settings.scan.dte_target,
         position=sym_position,
     )
 

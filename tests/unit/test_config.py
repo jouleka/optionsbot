@@ -122,6 +122,32 @@ def test_scan_back_month_dte_gap_rejects_below_one() -> None:
         ScanSettings(back_month_dte_gap=0)
 
 
+def test_scan_dte_defaults() -> None:
+    scan = Settings().scan
+    assert scan.dte_target == 45
+    assert scan.dte_window_min == 25
+    assert scan.dte_window_max == 55
+
+
+def test_scan_dte_window_accepts_aggressive_profile() -> None:
+    scan = ScanSettings(dte_target=21, dte_window_min=10, dte_window_max=35)
+    assert (scan.dte_window_min, scan.dte_target, scan.dte_window_max) == (10, 21, 35)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dte_window_min": 22, "dte_target": 21, "dte_window_max": 35},
+        {"dte_window_min": 10, "dte_target": 36, "dte_window_max": 35},
+    ],
+)
+def test_scan_dte_window_rejects_target_outside_window(kwargs: dict[str, int]) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ScanSettings(**kwargs)
+
+
 def test_env_var_overrides_nested_field(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPTIONSBOT_IBKR__PORT", "7497")
     monkeypatch.setenv("OPTIONSBOT_IBKR__PAPER", "false")

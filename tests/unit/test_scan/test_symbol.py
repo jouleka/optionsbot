@@ -171,6 +171,11 @@ async def test_scan_symbol_passes_spot_and_strike_window_to_get_chain(
     assert kwargs["underlying_price"] == 400.0  # fake_stock_quote.mid
     assert kwargs["strike_band_pct"] == scan_settings.scan.strike_band_pct  # type: ignore[attr-defined]
     assert kwargs["max_strikes_per_side"] == scan_settings.scan.max_strikes_per_side  # type: ignore[attr-defined]
+    assert kwargs["dte_window"] == (
+        scan_settings.scan.dte_window_min,  # type: ignore[attr-defined]
+        scan_settings.scan.dte_window_max,  # type: ignore[attr-defined]
+    )
+    assert kwargs["dte_target"] == scan_settings.scan.dte_target  # type: ignore[attr-defined]
 
 
 async def test_scan_symbol_persists_earnings_in_window(
