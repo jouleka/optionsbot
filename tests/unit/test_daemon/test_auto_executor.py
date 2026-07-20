@@ -161,6 +161,85 @@ async def test_auto_does_not_execute_unreviewed_candidate(
     run.assert_not_awaited()
 
 
+def _mark_trusted_evidence_ready(context: DaemonContext, score_id: int) -> None:
+    with context.engine.begin() as conn:
+        suggestion = dict(
+            conn.execute(
+                select(strategy_scores.c.suggestion_json).where(
+                    strategy_scores.c.id == score_id
+                )
+            ).scalar_one()
+        )
+        suggestion["review_evidence"] = {
+            "schema_version": 1,
+            "source": "trusted_daemon",
+            "score_id": score_id,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "ready": True,
+            "readiness_issues": [],
+            "option_quotes": [{"bid": 1.0, "ask": 1.1}],
+            "account": {
+                "net_liquidation_usd": 100_000.0,
+                "buying_power": 100_000.0,
+                "available_funds": 100_000.0,
+            },
+            "risk": {
+                "execution_allowed": True,
+                "paper_only": True,
+                "entry_loss_guard_allowed": True,
+            },
+        }
+        conn.execute(
+            update(strategy_scores)
+            .where(strategy_scores.c.id == score_id)
+            .values(suggestion_json=suggestion)
+        )
+
+
+async def test_auto_executes_ready_trusted_paper_candidate_without_review(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.settings.execution.require_hermes_entry_review = False
+    daemon_context.order_client = MagicMock()
+    snap, score = _pick(daemon_context)
+    _mark_trusted_evidence_ready(daemon_context, score)
+    scored = MagicMock(strategy_name="bull_put_spread")
+
+    with patch(
+        "optionsbot.execution.engine.execute_pick",
+        new=AsyncMock(
+            return_value=ExecuteOutcome(ok=True, message="submitted", order_id=13)
+        ),
+    ) as run:
+        submitted = await auto_execute_candidates(
+            daemon_context, [("SPY", scored, snap)]
+        )
+
+    assert submitted == 1
+    assert run.await_args.args[1] == score
+    with daemon_context.engine.connect() as conn:
+        assert conn.execute(select(entry_reviews)).fetchall() == []
+
+
+async def test_auto_direct_paper_path_rejects_unready_evidence(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.settings.execution.require_hermes_entry_review = False
+    daemon_context.order_client = MagicMock()
+    snap, _score = _pick(daemon_context)
+    scored = MagicMock(strategy_name="bull_put_spread")
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await auto_execute_candidates(
+            daemon_context, [("SPY", scored, snap)]
+        )
+
+    assert submitted == 0
+    run.assert_not_awaited()
+
+
 async def test_auto_holds_review_when_hermes_overlay_is_disabled(
     daemon_context: DaemonContext,
 ) -> None:

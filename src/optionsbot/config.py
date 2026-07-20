@@ -187,6 +187,10 @@ class ExecutionSettings(BaseModel):
     # 7497 TWS). Flipping this off is a deliberate live-trading decision and
     # out of scope for the paper epic.
     paper_only: bool = True
+    # Optional analyst overlay for entries. Production paper discovery may
+    # execute a trusted ready evidence packet directly; disabling the review
+    # is forbidden unless the paper-only interlock remains enabled.
+    require_hermes_entry_review: bool = True
     # Portfolio caps consumed by the entry gates (IBK-126/130).
     max_open_positions: int = Field(default=6, ge=1)
     max_per_symbol: int = Field(default=1, ge=1)
@@ -265,6 +269,11 @@ class ExecutionSettings(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_phase0_ceilings(self) -> ExecutionSettings:
+        if not self.require_hermes_entry_review and not self.paper_only:
+            raise ValueError(
+                "execution.require_hermes_entry_review may be disabled only "
+                "while execution.paper_only is true"
+            )
         # Phase 0 hard ceilings: reject a config that lifts the risk caps
         # past what is safe to run unattended 24/7. These are absolute
         # upper bounds — the per-field Field(le=...) bounds are looser

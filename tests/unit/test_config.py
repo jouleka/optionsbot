@@ -69,6 +69,18 @@ def test_ibkr_paper_defaults_to_true() -> None:
     assert Settings().ibkr.paper is True
 
 
+def test_hermes_entry_review_bypass_requires_paper_only() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        from optionsbot.config import ExecutionSettings
+
+        ExecutionSettings(
+            paper_only=False,
+            require_hermes_entry_review=False,
+        )
+
+
 def test_ibkr_port_defaults_to_paper_4002() -> None:
     assert Settings().ibkr.port == 4002
 

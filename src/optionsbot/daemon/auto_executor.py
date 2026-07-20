@@ -20,7 +20,7 @@ from optionsbot.execution.state import trip_kill
 from optionsbot.hermes_overlay import hold_pending_reviews, load_overlay_state
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
-from optionsbot.review_evidence import snapshot_ready_for_auto
+from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.storage.schema import (
     alerts,
@@ -290,6 +290,98 @@ def _prior_order_id(context: DaemonContext, score_id: int) -> int | None:
     return int(value) if value is not None else None
 
 
+def _trusted_candidate_ready(context: DaemonContext, score_id: int) -> bool:
+    """Authorize the direct paper path from daemon-captured evidence only."""
+    with context.engine.connect() as conn:
+        row = conn.execute(
+            select(
+                strategy_scores.c.legs_json,
+                strategy_scores.c.suggestion_json,
+                snapshots.c.raw_json,
+            )
+            .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+            .where(strategy_scores.c.id == score_id)
+        ).first()
+    if row is None or not snapshot_ready_for_auto(row.raw_json):
+        return False
+    if not _positive_defined_risk(row):
+        return False
+    suggestion = row.suggestion_json
+    if not isinstance(suggestion, dict):
+        return False
+    return review_evidence_ready(
+        suggestion.get("review_evidence"),
+        score_id=score_id,
+        now=datetime.now(UTC),
+        max_age_minutes=context.settings.execution.max_pick_age_minutes,
+    )
+
+
+async def _execute_trusted_paper_score(
+    context: DaemonContext,
+    *,
+    score_id: int,
+    symbol: str,
+    strategy: str,
+) -> bool:
+    """Execute ready daemon evidence without waiting for an external analyst.
+
+    This path is reachable only when configuration keeps the paper-only
+    interlock enabled. ``execute_pick`` independently repeats all broker,
+    quote, liquidity, sizing, margin, concentration, and market-hours gates.
+    """
+    if context.order_client is None or not _trusted_candidate_ready(context, score_id):
+        log.info(
+            "auto-execute hold %s/%s score_id=%s: trusted evidence not ready",
+            symbol,
+            strategy,
+            score_id,
+        )
+        return False
+    try:
+        from optionsbot.execution import engine as execution_engine
+
+        walk_md = (
+            MarketDataClient(context.exec_ibkr, context.resolver)
+            if context.exec_ibkr is not None
+            else None
+        )
+        deps = execution_engine.ExecutionDeps(
+            engine=context.engine,
+            settings=context.settings,
+            order_client=context.order_client,
+            md=MarketDataClient(context.ibkr, context.resolver),
+            positions=PositionsClient(context.ibkr),
+            ibkr_lock=context.ibkr_lock,
+            walk_md=walk_md,
+            walk_tasks=context.walk_tasks,
+        )
+        async with context.hermes_overlay_lock:
+            outcome = await execution_engine.execute_pick(deps, score_id)
+        log.info(
+            "auto-execute trusted-paper %s/%s score_id=%s -> ok=%s | %s",
+            symbol,
+            strategy,
+            score_id,
+            outcome.ok,
+            outcome.message.replace("\n", " "),
+        )
+        await _send(
+            context,
+            f"🤖 auto-execute {symbol} {strategy}:\n{outcome.message}",
+        )
+        return bool(outcome.ok)
+    except Exception as exc:  # noqa: BLE001 -- broker side effects may be uncertain
+        reason = (
+            f"automatic paper entry score #{score_id} raised during execution; "
+            "broker side effects are uncertain"
+        )
+        trip_kill(context.engine, reason)
+        log.exception("trusted-paper auto-execution failed for score %s", score_id)
+        await _send(context, f"🚨 {reason}; execution halted ({exc})")
+        return False
+
+
 def _trip_review_state_race(context: DaemonContext, review_id: int) -> str:
     reason = f"entry review #{review_id} changed state during execution handoff"
     trip_kill(context.engine, reason)
@@ -444,10 +536,12 @@ async def auto_execute_candidates(
     """Execute only alerted candidates with an exact requested Hermes review."""
     if context.settings.execution.mode != "auto" or context.order_client is None:
         return 0
-    overlay = load_overlay_state(context.engine)
-    if not overlay.enabled:
-        hold_pending_reviews(context.engine, overlay)
-        return 0
+    require_review = context.settings.execution.require_hermes_entry_review
+    if require_review:
+        overlay = load_overlay_state(context.engine)
+        if not overlay.enabled:
+            hold_pending_reviews(context.engine, overlay)
+            return 0
     submitted = 0
     log.info("auto-execute pass: %d candidate(s)", len(candidates))
     for symbol, scored, snapshot_id in candidates:
@@ -460,7 +554,8 @@ async def auto_execute_candidates(
                 snapshot_id,
             )
             continue
-        if await _execute_reviewed_score(
+        execute = _execute_reviewed_score if require_review else _execute_trusted_paper_score
+        if await execute(
             context,
             score_id=score_id,
             symbol=symbol,
@@ -472,7 +567,11 @@ async def auto_execute_candidates(
 
 async def run_entry_reviews_tick(context: DaemonContext) -> int:
     """Consume delayed Hermes reviews through the normal auto-execution path."""
-    if context.settings.execution.mode != "auto" or context.order_client is None:
+    if (
+        context.settings.execution.mode != "auto"
+        or context.order_client is None
+        or not context.settings.execution.require_hermes_entry_review
+    ):
         return 0
     overlay = load_overlay_state(context.engine)
     if not overlay.enabled:
