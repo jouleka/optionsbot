@@ -35,6 +35,7 @@ from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
 from optionsbot.strategies import Leg, StrategySnapshot
+from optionsbot.strategies.strikes import closest_expiry_to_dte
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,23 @@ async def scan_symbol(
     if hv20 is not None and math.isnan(hv20):
         hv20 = None
     now = datetime.now(UTC)
+    front_expiry = closest_expiry_to_dte(
+        tuple(chain), settings.scan.dte_target, today=now.date()
+    )
+    front_dte = (
+        (datetime.strptime(front_expiry, "%Y%m%d").date() - now.date()).days
+        if front_expiry is not None
+        else None
+    )
+    expected_move = (
+        spot * atm_iv * math.sqrt(front_dte / 365.0)
+        if atm_iv is not None
+        and atm_iv > 0.0
+        and spot > 0.0
+        and front_dte is not None
+        and front_dte > 0
+        else None
+    )
     if atm_iv is not None:
         # Record today's ATM IV (keyed by UTC date; latest scan of the day
         # wins -- US sessions don't cross UTC midnight), then read the trailing
@@ -253,6 +271,9 @@ async def scan_symbol(
         "iv_rank_is_proxy": view.iv_rank_is_proxy,
         "earnings_in_window": view.earnings_in_window,
         "relative_strength": relative_strength_value,
+        "front_expiry": front_expiry,
+        "front_dte": front_dte,
+        "expected_move": expected_move,
     }
     with engine.begin() as conn:
         result = conn.execute(
@@ -263,7 +284,7 @@ async def scan_symbol(
                 iv_rank=view.iv_rank_value,
                 hv20=hv20,
                 iv_hv_ratio=ratio,
-                expected_move=None,
+                expected_move=expected_move,
                 regime_dir=view.direction,
                 regime_iv=view.iv_regime,
                 raw_json=raw_extra,

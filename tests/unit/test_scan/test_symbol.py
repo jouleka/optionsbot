@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
+import pytest
 from sqlalchemy import select
 
 from optionsbot.scan import ScanResult, scan_symbol
@@ -33,6 +35,11 @@ async def test_scan_symbol_persists_snapshot(
     assert len(rows) == 1
     assert rows[0].symbol == "SPY"
     assert rows[0].spot == 400.0
+    assert rows[0].expected_move == pytest.approx(
+        400.0 * 0.20 * math.sqrt(45 / 365.0)
+    )
+    assert rows[0].raw_json["front_dte"] == 45
+    assert rows[0].raw_json["expected_move"] == pytest.approx(rows[0].expected_move)
 
 
 async def test_scan_symbol_persists_strategy_scores(
