@@ -194,6 +194,10 @@ class ExecutionSettings(BaseModel):
     # Auto mode normally avoids binary earnings risk. Paper discovery may opt
     # into it while all defined-risk and account caps stay authoritative.
     auto_skip_earnings: bool = True
+    # IBKR paper what-if occasionally omits initMarginChange for a BAG. A
+    # paper profile may reserve the independently reconstructed full max loss
+    # instead; live-capable profiles must keep broker margin authoritative.
+    allow_structural_margin_fallback: bool = False
     # Portfolio caps consumed by the entry gates (IBK-126/130).
     max_open_positions: int = Field(default=6, ge=1)
     max_per_symbol: int = Field(default=1, ge=1)
@@ -281,6 +285,11 @@ class ExecutionSettings(BaseModel):
             raise ValueError(
                 "execution.auto_skip_earnings may be disabled only while "
                 "execution.paper_only is true"
+            )
+        if self.allow_structural_margin_fallback and not self.paper_only:
+            raise ValueError(
+                "execution.allow_structural_margin_fallback requires "
+                "execution.paper_only=true"
             )
         # Phase 0 hard ceilings: reject a config that lifts the risk caps
         # past what is safe to run unattended 24/7. These are absolute

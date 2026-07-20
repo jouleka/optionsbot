@@ -20,6 +20,7 @@ from optionsbot.execution.orders import (
     total_commissions,
     transition,
 )
+from optionsbot.ibkr.types import MarginPreview
 from optionsbot.storage.schema import fills, orders
 from optionsbot.validation.execution_report import execution_report
 from tests.unit.test_execution.test_engine import (
@@ -73,6 +74,28 @@ async def test_auto_paper_profile_can_trade_defined_risk_through_earnings(
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
 
     assert outcome.ok, outcome.message
+
+
+async def test_paper_profile_uses_structural_max_loss_when_whatif_margin_missing(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+    deps.settings.execution.allow_structural_margin_fallback = True
+    deps.order_client.whatif_combo.return_value = MarginPreview(
+        init_margin_change=None,
+        maint_margin_change=None,
+        equity_with_loan_change=None,
+        commission=None,
+        max_commission=None,
+        warning="paper BAG omitted margin",
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
+    assert "structural max loss" in outcome.message.lower()
 
 
 @pytest.mark.parametrize("quality_flag", ["delayed", "warming_up"])

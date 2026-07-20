@@ -427,13 +427,23 @@ async def execute_pick(
                     f"{settings.execution.max_bp_usage_pct * 100:.0f}% auto-mode cap"
                 )
     needed = preview.init_margin_change
-    if needed is None or available is None:
+    if available is None:
         # IBK-122 fail-closed: never place blind. If IBKR gives no init-margin
         # or no available-funds figure, reject rather than skip the money gate.
         return _reject(
             "margin preview incomplete (init-margin or available funds unknown) "
             "— refusing to place blind"
         )
+    structural_margin_fallback = False
+    if needed is None:
+        if settings.execution.allow_structural_margin_fallback:
+            needed = max_loss_unit * quantity
+            structural_margin_fallback = True
+        else:
+            return _reject(
+                "margin preview incomplete (init-margin or available funds unknown) "
+                "— refusing to place blind"
+            )
     if not math.isfinite(needed) or not math.isfinite(available):
         return _reject(
             "margin preview invalid (init-margin or available funds non-finite) "
@@ -444,6 +454,8 @@ async def execute_pick(
             f"margin Δ ${needed:,.0f} exceeds available funds ${available:,.0f}"
         )
     margin_note = f"margin Δ ${needed:,.0f}"
+    if structural_margin_fallback:
+        margin_note += " (paper fallback: full structural max loss)"
     if preview.warning:
         margin_note += f" ({preview.warning})"
 
