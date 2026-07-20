@@ -54,6 +54,27 @@ async def test_auto_mode_rejects_earnings_window(tmp_db: Engine) -> None:
     assert "earnings" in outcome.message.lower()
 
 
+async def test_auto_paper_profile_can_trade_defined_risk_through_earnings(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={
+            "delayed": False,
+            "warming_up": False,
+            "earnings_in_window": True,
+        },
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+    deps.settings.execution.auto_skip_earnings = False
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
+
+
 @pytest.mark.parametrize("quality_flag", ["delayed", "warming_up"])
 async def test_auto_mode_rejects_unready_snapshot(
     tmp_db: Engine,

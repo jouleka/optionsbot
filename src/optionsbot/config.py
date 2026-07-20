@@ -191,6 +191,9 @@ class ExecutionSettings(BaseModel):
     # execute a trusted ready evidence packet directly; disabling the review
     # is forbidden unless the paper-only interlock remains enabled.
     require_hermes_entry_review: bool = True
+    # Auto mode normally avoids binary earnings risk. Paper discovery may opt
+    # into it while all defined-risk and account caps stay authoritative.
+    auto_skip_earnings: bool = True
     # Portfolio caps consumed by the entry gates (IBK-126/130).
     max_open_positions: int = Field(default=6, ge=1)
     max_per_symbol: int = Field(default=1, ge=1)
@@ -273,6 +276,11 @@ class ExecutionSettings(BaseModel):
             raise ValueError(
                 "execution.require_hermes_entry_review may be disabled only "
                 "while execution.paper_only is true"
+            )
+        if not self.auto_skip_earnings and not self.paper_only:
+            raise ValueError(
+                "execution.auto_skip_earnings may be disabled only while "
+                "execution.paper_only is true"
             )
         # Phase 0 hard ceilings: reject a config that lifts the risk caps
         # past what is safe to run unattended 24/7. These are absolute

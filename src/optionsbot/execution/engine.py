@@ -201,7 +201,10 @@ async def execute_pick(
                 "snapshot data not explicitly live and ready — auto mode requires "
                 "delayed=false; warming up requires an explicit HV-rank proxy"
             )
-        if snapshot_raw.get("earnings_in_window"):
+        if (
+            settings.execution.auto_skip_earnings
+            and snapshot_raw.get("earnings_in_window")
+        ):
             return _reject(
                 "earnings inside the expiry window — auto mode skips "
                 "(use /execute to override deliberately)"
