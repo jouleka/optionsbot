@@ -51,7 +51,7 @@ def _add_judgeable(
                         strategy=strategy,
                         score=80.0,
                         legs_json=[],
-                        suggestion_json={},
+                        suggestion_json={"review_evidence": {"ready": True}},
                     )
                 ).inserted_primary_key[0]
             )

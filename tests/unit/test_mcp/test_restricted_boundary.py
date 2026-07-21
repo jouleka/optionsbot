@@ -83,7 +83,7 @@ def test_hermes_metrics_uses_only_judgeable_calls_and_reports_churn(
                         strategy=strategy,
                         score=80.0,
                         legs_json=[],
-                        suggestion_json={},
+                        suggestion_json={"review_evidence": {"ready": True}},
                     )
                 ).inserted_primary_key[0]
             )

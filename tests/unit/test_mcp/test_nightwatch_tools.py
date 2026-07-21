@@ -161,6 +161,7 @@ def test_pending_picks_returns_grounded_pre_trade_packet(server_context: ServerC
     assert pick["market"]["relative_strength"] == 0.03
     assert pick["review_evidence"]["source"] == "trusted_daemon"
     assert "news/catalyst corroboration" in result["rubric"]["must_check"]
+    assert result["learning_feedback"]["review_calls"] == 0
 
 
 def test_pending_picks_omits_unalerted_scores(server_context: ServerContext) -> None:

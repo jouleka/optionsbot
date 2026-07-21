@@ -11,12 +11,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Engine, insert, select, update
+from sqlalchemy import Engine, case, func, insert, select, update
 
 from optionsbot.storage.schema import (
     entry_reviews,
+    fills,
     hermes_overlay_state,
+    orders,
     pick_outcomes,
+    snapshots,
+    strategy_scores,
 )
 
 MIN_JUDGEABLE = 20
@@ -33,23 +37,208 @@ class HermesOverlayState:
     accuracy: float | None
 
 
-def correctness_report(engine: Engine) -> dict[str, Any]:
-    """Return the single canonical correctness calculation."""
+def _review_outcome_rows(engine: Engine) -> list[Any]:
+    first_orders = (
+        select(
+            orders.c.strategy_score_id,
+            func.min(orders.c.staged_ts).label("first_order_ts"),
+        )
+        .where(orders.c.intent == "open")
+        .where(orders.c.strategy_score_id.is_not(None))
+        .group_by(orders.c.strategy_score_id)
+        .subquery()
+    )
+    with engine.connect() as conn:
+        return list(
+            conn.execute(
+                select(
+                    entry_reviews.c.id.label("review_id"),
+                    entry_reviews.c.strategy_score_id,
+                    entry_reviews.c.verdict,
+                    entry_reviews.c.status,
+                    entry_reviews.c.reason,
+                    entry_reviews.c.reviewed_at,
+                    strategy_scores.c.strategy,
+                    strategy_scores.c.score,
+                    strategy_scores.c.legs_json,
+                    strategy_scores.c.suggestion_json,
+                    snapshots.c.symbol,
+                    first_orders.c.first_order_ts,
+                    pick_outcomes.c.expiry,
+                    pick_outcomes.c.terminal_spot,
+                    pick_outcomes.c.realized_pnl,
+                    pick_outcomes.c.win,
+                    pick_outcomes.c.evaluated_at,
+                )
+                .select_from(
+                    entry_reviews.join(
+                        strategy_scores,
+                        entry_reviews.c.strategy_score_id == strategy_scores.c.id,
+                    )
+                    .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+                    .outerjoin(
+                        first_orders,
+                        entry_reviews.c.strategy_score_id
+                        == first_orders.c.strategy_score_id,
+                    )
+                    .outerjoin(
+                        pick_outcomes,
+                        entry_reviews.c.strategy_score_id
+                        == pick_outcomes.c.strategy_score_id,
+                    )
+                )
+                .order_by(entry_reviews.c.reviewed_at.desc())
+            ).fetchall()
+        )
+
+
+def _review_context(row: Any) -> tuple[bool, bool, str]:
+    suggestion = row.suggestion_json if isinstance(row.suggestion_json, dict) else {}
+    evidence = suggestion.get("review_evidence")
+    evidence_ready = isinstance(evidence, dict) and evidence.get("ready") is True
+    post_trade = (
+        row.first_order_ts is not None
+        and row.reviewed_at is not None
+        and row.first_order_ts <= row.reviewed_at
+    )
+    if post_trade:
+        return evidence_ready, True, "post_trade_observation"
+    if not evidence_ready:
+        return False, False, "operational_guard"
+    return True, False, "pre_trade_forecast"
+
+
+def _actual_round_trip_pnl(engine: Engine) -> dict[int, float]:
+    """Completed fill cashflows by originating score, commissions included."""
+    fill_cash = (
+        select(
+            fills.c.order_id,
+            func.sum(
+                case(
+                    (fills.c.side == "SELL", fills.c.price * fills.c.qty * 100.0),
+                    else_=-(fills.c.price * fills.c.qty * 100.0),
+                )
+                - func.coalesce(fills.c.commission, 0.0)
+            ).label("cash"),
+        )
+        .group_by(fills.c.order_id)
+        .having(func.count() == func.count(fills.c.commission))
+        .subquery()
+    )
+    entries = orders.alias("learning_entries")
+    closes = orders.alias("learning_closes")
+    entry_cash = fill_cash.alias("learning_entry_cash")
+    close_cash = fill_cash.alias("learning_close_cash")
     with engine.connect() as conn:
         rows = conn.execute(
             select(
-                entry_reviews.c.verdict,
-                entry_reviews.c.status,
-                entry_reviews.c.reviewed_at,
-                pick_outcomes.c.win,
-                pick_outcomes.c.evaluated_at,
-            ).select_from(
-                entry_reviews.outerjoin(
-                    pick_outcomes,
-                    entry_reviews.c.strategy_score_id == pick_outcomes.c.strategy_score_id,
-                )
+                entries.c.strategy_score_id,
+                (entry_cash.c.cash + close_cash.c.cash).label("actual_pnl"),
             )
+            .select_from(
+                entries.join(
+                    closes,
+                    closes.c.closes_order_id == entries.c.id,
+                )
+                .join(entry_cash, entry_cash.c.order_id == entries.c.id)
+                .join(close_cash, close_cash.c.order_id == closes.c.id)
+            )
+            .where(entries.c.intent == "open")
+            .where(entries.c.status == "filled")
+            .where(closes.c.intent == "close")
+            .where(closes.c.status == "filled")
+            .where(entries.c.strategy_score_id.is_not(None))
         ).fetchall()
+    return {
+        int(row.strategy_score_id): float(row.actual_pnl)
+        for row in rows
+        if row.actual_pnl is not None
+    }
+
+
+def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, Any]:
+    """Counterfactual lessons fed back to every new Hermes review pass.
+
+    A theoretical expiry winner is useful evidence about a forecast, but does
+    not invalidate a refusal caused by stale quotes or untradeable spreads.
+    Those operational guards and reviews made after an order already existed
+    are therefore reported separately from forecast accuracy.
+    """
+    rows = _review_outcome_rows(engine)
+    actual_pnl = _actual_round_trip_pnl(engine)
+    evaluated = [row for row in rows if row.win is not None]
+    lessons: list[dict[str, Any]] = []
+    mistakes = guarded_winners = 0
+    forecast_judgeable = forecast_useful = 0
+    for row in evaluated:
+        evidence_ready, post_trade, context = _review_context(row)
+        approved = row.verdict == "vetted_paper_candidate"
+        filled_pnl = actual_pnl.get(int(row.strategy_score_id)) if approved else None
+        observed_pnl = filled_pnl if filled_pnl is not None else float(row.realized_pnl)
+        won = observed_pnl > 0.0
+        outcome_basis = (
+            "actual_filled_round_trip"
+            if filled_pnl is not None
+            else "expiry_close_counterfactual"
+        )
+        useful: bool | None = None
+        lesson = "not_forecast_judgeable"
+        if context == "pre_trade_forecast":
+            forecast_judgeable += 1
+            useful = won == approved
+            forecast_useful += int(useful)
+            if not useful:
+                mistakes += 1
+                lesson = "missed_winner" if won else "approved_loser"
+            else:
+                lesson = "correct_approval" if approved else "correct_rejection"
+        elif context == "operational_guard" and won:
+            guarded_winners += 1
+            lesson = "theoretical_winner_but_execution_guard_was_not_overruled"
+        lessons.append(
+            {
+                "review_id": int(row.review_id),
+                "pick_id": int(row.strategy_score_id),
+                "symbol": row.symbol,
+                "strategy": row.strategy,
+                "score": float(row.score),
+                "verdict": row.verdict,
+                "review_context": context,
+                "evidence_ready": evidence_ready,
+                "post_trade": post_trade,
+                "expiry": row.expiry,
+                "theoretical_win": bool(row.win),
+                "theoretical_pnl": float(row.realized_pnl),
+                "actual_trade_pnl": filled_pnl,
+                "outcome_basis": outcome_basis,
+                "observed_win": won,
+                "observed_pnl": observed_pnl,
+                "forecast_useful": useful,
+                "lesson": lesson,
+                "review_reason": row.reason,
+            }
+        )
+    return {
+        "meaning": (
+            "Expiry-close counterfactuals, not actual fill P&L. Learn forecast "
+            "mistakes; never waive stale-quote, liquidity, or risk guards."
+        ),
+        "review_calls": len(rows),
+        "outcomes_available": len(evaluated),
+        "forecast_judgeable": forecast_judgeable,
+        "forecast_useful": forecast_useful,
+        "forecast_accuracy": (
+            forecast_useful / forecast_judgeable if forecast_judgeable else None
+        ),
+        "forecast_mistakes": mistakes,
+        "guarded_theoretical_winners": guarded_winners,
+        "recent_lessons": lessons[: max(1, min(recent_limit, 100))],
+    }
+
+
+def correctness_report(engine: Engine) -> dict[str, Any]:
+    """Return the single canonical correctness calculation."""
+    rows = _review_outcome_rows(engine)
 
     verdicts = ("no_trade", "vetted_paper_candidate", "watch_only")
     by_verdict: dict[str, dict[str, int | float | None]] = {}
@@ -57,7 +246,11 @@ def correctness_report(engine: Engine) -> dict[str, Any]:
     useful = 0
     for verdict in verdicts:
         matching = [row for row in rows if row.verdict == verdict]
-        judged = [row for row in matching if row.win is not None]
+        judged = [
+            row
+            for row in matching
+            if row.win is not None and _review_context(row)[2] == "pre_trade_forecast"
+        ]
         verdict_useful = sum(
             1 for row in judged if bool(row.win) == (verdict == "vetted_paper_candidate")
         )

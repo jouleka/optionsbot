@@ -23,7 +23,11 @@ from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
 from optionsbot.config import Settings
-from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.daemon.market_hours import (
+    is_market_open,
+    minutes_to_nyse_close,
+    nyse_session_date,
+)
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
     record_order_quotes,
@@ -221,6 +225,31 @@ async def execute_pick(
     # 5. Market hours.
     if not is_market_open(ts_now):
         return _reject("market is closed — orders would rest blind on stale quotes")
+
+    # Exact-0DTE mode is an execution invariant, not just a scanner preference:
+    # stale database picks and future-expiry legs cannot slip through it.
+    if settings.execution.zero_dte_only:
+        expiry_strings = {
+            str(leg.get("expiry"))
+            for leg in legs
+            if leg.get("sec_type", "OPT") == "OPT"
+        }
+        session_expiry = nyse_session_date(ts_now).strftime("%Y%m%d")
+        if not expiry_strings or expiry_strings != {session_expiry}:
+            return _reject(
+                "0DTE-only mode: every option leg must expire in today's NYSE session"
+            )
+        minutes_left = minutes_to_nyse_close(ts_now)
+        if (
+            minutes_left is None
+            or minutes_left <= settings.execution.zero_dte_entry_cutoff_minutes
+        ):
+            remaining = "unknown" if minutes_left is None else f"{minutes_left:.0f}m"
+            return _reject(
+                "0DTE entry cutoff: "
+                f"{remaining} to close (requires more than "
+                f"{settings.execution.zero_dte_entry_cutoff_minutes}m)"
+            )
 
     # 6. One active order per pick.
     with engine.connect() as conn:

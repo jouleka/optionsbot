@@ -25,15 +25,27 @@ def evaluate_exit(
     current_net: float | None,
     dte: int,
     settings: Settings,
+    minutes_to_close: float | None = None,
 ) -> str | None:
     """Return a human-readable close reason, or None to keep holding."""
     execution = settings.execution
     manage = settings.manage
 
+    # In explicit exact-0DTE mode, don't let the generic 3-DTE guard close a
+    # newly filled same-day position immediately. Hold through the session,
+    # while preserving take-profit/stop checks, then flatten before expiry.
+    zero_dte_session = execution.zero_dte_only and dte == 0
+    if zero_dte_session and (
+        minutes_to_close is None
+        or minutes_to_close <= execution.zero_dte_force_exit_minutes
+    ):
+        remaining = "unknown" if minutes_to_close is None else f"{minutes_to_close:.0f}m"
+        return f"0DTE close guard ({remaining} to close)"
+
     # The expiry guard is unconditional — assignment/pin risk dwarfs any
     # remaining theta. Checked before the quote-dependent rules so a missing
     # quote can never block the force-close path in the runner.
-    if dte <= execution.expiry_guard_dte:
+    if not zero_dte_session and dte <= execution.expiry_guard_dte:
         return f"expiry guard ({dte} DTE)"
 
     if current_net is None:
@@ -54,6 +66,6 @@ def evaluate_exit(
         if execution.exit_stop_enabled and pnl <= -(manage.debit_stop_pct * basis):
             return f"soft stop (-{abs(pnl) / basis * 100:.0f}% of debit)"
 
-    if dte <= manage.manage_dte:
+    if not zero_dte_session and dte <= manage.manage_dte:
         return f"time exit ({dte} DTE)"
     return None

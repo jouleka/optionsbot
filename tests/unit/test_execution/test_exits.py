@@ -97,6 +97,25 @@ def test_current_net_none_holds() -> None:
     assert evaluate_exit(entry_net=1.20, current_net=None, dte=30, settings=_settings()) is None
 
 
+def test_zero_dte_mode_holds_until_dedicated_close_guard() -> None:
+    settings = _settings(zero_dte_only=True)
+    assert evaluate_exit(
+        entry_net=1.20,
+        current_net=1.10,
+        dte=0,
+        settings=settings,
+        minutes_to_close=60,
+    ) is None
+    reason = evaluate_exit(
+        entry_net=1.20,
+        current_net=None,
+        dte=0,
+        settings=settings,
+        minutes_to_close=30,
+    )
+    assert reason is not None and "0DTE" in reason
+
+
 # --- stage_close_order ----------------------------------------------------------------
 
 

@@ -45,3 +45,20 @@ def test_estimate_prob_profit_none_without_iv() -> None:
     exp = _expiry(30)
     legs = (Leg(symbol="SPY", side="buy", sec_type="OPT", expiry=exp, strike=100.0, right="C"),)
     assert IronCondor().estimate_prob_profit(legs, _snapshot(atm_iv=None)) is None
+
+
+def test_same_day_horizon_does_not_round_zero_dte_to_zero() -> None:
+    snap = _snapshot(atm_iv=0.20)
+    snap = StrategySnapshot(
+        symbol=snap.symbol,
+        spot=snap.spot,
+        atm_iv=snap.atm_iv,
+        hv20=snap.hv20,
+        iv_rank=snap.iv_rank,
+        chain=snap.chain,
+        view=snap.view,
+        dte_target=0,
+        same_day_time_to_expiry_days=2.0 / 24.0,
+    )
+    exp = datetime.now(UTC).strftime("%Y%m%d")
+    assert IronCondor._expiry_horizon_days(exp, snap) == 2.0 / 24.0

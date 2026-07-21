@@ -187,6 +187,12 @@ class ExecutionSettings(BaseModel):
     # 7497 TWS). Flipping this off is a deliberate live-trading decision and
     # out of scope for the paper epic.
     paper_only: bool = True
+    # Exact same-session expiry mode. When enabled the execution gate rejects
+    # every non-0DTE option structure, stops opening before the close, and
+    # forces remaining positions flat before expiry/assignment risk spikes.
+    zero_dte_only: bool = False
+    zero_dte_entry_cutoff_minutes: int = Field(default=90, ge=30, le=240)
+    zero_dte_force_exit_minutes: int = Field(default=30, ge=10, le=120)
     # Optional analyst overlay for entries. Production paper discovery may
     # execute a trusted ready evidence packet directly; disabling the review
     # is forbidden unless the paper-only interlock remains enabled.
@@ -276,6 +282,13 @@ class ExecutionSettings(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_phase0_ceilings(self) -> ExecutionSettings:
+        if self.zero_dte_only and not self.paper_only:
+            raise ValueError("execution.zero_dte_only requires execution.paper_only=true")
+        if self.zero_dte_force_exit_minutes >= self.zero_dte_entry_cutoff_minutes:
+            raise ValueError(
+                "execution.zero_dte_force_exit_minutes must be less than "
+                "execution.zero_dte_entry_cutoff_minutes"
+            )
         if not self.require_hermes_entry_review and not self.paper_only:
             raise ValueError(
                 "execution.require_hermes_entry_review may be disabled only "

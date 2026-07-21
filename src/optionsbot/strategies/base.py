@@ -63,6 +63,11 @@ class StrategySnapshot:
     view: MarketView
     dte_target: int = 45
     position: PositionRecord | None = None  # used by Covered Call eligibility
+    # Exact-0DTE contracts still have hours of distributional variance before
+    # the close. Calendar-day arithmetic rounds that horizon to zero and used
+    # to make PoP/EV unavailable, which in turn made every 0DTE pick
+    # unexecutable. The scanner supplies the remaining session fraction here.
+    same_day_time_to_expiry_days: float | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,15 @@ class Strategy(ABC):
     # earnings_penalty, range_bound. Must sum to 1.0.
     factor_weights: ClassVar[dict[str, float]]
 
+    @staticmethod
+    def _expiry_horizon_days(expiry: str, snapshot: StrategySnapshot) -> float:
+        calendar_days = (
+            datetime.strptime(expiry, "%Y%m%d").date() - date.today()
+        ).days
+        if calendar_days == 0 and snapshot.same_day_time_to_expiry_days is not None:
+            return max(0.0, snapshot.same_day_time_to_expiry_days)
+        return float(calendar_days)
+
     def is_applicable(self, view: MarketView) -> bool:
         return (view.direction, view.iv_regime) in self.applicable_views
 
@@ -156,14 +170,14 @@ class Strategy(ABC):
             return None
         expiry = legs[0].expiry
         assert expiry is not None  # guaranteed by is_terminal_modelable
-        dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
+        dte_days = self._expiry_horizon_days(expiry, snapshot)
         credit = self.estimate_credit(legs, snapshot)
         smile = build_smile(snapshot.chain, expiry, snapshot.spot)
         if smile is not None:
-            pop = prob_of_profit_smile(legs, credit, snapshot.spot, smile, float(dte_days))
+            pop = prob_of_profit_smile(legs, credit, snapshot.spot, smile, dte_days)
             if pop is not None:
                 return pop
-        return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, float(dte_days))
+        return prob_of_profit(legs, credit, snapshot.spot, snapshot.atm_iv, dte_days)
 
     def estimate_expected_value(
         self, legs: tuple[Leg, ...], snapshot: StrategySnapshot
@@ -183,17 +197,17 @@ class Strategy(ABC):
             return None
         expiry = legs[0].expiry
         assert expiry is not None  # guaranteed by is_terminal_modelable
-        dte_days = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
+        dte_days = self._expiry_horizon_days(expiry, snapshot)
         credit = self.estimate_credit(legs, snapshot)
         smile = build_smile(snapshot.chain, expiry, snapshot.spot)
         if smile is not None:
             ev = expected_value_smile(
-                legs, credit, snapshot.spot, smile, snapshot.hv20, float(dte_days)
+                legs, credit, snapshot.spot, smile, snapshot.hv20, dte_days
             )
             if ev is not None:
                 return ev
         return expected_value_dollars(
-            legs, credit, snapshot.spot, snapshot.hv20, float(dte_days)
+            legs, credit, snapshot.spot, snapshot.hv20, dte_days
         )
 
     def suggest_size(

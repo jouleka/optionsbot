@@ -145,7 +145,16 @@ def make_close_fetcher(
 
     async def fetch_close_at(symbol: str, expiry: str) -> float | None:
         exp = datetime.strptime(expiry, "%Y%m%d").date()
-        df = await history.get_history(symbol, days=400)
+        # Use an expiry-specific cache key. The scanner may have cached today's
+        # still-forming daily bar before the close; reusing that file would
+        # falsely judge 0DTE picks against an intraday price. The next-day key
+        # is first created by the post-close outcome pass and then remains
+        # stable for retries.
+        df = await history.get_history(
+            symbol,
+            days=400,
+            end_date=exp + timedelta(days=1),
+        )
         by_date = {
             (d.date() if hasattr(d, "date") else d): float(c)
             for d, c in zip(df.index, df["close"].tolist(), strict=False)

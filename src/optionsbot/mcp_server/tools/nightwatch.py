@@ -18,6 +18,7 @@ from mcp.server.session import ServerSession
 from sqlalchemy import desc, insert, select
 from sqlalchemy.exc import IntegrityError
 
+from optionsbot.hermes_overlay import learning_feedback
 from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.intent_queue import enqueue_intent
 from optionsbot.mcp_server.serialization import iso_utc
@@ -249,6 +250,7 @@ def register(server: FastMCP) -> None:
             "count": len(picks),
             "picks": picks,
             "rubric": RUBRIC,
+            "learning_feedback": learning_feedback(lifespan.engine),
         }
 
     @server.tool()

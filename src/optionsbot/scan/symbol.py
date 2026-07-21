@@ -29,6 +29,7 @@ from optionsbot.ibkr import (
 )
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg
+from optionsbot.market_hours import minutes_to_nyse_close
 from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import score_all
 from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
@@ -145,7 +146,13 @@ async def scan_symbol(
             max_strikes_per_side=settings.scan.max_strikes_per_side,
             dte_window=(settings.scan.dte_window_min, settings.scan.dte_window_max),
             dte_target=settings.scan.dte_target,
-            back_dte_gap=settings.scan.back_month_dte_gap,
+            # Exact-0DTE mode must not spend quote lines or alert slots on a
+            # back-month calendar that the execution invariant will reject.
+            back_dte_gap=(
+                None
+                if settings.execution.zero_dte_only
+                else settings.scan.back_month_dte_gap
+            ),
         ),
         positions_client.get_positions(),
         positions_client.get_account_summary(),
@@ -169,13 +176,21 @@ async def scan_symbol(
         if front_expiry is not None
         else None
     )
+    minutes_left = minutes_to_nyse_close(now)
+    expiry_horizon_days = (
+        front_dte
+        if front_dte is not None and front_dte > 0
+        else max(0.0, minutes_left / (24.0 * 60.0))
+        if front_dte == 0 and minutes_left is not None
+        else None
+    )
     expected_move = (
-        spot * atm_iv * math.sqrt(front_dte / 365.0)
+        spot * atm_iv * math.sqrt(expiry_horizon_days / 365.0)
         if atm_iv is not None
         and atm_iv > 0.0
         and spot > 0.0
-        and front_dte is not None
-        and front_dte > 0
+        and expiry_horizon_days is not None
+        and expiry_horizon_days > 0
         else None
     )
     if atm_iv is not None:
@@ -217,6 +232,9 @@ async def scan_symbol(
         view=view,
         dte_target=settings.scan.dte_target,
         position=sym_position,
+        same_day_time_to_expiry_days=(
+            expiry_horizon_days if front_dte == 0 else None
+        ),
     )
 
     account_value = (

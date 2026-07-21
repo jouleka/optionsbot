@@ -20,6 +20,7 @@ from sqlalchemy import Engine, select, update
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.market_hours import (
     is_market_open,
+    minutes_to_nyse_close,
     nyse_session_date,
     nyse_session_start_utc,
 )
@@ -314,6 +315,7 @@ async def _quote_gate_state(
             current_net=current_net,
             dte=dte,
             settings=context.settings,
+            minutes_to_close=minutes_to_nyse_close(now),
         )
     return QuoteGateState(
         entry_net=entry_net,
@@ -682,6 +684,7 @@ async def _manage_entry(
             current_net=current_net,
             dte=dte,
             settings=context.settings,
+            minutes_to_close=minutes_to_nyse_close(now),
         )
     if reason is None:
         return 0

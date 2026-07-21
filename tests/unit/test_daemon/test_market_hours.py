@@ -61,6 +61,13 @@ def test_market_closed_on_early_close_after_1pm_et() -> None:
     assert not is_market_open(datetime(2026, 11, 27, 14, 0, tzinfo=ET))
 
 
+def test_minutes_to_close_uses_regular_and_half_day_schedule() -> None:
+    from optionsbot.daemon.market_hours import minutes_to_nyse_close
+
+    assert minutes_to_nyse_close(datetime(2026, 5, 27, 15, 0, tzinfo=ET)) == 60.0
+    assert minutes_to_nyse_close(datetime(2026, 11, 27, 12, 0, tzinfo=ET)) == 60.0
+
+
 def test_nyse_session_date_uses_et_not_utc() -> None:
     from datetime import UTC, date
 
