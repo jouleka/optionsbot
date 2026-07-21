@@ -154,6 +154,10 @@ def make_close_fetcher(
             symbol,
             days=400,
             end_date=exp + timedelta(days=1),
+            # IBKR rejects day-based durations greater than 365 days.  Keep
+            # enough rows for older recorded picks while expressing the
+            # broker request in its supported year form.
+            duration_str="2 Y",
         )
         by_date = {
             (d.date() if hasattr(d, "date") else d): float(c)

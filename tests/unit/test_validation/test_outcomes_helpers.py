@@ -18,6 +18,12 @@ async def test_make_close_fetcher_finds_close_on_or_before_expiry() -> None:
     assert await fetch("SPY", "20260617") == 12.0
     # expiry on a non-trading day (Sat 2026-06-20) -> backscan to 2026-06-17
     assert await fetch("SPY", "20260620") == 12.0
+    history.get_history.assert_awaited_with(
+        "SPY",
+        days=400,
+        end_date=pd.Timestamp("2026-06-21").date(),
+        duration_str="2 Y",
+    )
 
 
 async def test_make_close_fetcher_none_when_no_data() -> None:
