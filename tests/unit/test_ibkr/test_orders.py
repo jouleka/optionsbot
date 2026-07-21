@@ -437,6 +437,42 @@ def test_status_event_translates(order_client: OrderClient) -> None:
     assert update.avg_fill_price == 1.5
 
 
+def test_status_event_accepts_negative_combo_credit_fill(
+    order_client: OrderClient,
+) -> None:
+    seen: list[OrderStatusUpdate] = []
+    order_client.on_status(seen.append)
+    trade = _make_trade()
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.filled = 1.0
+    trade.orderStatus.remaining = 0.0
+    trade.orderStatus.avgFillPrice = -0.36
+
+    order_client._handle_order_status(trade)  # noqa: SLF001
+
+    [update] = seen
+    assert update.status == "Filled"
+    assert update.avg_fill_price == pytest.approx(-0.36)
+
+
+def test_status_event_rejects_negative_single_leg_fill(
+    order_client: OrderClient,
+) -> None:
+    errors: list[tuple[str, Exception]] = []
+    order_client._callback_error_handler = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda kind, error: errors.append((kind, error))
+    )
+    trade = _make_trade()
+    trade.contract.secType = "OPT"
+    trade.orderStatus.avgFillPrice = -0.36
+
+    order_client._handle_order_status(trade)  # noqa: SLF001
+
+    [(kind, error)] = errors
+    assert kind == "orderStatus"
+    assert isinstance(error, ValueError)
+
+
 def test_malformed_status_event_reports_callback_error_without_raising(
     order_client: OrderClient,
 ) -> None:

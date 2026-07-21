@@ -747,7 +747,9 @@ class OrderClient:
             not isinstance(raw_avg, (int, float))
             or isinstance(raw_avg, bool)
             or not math.isfinite(float(raw_avg))
-            or raw_avg < 0
+            # IBKR reports a combo's net credit as a negative BAG price.
+            # Prices for individual option legs must remain nonnegative.
+            or (raw_avg < 0 and trade.contract.secType != "BAG")
         ):
             raise ValueError("order-status average fill price is malformed")
         avg_fill_price: float | None = None
