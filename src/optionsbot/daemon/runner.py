@@ -432,9 +432,9 @@ class Daemon:
             return
         assert self._context is not None
         try:
-            from optionsbot.daemon.control_intents import consume_control_intents
+            from optionsbot.daemon.control_intents import consume_control_intents_async
 
-            consumed = consume_control_intents(self._context, path)
+            consumed = await consume_control_intents_async(self._context, path)
             if consumed:
                 log.info("restricted MCP intents consumed=%d", consumed)
         except Exception:

@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.hermes_overlay import learning_feedback
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.intent_queue import enqueue_intent
+from optionsbot.mcp_server.intent_queue import control_intents, enqueue_intent
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.risk_structure import has_structurally_defined_option_risk
@@ -61,6 +61,7 @@ REQUIRED_ENTRY_CHECKS = {
     "catalysts",
     "account_risk",
 }
+REQUIRED_PROPOSAL_CHECKS = {"bot_health", "regime_history", "catalysts"}
 ENTRY_VERDICT_STATUS = {
     "vetted_paper_candidate": "requested",
     "watch_only": "held",
@@ -251,6 +252,115 @@ def register(server: FastMCP) -> None:
             "picks": picks,
             "rubric": RUBRIC,
             "learning_feedback": learning_feedback(lifespan.engine),
+        }
+
+    @server.tool()
+    def propose_entry(
+        symbol: str,
+        direction: str,
+        iv_regime: str,
+        strategy: str,
+        confidence: float,
+        sources: list[str],
+        thesis: str,
+        checks: dict[str, bool],
+        ctx: Context[ServerSession, ServerContext],
+    ) -> dict[str, Any]:
+        """Ask OptionsBot to independently scan and gate a Hermes trade idea.
+
+        This never creates an order. It appends a bounded proposal to the
+        unprivileged intent queue; the trusted daemon must reconstruct an exact
+        current candidate and pass every normal paper-execution gate.
+        """
+        lifespan = ctx.request_context.lifespan_context
+        clean_symbol = symbol.strip().upper()
+        clean_direction = direction.strip().lower()
+        clean_iv = iv_regime.strip().lower()
+        clean_strategy = strategy.strip().lower().replace(" ", "_") or "auto"
+        clean_thesis = thesis.strip()
+        if not clean_symbol or not clean_thesis:
+            return {"ok": False, "error": "symbol_and_thesis_required"}
+        if clean_direction not in {"bull", "neutral", "bear"}:
+            return {"ok": False, "error": "direction_must_be_bull_neutral_or_bear"}
+        if clean_iv not in {"high", "neutral", "low"}:
+            return {"ok": False, "error": "iv_regime_must_be_high_neutral_or_low"}
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError, OverflowError):
+            return {"ok": False, "error": "confidence_must_be_finite_0_to_1"}
+        if (
+            not math.isfinite(normalized_confidence)
+            or normalized_confidence < 0.65
+            or normalized_confidence > 1.0
+        ):
+            return {"ok": False, "error": "confidence_below_0_65_or_invalid"}
+        if set(checks) != REQUIRED_PROPOSAL_CHECKS or any(
+            checks.get(name) is not True for name in REQUIRED_PROPOSAL_CHECKS
+        ):
+            return {"ok": False, "error": "all_seven_checks_must_pass"}
+        raw_sources = [str(source).strip() for source in sources if str(source).strip()]
+        clean_sources: list[str] = []
+        seen_sources: set[str] = set()
+        for source in raw_sources:
+            key = source.casefold()
+            if key not in seen_sources:
+                seen_sources.add(key)
+                clean_sources.append(source)
+        if len(clean_sources) < 2:
+            return {"ok": False, "error": "two_distinct_sources_required"}
+        intent_engine = getattr(lifespan, "intent_engine", None)
+        if intent_engine is None:
+            return {"ok": False, "error": "proposal_queue_unavailable"}
+
+        # Keep one thesis from being resubmitted every analyst interval. The
+        # daemon may still decline it; Hermes can propose a materially different
+        # direction/strategy immediately or retry this one after 30 minutes.
+        cutoff = datetime.now(UTC) - timedelta(minutes=30)
+        with intent_engine.connect() as conn:
+            recent = conn.execute(
+                select(control_intents.c.id, control_intents.c.payload_json)
+                .where(control_intents.c.kind == "entry_proposal")
+                .where(control_intents.c.created_at >= cutoff)
+                .order_by(control_intents.c.id.desc())
+                .limit(50)
+            ).fetchall()
+        for row in recent:
+            payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+            if (
+                payload.get("symbol") == clean_symbol
+                and payload.get("direction") == clean_direction
+                and payload.get("strategy") == clean_strategy
+            ):
+                return {
+                    "ok": True,
+                    "already_proposed": True,
+                    "intent_id": int(row.id),
+                    "note": "same symbol/direction/strategy is inside the 30-minute window",
+                }
+        now = datetime.now(UTC)
+        intent_id, intent_uid = enqueue_intent(
+            intent_engine,
+            "entry_proposal",
+            {
+                "proposed_at": now.isoformat(),
+                "symbol": clean_symbol,
+                "direction": clean_direction,
+                "iv_regime": clean_iv,
+                "strategy": clean_strategy,
+                "confidence": normalized_confidence,
+                "sources": clean_sources,
+                "thesis": clean_thesis,
+                "checks": dict(checks),
+            },
+            now=now,
+        )
+        return {
+            "ok": True,
+            "status": "queued_for_optionsbot_validation",
+            "intent_id": intent_id,
+            "intent_uid": intent_uid,
+            "symbol": clean_symbol,
+            "note": "OptionsBot will rescan and may decline; Hermes cannot place orders",
         }
 
     @server.tool()

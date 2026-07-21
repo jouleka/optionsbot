@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import Engine, insert, select, update
@@ -15,9 +16,17 @@ from sqlalchemy.exc import OperationalError
 
 from optionsbot.config import Settings
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.control_intents import _consume_entry_review, consume_control_intents
+from optionsbot.daemon.control_intents import (
+    _consume_entry_review,
+    consume_control_intents,
+    consume_control_intents_async,
+)
 from optionsbot.execution.state import load_state
-from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
+from optionsbot.mcp_server.intent_queue import (
+    control_intents,
+    create_intent_engine,
+    enqueue_intent,
+)
 from optionsbot.mcp_server.restricted_context import RestrictedServerContext
 from optionsbot.mcp_server.server import build_server
 from optionsbot.mcp_server.tools import nightwatch, restricted
@@ -51,6 +60,7 @@ async def test_restricted_server_exposes_only_bounded_surface() -> None:
         "list_watchlist",
         "pending_picks",
         "positions",
+        "propose_entry",
         "request_exit",
         "score_breakdown",
         "submit_entry_review",
@@ -356,6 +366,69 @@ def test_restricted_context_contains_no_broker_or_messaging_secrets(
     assert not hasattr(context, "ibkr")
     assert not hasattr(context.settings, "telegram")
     assert not hasattr(context.settings, "ibkr")
+
+
+def test_hermes_entry_proposal_only_enters_isolated_queue(
+    mcp_engine: Engine, tmp_path: Path
+) -> None:
+    intent_engine = create_intent_engine(tmp_path / "proposal-intents.db")
+    context = RestrictedServerContext(
+        engine=mcp_engine,
+        intent_engine=intent_engine,
+        max_pick_age_minutes=20,
+    )
+    propose = get_tools(nightwatch.register)["propose_entry"]
+    result = propose(
+        "SPY",
+        "bull",
+        "neutral",
+        "auto",
+        0.9,
+        ["trusted daemon", "Finnhub"],
+        "Index strength supports a bounded bullish 0DTE structure.",
+        {
+            "bot_health": True,
+            "regime_history": True,
+            "catalysts": True,
+        },
+        FakeCtx(context),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "queued_for_optionsbot_validation"
+    with intent_engine.connect() as conn:
+        row = conn.execute(select(control_intents)).one()
+    assert row.kind == "entry_proposal"
+    assert row.status == "pending"
+    assert row.payload_json["symbol"] == "SPY"
+    assert row.payload_json["direction"] == "bull"
+    with mcp_engine.connect() as conn:
+        assert conn.execute(select(orders.c.id)).fetchall() == []
+
+
+async def test_async_consumer_routes_entry_proposal_to_live_rebuilder(
+    mcp_engine: Engine, tmp_path: Path
+) -> None:
+    intent_path = tmp_path / "proposal-consumer.db"
+    intent_engine = create_intent_engine(intent_path)
+    enqueue_intent(
+        intent_engine,
+        "entry_proposal",
+        {"symbol": "SPY"},
+    )
+    daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
+    with patch(
+        "optionsbot.daemon.control_intents._consume_entry_proposal",
+        new=AsyncMock(return_value="proposal independently rebuilt"),
+    ) as rebuild:
+        consumed = await consume_control_intents_async(daemon_context, intent_path)
+
+    assert consumed == 1
+    rebuild.assert_awaited_once()
+    with intent_engine.connect() as conn:
+        row = conn.execute(select(control_intents)).one()
+    assert row.status == "processed"
+    assert row.result_text == "proposal independently rebuilt"
 
 
 def test_halt_is_queued_then_monotonically_consumed_by_daemon(
