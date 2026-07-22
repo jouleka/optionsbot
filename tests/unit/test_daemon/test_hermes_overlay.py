@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, insert
 
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.hermes_overlay import evaluate_overlay, load_overlay_state, reset_overlay
+from optionsbot.hermes_overlay import (
+    evaluate_overlay,
+    learning_feedback,
+    load_overlay_state,
+    reset_overlay,
+)
 from optionsbot.storage.schema import (
     alerts,
     entry_reviews,
+    fills,
     hermes_overlay_state,
+    orders,
     pick_outcomes,
     snapshots,
     strategy_scores,
@@ -30,16 +37,12 @@ def test_missing_overlay_state_fails_closed(daemon_context: DaemonContext) -> No
     assert reset.enabled is True
 
 
-def _add_judgeable(
-    context: DaemonContext, *, count: int, wins: int, offset: int = 0
-) -> None:
+def _add_judgeable(context: DaemonContext, *, count: int, wins: int, offset: int = 0) -> None:
     now = datetime.now(UTC)
     with context.engine.begin() as conn:
         snapshot_id = int(
             conn.execute(
-                insert(snapshots).values(
-                    symbol="SPY", ts=now, spot=600.0, raw_json={}
-                )
+                insert(snapshots).values(symbol="SPY", ts=now, spot=600.0, raw_json={})
             ).inserted_primary_key[0]
         )
         for index in range(count):
@@ -149,3 +152,120 @@ def test_overlay_trips_persists_and_requires_explicit_reset(
     assert tripped is False
     assert state.enabled is False
     assert state.accuracy == 21 / 33
+
+
+def test_learning_feedback_records_actual_post_trade_result_without_outcome(
+    daemon_context: DaemonContext,
+) -> None:
+    """A hindsight Hermes refusal still learns the bot's actual round trip."""
+    now = datetime.now(UTC)
+    entry_ts = now - timedelta(minutes=5)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(symbol="IWM", ts=entry_ts, spot=295.0, raw_json={})
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_call_spread",
+                    score=75.0,
+                    legs_json=[],
+                    suggestion_json={"review_evidence": {"ready": True}},
+                )
+            ).inserted_primary_key[0]
+        )
+        alert_id = int(
+            conn.execute(
+                insert(alerts).values(
+                    strategy_score_id=score_id,
+                    ts=entry_ts,
+                    symbol="IWM",
+                    strategy="bull_call_spread",
+                    score=75.0,
+                    status="sent",
+                    sent_ts=entry_ts,
+                    telegram_msg_id=999,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(entry_reviews).values(
+                strategy_score_id=score_id,
+                alert_id=alert_id,
+                reviewed_at=now,
+                verdict="no_trade",
+                confidence=0.9,
+                sources_json=["source A", "source B"],
+                reason="review arrived after the fill",
+                checks_json={},
+                status="refused",
+            )
+        )
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    strategy_score_id=score_id,
+                    intent="open",
+                    symbol="IWM",
+                    strategy="bull_call_spread",
+                    legs_json=[],
+                    quantity=1,
+                    status="filled",
+                    staged_ts=entry_ts,
+                    terminal_ts=entry_ts,
+                )
+            ).inserted_primary_key[0]
+        )
+        close_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="close",
+                    symbol="IWM",
+                    strategy="bull_call_spread",
+                    legs_json=[],
+                    quantity=1,
+                    closes_order_id=entry_id,
+                    status="filled",
+                    staged_ts=now,
+                    terminal_ts=now,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(fills),
+            [
+                {
+                    "order_id": entry_id,
+                    "ib_exec_id": "hermes-entry",
+                    "side": "BUY",
+                    "price": 0.80,
+                    "qty": 1,
+                    "ts": entry_ts,
+                    "commission": 1.0,
+                },
+                {
+                    "order_id": close_id,
+                    "ib_exec_id": "hermes-close",
+                    "side": "SELL",
+                    "price": 0.50,
+                    "qty": 1,
+                    "ts": now,
+                    "commission": 1.0,
+                },
+            ],
+        )
+
+    feedback = learning_feedback(daemon_context.engine)
+
+    assert feedback["outcomes_available"] == 1
+    assert feedback["forecast_judgeable"] == 0
+    lesson = feedback["recent_lessons"][0]
+    assert lesson["review_context"] == "post_trade_observation"
+    assert lesson["outcome_basis"] == "actual_filled_round_trip"
+    assert lesson["actual_trade_pnl"] == -32.0
+    assert lesson["theoretical_pnl"] is None
+    assert lesson["forecast_useful"] is None
+    assert lesson["lesson"] == "actual_trade_loser_post_trade_observation"

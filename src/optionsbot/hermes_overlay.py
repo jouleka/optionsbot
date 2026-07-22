@@ -78,13 +78,11 @@ def _review_outcome_rows(engine: Engine) -> list[Any]:
                     .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
                     .outerjoin(
                         first_orders,
-                        entry_reviews.c.strategy_score_id
-                        == first_orders.c.strategy_score_id,
+                        entry_reviews.c.strategy_score_id == first_orders.c.strategy_score_id,
                     )
                     .outerjoin(
                         pick_outcomes,
-                        entry_reviews.c.strategy_score_id
-                        == pick_outcomes.c.strategy_score_id,
+                        entry_reviews.c.strategy_score_id == pick_outcomes.c.strategy_score_id,
                     )
                 )
                 .order_by(entry_reviews.c.reviewed_at.desc())
@@ -157,29 +155,34 @@ def _actual_round_trip_pnl(engine: Engine) -> dict[int, float]:
 
 
 def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, Any]:
-    """Counterfactual lessons fed back to every new Hermes review pass.
+    """Actual and counterfactual lessons fed back to every Hermes review pass.
 
-    A theoretical expiry winner is useful evidence about a forecast, but does
-    not invalidate a refusal caused by stale quotes or untradeable spreads.
+    Completed fill cashflows take precedence over theoretical expiry outcomes.
+    A theoretical expiry winner is still useful evidence about a forecast, but
+    does not invalidate a refusal caused by stale quotes or untradeable spreads.
     Those operational guards and reviews made after an order already existed
-    are therefore reported separately from forecast accuracy.
+    are reported separately from forecast accuracy.
     """
     rows = _review_outcome_rows(engine)
     actual_pnl = _actual_round_trip_pnl(engine)
-    evaluated = [row for row in rows if row.win is not None]
+    evaluated = [
+        row for row in rows if row.win is not None or int(row.strategy_score_id) in actual_pnl
+    ]
     lessons: list[dict[str, Any]] = []
     mistakes = guarded_winners = 0
     forecast_judgeable = forecast_useful = 0
     for row in evaluated:
         evidence_ready, post_trade, context = _review_context(row)
         approved = row.verdict == "vetted_paper_candidate"
-        filled_pnl = actual_pnl.get(int(row.strategy_score_id)) if approved else None
+        # A bot fill is ground truth regardless of Hermes's verdict. This is
+        # especially important for reviews that arrived after the order was
+        # already filled: Hermes must learn the realized result without that
+        # hindsight observation being scored as a pre-trade forecast.
+        filled_pnl = actual_pnl.get(int(row.strategy_score_id))
         observed_pnl = filled_pnl if filled_pnl is not None else float(row.realized_pnl)
         won = observed_pnl > 0.0
         outcome_basis = (
-            "actual_filled_round_trip"
-            if filled_pnl is not None
-            else "expiry_close_counterfactual"
+            "actual_filled_round_trip" if filled_pnl is not None else "expiry_close_counterfactual"
         )
         useful: bool | None = None
         lesson = "not_forecast_judgeable"
@@ -195,6 +198,12 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         elif context == "operational_guard" and won:
             guarded_winners += 1
             lesson = "theoretical_winner_but_execution_guard_was_not_overruled"
+        elif context == "post_trade_observation" and filled_pnl is not None:
+            lesson = (
+                "actual_trade_winner_post_trade_observation"
+                if won
+                else "actual_trade_loser_post_trade_observation"
+            )
         lessons.append(
             {
                 "review_id": int(row.review_id),
@@ -207,8 +216,10 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 "evidence_ready": evidence_ready,
                 "post_trade": post_trade,
                 "expiry": row.expiry,
-                "theoretical_win": bool(row.win),
-                "theoretical_pnl": float(row.realized_pnl),
+                "theoretical_win": bool(row.win) if row.win is not None else None,
+                "theoretical_pnl": (
+                    float(row.realized_pnl) if row.realized_pnl is not None else None
+                ),
                 "actual_trade_pnl": filled_pnl,
                 "outcome_basis": outcome_basis,
                 "observed_win": won,
@@ -220,16 +231,15 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         )
     return {
         "meaning": (
-            "Expiry-close counterfactuals, not actual fill P&L. Learn forecast "
-            "mistakes; never waive stale-quote, liquidity, or risk guards."
+            "Completed actual fill P&L (including commissions) takes precedence; "
+            "expiry-close counterfactuals are used otherwise. Learn forecast "
+            "mistakes, but never waive stale-quote, liquidity, or risk guards."
         ),
         "review_calls": len(rows),
         "outcomes_available": len(evaluated),
         "forecast_judgeable": forecast_judgeable,
         "forecast_useful": forecast_useful,
-        "forecast_accuracy": (
-            forecast_useful / forecast_judgeable if forecast_judgeable else None
-        ),
+        "forecast_accuracy": (forecast_useful / forecast_judgeable if forecast_judgeable else None),
         "forecast_mistakes": mistakes,
         "guarded_theoretical_winners": guarded_winners,
         "recent_lessons": lessons[: max(1, min(recent_limit, 100))],
