@@ -75,7 +75,21 @@ async def run_orders_tick(
     rec_min = context.settings.execution.reconcile_minutes
     if rec_min > 0:
         last = context.last_reconcile_ts or context.started_at
-        if now - last >= timedelta(minutes=rec_min):
+        reconcile_due = now - last >= timedelta(minutes=rec_min)
+        active_walks = sum(not task.done() for task in context.walk_tasks)
+        if reconcile_due and active_walks:
+            # Reconciliation deliberately revokes and rebuilds the
+            # OrderClient's mutation registry.  Doing that while a live price
+            # walk is still responsible for modifying/cancelling its order
+            # creates a false "unknown order id" cancellation failure.  Defer
+            # the periodic snapshot until the bounded walk finishes; keep the
+            # cadence watermark unchanged so the very next watcher tick runs
+            # reconciliation immediately.
+            log.info(
+                "periodic reconcile deferred: %d active price walk(s)",
+                active_walks,
+            )
+        elif reconcile_due:
             from optionsbot.execution.reconcile import reconcile
 
             async def _notify(text: str) -> None:

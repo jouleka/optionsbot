@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -233,6 +234,36 @@ async def test_reconcile_runs_on_fixed_cadence_with_no_open_orders(
 
     await _order_watcher_module.run_orders_tick(context)
     assert called == [True]  # reconcile ran AND was given a positions snapshot
+
+
+async def test_periodic_reconcile_defers_until_active_price_walk_finishes(
+    monkeypatch: Any,
+) -> None:
+    context = _make_context()
+    context.order_client = MagicMock()
+    context.last_reconcile_ts = datetime.now(UTC) - timedelta(minutes=10)
+    context.settings.execution.reconcile_minutes = 5
+    blocker = asyncio.Event()
+    walk = asyncio.create_task(blocker.wait())
+    context.walk_tasks.add(walk)
+    reconcile = AsyncMock(return_value=ReconcileSummary(0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr("optionsbot.execution.reconcile.reconcile", reconcile)
+
+    try:
+        await _order_watcher_module.run_orders_tick(context)
+        reconcile.assert_not_awaited()
+        # The due watermark stays old so reconciliation is not postponed for
+        # another full cadence after the walk releases mutation authority.
+        assert context.last_reconcile_ts < datetime.now(UTC) - timedelta(minutes=5)
+
+        blocker.set()
+        await walk
+        context.walk_tasks.discard(walk)
+        await _order_watcher_module.run_orders_tick(context)
+        reconcile.assert_awaited_once()
+    finally:
+        blocker.set()
+        await walk
 
 
 async def test_reconcile_mismatch_emits_critical_event(monkeypatch: Any) -> None:
