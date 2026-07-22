@@ -38,7 +38,7 @@ from optionsbot.execution.exit_requests import (
     evaluate_hermes_loss_cap,
 )
 from optionsbot.execution.exits import evaluate_exit
-from optionsbot.execution.gate import can_execute
+from optionsbot.execution.gate import can_execute, can_reduce_risk
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
     CloseAlreadyClaimed,
@@ -447,9 +447,7 @@ async def _process_exit_requests(
         )
         canonical_sources = {source.casefold() for source in sources}
         reason = row.reason.strip() if isinstance(row.reason, str) else ""
-        catalyst_type = (
-            row.catalyst_type.strip() if isinstance(row.catalyst_type, str) else ""
-        )
+        catalyst_type = row.catalyst_type.strip() if isinstance(row.catalyst_type, str) else ""
         if (
             not math.isfinite(confidence)
             or not 0.0 <= confidence <= 1.0
@@ -513,25 +511,28 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
         return ExitsTickSummary(0, 0, 0)
 
     submitted = errors = 0
-    verdict = can_execute(context.settings, load_state(context.engine))
+    entry_verdict = can_execute(context.settings, load_state(context.engine))
+    exit_verdict = can_reduce_risk(context.settings)
     md = _exec_md(context)
-    # Order placement (TP / soft-stop / DTE / expiry closes) requires the
-    # execution interlock open AND a live quote source AND an open market -- a
-    # combo cannot fill while killed, without quotes, or outside RTH.
-    if verdict.allowed and md is not None and is_market_open(now):
-        try:
-            submitted += await _process_exit_requests(context, md, entries, now)
-        except Exception:  # noqa: BLE001 -- request queue must not starve deterministic exits
-            errors += 1
-            log.exception("request_exit queue processing failed")
+    # Protective TP / soft-stop / DTE / expiry closes deliberately ignore the
+    # kill bit: a drawdown halt blocks NEW risk, never risk reduction. Broker
+    # environment/config and market-hours interlocks remain mandatory. Hermes
+    # discretionary exit requests retain the stricter entry gate while killed.
+    if exit_verdict.allowed and md is not None and is_market_open(now):
+        if entry_verdict.allowed:
+            try:
+                submitted += await _process_exit_requests(context, md, entries, now)
+            except Exception:  # noqa: BLE001 -- request queue must not starve deterministic exits
+                errors += 1
+                log.exception("request_exit queue processing failed")
         for entry in entries:
             try:
                 submitted += await _manage_entry(context, md, entry, now)
             except Exception:  # noqa: BLE001 -- one bad position must not starve the rest
                 errors += 1
                 log.exception("exit evaluation failed for entry #%s", entry.id)
-    elif not verdict.allowed:
-        log.debug("exits tick: order placement skipped: %s", verdict.reason)
+    elif not exit_verdict.allowed:
+        log.warning("exits tick: protective placement disabled: %s", exit_verdict.reason)
     # Post-close naked-short P1 sweep: detect-and-halt (trip the kill + alert, no
     # order placement). It reads only the broker portfolio, so it runs on EVERY
     # tick regardless of the interlock, market hours, or quote availability
@@ -578,7 +579,11 @@ async def _manage_entry(
     order_client = context.order_client
     if order_client is None:
         return 0
-    execution_verdict = can_execute(context.settings, load_state(engine))
+    execution_verdict = (
+        can_execute(context.settings, load_state(engine))
+        if exit_request_id is not None
+        else can_reduce_risk(context.settings)
+    )
     if not execution_verdict.allowed:
         if exit_request_id is not None:
             _mark_exit_request(
@@ -773,7 +778,11 @@ async def _manage_entry(
             )
             return 0
 
-    execution_verdict = can_execute(context.settings, load_state(engine))
+    execution_verdict = (
+        can_execute(context.settings, load_state(engine))
+        if exit_request_id is not None
+        else can_reduce_risk(context.settings)
+    )
     if not execution_verdict.allowed:
         reason = f"execution interlock closed before placement: {execution_verdict.reason}"
         transition(engine, close.id, "skipped", error=reason, now=now)
@@ -798,9 +807,7 @@ async def _manage_entry(
             order_ref=close.order_ref or f"obot-{close.id}",
         )
     except Exception as exc:  # noqa: BLE001 -- placement outcome may be unknown
-        halt_reason = (
-            f"close #{close.id} broker placement outcome unknown after exception: {exc}"
-        )
+        halt_reason = f"close #{close.id} broker placement outcome unknown after exception: {exc}"
         # Keep the close in `submitting` so the permanent active-close claim
         # blocks retries until broker/ledger reconciliation determines whether
         # the order exists. A terminal transition here could stage a duplicate.
@@ -826,8 +833,7 @@ async def _manage_entry(
         )
     except Exception as exc:  # noqa: BLE001 -- broker side effect may already exist
         halt_reason = (
-            f"close #{close.id} broker placement completed but ledger finalization "
-            f"failed: {exc}"
+            f"close #{close.id} broker placement completed but ledger finalization failed: {exc}"
         )
         trip_kill(engine, halt_reason, now=now)
         try:
@@ -960,7 +966,7 @@ async def force_close_entry(
     # that way: any await inserted before staging reopens a double-close race.
     if open_close_for(engine, entry_id) is not None:
         return f"#{entry_id} {entry.symbol} {entry.strategy} is already closing"
-    verdict = can_execute(context.settings, load_state(engine))
+    verdict = can_reduce_risk(context.settings)
     if not verdict.allowed:
         return f"can't close #{entry_id}: {verdict.reason}"
     if not is_market_open(now):

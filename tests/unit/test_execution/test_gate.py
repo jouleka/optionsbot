@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from optionsbot.config import Settings
-from optionsbot.execution.gate import can_execute
+from optionsbot.execution.gate import can_execute, can_reduce_risk
 from optionsbot.execution.state import ExecutionState
 
 NOT_KILLED = ExecutionState(killed=False, reason=None, ts=None)
@@ -63,6 +63,18 @@ def test_kill_switch_denies_and_reports_reason() -> None:
     result = can_execute(_settings(enabled=True), KILLED)
     assert result.allowed is False
     assert "manual /kill" in result.reason
+
+
+def test_kill_switch_does_not_block_risk_reducing_execution() -> None:
+    result = can_reduce_risk(_settings(enabled=True))
+    assert result.allowed is True
+
+
+def test_risk_reduction_still_obeys_paper_interlock_and_enabled() -> None:
+    assert can_reduce_risk(_settings(enabled=False)).allowed is False
+    result = can_reduce_risk(_settings(enabled=True, port=4001))
+    assert result.allowed is False
+    assert "4001" in result.reason
 
 
 def test_interlock_outranks_disabled_message() -> None:

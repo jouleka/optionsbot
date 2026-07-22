@@ -43,31 +43,77 @@ def _force_market_open():
 
 def _legs(expiry: str) -> list[dict[str, object]]:
     return [
-        {"symbol": "SPY", "side": "sell", "sec_type": "OPT", "expiry": expiry,
-         "strike": 580.0, "right": "P", "quantity": 1,
-         "con_id": 580001, "multiplier": 100, "currency": "USD"},
-        {"symbol": "SPY", "side": "buy", "sec_type": "OPT", "expiry": expiry,
-         "strike": 575.0, "right": "P", "quantity": 1,
-         "con_id": 575001, "multiplier": 100, "currency": "USD"},
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": expiry,
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 580001,
+            "multiplier": 100,
+            "currency": "USD",
+        },
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": expiry,
+            "strike": 575.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 575001,
+            "multiplier": 100,
+            "currency": "USD",
+        },
     ]
 
 
 def _filled_entry(context: DaemonContext, *, expiry: str = FAR) -> int:
     engine = context.engine
     with engine.begin() as conn:
-        pk = conn.execute(insert(orders).values(
-            intent="open", symbol="SPY", strategy="bull_put_spread",
-            legs_json=_legs(expiry), quantity=1, status="filled", staged_ts=NOW,
-            submitted_ts=NOW, terminal_ts=NOW, reprice_count=0,
-        )).inserted_primary_key
+        pk = conn.execute(
+            insert(orders).values(
+                intent="open",
+                symbol="SPY",
+                strategy="bull_put_spread",
+                legs_json=_legs(expiry),
+                quantity=1,
+                status="filled",
+                staged_ts=NOW,
+                submitted_ts=NOW,
+                terminal_ts=NOW,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
         assert pk is not None
         order_id = int(pk[0])
-        conn.execute(update(orders).where(orders.c.id == order_id)
-                     .values(order_ref=f"obot-{order_id}", ib_order_id=10 + order_id))
-    record_fill(engine, order_id, exec_id=f"x{order_id}a", side="SELL",
-                price=1.60, qty=1, ts=NOW, leg_con_id=580001)
-    record_fill(engine, order_id, exec_id=f"x{order_id}b", side="BUY",
-                price=0.40, qty=1, ts=NOW, leg_con_id=575001)
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == order_id)
+            .values(order_ref=f"obot-{order_id}", ib_order_id=10 + order_id)
+        )
+    record_fill(
+        engine,
+        order_id,
+        exec_id=f"x{order_id}a",
+        side="SELL",
+        price=1.60,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580001,
+    )
+    record_fill(
+        engine,
+        order_id,
+        exec_id=f"x{order_id}b",
+        side="BUY",
+        price=0.40,
+        qty=1,
+        ts=NOW,
+        leg_con_id=575001,
+    )
     set_fill_commission(engine, f"x{order_id}a", 0.65)
     set_fill_commission(engine, f"x{order_id}b", 0.65)
     return order_id
@@ -82,10 +128,22 @@ def _quote(
     ts: datetime | None = None,
 ) -> OptionQuote:
     return OptionQuote(
-        symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
-        bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
-        iv=None, delta=None, gamma=None, theta=None, vega=None,
-        open_interest=None, volume=None, ts=ts or datetime.now(UTC),
+        symbol="SPY",
+        expiry=FAR,
+        strike=strike,
+        right=right,  # type: ignore[arg-type]
+        bid=round(mid - 0.05, 4),
+        ask=round(mid + 0.05, 4),
+        last=None,
+        mid=mid,
+        iv=None,
+        delta=None,
+        gamma=None,
+        theta=None,
+        vega=None,
+        open_interest=None,
+        volume=None,
+        ts=ts or datetime.now(UTC),
         delayed=delayed,  # type: ignore[arg-type]
     )
 
@@ -102,8 +160,11 @@ def _wire(
     order_client = MagicMock()
     order_client.place_combo_limit = AsyncMock(
         side_effect=lambda *a, **k: PlacedOrder(
-            ib_order_id=99, order_ref=k["order_ref"], action="BUY",
-            limit_price=k["limit_price"], quantity=k["quantity"],
+            ib_order_id=99,
+            order_ref=k["order_ref"],
+            action="BUY",
+            limit_price=k["limit_price"],
+            quantity=k["quantity"],
             leg_contracts=((580001, 100, "USD"), (575001, 100, "USD")),
         )
     )
@@ -153,17 +214,14 @@ async def test_take_profit_fires_closing_order(daemon_context: DaemonContext) ->
     entry_id = _filled_entry(daemon_context)
     # Entry credit 1.20; structure now reopens at 0.50 -> kept 58% -> close.
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         summary = await run_exits_tick(daemon_context)
     assert summary.closes_submitted == 1
     call = order_client.place_combo_limit.call_args
     # Flipped close: we PAY ~0.50/unit -> BUY-bag positive limit.
     assert call.kwargs["limit_price"] > 0
     with daemon_context.engine.connect() as conn:
-        close = conn.execute(
-            select(orders).where(orders.c.intent == "close")
-        ).one()
+        close = conn.execute(select(orders).where(orders.c.intent == "close")).one()
     assert close.closes_order_id == entry_id
     assert close.status == "submitted"
     sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
@@ -173,8 +231,7 @@ async def test_take_profit_fires_closing_order(daemon_context: DaemonContext) ->
 async def test_no_trigger_no_close(daemon_context: DaemonContext) -> None:
     _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         summary = await run_exits_tick(daemon_context)
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
@@ -264,9 +321,7 @@ async def test_request_exit_adverse_loser_submits_audited_close(
     assert summary.closes_submitted == 1
     order_client.place_combo_limit.assert_awaited_once()
     with daemon_context.engine.connect() as conn:
-        row = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        row = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert row.status == "submitted"
     assert row.close_order_id is not None
     assert "adverse" in row.decision_reason
@@ -294,9 +349,7 @@ async def test_delayed_or_unknown_quote_cannot_corroborate_hermes_exit(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with daemon_context.engine.connect() as conn:
-        row = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        row = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert row.status == "refused"
     assert "no live quote" in row.decision_reason
 
@@ -338,9 +391,7 @@ async def test_persisted_exit_request_evidence_must_be_finite_and_well_formed(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with daemon_context.engine.connect() as conn:
-        row = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        row = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert row.status == "refused"
     assert "evidence" in row.decision_reason
 
@@ -358,9 +409,7 @@ async def test_request_exit_is_bound_before_broker_placement(
             request = conn.execute(
                 select(exit_requests).where(exit_requests.c.id == request_id)
             ).one()
-            close = conn.execute(
-                select(orders).where(orders.c.id == request.close_order_id)
-            ).one()
+            close = conn.execute(select(orders).where(orders.c.id == request.close_order_id)).one()
         assert request.status == "requested"
         assert request.close_order_id is not None
         assert close.status == "submitting"
@@ -408,17 +457,13 @@ async def test_request_exit_rechecks_loss_cap_immediately_before_placement(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with daemon_context.engine.connect() as conn:
-        request = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
-        close = conn.execute(
-            select(orders).where(orders.c.id == request.close_order_id)
-        ).one()
+        request = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
+        close = conn.execute(select(orders).where(orders.c.id == request.close_order_id)).one()
     assert request.status == "refused"
     assert close.status == "skipped"
 
 
-async def test_kill_tripped_by_final_hermes_gate_stops_same_tick_deterministic_close(
+async def test_kill_tripped_by_final_hermes_gate_does_not_stop_deterministic_close(
     daemon_context: DaemonContext,
 ) -> None:
     entry_id = _filled_entry(daemon_context, expiry=NEAR)
@@ -448,17 +493,17 @@ async def test_kill_tripped_by_final_hermes_gate_stops_same_tick_deterministic_c
 
     assert calls == 2
     assert load_state(daemon_context.engine).killed is True
-    assert summary.closes_submitted == 0
-    order_client.place_combo_limit.assert_not_awaited()
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
     with daemon_context.engine.connect() as conn:
-        request = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
-        closes = conn.execute(
-            select(orders.c.status).where(orders.c.closes_order_id == entry_id)
-        ).scalars().all()
+        request = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
+        closes = (
+            conn.execute(select(orders.c.status).where(orders.c.closes_order_id == entry_id))
+            .scalars()
+            .all()
+        )
     assert request.status == "refused"
-    assert closes == ["skipped"]
+    assert closes == ["skipped", "submitted"]
 
 
 async def test_request_exit_losing_eligibility_after_binding_is_not_placed(
@@ -496,12 +541,8 @@ async def test_request_exit_losing_eligibility_after_binding_is_not_placed(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with daemon_context.engine.connect() as conn:
-        request = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
-        close = conn.execute(
-            select(orders).where(orders.c.id == request.close_order_id)
-        ).one()
+        request = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
+        close = conn.execute(select(orders).where(orders.c.id == request.close_order_id)).one()
     assert request.status == "refused"
     assert close.status == "skipped"
 
@@ -541,9 +582,7 @@ async def test_request_exit_completion_rowcount_failure_halts_after_placement(
     order_client.place_combo_limit.assert_awaited_once()
     assert load_state(daemon_context.engine).killed is True
     with daemon_context.engine.connect() as conn:
-        request = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        request = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert request.status == "refused"
     assert request.close_order_id is not None
 
@@ -611,9 +650,7 @@ async def test_close_placement_exception_halts_with_claim_preserved(
 ) -> None:
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    order_client.place_combo_limit.side_effect = TimeoutError(
-        "broker acknowledgement lost"
-    )
+    order_client.place_combo_limit.side_effect = TimeoutError("broker acknowledgement lost")
 
     with patch(
         "optionsbot.daemon.exit_runner._exec_md",
@@ -627,9 +664,7 @@ async def test_close_placement_exception_halts_with_claim_preserved(
     assert state.killed is True
     assert state.reason is not None and "unknown" in state.reason
     with daemon_context.engine.connect() as conn:
-        close = conn.execute(
-            select(orders).where(orders.c.closes_order_id == entry_id)
-        ).one()
+        close = conn.execute(select(orders).where(orders.c.closes_order_id == entry_id)).one()
     assert close.status == "submitting"
 
 
@@ -662,9 +697,7 @@ async def test_close_ack_without_qualified_contracts_halts(
     assert load_state(daemon_context.engine).killed is True
     order_client.cancel.assert_awaited_once_with(100)
     with daemon_context.engine.connect() as conn:
-        close = conn.execute(
-            select(orders).where(orders.c.closes_order_id == entry_id)
-        ).one()
+        close = conn.execute(select(orders).where(orders.c.closes_order_id == entry_id)).one()
     assert close.status == "submitting"
 
 
@@ -690,9 +723,7 @@ async def test_request_exit_refuses_winning_headline_without_deterministic_exit(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with daemon_context.engine.connect() as conn:
-        row = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        row = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert row.status == "refused"
     assert "winner" in row.decision_reason
 
@@ -726,10 +757,26 @@ async def test_cumulative_hermes_realized_loss_trips_kill_before_another_exit(
     assert close_pk is not None
     close_id = int(close_pk[0])
     # Entry +$120, close -$370 => Hermes-driven realized P&L -$250.
-    record_fill(engine, close_id, exec_id="hermes-loss-a", side="BUY", price=3.80,
-                qty=1, ts=NOW, leg_con_id=580001)
-    record_fill(engine, close_id, exec_id="hermes-loss-b", side="SELL", price=0.10,
-                qty=1, ts=NOW, leg_con_id=575001)
+    record_fill(
+        engine,
+        close_id,
+        exec_id="hermes-loss-a",
+        side="BUY",
+        price=3.80,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580001,
+    )
+    record_fill(
+        engine,
+        close_id,
+        exec_id="hermes-loss-b",
+        side="SELL",
+        price=0.10,
+        qty=1,
+        ts=NOW,
+        leg_con_id=575001,
+    )
     set_fill_commission(engine, "hermes-loss-a", 0.65)
     set_fill_commission(engine, "hermes-loss-b", 0.65)
     with engine.begin() as conn:
@@ -794,10 +841,26 @@ async def test_cumulative_hermes_loss_trips_kill_after_last_position_closes(
         ).inserted_primary_key
     assert close_pk is not None
     close_id = int(close_pk[0])
-    record_fill(engine, close_id, exec_id="hermes-final-loss-a", side="BUY",
-                price=3.80, qty=1, ts=NOW, leg_con_id=580001)
-    record_fill(engine, close_id, exec_id="hermes-final-loss-b", side="SELL",
-                price=0.10, qty=1, ts=NOW, leg_con_id=575001)
+    record_fill(
+        engine,
+        close_id,
+        exec_id="hermes-final-loss-a",
+        side="BUY",
+        price=3.80,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580001,
+    )
+    record_fill(
+        engine,
+        close_id,
+        exec_id="hermes-final-loss-b",
+        side="SELL",
+        price=0.10,
+        qty=1,
+        ts=NOW,
+        leg_con_id=575001,
+    )
     set_fill_commission(engine, "hermes-final-loss-a", 0.65)
     set_fill_commission(engine, "hermes-final-loss-b", 0.65)
     with engine.begin() as conn:
@@ -897,9 +960,7 @@ async def test_incomplete_hermes_realized_accounting_refuses_next_exit(
     assert summary.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     with engine.connect() as conn:
-        request = conn.execute(
-            select(exit_requests).where(exit_requests.c.id == request_id)
-        ).one()
+        request = conn.execute(select(exit_requests).where(exit_requests.c.id == request_id)).one()
     assert request.status == "refused"
     assert "accounting" in request.decision_reason
 
@@ -907,8 +968,7 @@ async def test_incomplete_hermes_realized_accounting_refuses_next_exit(
 async def test_active_close_blocks_duplicate(daemon_context: DaemonContext) -> None:
     _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         first = await run_exits_tick(daemon_context)
         second = await run_exits_tick(daemon_context)
     assert first.closes_submitted == 1
@@ -916,20 +976,25 @@ async def test_active_close_blocks_duplicate(daemon_context: DaemonContext) -> N
     assert order_client.place_combo_limit.await_count == 1
 
 
-async def test_kill_switch_blocks_exits(daemon_context: DaemonContext) -> None:
+async def test_kill_switch_allows_deterministic_protective_exits(
+    daemon_context: DaemonContext,
+) -> None:
     _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
     trip_kill(daemon_context.engine, "halt")
-    summary = await run_exits_tick(daemon_context)
-    assert summary.closes_submitted == 0
-    order_client.place_combo_limit.assert_not_awaited()
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        summary = await run_exits_tick(daemon_context)
+    assert summary.closes_submitted == 1
+    order_client.place_combo_limit.assert_awaited_once()
 
 
 async def test_expiry_guard_forces_close(daemon_context: DaemonContext) -> None:
     _filled_entry(daemon_context, expiry=NEAR)
     order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         summary = await run_exits_tick(daemon_context)
     assert summary.closes_submitted == 1
     order_client.place_combo_limit.assert_awaited_once()
@@ -969,29 +1034,40 @@ async def test_half_closed_position_hands_off_instead_of_reclosing(
     # never be auto-restaged at full quantity (over-close = wrong-way risk).
     entry_id = _filled_entry(daemon_context)
     with daemon_context.engine.begin() as conn:
-        pk = conn.execute(insert(orders).values(
-            intent="close", closes_order_id=entry_id, symbol="SPY",
-            strategy="bull_put_spread", legs_json=_legs(FAR), quantity=1,
-            status="abandoned", staged_ts=NOW, submitted_ts=NOW,
-            terminal_ts=NOW, reprice_count=0,
-        )).inserted_primary_key
+        pk = conn.execute(
+            insert(orders).values(
+                intent="close",
+                closes_order_id=entry_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                legs_json=_legs(FAR),
+                quantity=1,
+                status="abandoned",
+                staged_ts=NOW,
+                submitted_ts=NOW,
+                terminal_ts=NOW,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
         assert pk is not None
         close_id = int(pk[0])
-        conn.execute(update(orders).where(orders.c.id == close_id)
-                     .values(order_ref=f"obot-{close_id}"))
-    record_fill(daemon_context.engine, close_id, exec_id="half1", side="BUY",
-                price=0.80, qty=1, ts=NOW)
+        conn.execute(
+            update(orders).where(orders.c.id == close_id).values(order_ref=f"obot-{close_id}")
+        )
+    record_fill(
+        daemon_context.engine, close_id, exec_id="half1", side="BUY", price=0.80, qty=1, ts=NOW
+    )
 
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         first = await run_exits_tick(daemon_context)
         second = await run_exits_tick(daemon_context)
     assert first.closes_submitted == 0
     assert second.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     warns = [
-        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        c.args[0]
+        for c in daemon_context.telegram.send_message.await_args_list
         if "HALF-CLOSED" in c.args[0]
     ]
     assert len(warns) == 1  # escalated exactly once
@@ -1027,10 +1103,23 @@ async def test_stale_quote_suppresses_take_profit_and_alerts(
     def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
         mid = {(580.0, "P"): 0.80, (575.0, "P"): 0.30}[(strike, right)]
         return OptionQuote(
-            symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
-            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
-            iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=False,
+            symbol="SPY",
+            expiry=FAR,
+            strike=strike,
+            right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4),
+            ask=round(mid + 0.05, 4),
+            last=None,
+            mid=mid,
+            iv=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            open_interest=None,
+            volume=None,
+            ts=stale_ts,
+            delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
@@ -1042,7 +1131,8 @@ async def test_stale_quote_suppresses_take_profit_and_alerts(
     assert second.closes_submitted == 0
     order_client.place_combo_limit.assert_not_awaited()
     stale_alerts = [
-        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        c.args[0]
+        for c in daemon_context.telegram.send_message.await_args_list
         if "stale" in c.args[0].lower()
     ]
     assert len(stale_alerts) == 1  # escalated exactly once
@@ -1069,8 +1159,7 @@ async def test_non_atomic_close_fails_safe_and_halts(
         return close
 
     with (
-        patch("optionsbot.daemon.exit_runner._exec_md",
-              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md),  # type: ignore[attr-defined]
         patch.object(er, "stage_close_order", _drop_a_leg),
     ):
         summary = await run_exits_tick(daemon_context)
@@ -1097,10 +1186,23 @@ async def test_stale_quote_still_allows_expiry_guard(
     def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
         mid = {(580.0, "P"): 1.40, (575.0, "P"): 0.30}[(strike, right)]
         return OptionQuote(
-            symbol="SPY", expiry=NEAR, strike=strike, right=right,  # type: ignore[arg-type]
-            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
-            iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=False,
+            symbol="SPY",
+            expiry=NEAR,
+            strike=strike,
+            right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4),
+            ask=round(mid + 0.05, 4),
+            last=None,
+            mid=mid,
+            iv=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            open_interest=None,
+            volume=None,
+            ts=stale_ts,
+            delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
@@ -1111,28 +1213,35 @@ async def test_stale_quote_still_allows_expiry_guard(
     order_client.place_combo_limit.assert_awaited_once()
 
 
-def _half_closed_entry_with_abandoned_close(
-    context: DaemonContext, *, expiry: str = FAR
-) -> int:
+def _half_closed_entry_with_abandoned_close(context: DaemonContext, *, expiry: str = FAR) -> int:
     """Create a filled open entry whose only close is terminal+partial-filled
     (abandoned with one fill) — the condition that triggers the post-close
     naked-short sweep in ``run_exits_tick``."""
     entry_id = _filled_entry(context, expiry=expiry)
     engine = context.engine
     with engine.begin() as conn:
-        pk = conn.execute(insert(orders).values(
-            intent="close", closes_order_id=entry_id, symbol="SPY",
-            strategy="bull_put_spread", legs_json=_legs(expiry), quantity=1,
-            status="abandoned", staged_ts=NOW, submitted_ts=NOW,
-            terminal_ts=NOW, reprice_count=0,
-        )).inserted_primary_key
+        pk = conn.execute(
+            insert(orders).values(
+                intent="close",
+                closes_order_id=entry_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                legs_json=_legs(expiry),
+                quantity=1,
+                status="abandoned",
+                staged_ts=NOW,
+                submitted_ts=NOW,
+                terminal_ts=NOW,
+                reprice_count=0,
+            )
+        ).inserted_primary_key
         assert pk is not None
         close_id = int(pk[0])
-        conn.execute(update(orders).where(orders.c.id == close_id)
-                     .values(order_ref=f"obot-{close_id}"))
+        conn.execute(
+            update(orders).where(orders.c.id == close_id).values(order_ref=f"obot-{close_id}")
+        )
     # Partial fill on the abandoned close — this is what _half_closed() detects.
-    record_fill(engine, close_id, exec_id="half1", side="BUY",
-                price=0.80, qty=1, ts=NOW)
+    record_fill(engine, close_id, exec_id="half1", side="BUY", price=0.80, qty=1, ts=NOW)
     return entry_id
 
 
@@ -1187,8 +1296,7 @@ async def test_post_close_naked_short_trips_kill_and_alerts_p1(
     residual = _residual_short_position(FAR)
 
     with (
-        patch("optionsbot.daemon.exit_runner._exec_md",
-              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md),  # type: ignore[attr-defined]
         patch(
             "optionsbot.ibkr.positions.PositionsClient",
             autospec=True,
@@ -1203,9 +1311,7 @@ async def test_post_close_naked_short_trips_kill_and_alerts_p1(
         # Kill switch must be tripped.
         assert load_state(daemon_context.engine).killed is True
         # Exactly one P1 alert must have been sent.
-        all_messages = [
-            c.args[0] for c in daemon_context.telegram.send_message.await_args_list
-        ]
+        all_messages = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
         p1_alerts = [m for m in all_messages if "P1" in m or "🛑" in m]
         assert len(p1_alerts) == 1, f"expected 1 P1 alert on first tick, got: {p1_alerts}"
         # The entry is now tracked in the dedup set.
@@ -1271,9 +1377,7 @@ async def test_post_close_malformed_portfolio_snapshot_trips_kill(
         "optionsbot.ibkr.positions.PositionsClient",
         autospec=True,
     ) as mock_positions_client:
-        mock_positions_client.return_value.get_portfolio = AsyncMock(
-            return_value=snapshot
-        )
+        mock_positions_client.return_value.get_portfolio = AsyncMock(return_value=snapshot)
         clean = await assert_no_naked_short_after_close(daemon_context, entry)
 
     assert clean is False
@@ -1289,8 +1393,7 @@ async def test_force_close_fires_without_a_trigger(daemon_context: DaemonContext
     # assert a close is placed anyway.
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         msg = await force_close_entry(daemon_context, entry_id)
     order_client.place_combo_limit.assert_awaited_once()
     with daemon_context.engine.connect() as conn:
@@ -1310,8 +1413,7 @@ async def test_force_close_rejects_non_open_entry(daemon_context: DaemonContext)
     # A cancelled (non-filled) order is not a closable position.
     entry_id = _filled_entry(daemon_context)
     with daemon_context.engine.begin() as conn:
-        conn.execute(update(orders).where(orders.c.id == entry_id)
-                     .values(status="cancelled"))
+        conn.execute(update(orders).where(orders.c.id == entry_id).values(status="cancelled"))
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
     msg = await force_close_entry(daemon_context, entry_id)
     order_client.place_combo_limit.assert_not_awaited()
@@ -1321,8 +1423,7 @@ async def test_force_close_rejects_non_open_entry(daemon_context: DaemonContext)
 async def test_force_close_blocks_when_already_closing(daemon_context: DaemonContext) -> None:
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         first = await force_close_entry(daemon_context, entry_id)
         second = await force_close_entry(daemon_context, entry_id)
     assert order_client.place_combo_limit.await_count == 1
@@ -1330,13 +1431,19 @@ async def test_force_close_blocks_when_already_closing(daemon_context: DaemonCon
     assert "already closing" in second.lower()
 
 
-async def test_force_close_respects_kill_switch(daemon_context: DaemonContext) -> None:
+async def test_force_close_can_reduce_risk_while_killed(
+    daemon_context: DaemonContext,
+) -> None:
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
     trip_kill(daemon_context.engine, "halt")
-    msg = await force_close_entry(daemon_context, entry_id)
-    order_client.place_combo_limit.assert_not_awaited()
-    assert "kill" in msg.lower()
+    with patch(
+        "optionsbot.daemon.exit_runner._exec_md",
+        return_value=daemon_context._test_md,  # type: ignore[attr-defined]
+    ):
+        msg = await force_close_entry(daemon_context, entry_id)
+    order_client.place_combo_limit.assert_awaited_once()
+    assert "close requested" in msg.lower()
 
 
 async def test_force_close_refused_when_market_closed(daemon_context: DaemonContext) -> None:
@@ -1371,10 +1478,23 @@ async def test_force_close_with_stale_quotes_places_and_skips_deferred_alert(
     def _stale_quote(symbol: str, expiry: str, strike: float, right: str) -> OptionQuote:
         mid = {(580.0, "P"): 0.80, (575.0, "P"): 0.30}[(strike, right)]
         return OptionQuote(
-            symbol="SPY", expiry=FAR, strike=strike, right=right,  # type: ignore[arg-type]
-            bid=round(mid - 0.05, 4), ask=round(mid + 0.05, 4), last=None, mid=mid,
-            iv=None, delta=None, gamma=None, theta=None, vega=None,
-            open_interest=None, volume=None, ts=stale_ts, delayed=False,
+            symbol="SPY",
+            expiry=FAR,
+            strike=strike,
+            right=right,  # type: ignore[arg-type]
+            bid=round(mid - 0.05, 4),
+            ask=round(mid + 0.05, 4),
+            last=None,
+            mid=mid,
+            iv=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            open_interest=None,
+            volume=None,
+            ts=stale_ts,
+            delayed=False,
         )
 
     md.get_option_snapshot = AsyncMock(side_effect=_stale_quote)
@@ -1392,8 +1512,7 @@ async def test_force_close_on_half_closed_hands_off(daemon_context: DaemonContex
     # re-closed by /close either — the _half_closed guard hands off to the human.
     entry_id = _half_closed_entry_with_abandoned_close(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         msg = await force_close_entry(daemon_context, entry_id)
     order_client.place_combo_limit.assert_not_awaited()
     assert "no close placed" in msg.lower()
@@ -1410,8 +1529,7 @@ async def test_close_command_replay_is_idempotent_end_to_end(
     daemon_context.settings.telegram.chat_id = "5356256463"
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
-    with patch("optionsbot.daemon.exit_runner._exec_md",
-               return_value=daemon_context._test_md):  # type: ignore[attr-defined]
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]
         first = await dispatch(daemon_context, f"/close {entry_id}")
         second = await dispatch(daemon_context, f"/close {entry_id}")
     assert order_client.place_combo_limit.await_count == 1  # exactly one close placed
@@ -1436,8 +1554,7 @@ async def test_naked_short_sweep_runs_when_market_closed(
 
     with (
         patch("optionsbot.daemon.exit_runner.is_market_open", return_value=False),
-        patch("optionsbot.daemon.exit_runner._exec_md",
-              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md),  # type: ignore[attr-defined]
         patch("optionsbot.ibkr.positions.PositionsClient", autospec=True) as MockPC,
     ):
         mock_pc = MagicMock()
@@ -1448,7 +1565,8 @@ async def test_naked_short_sweep_runs_when_market_closed(
     # The sweep ran despite the closed market: kill tripped + exactly one P1 alert.
     assert load_state(daemon_context.engine).killed is True
     p1 = [
-        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        c.args[0]
+        for c in daemon_context.telegram.send_message.await_args_list
         if "P1" in c.args[0] or "🛑" in c.args[0]
     ]
     assert len(p1) == 1
@@ -1473,8 +1591,7 @@ async def test_naked_short_sweep_runs_when_kill_switched(
     trip_kill(daemon_context.engine, "operator halt")  # interlock tripped BEFORE the tick
 
     with (
-        patch("optionsbot.daemon.exit_runner._exec_md",
-              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md),  # type: ignore[attr-defined]
         patch("optionsbot.ibkr.positions.PositionsClient", autospec=True) as MockPC,
     ):
         mock_pc = MagicMock()
@@ -1484,14 +1601,15 @@ async def test_naked_short_sweep_runs_when_kill_switched(
 
     assert load_state(daemon_context.engine).killed is True
     p1 = [
-        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        c.args[0]
+        for c in daemon_context.telegram.send_message.await_args_list
         if "P1" in c.args[0] or "🛑" in c.args[0]
     ]
-    assert len(p1) == 1                                   # sweep alerted despite the kill
+    assert len(p1) == 1  # sweep alerted despite the kill
     assert entry_id in daemon_context.naked_leg_halted
-    order_client.place_combo_limit.assert_not_awaited()   # placement still interlocked
+    order_client.place_combo_limit.assert_not_awaited()  # placement still interlocked
     assert summary.closes_submitted == 0
-    assert summary.positions == 1                          # real count even while killed
+    assert summary.positions == 1  # real count even while killed
 
 
 async def test_naked_short_sweep_runs_when_md_unavailable(
@@ -1516,7 +1634,8 @@ async def test_naked_short_sweep_runs_when_md_unavailable(
 
     assert load_state(daemon_context.engine).killed is True
     p1 = [
-        c.args[0] for c in daemon_context.telegram.send_message.await_args_list
+        c.args[0]
+        for c in daemon_context.telegram.send_message.await_args_list
         if "P1" in c.args[0] or "🛑" in c.args[0]
     ]
     assert len(p1) == 1
@@ -1535,8 +1654,7 @@ async def test_market_closed_skips_order_placement(
     order_client = _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
     with (
         patch("optionsbot.daemon.exit_runner.is_market_open", return_value=False),
-        patch("optionsbot.daemon.exit_runner._exec_md",
-              return_value=daemon_context._test_md),  # type: ignore[attr-defined]
+        patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md),  # type: ignore[attr-defined]
     ):
         summary = await run_exits_tick(daemon_context)
     order_client.place_combo_limit.assert_not_awaited()
