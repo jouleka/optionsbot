@@ -262,6 +262,31 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
 
     assert feedback["outcomes_available"] == 1
     assert feedback["forecast_judgeable"] == 0
+    assert feedback["actual_trade_summary"] == {
+        "trades": 1,
+        "wins": 0,
+        "losses": 1,
+        "win_rate": 0.0,
+        "net_pnl": -32.0,
+        "by_strategy": {
+            "bull_call_spread": {
+                "trades": 1,
+                "wins": 0,
+                "losses": 1,
+                "net_pnl": -32.0,
+                "win_rate": 0.0,
+            }
+        },
+        "by_symbol": {
+            "IWM": {
+                "trades": 1,
+                "wins": 0,
+                "losses": 1,
+                "net_pnl": -32.0,
+                "win_rate": 0.0,
+            }
+        },
+    }
     lesson = feedback["recent_lessons"][0]
     assert lesson["review_context"] == "post_trade_observation"
     assert lesson["outcome_basis"] == "actual_filled_round_trip"

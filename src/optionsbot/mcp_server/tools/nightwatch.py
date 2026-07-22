@@ -251,7 +251,10 @@ def register(server: FastMCP) -> None:
             "count": len(picks),
             "picks": picks,
             "rubric": RUBRIC,
-            "learning_feedback": learning_feedback(lifespan.engine),
+            # Aggregate statistics retain the full history. A compact recent
+            # lesson window keeps the five-minute analyst pass from spending
+            # its whole context budget before it reaches independent ideas.
+            "learning_feedback": learning_feedback(lifespan.engine, recent_limit=10),
         }
 
     @server.tool()

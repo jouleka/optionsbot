@@ -511,7 +511,8 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
         return ExitsTickSummary(0, 0, 0)
 
     submitted = errors = 0
-    entry_verdict = can_execute(context.settings, load_state(context.engine))
+    state = load_state(context.engine)
+    entry_verdict = can_execute(context.settings, state)
     exit_verdict = can_reduce_risk(context.settings)
     md = _exec_md(context)
     # Protective TP / soft-stop / DTE / expiry closes deliberately ignore the
@@ -519,6 +520,12 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     # environment/config and market-hours interlocks remain mandatory. Hermes
     # discretionary exit requests retain the stricter entry gate while killed.
     if exit_verdict.allowed and md is not None and is_market_open(now):
+        if not entry_verdict.allowed:
+            log.info(
+                "exits tick: new risk and Hermes discretionary exits blocked (%s); "
+                "deterministic protective exits remain active",
+                entry_verdict.reason,
+            )
         if entry_verdict.allowed:
             try:
                 submitted += await _process_exit_requests(context, md, entries, now)
@@ -691,6 +698,24 @@ async def _manage_entry(
             settings=context.settings,
             minutes_to_close=minutes_to_nyse_close(now),
         )
+    pnl = entry_net - current_net if current_net is not None else None
+    pnl_pct = pnl / abs(entry_net) * 100.0 if pnl is not None and abs(entry_net) > 1e-9 else None
+    log.info(
+        "exit decision entry_id=%s symbol=%s strategy=%s action=%s reason=%s "
+        "entry_net=%.4f current_net=%s pnl_pct=%s dte=%s minutes_to_close=%s "
+        "quote_status=%s",
+        entry.id,
+        entry.symbol,
+        entry.strategy,
+        "close" if reason is not None else "hold",
+        reason,
+        entry_net,
+        f"{current_net:.4f}" if current_net is not None else "unavailable",
+        f"{pnl_pct:.2f}" if pnl_pct is not None else "unavailable",
+        dte,
+        minutes_to_nyse_close(now),
+        quote_issue or "ready",
+    )
     if reason is None:
         return 0
 

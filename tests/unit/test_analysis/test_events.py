@@ -31,6 +31,14 @@ def test_yfinance_calendar_returns_next_date() -> None:
     assert info.source == "yfinance"
 
 
+def test_etf_skips_inapplicable_earnings_lookup() -> None:
+    with patch("optionsbot.analysis.events.yf") as mock_yf:
+        info = next_earnings("QQQ")
+    mock_yf.Ticker.assert_not_called()
+    assert info.next_date is None
+    assert info.source == "unknown"
+
+
 def test_yfinance_missing_returns_unknown() -> None:
     mock_ticker = MagicMock()
     mock_ticker.calendar = None

@@ -106,8 +106,8 @@ def _review_context(row: Any) -> tuple[bool, bool, str]:
     return True, False, "pre_trade_forecast"
 
 
-def _actual_round_trip_pnl(engine: Engine) -> dict[int, float]:
-    """Completed fill cashflows by originating score, commissions included."""
+def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
+    """Completed fill cashflows by trade, commissions included."""
     fill_cash = (
         select(
             fills.c.order_id,
@@ -131,6 +131,8 @@ def _actual_round_trip_pnl(engine: Engine) -> dict[int, float]:
         rows = conn.execute(
             select(
                 entries.c.strategy_score_id,
+                entries.c.symbol,
+                entries.c.strategy,
                 (entry_cash.c.cash + close_cash.c.cash).label("actual_pnl"),
             )
             .select_from(
@@ -147,11 +149,16 @@ def _actual_round_trip_pnl(engine: Engine) -> dict[int, float]:
             .where(closes.c.status == "filled")
             .where(entries.c.strategy_score_id.is_not(None))
         ).fetchall()
-    return {
-        int(row.strategy_score_id): float(row.actual_pnl)
+    return [
+        {
+            "pick_id": int(row.strategy_score_id),
+            "symbol": str(row.symbol),
+            "strategy": str(row.strategy),
+            "pnl": float(row.actual_pnl),
+        }
         for row in rows
         if row.actual_pnl is not None
-    }
+    ]
 
 
 def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, Any]:
@@ -164,7 +171,8 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
     are reported separately from forecast accuracy.
     """
     rows = _review_outcome_rows(engine)
-    actual_pnl = _actual_round_trip_pnl(engine)
+    actual_results = _actual_round_trip_results(engine)
+    actual_pnl = {result["pick_id"]: result["pnl"] for result in actual_results}
     evaluated = [
         row for row in rows if row.win is not None or int(row.strategy_score_id) in actual_pnl
     ]
@@ -229,6 +237,27 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 "review_reason": row.reason,
             }
         )
+    by_strategy: dict[str, dict[str, int | float]] = {}
+    by_symbol: dict[str, dict[str, int | float]] = {}
+    for result in actual_results:
+        for key, groups in (
+            (result["strategy"], by_strategy),
+            (result["symbol"], by_symbol),
+        ):
+            group = groups.setdefault(
+                key,
+                {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+            )
+            group["trades"] += 1
+            group["wins" if result["pnl"] > 0 else "losses"] += 1
+            group["net_pnl"] += result["pnl"]
+    for groups in (by_strategy, by_symbol):
+        for group in groups.values():
+            trades = int(group["trades"])
+            group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
+            group["net_pnl"] = round(float(group["net_pnl"]), 2)
+
+    actual_wins = sum(result["pnl"] > 0 for result in actual_results)
     return {
         "meaning": (
             "Completed actual fill P&L (including commissions) takes precedence; "
@@ -242,6 +271,15 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         "forecast_accuracy": (forecast_useful / forecast_judgeable if forecast_judgeable else None),
         "forecast_mistakes": mistakes,
         "guarded_theoretical_winners": guarded_winners,
+        "actual_trade_summary": {
+            "trades": len(actual_results),
+            "wins": actual_wins,
+            "losses": len(actual_results) - actual_wins,
+            "win_rate": (actual_wins / len(actual_results) if actual_results else None),
+            "net_pnl": round(sum(result["pnl"] for result in actual_results), 2),
+            "by_strategy": by_strategy,
+            "by_symbol": by_symbol,
+        },
         "recent_lessons": lessons[: max(1, min(recent_limit, 100))],
     }
 

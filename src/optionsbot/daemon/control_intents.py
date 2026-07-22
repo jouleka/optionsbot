@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,8 @@ _REQUIRED_PROPOSAL_CHECKS = {
     "regime_history",
     "catalysts",
 }
+
+log = logging.getLogger(__name__)
 
 
 def _timestamp(value: object, field: str) -> datetime:
@@ -390,6 +393,20 @@ def consume_control_intents(
                     .where(control_intents.c.status == "pending")
                     .values(status=status, processed_at=now, result_text=result)
                 )
+            if status == "rejected":
+                log.warning(
+                    "restricted intent rejected id=%s kind=%s result=%s",
+                    row.id,
+                    row.kind,
+                    result,
+                )
+            else:
+                log.info(
+                    "restricted intent processed id=%s kind=%s result=%s",
+                    row.id,
+                    row.kind,
+                    result,
+                )
     finally:
         intent_engine.dispose()
     return consumed
@@ -442,6 +459,20 @@ async def consume_control_intents_async(
                     .where(control_intents.c.id == row.id)
                     .where(control_intents.c.status == "pending")
                     .values(status=status, processed_at=now, result_text=result)
+                )
+            if status == "rejected":
+                log.warning(
+                    "restricted intent rejected id=%s kind=%s result=%s",
+                    row.id,
+                    row.kind,
+                    result,
+                )
+            else:
+                log.info(
+                    "restricted intent processed id=%s kind=%s result=%s",
+                    row.id,
+                    row.kind,
+                    result,
                 )
     finally:
         intent_engine.dispose()

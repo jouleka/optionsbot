@@ -20,6 +20,28 @@ import yfinance as yf  # type: ignore[import-untyped]
 
 from optionsbot.analysis.types import EarningsInfo
 
+_NO_EARNINGS_ETFS = frozenset(
+    {
+        "DIA",
+        "GLD",
+        "IWM",
+        "QQQ",
+        "SLV",
+        "SPY",
+        "TLT",
+        "XLB",
+        "XLE",
+        "XLF",
+        "XLI",
+        "XLK",
+        "XLP",
+        "XLRE",
+        "XLU",
+        "XLV",
+        "XLY",
+    }
+)
+
 
 def _coerce_to_date(value: Any) -> date | None:
     """Best-effort conversion of a yfinance value to ``datetime.date``.
@@ -78,6 +100,12 @@ def next_earnings(
         return EarningsInfo(
             next_date=manual_overrides[symbol], source="manual"
         )
+    # Broad/index/sector ETFs do not report corporate earnings. Asking Yahoo
+    # for their earnings calendar emits a misleading ERROR-level 404 on every
+    # scan even though the scan correctly continues. Skip that inapplicable
+    # request so operational error logs retain signal.
+    if symbol.upper() in _NO_EARNINGS_ETFS:
+        return EarningsInfo(next_date=None, source="unknown")
     try:
         ticker = yf.Ticker(symbol)
         calendar = ticker.calendar
