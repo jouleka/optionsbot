@@ -284,13 +284,22 @@ async def _consume_entry_proposal(
         else:
             bot_eligible = False
 
-    review_status = "requested" if bot_eligible else "held"
-    decision_reason = None
     if not bot_eligible:
         decision_reason = (
             "OptionsBot independently declined: candidate lacked positive edge, "
             "affordability, score floor, fresh execution evidence, or alert admission"
         )
+        # The control-intent row is the immutable audit record for a proposal
+        # that never passed OptionsBot's own admission gates.  entry_reviews
+        # deliberately requires an exact, proven-delivered alert identity, so
+        # do not manufacture a nullable review merely to shadow-record a
+        # declined hypothesis.
+        return (
+            f"Hermes proposal declined for {symbol}/{selected.strategy_name}: "
+            f"{decision_reason}"
+        )
+
+    assert alert_id is not None
     with context.engine.begin() as conn:
         pk = conn.execute(
             insert(entry_reviews).values(
@@ -302,18 +311,13 @@ async def _consume_entry_proposal(
                 sources_json=sources,
                 reason=f"Hermes-originated proposal: {thesis}",
                 checks_json=checks,
-                status=review_status,
-                decision_reason=decision_reason,
-                processed_at=now if not bot_eligible else None,
+                status="requested",
+                decision_reason=None,
+                processed_at=None,
             )
         )
         assert pk.inserted_primary_key is not None
         review_id = int(pk.inserted_primary_key[0])
-    if not bot_eligible:
-        return (
-            f"Hermes proposal #{review_id} shadow-recorded but OptionsBot declined "
-            f"{symbol}/{selected.strategy_name}: {decision_reason}"
-        )
 
     submitted = await auto_execute_candidates(
         context,

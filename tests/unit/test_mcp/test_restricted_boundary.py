@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 from optionsbot.config import Settings
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.control_intents import (
+    _consume_entry_proposal,
     _consume_entry_review,
     consume_control_intents,
     consume_control_intents_async,
@@ -429,6 +431,115 @@ async def test_async_consumer_routes_entry_proposal_to_live_rebuilder(
         row = conn.execute(select(control_intents)).one()
     assert row.status == "processed"
     assert row.result_text == "proposal independently rebuilt"
+
+
+@pytest.mark.asyncio
+async def test_declined_entry_proposal_does_not_create_alertless_review(
+    mcp_engine: Engine,
+) -> None:
+    now = datetime.now(UTC)
+    with mcp_engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=now,
+                    spot=500.0,
+                    regime_dir="bull",
+                    regime_iv="neutral",
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=snapshot_id,
+                strategy="bull_call_spread",
+                score=80.0,
+                rationale="candidate rebuilt from live data",
+                legs_json=[],
+                suggestion_json={},
+            )
+        )
+
+    selected = SimpleNamespace(
+        strategy_name="bull_call_spread",
+        score=80.0,
+        suggestion=SimpleNamespace(legs=()),
+    )
+    scan_result = SimpleNamespace(snapshot_id=snapshot_id, scored=(selected,))
+    settings = SimpleNamespace(
+        screener=SimpleNamespace(universe=["SPY"]),
+        execution=SimpleNamespace(
+            paper_only=True,
+            zero_dte_only=True,
+            zero_dte_entry_cutoff_minutes=30,
+            max_single_trade_risk_pct=0.10,
+        ),
+        ibkr=SimpleNamespace(paper=True),
+        scan=SimpleNamespace(scan_symbol_timeout_s=5.0, score_threshold=70.0),
+    )
+    context = cast(
+        "DaemonContext",
+        SimpleNamespace(
+            engine=mcp_engine,
+            settings=settings,
+            ibkr=object(),
+            ibkr_lock=asyncio.Lock(),
+            resolver=None,
+        ),
+    )
+    account = SimpleNamespace(net_liquidation_usd=10_000.0)
+    positions_client = SimpleNamespace(
+        get_account_summary=AsyncMock(return_value=account)
+    )
+    payload = {
+        "proposed_at": now.isoformat(),
+        "symbol": "SPY",
+        "direction": "bull",
+        "iv_regime": "neutral",
+        "strategy": "auto",
+        "confidence": 0.8,
+        "sources": ["FRED macro snapshot", "Finnhub SPY news"],
+        "thesis": "Bounded paper hypothesis.",
+        "checks": {
+            "bot_health": True,
+            "regime_history": True,
+            "catalysts": True,
+        },
+    }
+
+    with (
+        patch(
+            "optionsbot.daemon.market_hours.is_market_open",
+            return_value=True,
+        ),
+        patch(
+            "optionsbot.daemon.market_hours.minutes_to_nyse_close",
+            return_value=120.0,
+        ),
+        patch(
+            "optionsbot.scan.scan_symbol",
+            new=AsyncMock(return_value=scan_result),
+        ),
+        patch(
+            "optionsbot.ibkr.positions.PositionsClient",
+            return_value=positions_client,
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner.rank_alert_candidates",
+            return_value=[],
+        ),
+        patch(
+            "optionsbot.daemon.candidate_evidence.capture_candidate_evidence",
+            new=AsyncMock(return_value={"ready": True}),
+        ),
+    ):
+        result = await _consume_entry_proposal(context, payload)
+
+    assert result.startswith("Hermes proposal declined for SPY/bull_call_spread")
+    with mcp_engine.connect() as conn:
+        assert conn.execute(select(entry_reviews.c.id)).fetchall() == []
 
 
 def test_halt_is_queued_then_monotonically_consumed_by_daemon(
