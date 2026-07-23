@@ -56,6 +56,8 @@ def _insert_pick(
     suggested_quantity: int = 1,
     credit_or_debit: float = 120.0,  # dollars per set; 1.20/unit
     max_loss: float = 380.0,
+    max_profit: float = 120.0,
+    expected_value: float = 11.0,
     legs: list[dict[str, Any]] | None = None,
     raw_json: Any = None,
 ) -> int:
@@ -72,9 +74,9 @@ def _insert_pick(
                 suggestion_json={
                     "defined_risk": defined_risk,
                     "credit_or_debit": credit_or_debit,
-                    "max_loss": max_loss, "max_profit": 120.0, "prob_profit": 0.7,
+                    "max_loss": max_loss, "max_profit": max_profit, "prob_profit": 0.7,
                     "suggested_quantity": suggested_quantity,
-                    "reward_risk": 0.32, "expected_value": 11.0,
+                    "reward_risk": 0.32, "expected_value": expected_value,
                     "risk_tier": "balanced",
                 },
             )
@@ -439,6 +441,43 @@ async def test_rejects_when_credit_sign_flipped(tmp_db: Engine) -> None:
     assert "edge" in outcome.message.lower() or "credit" in outcome.message.lower()
 
 
+async def test_rejects_when_fresh_debit_turns_positive_scan_ev_negative(
+    tmp_db: Engine,
+) -> None:
+    qqq_legs = [
+        {
+            "symbol": "QQQ", "side": "sell", "sec_type": "OPT",
+            "expiry": "20260717", "strike": 689.0, "right": "P", "quantity": 1,
+        },
+        {
+            "symbol": "QQQ", "side": "buy", "sec_type": "OPT",
+            "expiry": "20260717", "strike": 692.0, "right": "P", "quantity": 1,
+        },
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        symbol="QQQ",
+        legs=qqq_legs,
+        credit_or_debit=-90.50,
+        max_loss=90.50,
+        max_profit=209.50,
+        expected_value=6.329505005969168,
+    )
+    deps = _deps(
+        tmp_db,
+        md_mids={(689.0, "P"): 0.84, (692.0, "P"): 2.07},
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "expected value" in outcome.message.lower()
+    assert "-26.17" in outcome.message
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
 async def test_rejects_when_margin_exceeds_available(tmp_db: Engine) -> None:
     score_id = _insert_pick(tmp_db)
     deps = _deps(tmp_db, available_funds=100.0, margin_change=380.0)
@@ -565,7 +604,12 @@ async def test_happy_path_debit_places_positive_limit(tmp_db: Engine) -> None:
 
 async def test_drift_warning_included(tmp_db: Engine) -> None:
     # Scan credit $1.80/unit, fresh mid $1.20 -> 33% drift > 25% default band.
-    score_id = _insert_pick(tmp_db, credit_or_debit=180.0)
+    # Keep enough model edge that the $60 adverse repricing remains positive.
+    score_id = _insert_pick(
+        tmp_db,
+        credit_or_debit=180.0,
+        expected_value=100.0,
+    )
     deps = _deps(tmp_db)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)

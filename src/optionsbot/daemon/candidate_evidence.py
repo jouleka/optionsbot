@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import select, update
 
 from optionsbot.daemon.context import DaemonContext
+from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.equity_guard import new_entry_allowed
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import open_orders
@@ -50,6 +51,22 @@ def _quote_dict(quote: OptionQuote, side: object, quantity: object) -> dict[str,
         "quote_ts": quote.ts.isoformat() if quote.ts is not None else None,
         "delayed": quote.delayed,
     }
+
+
+def apply_reconciled_economics(suggestion: object, evidence: dict[str, Any]) -> None:
+    """Update an in-memory StrategySuggestion to match persisted fresh metrics."""
+    economics = evidence.get("economics")
+    if not isinstance(economics, dict):
+        return
+    for name in (
+        "credit_or_debit",
+        "max_loss",
+        "max_profit",
+        "reward_risk",
+        "expected_value",
+    ):
+        if name in economics:
+            setattr(suggestion, name, economics[name])
 
 
 def _active_position_counts(context: DaemonContext, symbol: str) -> tuple[int, int]:
@@ -155,6 +172,7 @@ async def capture_candidate_evidence(
     combo = combo_bid_ask(legs, quote_map)
     mid = (combo[0] + combo[1]) / 2 if combo is not None else None
     combo_issue = None
+    economics = None
     if mid is None:
         issues.append("combo mid unavailable")
     else:
@@ -166,6 +184,26 @@ async def capture_candidate_evidence(
         )
         if combo_issue is not None:
             issues.append("liquidity: " + combo_issue)
+        with context.engine.connect() as conn:
+            stored_suggestion = conn.execute(
+                select(strategy_scores.c.suggestion_json).where(
+                    strategy_scores.c.id == score_id
+                )
+            ).scalar_one()
+        economics = reconcile_entry_economics(
+            legs,
+            dict(stored_suggestion or {}),
+            fresh_net_per_share=mid,
+        )
+        if economics is None:
+            issues.append("fresh executable economics unavailable")
+        elif economics.expected_value is None:
+            issues.append("fresh executable expected value unavailable")
+        elif economics.expected_value <= 0:
+            issues.append(
+                "fresh executable expected value is non-positive "
+                f"({economics.expected_value:.2f})"
+            )
 
     state = load_state(context.engine)
     execution_gate = can_execute(context.settings, state)
@@ -194,6 +232,43 @@ async def capture_candidate_evidence(
     except Exception as exc:  # noqa: BLE001
         open_heat = None
         issues.append(f"portfolio heat unavailable: {type(exc).__name__}")
+    candidate_max_loss = economics.max_loss if economics is not None else None
+    single_trade_cap = (
+        net_liq_usd * context.settings.execution.max_single_trade_risk_pct
+        if net_liq_usd is not None
+        else None
+    )
+    portfolio_heat_cap = (
+        net_liq_usd * context.settings.execution.max_portfolio_heat_pct
+        if net_liq_usd is not None
+        else None
+    )
+    single_trade_risk_allowed = (
+        candidate_max_loss <= single_trade_cap
+        if candidate_max_loss is not None and single_trade_cap is not None
+        else False
+    )
+    portfolio_heat_allowed = (
+        open_heat + candidate_max_loss <= portfolio_heat_cap
+        if open_heat is not None
+        and candidate_max_loss is not None
+        and portfolio_heat_cap is not None
+        else False
+    )
+    position_count_allowed = (
+        active_count < context.settings.execution.max_open_positions
+    )
+    symbol_count_allowed = (
+        symbol_count < context.settings.execution.max_per_symbol
+    )
+    if not single_trade_risk_allowed:
+        issues.append("candidate exceeds or cannot prove the single-trade risk cap")
+    if not portfolio_heat_allowed:
+        issues.append("candidate exceeds or cannot prove the portfolio heat cap")
+    if not position_count_allowed:
+        issues.append("maximum open-position count reached")
+    if not symbol_count_allowed:
+        issues.append(f"maximum active {symbol} position count reached")
     evidence = {
         "schema_version": 1,
         "source": "trusted_daemon",
@@ -208,6 +283,7 @@ async def capture_candidate_evidence(
             "mid": mid,
             "liquidity_issue": combo_issue,
         },
+        "economics": economics.to_dict() if economics is not None else None,
         "account": account,
         "positions": [
             {
@@ -240,6 +316,18 @@ async def capture_candidate_evidence(
             "max_portfolio_heat_pct": context.settings.execution.max_portfolio_heat_pct,
             "max_single_trade_risk_pct": context.settings.execution.max_single_trade_risk_pct,
             "max_bp_usage_pct": context.settings.execution.max_bp_usage_pct,
+            "candidate_max_loss": candidate_max_loss,
+            "single_trade_cap": single_trade_cap,
+            "single_trade_risk_allowed": single_trade_risk_allowed,
+            "portfolio_heat_after": (
+                open_heat + candidate_max_loss
+                if open_heat is not None and candidate_max_loss is not None
+                else None
+            ),
+            "portfolio_heat_cap": portfolio_heat_cap,
+            "portfolio_heat_allowed": portfolio_heat_allowed,
+            "position_count_allowed": position_count_allowed,
+            "symbol_count_allowed": symbol_count_allowed,
             "last_reconcile_at": (
                 context.last_reconcile_ts.isoformat()
                 if context.last_reconcile_ts is not None
@@ -252,6 +340,14 @@ async def capture_candidate_evidence(
             select(strategy_scores.c.suggestion_json).where(strategy_scores.c.id == score_id)
         ).scalar_one()
         updated = dict(suggestion or {})
+        if economics is not None:
+            updated.update(
+                credit_or_debit=economics.credit_or_debit,
+                max_loss=economics.max_loss,
+                max_profit=economics.max_profit,
+                reward_risk=economics.reward_risk,
+                expected_value=economics.expected_value,
+            )
         updated["review_evidence"] = evidence
         conn.execute(
             update(strategy_scores)

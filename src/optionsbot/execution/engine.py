@@ -28,6 +28,7 @@ from optionsbot.daemon.market_hours import (
     minutes_to_nyse_close,
     nyse_session_date,
 )
+from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.gate import can_execute
 from optionsbot.execution.orders import (
     record_order_quotes,
@@ -36,10 +37,7 @@ from optionsbot.execution.orders import (
     stage_order,
     transition,
 )
-from optionsbot.execution.risk_structure import (
-    has_structurally_defined_option_risk,
-    structural_max_loss_dollars,
-)
+from optionsbot.execution.risk_structure import has_structurally_defined_option_risk
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
@@ -344,15 +342,25 @@ async def execute_pick(
     # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
     # rejects sub-increment limits with Error 110. Round to the symbol's tick.
     fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
-    structural_max_loss = structural_max_loss_dollars(
+    fresh_economics = reconcile_entry_economics(
         legs,
-        entry_net_per_share=fresh_net,
+        suggestion,
+        fresh_net_per_share=fresh_net,
     )
-    if structural_max_loss is None:
-        return _reject("option legs do not prove a finite structural max loss")
-    # Persisted scanner risk is advisory. Never size below the larger of the
-    # scanner estimate and the independently reconstructed expiry loss.
-    max_loss_unit = max(max_loss_unit, structural_max_loss)
+    if fresh_economics is None:
+        return _reject("fresh option economics do not prove a finite structural loss")
+    max_loss_unit = fresh_economics.max_loss
+    max_profit_unit = fresh_economics.max_profit
+    fresh_expected_value = fresh_economics.expected_value
+    if fresh_expected_value is None and settings.execution.mode == "auto":
+        return _reject(
+            "fresh executable expected value unavailable — refusing automatic entry"
+        )
+    if fresh_expected_value is not None and fresh_expected_value <= 0:
+        return _reject(
+            "edge gone — fresh executable expected value is "
+            f"${fresh_expected_value:.2f} at {fresh_net:+.2f}/unit"
+        )
     # Economic liquidity gate: combo spread vs the premium we're capturing.
     combo_issue = combo_spread_issue(
         legs, quotes, fresh_net, max_frac=settings.execution.max_combo_spread_frac
@@ -411,9 +419,7 @@ async def execute_pick(
     decision = dynamic_quantity(
         equity=equity,
         max_loss_unit=max_loss_unit,
-        max_profit_unit=(
-            float(suggestion["max_profit"]) if suggestion.get("max_profit") else None
-        ),
+        max_profit_unit=max_profit_unit,
         prob_profit=(
             float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
         ),

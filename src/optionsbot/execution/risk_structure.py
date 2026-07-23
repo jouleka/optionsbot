@@ -79,6 +79,70 @@ def structural_max_loss_dollars(
     return max(0.0, -worst_pnl)
 
 
+def structural_max_profit_dollars(
+    legs: object,
+    *,
+    entry_net_per_share: float,
+) -> float | None:
+    """Return finite expiry max profit from legs and the fresh entry price.
+
+    ``None`` means the profit is unbounded or the structure cannot be proven.
+    This is the max-profit counterpart to :func:`structural_max_loss_dollars`;
+    both operate in signed credit-positive entry-price space.
+    """
+    if (
+        not has_structurally_defined_option_risk(legs)
+        or not math.isfinite(entry_net_per_share)
+    ):
+        return None
+    assert isinstance(legs, list)
+
+    groups: dict[tuple[str, str], list[tuple[str, str, float, int]]] = defaultdict(list)
+    identities: set[tuple[str, str, str, float]] = set()
+    for leg in legs:
+        symbol = str(leg["symbol"]).strip().upper()
+        expiry = str(leg["expiry"])
+        right = str(leg["right"])
+        side = str(leg["side"])
+        strike = float(leg["strike"])
+        quantity = int(leg["quantity"])
+        identity = (symbol, expiry, right, strike)
+        if identity in identities:
+            return None
+        identities.add(identity)
+        groups[(symbol, expiry)].append((side, right, strike, quantity))
+
+    best_intrinsic_per_share = 0.0
+    for group_legs in groups.values():
+        high_price_slope = sum(
+            (1 if side == "buy" else -1) * quantity
+            for side, right, _strike, quantity in group_legs
+            if right == "C"
+        )
+        if high_price_slope > 0:
+            return None
+        checkpoints = {0.0, *(strike for _side, _right, strike, _qty in group_legs)}
+        group_max = -math.inf
+        for spot in checkpoints:
+            intrinsic = 0.0
+            for side, right, strike, quantity in group_legs:
+                payoff = (
+                    max(spot - strike, 0.0)
+                    if right == "C"
+                    else max(strike - spot, 0.0)
+                )
+                intrinsic += (1.0 if side == "buy" else -1.0) * quantity * payoff
+            group_max = max(group_max, intrinsic)
+        if not math.isfinite(group_max):
+            return None
+        best_intrinsic_per_share += group_max
+
+    best_pnl = (entry_net_per_share + best_intrinsic_per_share) * 100.0
+    if not math.isfinite(best_pnl):
+        return None
+    return max(0.0, best_pnl)
+
+
 def has_structurally_defined_option_risk(legs: object) -> bool:
     """Return True only when the persisted option legs prove bounded short risk."""
     if not isinstance(legs, list) or not legs:

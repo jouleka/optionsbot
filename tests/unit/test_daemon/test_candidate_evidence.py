@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from sqlalchemy import insert, select
 
 from optionsbot.daemon.candidate_evidence import capture_candidate_evidence
@@ -85,7 +86,14 @@ async def test_capture_candidate_evidence_persists_ready_packet(
                     strategy="bull_put_spread",
                     score=80.0,
                     legs_json=LEGS,
-                    suggestion_json={"defined_risk": True, "max_loss": 380.0},
+                    suggestion_json={
+                        "defined_risk": True,
+                        "credit_or_debit": 100.0,
+                        "max_loss": 400.0,
+                        "max_profit": 100.0,
+                        "prob_profit": 0.65,
+                        "expected_value": 10.0,
+                    },
                 )
             ).inserted_primary_key[0]
         )
@@ -127,6 +135,12 @@ async def test_capture_candidate_evidence_persists_ready_packet(
     assert evidence["readiness_issues"] == []
     assert len(evidence["option_quotes"]) == 2
     assert evidence["combo"]["mid"] == 1.2
+    assert evidence["economics"]["credit_or_debit"] == pytest.approx(120.0)
+    assert evidence["economics"]["max_loss"] == pytest.approx(380.0)
+    assert evidence["economics"]["max_profit"] == pytest.approx(120.0)
+    assert evidence["economics"]["expected_value"] == pytest.approx(30.0)
+    assert evidence["risk"]["single_trade_risk_allowed"] is True
+    assert evidence["risk"]["portfolio_heat_allowed"] is True
     assert review_evidence_ready(
         evidence,
         score_id=score_id,
@@ -138,3 +152,7 @@ async def test_capture_candidate_evidence_persists_ready_packet(
             select(strategy_scores.c.suggestion_json).where(strategy_scores.c.id == score_id)
         ).scalar_one()
     assert suggestion["review_evidence"]["source"] == "trusted_daemon"
+    assert suggestion["credit_or_debit"] == pytest.approx(120.0)
+    assert suggestion["max_loss"] == pytest.approx(380.0)
+    assert suggestion["max_profit"] == pytest.approx(120.0)
+    assert suggestion["expected_value"] == pytest.approx(30.0)

@@ -147,7 +147,10 @@ async def _consume_entry_proposal(
     """Rebuild a Hermes idea from live data; OptionsBot remains authoritative."""
     from optionsbot.daemon.alert_pipeline import enqueue_alert
     from optionsbot.daemon.auto_executor import auto_execute_candidates
-    from optionsbot.daemon.candidate_evidence import capture_candidate_evidence
+    from optionsbot.daemon.candidate_evidence import (
+        apply_reconciled_economics,
+        capture_candidate_evidence,
+    )
     from optionsbot.daemon.market_hours import (
         is_market_open,
         minutes_to_nyse_close,
@@ -272,6 +275,7 @@ async def _consume_entry_proposal(
         symbol=symbol,
         legs=legs,
     )
+    apply_reconciled_economics(selected.suggestion, evidence)
 
     admission_blockers = candidate_admission_blockers(
         selected,

@@ -63,9 +63,12 @@ async def enqueue_alert(
     # Hermes is deliberately broker-isolated. Capture the exact live quote,
     # account, and risk packet before the alert becomes visible as sent.
     try:
-        from optionsbot.daemon.candidate_evidence import capture_candidate_evidence
+        from optionsbot.daemon.candidate_evidence import (
+            apply_reconciled_economics,
+            capture_candidate_evidence,
+        )
 
-        await capture_candidate_evidence(
+        evidence = await capture_candidate_evidence(
             context,
             score_id=strategy_score_id,
             symbol=symbol,
@@ -82,6 +85,7 @@ async def enqueue_alert(
                 for leg in scored.suggestion.legs
             ],
         )
+        apply_reconciled_economics(scored.suggestion, evidence)
     except Exception:  # noqa: BLE001 - alert still delivers; Hermes fails closed
         log.exception("candidate evidence capture failed for score %s", strategy_score_id)
     await dispatch_alert(context, alert_id, snapshot_id, scored)
