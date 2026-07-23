@@ -1,10 +1,9 @@
 """Automated exit tick (IBK-129): bot positions → closing orders.
 
-Runs as a sibling of the scan/manage ticks (15-minute cadence — right for
-50%-profit / DTE rules; the 1-minute order watcher manages the resulting
-working orders). Only ledger-attributed positions are ever touched: a
-position is a FILLED open-intent order with no filled close. Manual
-positions remain alert-only.
+Runs on a dedicated wall-clock-aligned one-minute cadence; the separate
+one-minute order watcher manages resulting working orders. Only
+ledger-attributed positions are ever touched: a position is a FILLED
+open-intent order with no filled close. Manual positions remain alert-only.
 """
 
 from __future__ import annotations
@@ -75,12 +74,14 @@ class ExitsTickSummary:
 
 
 def _exec_md(context: DaemonContext) -> MarketDataClient | None:
-    """Quote source for exit pricing: the EXEC connection (lock-free; the
-    scan tick has just released ibkr_lock but /scan can grab it any time).
-    Patchable seam for tests."""
-    if context.exec_ibkr is None:
-        return None
-    return MarketDataClient(context.exec_ibkr, context.resolver)
+    """Quote source for exit pricing: the daemon's sole market-data session.
+
+    The EXEC connection is reserved for orders and their events. Requesting
+    live quotes on both API sessions caused intermittent IBKR Error 10197
+    ("competing live session"). Callers serialize quote sets on ``ibkr_lock``.
+    Patchable seam for tests.
+    """
+    return MarketDataClient(context.ibkr, context.resolver)
 
 
 def _open_entries(context: DaemonContext) -> list[OrderRecord]:
@@ -289,14 +290,15 @@ async def _quote_gate_state(
     quotes: dict[tuple[str, float, str], OptionQuote] = {}
     current_net: float | None = None
     try:
-        for leg in option_legs:
-            spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
-            quotes[spec] = await md.get_option_snapshot(
-                entry.symbol,
-                spec[0],
-                spec[1],
-                spec[2],  # type: ignore[arg-type]
-            )
+        async with context.ibkr_lock:
+            for leg in option_legs:
+                spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+                quotes[spec] = await md.get_option_snapshot(
+                    entry.symbol,
+                    spec[0],
+                    spec[1],
+                    spec[2],  # type: ignore[arg-type]
+                )
         current_net = combo_mid(entry.legs, quotes)
     except Exception:  # noqa: BLE001 -- request_exit fails closed without quote corroboration
         log.warning("request_exit quote gate failed for entry #%s", entry.id)
@@ -630,14 +632,15 @@ async def _manage_entry(
     quotes: dict[tuple[str, float, str], OptionQuote] = {}
     current_net: float | None = None
     try:
-        for leg in option_legs:
-            spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
-            quotes[spec] = await md.get_option_snapshot(
-                entry.symbol,
-                spec[0],
-                spec[1],
-                spec[2],  # type: ignore[arg-type]
-            )
+        async with context.ibkr_lock:
+            for leg in option_legs:
+                spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+                quotes[spec] = await md.get_option_snapshot(
+                    entry.symbol,
+                    spec[0],
+                    spec[1],
+                    spec[2],  # type: ignore[arg-type]
+                )
         current_net = combo_mid(entry.legs, quotes)
     except Exception:  # noqa: BLE001 -- deterministic exits must still work quote-blind
         log.warning("exit quotes failed for entry #%s — DTE rules only", entry.id)
@@ -942,6 +945,7 @@ async def _manage_entry(
                 decision_mid=close_net,
                 budget=budget,
                 increment=increment,
+                ibkr_lock=context.ibkr_lock,
             )
         )
         context.walk_tasks.add(task)

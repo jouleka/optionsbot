@@ -369,15 +369,9 @@ async def _cmd_execute(context: DaemonContext, args: list[str]) -> list[CommandR
     # as _cmd_record).
     from optionsbot.execution import engine as execution_engine
 
-    # The walk re-anchors quotes over the EXEC connection (no ibkr_lock —
-    # scan ticks hold the daemon lock for minutes). Legs are resolver-cache
-    # warm from the decision quotes, so qualification stays off the daemon
-    # connection.
-    walk_md = (
-        MarketDataClient(context.exec_ibkr, context.resolver)
-        if context.exec_ibkr is not None
-        else None
-    )
+    # All quotes share the daemon market-data session and ibkr_lock. The EXEC
+    # connection is deliberately order-only to avoid IBKR Error 10197.
+    walk_md = MarketDataClient(context.ibkr, context.resolver)
     deps = execution_engine.ExecutionDeps(
         engine=context.engine,
         settings=context.settings,

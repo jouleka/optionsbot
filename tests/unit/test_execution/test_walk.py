@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from typing import Any
@@ -295,6 +296,52 @@ def _tracker_confirms_cancel(engine: Engine, order_id: int) -> AsyncMock:
             )
 
     return AsyncMock(side_effect=_cancel)
+
+
+async def test_walk_serializes_complete_quote_sets_on_shared_ibkr_lock(
+    tmp_db: Engine,
+) -> None:
+    order_id = _walk_order(tmp_db)
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    lock = asyncio.Lock()
+    md = MagicMock()
+
+    async def _locked_snapshot(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        assert lock.locked()
+        bid, ask = {
+            (580.0, "P"): (1.55, 1.65),
+            (575.0, "P"): (0.35, 0.45),
+        }[(strike, right)]
+        return _quote(
+            strike,
+            right,
+            bid=bid,
+            ask=ask,
+            ts=datetime.now(UTC),
+            delayed=False,
+        )
+
+    md.get_option_snapshot = AsyncMock(side_effect=_locked_snapshot)
+    await run_price_walk(
+        engine=tmp_db,
+        settings=_walk_settings(),
+        order_client=order_client,
+        md=md,
+        symbol="SPY",
+        legs=LEGS,
+        order_id=order_id,
+        ib_order_id=11,
+        decision_mid=1.20,
+        budget=0.09,
+        increment=0.01,
+        ibkr_lock=lock,
+    )
+
+    assert md.get_option_snapshot.await_count == 6
 
 
 async def test_walk_exhaustion_requests_cancel_tracker_confirms(tmp_db: Engine) -> None:

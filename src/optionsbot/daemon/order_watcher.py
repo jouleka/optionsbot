@@ -106,6 +106,7 @@ async def run_orders_tick(
                     engine, context.order_client, notify=_notify, now=now,
                     walk_md=_walk_md_for(context),
                     walk_tasks=context.walk_tasks,
+                    walk_lock=context.ibkr_lock,
                     settings=context.settings,
                     positions_snapshot=_positions,
                 )
@@ -384,10 +385,8 @@ async def _check_net_liq_drawdown(context: DaemonContext, now: datetime) -> None
 
 
 def _walk_md_for(context: DaemonContext) -> Any:
-    if context.exec_ibkr is None:
-        return None
     from optionsbot.ibkr.market_data import MarketDataClient
-    return MarketDataClient(context.exec_ibkr)
+    return MarketDataClient(context.ibkr, context.resolver)
 
 
 async def _send(context: DaemonContext, text: str) -> None:

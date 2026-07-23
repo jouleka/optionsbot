@@ -341,11 +341,7 @@ async def _execute_trusted_paper_score(
     try:
         from optionsbot.execution import engine as execution_engine
 
-        walk_md = (
-            MarketDataClient(context.exec_ibkr, context.resolver)
-            if context.exec_ibkr is not None
-            else None
-        )
+        walk_md = MarketDataClient(context.ibkr, context.resolver)
         deps = execution_engine.ExecutionDeps(
             engine=context.engine,
             settings=context.settings,
@@ -452,11 +448,7 @@ async def _execute_reviewed_score(
         # module-level import would close a cycle.
         from optionsbot.execution import engine as execution_engine
 
-        walk_md = (
-            MarketDataClient(context.exec_ibkr, context.resolver)
-            if context.exec_ibkr is not None
-            else None
-        )
+        walk_md = MarketDataClient(context.ibkr, context.resolver)
         deps = execution_engine.ExecutionDeps(
             engine=context.engine,
             settings=context.settings,

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
@@ -149,6 +150,7 @@ class Daemon:
                     notify=_notify,
                     walk_md=_walk_md_for(self._context),
                     walk_tasks=self._context.walk_tasks,
+                    walk_lock=self._context.ibkr_lock,
                     settings=self._settings,
                     positions_snapshot=_positions,
                 )
@@ -339,8 +341,13 @@ class Daemon:
             )
         except Exception:
             log.exception("manage tick failed catastrophically")
-        # IBK-129: automated exits for bot-opened positions — third sibling,
-        # isolated the same way.
+        # Protective exits run on their own wall-clock-aligned minute job.
+        # Keeping them out of the scanner prevents scan duration/restarts from
+        # shifting the 0DTE force-exit deadline.
+
+    async def _exits_tick(self) -> None:
+        """Run protective exits independently of scan latency and cadence."""
+        assert self._context is not None
         try:
             from optionsbot.daemon.exit_runner import run_exits_tick
 
@@ -496,6 +503,17 @@ class Daemon:
             self._entry_reviews_tick,
             trigger=IntervalTrigger(minutes=1),
             id="entry_reviews",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        # Protective exits are deadline-sensitive (especially the 0DTE close
+        # guard). CronTrigger anchors them to each wall-clock minute instead of
+        # inheriting a daemon-start offset or the scanner's variable duration.
+        self._scheduler.add_job(
+            self._exits_tick,
+            trigger=CronTrigger(second=0, timezone=UTC),
+            id="exits",
             max_instances=1,
             coalesce=True,
             replace_existing=True,

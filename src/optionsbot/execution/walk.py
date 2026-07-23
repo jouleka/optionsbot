@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -211,16 +212,16 @@ async def run_price_walk(
     decision_mid: float,
     budget: float,
     increment: float,
+    ibkr_lock: asyncio.Lock | None = None,
     start_step: int = 0,
     prev_target_override: float | None = None,
 ) -> None:
     """Walk one working order from mid toward marketable, then give up.
 
-    Runs as a fire-and-forget task. Quotes come from the EXEC connection's
-    MarketDataClient (no ibkr_lock — a scan tick holds the daemon lock for
-    minutes and would wreck the cadence; the legs are resolver-cache-warm
-    from execute_pick so qualification does no daemon-connection I/O).
-    Never raises; the TTL watcher remains the backstop if this task dies.
+    Runs as a fire-and-forget task. When the quote client shares the daemon's
+    single market-data session, ``ibkr_lock`` serializes the complete leg set
+    against scans so IBKR never sees competing API quote streams. Never raises;
+    the TTL watcher remains the backstop if this task dies.
     """
     # Local import to avoid a module-level execution->engine cycle.
     from optionsbot.execution.engine import combo_mid
@@ -249,11 +250,17 @@ async def run_price_walk(
             current_mid: float | None = None
             nbbo: tuple[float, float] | None = None
             try:
-                for leg in option_legs:
-                    spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
-                    quotes[spec] = await md.get_option_snapshot(
-                        symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
-                    )
+                quote_guard = ibkr_lock if ibkr_lock is not None else nullcontext()
+                async with quote_guard:
+                    for leg in option_legs:
+                        spec = (
+                            str(leg["expiry"]),
+                            float(leg["strike"]),
+                            str(leg["right"]),
+                        )
+                        quotes[spec] = await md.get_option_snapshot(
+                            symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
+                        )
                 if any(quote.delayed is not False for quote in quotes.values()):
                     log.warning(
                         "walk %s step %d: delayed or unknown quote delivery; not repricing",
@@ -587,6 +594,7 @@ async def resume_walks(
     order_client: OrderClient,
     md: MarketDataClient,
     walk_tasks: set[asyncio.Task[None]],
+    ibkr_lock: asyncio.Lock | None = None,
     notify: Callable[[str], Awaitable[None]] | None = None,
 ) -> int:
     """Re-attach persisted price-walks after a restart (Work-stream D1).
@@ -617,6 +625,7 @@ async def resume_walks(
                 md=md, symbol=ws.symbol, legs=ws.legs, order_id=ws.order_id,
                 ib_order_id=ws.ib_order_id, decision_mid=ws.decision_mid,
                 budget=ws.budget, increment=ws.increment,
+                ibkr_lock=ibkr_lock,
                 start_step=ws.step, prev_target_override=ws.prev_target,
             )
         )

@@ -68,10 +68,10 @@ LegSpec = tuple[str, float, str]
 class ExecutionDeps:
     """Everything execute_pick needs; daemon/commands assembles it from context.
 
-    walk_md is a MarketDataClient bound to the EXEC connection (the walk
-    re-anchors quotes without ibkr_lock); walk_tasks holds strong refs to
-    spawned walk tasks. Either being None disables the walk (v1 behavior:
-    rest at mid until the TTL watcher cancels).
+    walk_md is a MarketDataClient bound to the daemon's single market-data
+    connection; the existing ibkr_lock serializes its refreshes. walk_tasks
+    holds strong refs to spawned walk tasks. Either being None disables the
+    walk (v1 behavior: rest at mid until the TTL watcher cancels).
     """
 
     engine: Engine
@@ -613,6 +613,7 @@ async def execute_pick(
                 symbol=symbol, legs=legs, order_id=record.id,
                 ib_order_id=placed.ib_order_id, decision_mid=fresh_net,
                 budget=budget, increment=increment,
+                ibkr_lock=deps.ibkr_lock,
             )
         )
         deps.walk_tasks.add(task)

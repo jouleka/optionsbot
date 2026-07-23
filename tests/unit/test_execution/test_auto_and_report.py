@@ -756,9 +756,40 @@ async def test_structural_max_loss_overrides_persisted_understatement(
 
 
 async def test_engine_rejects_oversized_trade_for_small_account(tmp_db: Engine) -> None:
-    # $18,885 max-loss CSP on a $5k account → clear refusal.
-    score_id = _insert_pick(tmp_db, credit_or_debit=615.0, max_loss=18_885.0)
-    deps = _deps(tmp_db, net_liquidation=5_000.0, available_funds=5_000.0)
+    # $18,885 max-loss wide put spread on a $5k account → clear refusal.
+    wide_spread_legs = [
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": "20260717",
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+        },
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": "20260717",
+            "strike": 390.0,
+            "right": "P",
+            "quantity": 1,
+        },
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        credit_or_debit=115.0,
+        max_loss=18_885.0,
+        max_profit=115.0,
+        legs=wide_spread_legs,
+    )
+    deps = _deps(
+        tmp_db,
+        net_liquidation=5_000.0,
+        available_funds=5_000.0,
+        md_mids={(580.0, "P"): 1.60, (390.0, "P"): 0.45},
+    )
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
     assert not outcome.ok

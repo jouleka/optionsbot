@@ -11,6 +11,7 @@ from sqlalchemy import insert, select, update
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import (
+    _exec_md,
     assert_no_naked_short_after_close,
     force_close_entry,
     run_exits_tick,
@@ -186,6 +187,42 @@ def _capture_loss_baseline(context: DaemonContext, net_liq: float = 10_000.0) ->
         net_liq,
         session=nyse_session_date(NOW).isoformat(),
     )
+
+
+def test_exit_quotes_use_the_single_daemon_market_data_session(
+    daemon_context: DaemonContext,
+) -> None:
+    """The execution client owns orders only; it must not compete for live quotes."""
+    daemon_context.ibkr = MagicMock()
+    daemon_context.exec_ibkr = MagicMock()
+
+    md = _exec_md(daemon_context)
+
+    assert md is not None
+    assert md.client is daemon_context.ibkr
+    assert md.client is not daemon_context.exec_ibkr
+
+
+async def test_exit_quote_set_is_serialized_on_daemon_ibkr_lock(
+    daemon_context: DaemonContext,
+) -> None:
+    _filled_entry(daemon_context)
+    _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+    md = daemon_context._test_md  # type: ignore[attr-defined]
+
+    def _locked_quote(
+        symbol: str, expiry: str, strike: float, right: str
+    ) -> OptionQuote:
+        assert daemon_context.ibkr_lock.locked()
+        mid = {(580.0, "P"): 1.40, (575.0, "P"): 0.30}[(strike, right)]
+        return _quote(strike, right, mid)
+
+    md.get_option_snapshot = AsyncMock(side_effect=_locked_quote)
+    with patch("optionsbot.daemon.exit_runner._exec_md", return_value=md):
+        summary = await run_exits_tick(daemon_context)
+
+    assert summary.errors == 0
+    assert md.get_option_snapshot.await_count == 2
 
 
 def _queue_exit_request(

@@ -352,6 +352,7 @@ async def _reconcile_once(
     now: datetime | None = None,
     walk_md: Any = None,
     walk_tasks: Any = None,
+    walk_lock: Any = None,
     walk_resume: Callable[..., Awaitable[int]] | None = None,
     settings: Any = None,
     positions_snapshot: Callable[[], Awaitable[list[PortfolioPosition]]] | None = None,
@@ -825,6 +826,7 @@ async def _reconcile_once(
                     order_client=order_client,
                     md=walk_md,
                     walk_tasks=walk_tasks,
+                    ibkr_lock=walk_lock,
                     notify=notify,
                 )
             except asyncio.CancelledError:
@@ -858,6 +860,7 @@ async def reconcile(
     now: datetime | None = None,
     walk_md: Any = None,
     walk_tasks: Any = None,
+    walk_lock: Any = None,
     walk_resume: Callable[..., Awaitable[int]] | None = None,
     settings: Any = None,
     positions_snapshot: Callable[[], Awaitable[list[PortfolioPosition]]] | None = None,
@@ -871,6 +874,7 @@ async def reconcile(
             now=now,
             walk_md=walk_md,
             walk_tasks=walk_tasks,
+            walk_lock=walk_lock,
             walk_resume=walk_resume,
             settings=settings,
             positions_snapshot=positions_snapshot,

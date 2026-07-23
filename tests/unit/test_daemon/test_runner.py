@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -118,11 +119,55 @@ async def test_scan_tick_feeds_summary_to_gateway_health_paging(
         new=AsyncMock(return_value=MagicMock(positions_seen=0, alerts_sent=0, errors=[])),
     ), patch(
         "optionsbot.daemon.exit_runner.run_exits_tick", new=AsyncMock()
-    ):
+    ) as mock_exits:
         await d._scan_tick()
 
     mock_page.assert_awaited_once()
     assert mock_page.await_args.args[1] is fake_summary  # (context, summary)
+    mock_exits.assert_not_awaited()
+
+
+async def test_exits_tick_isolated_from_scan_tick(daemon_settings) -> None:
+    """Protective exits have a dedicated scheduler callback.
+
+    A slow or restart-shifted scanner must not define the 0DTE force-exit
+    cadence.
+    """
+    d = Daemon(settings=daemon_settings)
+    d._context = MagicMock()
+    summary = MagicMock(positions=1, closes_submitted=1, errors=0)
+    with patch(
+        "optionsbot.daemon.exit_runner.run_exits_tick",
+        new=AsyncMock(return_value=summary),
+    ) as mock_exits:
+        await d._exits_tick()
+    mock_exits.assert_awaited_once_with(d._context)
+
+
+def test_periodic_jobs_align_exits_to_every_wall_clock_minute(
+    daemon_settings,
+) -> None:
+    """The exit guard fires at :00 each minute, independent of daemon start."""
+    daemon_settings.telegram.heartbeat_minutes = 0
+    daemon_settings.validation.outcomes_eval_hours = 0
+    d = Daemon(settings=daemon_settings)
+    d._scheduler = MagicMock()
+
+    d._register_periodic_jobs()
+
+    jobs = {
+        call.kwargs["id"]: call.kwargs
+        for call in d._scheduler.add_job.call_args_list
+    }
+    assert "exits" in jobs
+    exits = jobs["exits"]
+    assert exits["max_instances"] == 1
+    assert exits["coalesce"] is True
+    trigger = exits["trigger"]
+    after = datetime(2026, 7, 23, 19, 29, 59, tzinfo=UTC)
+    assert trigger.get_next_fire_time(None, after) == datetime(
+        2026, 7, 23, 19, 30, tzinfo=UTC
+    )
 
 
 def test_config_summary_includes_key_fields(daemon_settings) -> None:
