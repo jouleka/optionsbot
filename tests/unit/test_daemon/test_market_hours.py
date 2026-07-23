@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from optionsbot.daemon.market_hours import is_market_open
+from optionsbot.daemon.market_hours import (
+    is_last_nyse_session_of_week,
+    is_market_open,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -40,6 +43,12 @@ def test_market_closed_on_us_holiday_independence_day() -> None:
 
 def test_market_closed_on_us_holiday_christmas() -> None:
     assert not is_market_open(datetime(2026, 12, 25, 12, 0, tzinfo=ET))
+
+
+def test_last_session_of_week_includes_friday_holiday_shift() -> None:
+    assert is_last_nyse_session_of_week(date(2026, 7, 24))
+    assert is_last_nyse_session_of_week(date(2026, 4, 2))  # Good Friday follows
+    assert not is_last_nyse_session_of_week(date(2026, 7, 23))
 
 
 def test_market_open_handles_utc_input() -> None:

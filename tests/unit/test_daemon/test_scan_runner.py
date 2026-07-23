@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import insert, select
@@ -374,6 +374,39 @@ async def test_resolve_scan_symbols_falls_back_to_watchlist_when_screen_raises(
         resolved = await _resolve_scan_symbols(daemon_context)
 
     assert resolved == [("AAPL", None)]
+
+
+async def test_resolve_scan_symbols_filters_exact_zero_dte_before_screening(
+    daemon_context: DaemonContext,
+) -> None:
+    """Friday-only names must not consume Tuesday/Thursday full-scan slots."""
+    from optionsbot.screener.screen import ScreenCandidate
+
+    daemon_context.settings.scan.auto_screen = True
+    daemon_context.settings.scan.dte_target = 0
+    daemon_context.settings.scan.dte_window_min = 0
+    daemon_context.settings.scan.dte_window_max = 0
+    daemon_context.settings.screener.universe = ["SPY", "NVDA", "TSLA"]
+    screened = AsyncMock(
+        return_value=(
+            ScreenCandidate(symbol="SPY", hv_rank=0.5, dollar_volume=1e9),
+        )
+    )
+
+    with patch(
+        "optionsbot.daemon.scan_runner.nyse_session_date",
+        return_value=date(2026, 7, 23),
+    ), patch(
+        "optionsbot.daemon.scan_runner.is_last_nyse_session_of_week",
+        return_value=False,
+    ), patch(
+        "optionsbot.daemon.scan_runner.screen_universe",
+        new=screened,
+    ):
+        resolved = await _resolve_scan_symbols(daemon_context)
+
+    assert resolved == [("SPY", None)]
+    assert screened.await_args.args[1] == ("SPY",)
 
 
 async def test_run_scan_tick_scans_screened_and_watchlist_symbols(

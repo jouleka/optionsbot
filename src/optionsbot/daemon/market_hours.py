@@ -2,6 +2,7 @@
 
 from optionsbot.market_hours import (
     ET,
+    is_last_nyse_session_of_week,
     is_market_open,
     minutes_to_nyse_close,
     nyse_session_close_utc,
@@ -11,6 +12,7 @@ from optionsbot.market_hours import (
 
 __all__ = [
     "ET",
+    "is_last_nyse_session_of_week",
     "is_market_open",
     "minutes_to_nyse_close",
     "nyse_session_close_utc",

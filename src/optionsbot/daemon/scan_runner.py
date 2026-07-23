@@ -16,7 +16,11 @@ from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.gateway_health import BUDGET_TIMEOUT_SUFFIX
-from optionsbot.daemon.market_hours import is_market_open, nyse_session_date
+from optionsbot.daemon.market_hours import (
+    is_last_nyse_session_of_week,
+    is_market_open,
+    nyse_session_date,
+)
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.observability import bind_log_context
@@ -24,7 +28,10 @@ from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
-from optionsbot.screener.universe import DEFAULT_UNIVERSE
+from optionsbot.screener.universe import (
+    DEFAULT_UNIVERSE,
+    zero_dte_universe_for_session,
+)
 from optionsbot.storage.schema import scan_runs, watchlist
 from optionsbot.strategies.base import StrategySuggestion
 
@@ -329,6 +336,24 @@ async def _resolve_scan_symbols(
     try:
         history = HistoryClient(context.ibkr, context.resolver)
         universe = context.settings.screener.universe or DEFAULT_UNIVERSE
+        if (
+            context.settings.scan.dte_target == 0
+            and context.settings.scan.dte_window_min == 0
+            and context.settings.scan.dte_window_max == 0
+        ):
+            session_date = nyse_session_date(datetime.now(UTC))
+            configured_count = len(universe)
+            universe = zero_dte_universe_for_session(
+                universe,
+                session_date,
+                end_of_week_expiry=is_last_nyse_session_of_week(session_date),
+            )
+            log.info(
+                "exact-0DTE universe: %d/%d configured symbols eligible for %s",
+                len(universe),
+                configured_count,
+                session_date,
+            )
         # IBK-149: bound the universe screen so a wedged IB Gateway during
         # screening (it runs BEFORE the symbol loop) can't hang the whole tick.
         # A timeout is caught below -> fall back to watchlist-only.

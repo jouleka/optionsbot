@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import cast
 from zoneinfo import ZoneInfo
 
@@ -52,6 +52,19 @@ def nyse_session_date(now: datetime) -> date:
     if now.tzinfo is None:
         raise ValueError("nyse_session_date requires a tz-aware datetime")
     return now.astimezone(ET).date()
+
+
+def is_last_nyse_session_of_week(session_date: date) -> bool:
+    """Whether ``session_date`` is the week's final NYSE trading session.
+
+    This is normally Friday, but is Thursday when Friday is an exchange
+    holiday.  End-of-week equity/ETF options shift to that prior session.
+    """
+    week_end = session_date + timedelta(days=4 - session_date.weekday())
+    schedule = _NYSE.schedule(start_date=session_date, end_date=week_end)
+    if schedule.empty:
+        return False
+    return bool(schedule.index[-1].date() == session_date)
 
 
 def nyse_session_start_utc(now: datetime) -> datetime:
