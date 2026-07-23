@@ -44,7 +44,8 @@ class EntryDecision:
     reason: str
 
 
-def _day_start_row(engine: Engine) -> tuple[float | None, str | None]:
+def load_day_start_baseline(engine: Engine) -> tuple[float | None, str | None]:
+    """Return the persisted net-liq baseline and its NYSE session key."""
     with engine.connect() as conn:
         row = conn.execute(
             select(
@@ -69,7 +70,7 @@ def capture_day_start_net_liq(
     """
     if not math.isfinite(net_liq) or net_liq <= 0:
         raise ValueError("day-start net liquidation must be finite positive")
-    existing_nl, existing_session = _day_start_row(engine)
+    existing_nl, existing_session = load_day_start_baseline(engine)
     if existing_nl is not None and existing_session == session:
         return float(existing_nl)
     # Ensure the singleton row exists, then set the baseline. We never disturb
@@ -116,7 +117,7 @@ def evaluate_net_liq_drawdown(
     """
     if load_state(engine).killed:
         return EquityVerdict(False, True, 0.0, "already killed")
-    day_start, _ = _day_start_row(engine)
+    day_start, _ = load_day_start_baseline(engine)
     invalid_equity = (
         day_start is not None
         and (not math.isfinite(day_start) or day_start <= 0)
@@ -149,7 +150,7 @@ def new_entry_allowed(
     cap. Missing baseline/current equity fails closed because the daily-loss
     guard cannot be proven before adding risk.
     """
-    day_start, _ = _day_start_row(engine)
+    day_start, _ = load_day_start_baseline(engine)
     dd = _drawdown(day_start, current_net_liq)
     if dd is None:
         return EntryDecision(

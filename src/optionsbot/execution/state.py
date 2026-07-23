@@ -16,6 +16,11 @@ from sqlalchemy import Engine, select
 from optionsbot.storage.schema import execution_state
 
 _ROW_ID = 1
+_SESSION_LOSS_KILL_PREFIXES = (
+    "net liq drawdown ",
+    "daily realized loss ",
+    "daily cumulative Hermes realized-loss cap breached ",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +54,20 @@ def trip_kill(
 
 def clear_kill(engine: Engine, *, now: datetime | None = None) -> ExecutionState:
     return _write(engine, killed=False, reason=None, now=now)
+
+
+def is_session_loss_kill(reason: str | None) -> bool:
+    """True only for loss limits whose authority ends with the NYSE session.
+
+    Manual halts, reconciliation mismatches, broker uncertainty, non-atomic
+    closes, and other operational kills intentionally remain latched until an
+    explicit repair and re-arm.
+    """
+    if reason is None:
+        return False
+    return reason.startswith(_SESSION_LOSS_KILL_PREFIXES) or reason.endswith(
+        " consecutive losing trades this session"
+    )
 
 
 def _write(

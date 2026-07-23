@@ -305,16 +305,64 @@ async def _check_loss_kill_triggers(context: DaemonContext, now: datetime) -> No
 
 
 async def _check_net_liq_drawdown(context: DaemonContext, now: datetime) -> None:
-    """PHASE 0 B1: trip the kill on a realized+unrealized day-start drawdown."""
+    """Trip same-session drawdowns and roll session-scoped loss kills forward."""
     from optionsbot.daemon.market_hours import nyse_session_date
     from optionsbot.execution.equity_guard import (
         capture_day_start_net_liq,
         evaluate_net_liq_drawdown,
+        load_day_start_baseline,
     )
-    from optionsbot.execution.state import load_state
+    from optionsbot.execution.state import (
+        clear_kill,
+        is_session_loss_kill,
+        load_state,
+    )
 
     engine = context.engine
-    if load_state(engine).killed:
+    session = nyse_session_date(now).isoformat()
+    state = load_state(engine)
+    if state.killed:
+        # Loss caps are scoped to one NYSE session. Roll only those kills into
+        # a fresh baseline on a later session; operational/manual kills remain
+        # latched. The kill timestamp is authoritative, with the baseline key
+        # as a compatibility fallback for older rows.
+        _, baseline_session = load_day_start_baseline(engine)
+        kill_session = (
+            nyse_session_date(state.ts).isoformat()
+            if state.ts is not None
+            else baseline_session
+        )
+        if (
+            not is_session_loss_kill(state.reason)
+            or kill_session is None
+            or kill_session >= session
+        ):
+            return
+        net_liq = await _net_liq(context)
+        if net_liq is None:
+            log.warning(
+                "new-session loss-kill re-arm deferred: net liquidation unavailable"
+            )
+            return
+        context.day_start_net_liq = capture_day_start_net_liq(
+            engine, net_liq, session=session
+        )
+        prior_reason = state.reason
+        clear_kill(engine, now=now)
+        log.info(
+            "new-session loss kill auto-rearmed session=%s baseline=%.2f prior=%s",
+            session,
+            net_liq,
+            prior_reason,
+        )
+        await _send(
+            context,
+            "✅ execution auto-rearmed for a new NYSE session after yesterday's "
+            f"session loss halt; fresh net-liq baseline ${net_liq:,.0f}.",
+        )
+        # Account for any closes that may already have completed in the new
+        # session while the stale prior-session latch was still present.
+        await _check_loss_kill_triggers(context, now)
         return
     net_liq = await _net_liq(context)
     if net_liq is None:
@@ -322,7 +370,6 @@ async def _check_net_liq_drawdown(context: DaemonContext, now: datetime) -> None
     # Capture the day-start baseline keyed by the NYSE session date so it resets
     # at the ET boundary but is idempotent (restart-stable) within a session.
     # context.day_start_net_liq mirrors it for /status without a DB hit.
-    session = nyse_session_date(now).isoformat()
     context.day_start_net_liq = capture_day_start_net_liq(
         engine, net_liq, session=session
     )

@@ -6,7 +6,12 @@ from pathlib import Path
 
 from sqlalchemy import Engine
 
-from optionsbot.execution.state import clear_kill, load_state, trip_kill
+from optionsbot.execution.state import (
+    clear_kill,
+    is_session_loss_kill,
+    load_state,
+    trip_kill,
+)
 from optionsbot.storage.db import create_engine_for_path
 from tests.conftest import apply_migrations  # noqa: TID252 (cross-package import OK in tests)
 
@@ -54,3 +59,15 @@ def test_trip_twice_keeps_latest_reason(tmp_db: Engine) -> None:
     trip_kill(tmp_db, "first")
     trip_kill(tmp_db, "second")
     assert load_state(tmp_db).reason == "second"
+
+
+def test_only_session_loss_reasons_are_session_scoped() -> None:
+    assert is_session_loss_kill("net liq drawdown 2.02% >= 2% cap")
+    assert is_session_loss_kill("daily realized loss $250 ≥ 2% of net liq")
+    assert is_session_loss_kill("3 consecutive losing trades this session")
+    assert is_session_loss_kill(
+        "daily cumulative Hermes realized-loss cap breached (-$200 <= -$175)"
+    )
+    assert not is_session_loss_kill("manual /kill via Telegram")
+    assert not is_session_loss_kill("reconcile exact position mismatch")
+    assert not is_session_loss_kill("broker side effects are uncertain")

@@ -880,6 +880,88 @@ async def test_unrealized_drawdown_under_cap_does_not_trip(
     assert load_state(daemon_context.engine).killed is False
 
 
+async def test_prior_session_drawdown_kill_auto_rearms_with_fresh_baseline(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.execution.equity_guard import (
+        capture_day_start_net_liq,
+        load_day_start_baseline,
+    )
+    from optionsbot.execution.state import trip_kill
+
+    daemon_context.order_client = MagicMock()
+    daemon_context.order_client.cancel = AsyncMock()
+    yesterday = (nyse_session_date(NOW) - timedelta(days=1)).isoformat()
+    capture_day_start_net_liq(daemon_context.engine, 100_000.0, session=yesterday)
+    trip_kill(
+        daemon_context.engine,
+        "net liq drawdown 2.50% >= 2% cap",
+        now=NOW - timedelta(days=1),
+    )
+
+    with patch(
+        "optionsbot.daemon.order_watcher._net_liq",
+        new=AsyncMock(return_value=98_500.0),
+    ):
+        await run_orders_tick(daemon_context, now=NOW)
+
+    assert load_state(daemon_context.engine).killed is False
+    assert load_day_start_baseline(daemon_context.engine) == (
+        98_500.0,
+        nyse_session_date(NOW).isoformat(),
+    )
+    sent = [c.args[0] for c in daemon_context.telegram.send_message.await_args_list]
+    assert any("auto-rearmed" in message for message in sent)
+
+
+async def test_same_session_loss_kill_stays_latched(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.execution.equity_guard import capture_day_start_net_liq
+    from optionsbot.execution.state import trip_kill
+
+    daemon_context.order_client = MagicMock()
+    daemon_context.order_client.cancel = AsyncMock()
+    session = nyse_session_date(NOW).isoformat()
+    capture_day_start_net_liq(daemon_context.engine, 100_000.0, session=session)
+    trip_kill(
+        daemon_context.engine,
+        "net liq drawdown 2.50% >= 2% cap",
+        now=NOW,
+    )
+    net_liq = AsyncMock(return_value=110_000.0)
+
+    with patch("optionsbot.daemon.order_watcher._net_liq", new=net_liq):
+        await run_orders_tick(daemon_context, now=NOW)
+
+    assert load_state(daemon_context.engine).killed is True
+    net_liq.assert_not_awaited()
+
+
+async def test_prior_session_operational_kill_stays_latched(
+    daemon_context: DaemonContext,
+) -> None:
+    from optionsbot.execution.equity_guard import capture_day_start_net_liq
+    from optionsbot.execution.state import trip_kill
+
+    daemon_context.order_client = MagicMock()
+    daemon_context.order_client.cancel = AsyncMock()
+    yesterday = (nyse_session_date(NOW) - timedelta(days=1)).isoformat()
+    capture_day_start_net_liq(daemon_context.engine, 100_000.0, session=yesterday)
+    trip_kill(
+        daemon_context.engine,
+        "reconcile exact position mismatch",
+        now=NOW - timedelta(days=1),
+    )
+    net_liq = AsyncMock(return_value=110_000.0)
+
+    with patch("optionsbot.daemon.order_watcher._net_liq", new=net_liq):
+        await run_orders_tick(daemon_context, now=NOW)
+
+    assert load_state(daemon_context.engine).killed is True
+    net_liq.assert_not_awaited()
+
+
 async def test_daily_loss_window_uses_et_session_not_utc(
     daemon_context: DaemonContext,
 ) -> None:
