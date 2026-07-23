@@ -152,7 +152,10 @@ async def _consume_entry_proposal(
         is_market_open,
         minutes_to_nyse_close,
     )
-    from optionsbot.daemon.scan_runner import rank_alert_candidates
+    from optionsbot.daemon.scan_runner import (
+        candidate_admission_blockers,
+        rank_alert_candidates,
+    )
     from optionsbot.ibkr.positions import PositionsClient
     from optionsbot.scan import scan_symbol
     from optionsbot.strategies import get_strategy
@@ -270,8 +273,23 @@ async def _consume_entry_proposal(
         legs=legs,
     )
 
+    admission_blockers = candidate_admission_blockers(
+        selected,
+        context.settings.scan.score_threshold,
+        account_value,
+        context.settings.execution.max_single_trade_risk_pct,
+    )
+    if evidence.get("ready") is not True:
+        reasons = evidence.get("reasons")
+        detail = ",".join(str(reason) for reason in reasons) if isinstance(reasons, list) else ""
+        admission_blockers.append(
+            f"execution_evidence_not_ready({detail or 'unspecified'})"
+        )
+    if not eligible and not admission_blockers:
+        admission_blockers.append("candidate_not_ranked_for_alert")
+
     alert_id: int | None = None
-    bot_eligible = bool(eligible) and evidence.get("ready") is True
+    bot_eligible = not admission_blockers
     if bot_eligible:
         if await enqueue_alert(context, symbol, selected, result.snapshot_id):
             with context.engine.connect() as conn:
@@ -283,11 +301,11 @@ async def _consume_entry_proposal(
                 ).scalar_one()
         else:
             bot_eligible = False
+            admission_blockers.append("alert_admission_dedup_or_delivery_failed")
 
     if not bot_eligible:
-        decision_reason = (
-            "OptionsBot independently declined: candidate lacked positive edge, "
-            "affordability, score floor, fresh execution evidence, or alert admission"
+        decision_reason = "OptionsBot independently declined: " + "; ".join(
+            admission_blockers
         )
         # The control-intent row is the immutable audit record for a proposal
         # that never passed OptionsBot's own admission gates.  entry_reviews
@@ -295,7 +313,8 @@ async def _consume_entry_proposal(
         # do not manufacture a nullable review merely to shadow-record a
         # declined hypothesis.
         return (
-            f"Hermes proposal declined for {symbol}/{selected.strategy_name}: "
+            f"Hermes proposal declined as score #{int(score_id)} for "
+            f"{symbol}/{selected.strategy_name}: "
             f"{decision_reason}"
         )
 

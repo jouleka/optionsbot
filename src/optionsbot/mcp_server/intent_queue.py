@@ -105,3 +105,55 @@ def recent_intents(engine: Engine, limit: int = 20) -> list[dict[str, Any]]:
             .limit(max(1, min(int(limit), 100)))
         ).fetchall()
     return [dict(row._mapping) for row in rows]
+
+
+def recent_proposal_decisions(
+    engine: Engine, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Return terminal Hermes proposal decisions for the next learning pass.
+
+    The trusted daemon writes the authoritative result after rebuilding a
+    proposal from live data.  Exposing this bounded, read-only projection lets
+    Hermes adapt its next hypothesis to the exact gate that declined the prior
+    one without granting it config, database, or broker mutation access.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                control_intents.c.id,
+                control_intents.c.created_at,
+                control_intents.c.processed_at,
+                control_intents.c.payload_json,
+                control_intents.c.status,
+                control_intents.c.result_text,
+            )
+            .where(control_intents.c.kind == "entry_proposal")
+            .where(control_intents.c.status.in_(("processed", "rejected")))
+            .order_by(control_intents.c.id.desc())
+            .limit(max(1, min(int(limit), 100)))
+        ).fetchall()
+
+    def _iso(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware.astimezone(UTC).isoformat()
+
+    decisions: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+        decisions.append(
+            {
+                "intent_id": int(row.id),
+                "symbol": payload.get("symbol"),
+                "direction": payload.get("direction"),
+                "iv_regime": payload.get("iv_regime"),
+                "strategy": payload.get("strategy"),
+                "confidence": payload.get("confidence"),
+                "proposed_at": _iso(row.created_at),
+                "processed_at": _iso(row.processed_at),
+                "status": str(row.status),
+                "decision": row.result_text,
+            }
+        )
+    return decisions

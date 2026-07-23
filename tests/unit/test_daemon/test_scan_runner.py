@@ -520,6 +520,27 @@ def test_rank_alert_candidates_uses_single_trade_cap() -> None:
     assert [sym for sym, _, _ in out] == ["SPY"]
 
 
+def test_candidate_admission_blockers_explain_edge_and_risk_failures() -> None:
+    from optionsbot.daemon.scan_runner import candidate_admission_blockers
+
+    scored = MagicMock(score=48.0)
+    scored.suggestion.expected_value = -12.5
+    scored.suggestion.risk_normalized_expectancy = -0.025
+    scored.suggestion.defined_risk = True
+    scored.suggestion.max_loss = 900.0
+
+    assert candidate_admission_blockers(
+        scored,
+        score_floor=50.0,
+        account_value_usd=5_000.0,
+        single_trade_cap_pct=0.10,
+    ) == [
+        "score_below_floor(score=48.00,floor=50.00)",
+        "non_positive_edge(expected_value=-12.50)",
+        "single_contract_risk_over_cap(max_loss=900.00,cap=500.00,cap_pct=0.1000)",
+    ]
+
+
 def test_rank_alert_candidates_fail_closed_without_equity() -> None:
     from optionsbot.daemon.scan_runner import rank_alert_candidates
 

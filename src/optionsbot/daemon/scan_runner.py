@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,6 +46,49 @@ def is_proposable(
     return float(sug.max_loss) <= account_value_usd * single_trade_cap_pct
 
 
+def candidate_admission_blockers(
+    scored: ScoredStrategy,
+    score_floor: float,
+    account_value_usd: float | None,
+    single_trade_cap_pct: float,
+) -> list[str]:
+    """Return stable, machine-readable reasons a candidate cannot be surfaced.
+
+    Hermes-originated proposals use these same reasons after OptionsBot rebuilds
+    the idea from live data.  Keeping the explanation beside the admission
+    predicate prevents the learning loop from seeing a vague "one of several
+    gates failed" result that it cannot adapt to on its next pass.
+    """
+    blockers: list[str] = []
+    suggestion = scored.suggestion
+    if scored.score < score_floor:
+        blockers.append(
+            f"score_below_floor(score={scored.score:.2f},floor={score_floor:.2f})"
+        )
+    if not has_positive_edge(suggestion):
+        expected_value = suggestion.expected_value
+        ev_text = (
+            f"{float(expected_value):.2f}"
+            if isinstance(expected_value, int | float) and math.isfinite(expected_value)
+            else "unavailable"
+        )
+        blockers.append(f"non_positive_edge(expected_value={ev_text})")
+    if not suggestion.defined_risk or suggestion.max_loss is None:
+        blockers.append("undefined_or_missing_max_loss")
+    elif account_value_usd is None:
+        blockers.append("live_equity_unavailable")
+    else:
+        max_loss = float(suggestion.max_loss)
+        risk_cap = float(account_value_usd) * float(single_trade_cap_pct)
+        if max_loss > risk_cap:
+            blockers.append(
+                "single_contract_risk_over_cap("
+                f"max_loss={max_loss:.2f},cap={risk_cap:.2f},"
+                f"cap_pct={single_trade_cap_pct:.4f})"
+            )
+    return blockers
+
+
 def rank_alert_candidates(
     picks: list[tuple[str, ScoredStrategy, int]],
     score_floor: float,
@@ -70,9 +114,12 @@ def rank_alert_candidates(
     above = [
         p
         for p in picks
-        if p[1].score >= score_floor
-        and has_positive_edge(p[1].suggestion)
-        and is_proposable(p[1].suggestion, account_value_usd, single_trade_cap_pct)
+        if not candidate_admission_blockers(
+            p[1],
+            score_floor,
+            account_value_usd,
+            single_trade_cap_pct,
+        )
     ]
     above.sort(key=lambda p: edge_sort_key(p[1].suggestion), reverse=True)
     return above

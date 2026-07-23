@@ -20,7 +20,11 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.hermes_overlay import learning_feedback
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.intent_queue import control_intents, enqueue_intent
+from optionsbot.mcp_server.intent_queue import (
+    control_intents,
+    enqueue_intent,
+    recent_proposal_decisions,
+)
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.risk_structure import has_structurally_defined_option_risk
@@ -246,6 +250,13 @@ def register(server: FastMCP) -> None:
             data = dict(row._mapping)
             data["age_minutes"] = round((now - ts).total_seconds() / 60, 1)
             picks.append(_pick_dict(SimpleNamespace(**data)))
+        feedback = learning_feedback(lifespan.engine, recent_limit=10)
+        intent_engine = getattr(lifespan, "intent_engine", None)
+        feedback["recent_proposal_decisions"] = (
+            recent_proposal_decisions(intent_engine, limit=10)
+            if intent_engine is not None
+            else []
+        )
         return {
             "ok": True,
             "count": len(picks),
@@ -254,7 +265,7 @@ def register(server: FastMCP) -> None:
             # Aggregate statistics retain the full history. A compact recent
             # lesson window keeps the five-minute analyst pass from spending
             # its whole context budget before it reaches independent ideas.
-            "learning_feedback": learning_feedback(lifespan.engine, recent_limit=10),
+            "learning_feedback": feedback,
         }
 
     @server.tool()

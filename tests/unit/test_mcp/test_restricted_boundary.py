@@ -28,6 +28,7 @@ from optionsbot.mcp_server.intent_queue import (
     control_intents,
     create_intent_engine,
     enqueue_intent,
+    recent_proposal_decisions,
 )
 from optionsbot.mcp_server.restricted_context import RestrictedServerContext
 from optionsbot.mcp_server.server import build_server
@@ -408,6 +409,56 @@ def test_hermes_entry_proposal_only_enters_isolated_queue(
         assert conn.execute(select(orders.c.id)).fetchall() == []
 
 
+def test_terminal_proposal_decision_is_available_to_next_learning_pass(
+    tmp_path: Path,
+) -> None:
+    intent_engine = create_intent_engine(tmp_path / "proposal-feedback.db")
+    proposed_at = datetime.now(UTC)
+    intent_id, _ = enqueue_intent(
+        intent_engine,
+        "entry_proposal",
+        {
+            "symbol": "QQQ",
+            "direction": "bear",
+            "iv_regime": "neutral",
+            "strategy": "bear_put_spread",
+            "confidence": 0.78,
+        },
+        now=proposed_at,
+    )
+    with intent_engine.begin() as conn:
+        conn.execute(
+            update(control_intents)
+            .where(control_intents.c.id == intent_id)
+            .values(
+                status="processed",
+                processed_at=proposed_at,
+                result_text=(
+                    "Hermes proposal declined as score #42: "
+                    "non_positive_edge(expected_value=-12.50)"
+                ),
+            )
+        )
+
+    assert recent_proposal_decisions(intent_engine) == [
+        {
+            "intent_id": intent_id,
+            "symbol": "QQQ",
+            "direction": "bear",
+            "iv_regime": "neutral",
+            "strategy": "bear_put_spread",
+            "confidence": 0.78,
+            "proposed_at": proposed_at.isoformat(),
+            "processed_at": proposed_at.isoformat(),
+            "status": "processed",
+            "decision": (
+                "Hermes proposal declined as score #42: "
+                "non_positive_edge(expected_value=-12.50)"
+            ),
+        }
+    ]
+
+
 async def test_async_consumer_routes_entry_proposal_to_live_rebuilder(
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
@@ -465,7 +516,13 @@ async def test_declined_entry_proposal_does_not_create_alertless_review(
     selected = SimpleNamespace(
         strategy_name="bull_call_spread",
         score=80.0,
-        suggestion=SimpleNamespace(legs=()),
+        suggestion=SimpleNamespace(
+            legs=(),
+            expected_value=-1.0,
+            risk_normalized_expectancy=-0.01,
+            defined_risk=True,
+            max_loss=100.0,
+        ),
     )
     scan_result = SimpleNamespace(snapshot_id=snapshot_id, scored=(selected,))
     settings = SimpleNamespace(
@@ -537,7 +594,8 @@ async def test_declined_entry_proposal_does_not_create_alertless_review(
     ):
         result = await _consume_entry_proposal(context, payload)
 
-    assert result.startswith("Hermes proposal declined for SPY/bull_call_spread")
+    assert result.startswith("Hermes proposal declined as score #")
+    assert "non_positive_edge" in result
     with mcp_engine.connect() as conn:
         assert conn.execute(select(entry_reviews.c.id)).fetchall() == []
 
