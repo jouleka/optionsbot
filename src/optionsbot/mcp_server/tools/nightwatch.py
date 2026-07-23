@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
@@ -271,8 +271,8 @@ def register(server: FastMCP) -> None:
     @server.tool()
     def propose_entry(
         symbol: str,
-        direction: str,
-        iv_regime: str,
+        direction: Literal["bull", "neutral", "bear"],
+        iv_regime: Literal["high", "neutral", "low"],
         strategy: str,
         confidence: float,
         sources: list[str],
