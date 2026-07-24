@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -141,15 +142,13 @@ def _consume_exit_request(context: DaemonContext, payload: dict[str, Any]) -> st
     return f"exit request imported as #{int(pk[0])} for daemon-side gating"
 
 
-async def _consume_entry_proposal(
-    context: DaemonContext, payload: dict[str, Any]
-) -> str:
+async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any]) -> str:
     """Rebuild a Hermes idea from live data; OptionsBot remains authoritative."""
     from optionsbot.daemon.alert_pipeline import enqueue_alert
     from optionsbot.daemon.auto_executor import auto_execute_candidates
     from optionsbot.daemon.candidate_evidence import (
-        apply_reconciled_economics,
         capture_candidate_evidence,
+        with_reconciled_economics,
     )
     from optionsbot.daemon.market_hours import (
         is_market_open,
@@ -229,9 +228,7 @@ async def _consume_entry_proposal(
             timeout=context.settings.scan.scan_symbol_timeout_s,
         )
     matching = [
-        scored
-        for scored in result.scored
-        if strategy == "auto" or scored.strategy_name == strategy
+        scored for scored in result.scored if strategy == "auto" or scored.strategy_name == strategy
     ]
     if not matching:
         return (
@@ -240,9 +237,7 @@ async def _consume_entry_proposal(
         )
     matching.sort(key=lambda scored: scored.score, reverse=True)
     account_value = (
-        float(summary.net_liquidation_usd)
-        if summary.net_liquidation_usd is not None
-        else None
+        float(summary.net_liquidation_usd) if summary.net_liquidation_usd is not None else None
     )
     eligible = rank_alert_candidates(
         [(symbol, scored, result.snapshot_id) for scored in matching],
@@ -275,7 +270,10 @@ async def _consume_entry_proposal(
         symbol=symbol,
         legs=legs,
     )
-    apply_reconciled_economics(selected.suggestion, evidence)
+    selected = replace(
+        selected,
+        suggestion=with_reconciled_economics(selected.suggestion, evidence),
+    )
 
     admission_blockers = candidate_admission_blockers(
         selected,
@@ -286,9 +284,7 @@ async def _consume_entry_proposal(
     if evidence.get("ready") is not True:
         reasons = evidence.get("reasons")
         detail = ",".join(str(reason) for reason in reasons) if isinstance(reasons, list) else ""
-        admission_blockers.append(
-            f"execution_evidence_not_ready({detail or 'unspecified'})"
-        )
+        admission_blockers.append(f"execution_evidence_not_ready({detail or 'unspecified'})")
     if not eligible and not admission_blockers:
         admission_blockers.append("candidate_not_ranked_for_alert")
 
@@ -308,9 +304,7 @@ async def _consume_entry_proposal(
             admission_blockers.append("alert_admission_dedup_or_delivery_failed")
 
     if not bot_eligible:
-        decision_reason = "OptionsBot independently declined: " + "; ".join(
-            admission_blockers
-        )
+        decision_reason = "OptionsBot independently declined: " + "; ".join(admission_blockers)
         # The control-intent row is the immutable audit record for a proposal
         # that never passed OptionsBot's own admission gates.  entry_reviews
         # deliberately requires an exact, proven-delivered alert identity, so

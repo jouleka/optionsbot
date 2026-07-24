@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -21,6 +22,7 @@ from optionsbot.execution.walk import combo_bid_ask, combo_spread_issue
 from optionsbot.ibkr import MarketDataClient, PositionsClient
 from optionsbot.ibkr.types import OptionQuote
 from optionsbot.storage.schema import orders, strategy_scores
+from optionsbot.strategies import StrategySuggestion
 
 
 def _number(value: Decimal | float | int | None) -> float | None:
@@ -53,20 +55,28 @@ def _quote_dict(quote: OptionQuote, side: object, quantity: object) -> dict[str,
     }
 
 
-def apply_reconciled_economics(suggestion: object, evidence: dict[str, Any]) -> None:
-    """Update an in-memory StrategySuggestion to match persisted fresh metrics."""
+def with_reconciled_economics(
+    suggestion: StrategySuggestion,
+    evidence: dict[str, Any],
+) -> StrategySuggestion:
+    """Return a suggestion whose economics match the persisted fresh metrics."""
     economics = evidence.get("economics")
     if not isinstance(economics, dict):
-        return
-    for name in (
-        "credit_or_debit",
-        "max_loss",
-        "max_profit",
-        "reward_risk",
-        "expected_value",
-    ):
-        if name in economics:
-            setattr(suggestion, name, economics[name])
+        return suggestion
+    updates = {
+        name: economics[name]
+        for name in (
+            "credit_or_debit",
+            "max_loss",
+            "max_profit",
+            "reward_risk",
+            "expected_value",
+        )
+        if name in economics
+    }
+    if not updates:
+        return suggestion
+    return replace(suggestion, **updates)
 
 
 def _active_position_counts(context: DaemonContext, symbol: str) -> tuple[int, int]:
@@ -74,11 +84,7 @@ def _active_position_counts(context: DaemonContext, symbol: str) -> tuple[int, i
         entries = conn.execute(
             select(orders.c.id, orders.c.symbol)
             .where(orders.c.intent == "open")
-            .where(
-                orders.c.status.in_(
-                    ("staged", "submitting", "submitted", "partial", "filled")
-                )
-            )
+            .where(orders.c.status.in_(("staged", "submitting", "submitted", "partial", "filled")))
         ).fetchall()
         closed = {
             int(row.closes_order_id)
@@ -114,12 +120,14 @@ async def capture_candidate_evidence(
             spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
             try:
                 quote_map[spec] = await md.get_option_review_snapshot(
-                    symbol, spec[0], spec[1], spec[2]  # type: ignore[arg-type]
+                    symbol,
+                    spec[0],
+                    spec[1],
+                    spec[2],  # type: ignore[arg-type]
                 )
             except Exception as exc:  # noqa: BLE001
                 issues.append(
-                    f"quote unavailable for {spec[0]} {spec[1]}{spec[2]}: "
-                    f"{type(exc).__name__}"
+                    f"quote unavailable for {spec[0]} {spec[1]}{spec[2]}: {type(exc).__name__}"
                 )
         try:
             summary = await asyncio.wait_for(
@@ -186,9 +194,7 @@ async def capture_candidate_evidence(
             issues.append("liquidity: " + combo_issue)
         with context.engine.connect() as conn:
             stored_suggestion = conn.execute(
-                select(strategy_scores.c.suggestion_json).where(
-                    strategy_scores.c.id == score_id
-                )
+                select(strategy_scores.c.suggestion_json).where(strategy_scores.c.id == score_id)
             ).scalar_one()
         economics = reconcile_entry_economics(
             legs,
@@ -201,16 +207,13 @@ async def capture_candidate_evidence(
             issues.append("fresh executable expected value unavailable")
         elif economics.expected_value <= 0:
             issues.append(
-                "fresh executable expected value is non-positive "
-                f"({economics.expected_value:.2f})"
+                f"fresh executable expected value is non-positive ({economics.expected_value:.2f})"
             )
 
     state = load_state(context.engine)
     execution_gate = can_execute(context.settings, state)
     net_liq_usd = _number(summary.net_liquidation_usd) if summary is not None else None
-    entry_gate = new_entry_allowed(
-        context.engine, context.settings, current_net_liq=net_liq_usd
-    )
+    entry_gate = new_entry_allowed(context.engine, context.settings, current_net_liq=net_liq_usd)
     if not execution_gate.allowed:
         issues.append("execution interlock: " + execution_gate.reason)
     if not entry_gate.allowed:
@@ -255,12 +258,8 @@ async def capture_candidate_evidence(
         and portfolio_heat_cap is not None
         else False
     )
-    position_count_allowed = (
-        active_count < context.settings.execution.max_open_positions
-    )
-    symbol_count_allowed = (
-        symbol_count < context.settings.execution.max_per_symbol
-    )
+    position_count_allowed = active_count < context.settings.execution.max_open_positions
+    symbol_count_allowed = symbol_count < context.settings.execution.max_per_symbol
     if not single_trade_risk_allowed:
         issues.append("candidate exceeds or cannot prove the single-trade risk cap")
     if not portfolio_heat_allowed:

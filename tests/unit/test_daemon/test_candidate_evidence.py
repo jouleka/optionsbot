@@ -9,12 +9,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import insert, select
 
-from optionsbot.daemon.candidate_evidence import capture_candidate_evidence
+from optionsbot.daemon.candidate_evidence import (
+    capture_candidate_evidence,
+    with_reconciled_economics,
+)
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.equity_guard import capture_day_start_net_liq
 from optionsbot.ibkr.types import AccountSummary, OptionQuote
 from optionsbot.review_evidence import review_evidence_ready
 from optionsbot.storage.schema import snapshots, strategy_scores
+from optionsbot.strategies import StrategySuggestion
 
 LEGS = [
     {
@@ -36,6 +40,44 @@ LEGS = [
         "quantity": 1,
     },
 ]
+
+
+def test_with_reconciled_economics_replaces_frozen_suggestion() -> None:
+    original = StrategySuggestion(
+        strategy_name="bull_put_spread",
+        legs=(),
+        credit_or_debit=100.0,
+        max_loss=400.0,
+        max_profit=100.0,
+        prob_profit=0.65,
+        suggested_quantity=2,
+        defined_risk=True,
+        rationale="scan economics",
+        reward_risk=0.25,
+        expected_value=10.0,
+    )
+
+    reconciled = with_reconciled_economics(
+        original,
+        {
+            "economics": {
+                "credit_or_debit": 120.0,
+                "max_loss": 380.0,
+                "max_profit": 120.0,
+                "reward_risk": 120 / 380,
+                "expected_value": 30.0,
+            }
+        },
+    )
+
+    assert reconciled is not original
+    assert reconciled.credit_or_debit == 120.0
+    assert reconciled.max_loss == 380.0
+    assert reconciled.max_profit == 120.0
+    assert reconciled.reward_risk == 120 / 380
+    assert reconciled.expected_value == 30.0
+    assert original.credit_or_debit == 100.0
+    assert original.expected_value == 10.0
 
 
 def _quote(strike: float, *, bid: float, ask: float) -> OptionQuote:
@@ -66,9 +108,7 @@ async def test_capture_candidate_evidence_persists_ready_packet(
 ) -> None:  # type: ignore[no-untyped-def]
     daemon_context.settings.execution.enabled = True
     daemon_context.settings.execution.mode = "auto"
-    capture_day_start_net_liq(
-        daemon_context.engine, 100_000.0, session="2026-07-16"
-    )
+    capture_day_start_net_liq(daemon_context.engine, 100_000.0, session="2026-07-16")
     with daemon_context.engine.begin() as conn:
         snapshot_id = int(
             conn.execute(

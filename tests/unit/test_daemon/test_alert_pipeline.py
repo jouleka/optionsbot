@@ -20,6 +20,7 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.scoring.types import FactorBreakdown
 from optionsbot.storage.schema import alerts, snapshots, strategy_scores
+from optionsbot.strategies import StrategySuggestion
 
 
 def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
@@ -35,18 +36,47 @@ def _scored(name: str = "iron_condor", score: float = 85.0) -> ScoredStrategy:
     sug.expected_value = 50.0
     sug.risk_tier = "balanced"
     return ScoredStrategy(
-        strategy_name=name, score=score,
+        strategy_name=name,
+        score=score,
         factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
-        suggestion=sug, rationale="...",
+        suggestion=sug,
+        rationale="...",
+    )
+
+
+def _frozen_scored() -> ScoredStrategy:
+    return ScoredStrategy(
+        strategy_name="iron_condor",
+        score=85.0,
+        factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
+        suggestion=StrategySuggestion(
+            strategy_name="iron_condor",
+            legs=(),
+            credit_or_debit=125.0,
+            max_loss=375.0,
+            max_profit=125.0,
+            prob_profit=0.68,
+            suggested_quantity=5,
+            defined_risk=True,
+            rationale="scan economics",
+            reward_risk=1 / 3,
+            expected_value=50.0,
+        ),
+        rationale="...",
     )
 
 
 def _seed_snapshot(daemon_context: DaemonContext, *, symbol: str = "SPY") -> int:
     with daemon_context.engine.begin() as conn:
-        result = conn.execute(insert(snapshots).values(
-            symbol=symbol, ts=datetime.now(UTC), spot=400.0,
-            regime_dir="bull", regime_iv="high",
-        ))
+        result = conn.execute(
+            insert(snapshots).values(
+                symbol=symbol,
+                ts=datetime.now(UTC),
+                spot=400.0,
+                regime_dir="bull",
+                regime_iv="high",
+            )
+        )
         return result.inserted_primary_key[0]
 
 
@@ -68,13 +98,15 @@ def _seed_score(daemon_context: DaemonContext, snapshot_id: int) -> int:
 
 # ---- enqueue_alert ---------------------------------------------------------
 
+
 async def test_enqueue_alert_inserts_pending_row_and_dispatches(
     daemon_context: DaemonContext,
 ) -> None:
     snap_id = _seed_snapshot(daemon_context)
     _seed_score(daemon_context, snap_id)
     with patch(
-        "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
+        "optionsbot.daemon.alert_pipeline.should_alert",
+        return_value=True,
     ):
         await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
 
@@ -102,7 +134,8 @@ async def test_enqueue_alert_links_exact_strategy_score(
         ).inserted_primary_key[0]
 
     with patch(
-        "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
+        "optionsbot.daemon.alert_pipeline.should_alert",
+        return_value=True,
     ):
         await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
 
@@ -150,9 +183,7 @@ def test_reconstruct_alert_uses_linked_score_not_newer_snapshot(
             )
         )
 
-    reconstructed = _reconstruct_scored(
-        daemon_context, int(alert_id), "iron_condor", 85.0
-    )
+    reconstructed = _reconstruct_scored(daemon_context, int(alert_id), "iron_condor", 85.0)
 
     assert reconstructed is not None
     assert reconstructed.rationale == "original candidate"
@@ -164,7 +195,8 @@ async def test_enqueue_alert_skips_when_dedup_says_no(
 ) -> None:
     snap_id = _seed_snapshot(daemon_context)
     with patch(
-        "optionsbot.daemon.alert_pipeline.should_alert", return_value=False,
+        "optionsbot.daemon.alert_pipeline.should_alert",
+        return_value=False,
     ):
         was_enqueued = await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
 
@@ -184,10 +216,54 @@ async def test_enqueue_alert_returns_true_when_actually_enqueued(
     snap_id = _seed_snapshot(daemon_context)
     _seed_score(daemon_context, snap_id)
     with patch(
-        "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
+        "optionsbot.daemon.alert_pipeline.should_alert",
+        return_value=True,
     ):
         was_enqueued = await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
     assert was_enqueued is True
+
+
+async def test_enqueue_alert_dispatches_fresh_economics_for_frozen_suggestion(
+    daemon_context: DaemonContext,
+) -> None:
+    snap_id = _seed_snapshot(daemon_context)
+    _seed_score(daemon_context, snap_id)
+    scored = _frozen_scored()
+    evidence = {
+        "economics": {
+            "credit_or_debit": 90.0,
+            "max_loss": 410.0,
+            "max_profit": 90.0,
+            "reward_risk": 90 / 410,
+            "expected_value": -5.0,
+        }
+    }
+
+    with (
+        patch(
+            "optionsbot.daemon.alert_pipeline.should_alert",
+            return_value=True,
+        ),
+        patch(
+            "optionsbot.daemon.candidate_evidence.capture_candidate_evidence",
+            new=AsyncMock(return_value=evidence),
+        ),
+        patch(
+            "optionsbot.daemon.alert_pipeline.dispatch_alert",
+            new=AsyncMock(),
+        ) as dispatch,
+    ):
+        await enqueue_alert(daemon_context, "SPY", scored, snap_id)
+
+    dispatched = dispatch.await_args.args[3]
+    assert dispatched is not scored
+    assert dispatched.suggestion.credit_or_debit == 90.0
+    assert dispatched.suggestion.max_loss == 410.0
+    assert dispatched.suggestion.max_profit == 90.0
+    assert dispatched.suggestion.reward_risk == 90 / 410
+    assert dispatched.suggestion.expected_value == -5.0
+    assert scored.suggestion.credit_or_debit == 125.0
+    assert scored.suggestion.expected_value == 50.0
 
 
 async def test_enqueue_alert_on_send_failure_marks_failed_with_backoff(
@@ -199,7 +275,8 @@ async def test_enqueue_alert_on_send_failure_marks_failed_with_backoff(
         side_effect=httpx.HTTPStatusError("429", request=MagicMock(), response=MagicMock())
     )
     with patch(
-        "optionsbot.daemon.alert_pipeline.should_alert", return_value=True,
+        "optionsbot.daemon.alert_pipeline.should_alert",
+        return_value=True,
     ):
         await enqueue_alert(daemon_context, "SPY", _scored(), snap_id)
 
@@ -213,15 +290,21 @@ async def test_enqueue_alert_on_send_failure_marks_failed_with_backoff(
 
 # ---- dispatch_alert direct -------------------------------------------------
 
+
 async def test_dispatch_alert_records_telegram_msg_id_on_success(
     daemon_context: DaemonContext,
 ) -> None:
     snap_id = _seed_snapshot(daemon_context)
     with daemon_context.engine.begin() as conn:
-        result = conn.execute(insert(alerts).values(
-            ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
-            score=85.0, status="pending",
-        ))
+        result = conn.execute(
+            insert(alerts).values(
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="pending",
+            )
+        )
         alert_id = result.inserted_primary_key[0]
     daemon_context.telegram.send_message = AsyncMock(return_value=777)
 
@@ -236,6 +319,7 @@ async def test_dispatch_alert_records_telegram_msg_id_on_success(
 
 # ---- backoff schedule ------------------------------------------------------
 
+
 def test_backoff_minutes_is_strictly_increasing() -> None:
     """1m -> 5m -> 15m -> 60m -> 240m or similar; reasonable scheme."""
     for a, b in zip(BACKOFF_MINUTES, BACKOFF_MINUTES[1:], strict=False):
@@ -245,6 +329,7 @@ def test_backoff_minutes_is_strictly_increasing() -> None:
 
 # ---- sweep_retries ---------------------------------------------------------
 
+
 async def test_sweep_retries_processes_failed_rows_past_next_retry_ts(
     daemon_context: DaemonContext,
 ) -> None:
@@ -252,12 +337,19 @@ async def test_sweep_retries_processes_failed_rows_past_next_retry_ts(
     score_id = _seed_score(daemon_context, snap_id)
     past = datetime.now(UTC) - timedelta(minutes=5)
     with daemon_context.engine.begin() as conn:
-        conn.execute(insert(alerts).values(
-            strategy_score_id=score_id,
-            ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
-            score=85.0, status="failed", retry_count=1,
-            next_retry_ts=past, last_error="prev fail",
-        ))
+        conn.execute(
+            insert(alerts).values(
+                strategy_score_id=score_id,
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+                retry_count=1,
+                next_retry_ts=past,
+                last_error="prev fail",
+            )
+        )
 
     daemon_context.telegram.send_message = AsyncMock(return_value=99)
     with patch(
@@ -339,11 +431,18 @@ async def test_sweep_retries_skips_row_when_reconstruct_returns_none(
     retry once the data lands."""
     past = datetime.now(UTC) - timedelta(minutes=5)
     with daemon_context.engine.begin() as conn:
-        conn.execute(insert(alerts).values(
-            ts=datetime.now(UTC), symbol="NEVERSCANNED", strategy="iron_condor",
-            score=85.0, status="failed", retry_count=1,
-            next_retry_ts=past, last_error="prev fail",
-        ))
+        conn.execute(
+            insert(alerts).values(
+                ts=datetime.now(UTC),
+                symbol="NEVERSCANNED",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+                retry_count=1,
+                next_retry_ts=past,
+                last_error="prev fail",
+            )
+        )
 
     # No snapshot rows exist for NEVERSCANNED, so _latest_snapshot_id_for_symbol
     # returns None inside _reconstruct_scored.
@@ -361,11 +460,17 @@ async def test_sweep_retries_skips_rows_with_future_next_retry_ts(
     daemon_context: DaemonContext,
 ) -> None:
     with daemon_context.engine.begin() as conn:
-        conn.execute(insert(alerts).values(
-            ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
-            score=85.0, status="failed", retry_count=1,
-            next_retry_ts=datetime.now(UTC) + timedelta(minutes=5),
-        ))
+        conn.execute(
+            insert(alerts).values(
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+                retry_count=1,
+                next_retry_ts=datetime.now(UTC) + timedelta(minutes=5),
+            )
+        )
     count = await sweep_retries(daemon_context)
     assert count == 0
 
@@ -377,12 +482,19 @@ async def test_sweep_retries_drops_after_max_retries(
     score_id = _seed_score(daemon_context, snap_id)
     past = datetime.now(UTC) - timedelta(minutes=5)
     with daemon_context.engine.begin() as conn:
-        conn.execute(insert(alerts).values(
-            strategy_score_id=score_id,
-            ts=datetime.now(UTC), symbol="SPY", strategy="iron_condor",
-            score=85.0, status="failed", retry_count=MAX_RETRIES,
-            next_retry_ts=past, last_error="repeated fail",
-        ))
+        conn.execute(
+            insert(alerts).values(
+                strategy_score_id=score_id,
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=85.0,
+                status="failed",
+                retry_count=MAX_RETRIES,
+                next_retry_ts=past,
+                last_error="repeated fail",
+            )
+        )
     daemon_context.telegram.send_message = AsyncMock(
         side_effect=httpx.HTTPStatusError("nope", request=MagicMock(), response=MagicMock())
     )
@@ -410,36 +522,60 @@ async def test_retry_preserves_undefined_risk_warning_via_suggestion_json(
     # suggestion_json indicating undefined risk.
     now = datetime.now(UTC)
     with daemon_context.engine.begin() as conn:
-        snap_result = conn.execute(insert(snapshots).values(
-            symbol="SPY", ts=now, spot=400.0,
-            regime_dir="neutral", regime_iv="high",
-        ))
+        snap_result = conn.execute(
+            insert(snapshots).values(
+                symbol="SPY",
+                ts=now,
+                spot=400.0,
+                regime_dir="neutral",
+                regime_iv="high",
+            )
+        )
         snap_id = snap_result.inserted_primary_key[0]
-        score_id = int(conn.execute(insert(strategy_scores).values(
-            snapshot_id=snap_id, strategy="short_straddle",
-            score=85.0, rationale="High IV + neutral",
-            legs_json=[{
-                "symbol": "SPY", "side": "sell", "sec_type": "OPT",
-                "strike": 400.0, "right": "C", "expiry": "20260711",
-                "quantity": 1,
-            }],
-            suggestion_json={
-                "defined_risk": False,
-                "credit_or_debit": 8.50,
-                "max_loss": None,
-                "max_profit": 8.50,
-                "prob_profit": 0.45,
-                "suggested_quantity": 1,
-            },
-        )).inserted_primary_key[0])
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snap_id,
+                    strategy="short_straddle",
+                    score=85.0,
+                    rationale="High IV + neutral",
+                    legs_json=[
+                        {
+                            "symbol": "SPY",
+                            "side": "sell",
+                            "sec_type": "OPT",
+                            "strike": 400.0,
+                            "right": "C",
+                            "expiry": "20260711",
+                            "quantity": 1,
+                        }
+                    ],
+                    suggestion_json={
+                        "defined_risk": False,
+                        "credit_or_debit": 8.50,
+                        "max_loss": None,
+                        "max_profit": 8.50,
+                        "prob_profit": 0.45,
+                        "suggested_quantity": 1,
+                    },
+                )
+            ).inserted_primary_key[0]
+        )
         # Seed a failed alert so sweep_retries finds it.
         past = now - timedelta(minutes=5)
-        conn.execute(insert(alerts).values(
-            strategy_score_id=score_id,
-            ts=now, symbol="SPY", strategy="short_straddle",
-            score=85.0, status="failed", retry_count=1,
-            next_retry_ts=past, last_error="prev fail",
-        ))
+        conn.execute(
+            insert(alerts).values(
+                strategy_score_id=score_id,
+                ts=now,
+                symbol="SPY",
+                strategy="short_straddle",
+                score=85.0,
+                status="failed",
+                retry_count=1,
+                next_retry_ts=past,
+                last_error="prev fail",
+            )
+        )
 
     sent_text: list[str] = []
 

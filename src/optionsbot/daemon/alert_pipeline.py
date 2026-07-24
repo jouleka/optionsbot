@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
@@ -43,9 +44,7 @@ async def enqueue_alert(
     ):
         return False
     now = datetime.now(UTC)
-    strategy_score_id = _strategy_score_id_for(
-        context, snapshot_id, scored.strategy_name
-    )
+    strategy_score_id = _strategy_score_id_for(context, snapshot_id, scored.strategy_name)
     if strategy_score_id is None:
         raise RuntimeError(
             f"missing exact persisted score for snapshot={snapshot_id} "
@@ -55,8 +54,11 @@ async def enqueue_alert(
         result = conn.execute(
             insert(alerts).values(
                 strategy_score_id=strategy_score_id,
-                ts=now, symbol=symbol, strategy=scored.strategy_name,
-                score=scored.score, status="pending",
+                ts=now,
+                symbol=symbol,
+                strategy=scored.strategy_name,
+                score=scored.score,
+                status="pending",
             )
         )
         alert_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
@@ -64,8 +66,8 @@ async def enqueue_alert(
     # account, and risk packet before the alert becomes visible as sent.
     try:
         from optionsbot.daemon.candidate_evidence import (
-            apply_reconciled_economics,
             capture_candidate_evidence,
+            with_reconciled_economics,
         )
 
         evidence = await capture_candidate_evidence(
@@ -85,16 +87,17 @@ async def enqueue_alert(
                 for leg in scored.suggestion.legs
             ],
         )
-        apply_reconciled_economics(scored.suggestion, evidence)
+        scored = replace(
+            scored,
+            suggestion=with_reconciled_economics(scored.suggestion, evidence),
+        )
     except Exception:  # noqa: BLE001 - alert still delivers; Hermes fails closed
         log.exception("candidate evidence capture failed for score %s", strategy_score_id)
     await dispatch_alert(context, alert_id, snapshot_id, scored)
     return True
 
 
-def _strategy_score_id_for(
-    context: DaemonContext, snapshot_id: int, strategy: str
-) -> int | None:
+def _strategy_score_id_for(context: DaemonContext, snapshot_id: int, strategy: str) -> int | None:
     with context.engine.connect() as conn:
         row = conn.execute(
             select(strategy_scores.c.id)
@@ -104,9 +107,7 @@ def _strategy_score_id_for(
     return cast(int, row.id) if row is not None else None
 
 
-def execute_hint_for(
-    context: DaemonContext, snapshot_id: int, strategy: str
-) -> str | None:
+def execute_hint_for(context: DaemonContext, snapshot_id: int, strategy: str) -> str | None:
     """`/execute <strategy_scores.id>` hint for an alert, or None.
 
     Only when execution is enabled (IBK-126) — the hint would be noise (and
@@ -143,11 +144,12 @@ async def dispatch_alert(
         and getattr(suggestion, "suggested_quantity", 0) > 0
     )
     text = format_alert_markdown(
-        symbol=symbol, view=view, scored=scored, snapshot_ts=snapshot_ts,
+        symbol=symbol,
+        view=view,
+        scored=scored,
+        snapshot_ts=snapshot_ts,
         execute_hint=(
-            execute_hint_for(context, snapshot_id, scored.strategy_name)
-            if executable
-            else None
+            execute_hint_for(context, snapshot_id, scored.strategy_name) if executable else None
         ),
     )
     try:
@@ -194,11 +196,14 @@ async def sweep_retries(context: DaemonContext) -> int:
 
 # ---- internals -------------------------------------------------------------
 
+
 def _mark_sent(context: DaemonContext, alert_id: int, msg_id: int) -> None:
     now = datetime.now(UTC)
     with context.engine.begin() as conn:
         conn.execute(
-            update(alerts).where(alerts.c.id == alert_id).values(
+            update(alerts)
+            .where(alerts.c.id == alert_id)
+            .values(
                 status="sent",
                 sent_ts=now,
                 telegram_msg_id=msg_id,
@@ -210,9 +215,7 @@ def _mark_sent(context: DaemonContext, alert_id: int, msg_id: int) -> None:
 
 def _mark_failed(context: DaemonContext, alert_id: int, error: str) -> None:
     with context.engine.connect() as conn:
-        row = conn.execute(
-            select(alerts.c.retry_count).where(alerts.c.id == alert_id)
-        ).fetchone()
+        row = conn.execute(select(alerts.c.retry_count).where(alerts.c.id == alert_id)).fetchone()
     current = int(row.retry_count) if row else 0
     new_count = current + 1
     new_status: str
@@ -226,7 +229,9 @@ def _mark_failed(context: DaemonContext, alert_id: int, error: str) -> None:
         next_retry_ts = datetime.now(UTC) + timedelta(minutes=backoff)
     with context.engine.begin() as conn:
         conn.execute(
-            update(alerts).where(alerts.c.id == alert_id).values(
+            update(alerts)
+            .where(alerts.c.id == alert_id)
+            .values(
                 status=new_status,
                 retry_count=new_count,
                 last_error=error,
@@ -237,9 +242,7 @@ def _mark_failed(context: DaemonContext, alert_id: int, error: str) -> None:
 
 def _load_view_for_snapshot(context: DaemonContext, snapshot_id: int) -> MarketView:
     with context.engine.connect() as conn:
-        row = conn.execute(
-            select(snapshots).where(snapshots.c.id == snapshot_id)
-        ).fetchone()
+        row = conn.execute(select(snapshots).where(snapshots.c.id == snapshot_id)).fetchone()
     if row is None:
         raise RuntimeError(f"snapshot {snapshot_id} not found")
     return MarketView(
@@ -258,9 +261,7 @@ def _load_view_for_snapshot(context: DaemonContext, snapshot_id: int) -> MarketV
 
 def _load_snapshot_ts(context: DaemonContext, snapshot_id: int) -> datetime:
     with context.engine.connect() as conn:
-        row = conn.execute(
-            select(snapshots.c.ts).where(snapshots.c.id == snapshot_id)
-        ).fetchone()
+        row = conn.execute(select(snapshots.c.ts).where(snapshots.c.id == snapshot_id)).fetchone()
     if row is None or row.ts is None:
         return datetime.now(UTC)
     ts: datetime = row.ts
@@ -271,17 +272,13 @@ def _load_snapshot_ts(context: DaemonContext, snapshot_id: int) -> datetime:
 
 def _load_symbol_for_alert(context: DaemonContext, alert_id: int) -> str:
     with context.engine.connect() as conn:
-        row = conn.execute(
-            select(alerts.c.symbol).where(alerts.c.id == alert_id)
-        ).fetchone()
+        row = conn.execute(select(alerts.c.symbol).where(alerts.c.id == alert_id)).fetchone()
     if row is None:
         raise RuntimeError(f"alert {alert_id} not found")
     return cast(str, row.symbol)
 
 
-def _snapshot_id_for_alert(
-    context: DaemonContext, alert_id: int, _symbol: str
-) -> int | None:
+def _snapshot_id_for_alert(context: DaemonContext, alert_id: int, _symbol: str) -> int | None:
     with context.engine.connect() as conn:
         row = conn.execute(
             select(strategy_scores.c.snapshot_id)
@@ -297,7 +294,10 @@ def _snapshot_id_for_alert(
 
 
 def _reconstruct_scored(
-    context: DaemonContext, alert_id: int, strategy: str, score: float,
+    context: DaemonContext,
+    alert_id: int,
+    strategy: str,
+    score: float,
 ) -> ScoredStrategy | None:
     """Look up the persisted strategy_scores row for this alert's strategy and
     rebuild a minimal ScoredStrategy so format_alert_markdown can render it.

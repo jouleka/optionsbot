@@ -33,6 +33,8 @@ from optionsbot.mcp_server.intent_queue import (
 from optionsbot.mcp_server.restricted_context import RestrictedServerContext
 from optionsbot.mcp_server.server import build_server
 from optionsbot.mcp_server.tools import nightwatch, restricted
+from optionsbot.scoring import ScoredStrategy
+from optionsbot.scoring.types import FactorBreakdown
 from optionsbot.storage.db import create_readonly_engine_for_path
 from optionsbot.storage.schema import (
     alerts,
@@ -45,6 +47,7 @@ from optionsbot.storage.schema import (
     strategy_scores,
     watchlist,
 )
+from optionsbot.strategies import StrategySuggestion
 from tests.unit.test_mcp.conftest import FakeCtx, get_tools
 
 
@@ -513,16 +516,24 @@ async def test_declined_entry_proposal_does_not_create_alertless_review(
             )
         )
 
-    selected = SimpleNamespace(
+    selected = ScoredStrategy(
         strategy_name="bull_call_spread",
         score=80.0,
-        suggestion=SimpleNamespace(
+        factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
+        suggestion=StrategySuggestion(
+            strategy_name="bull_call_spread",
             legs=(),
-            expected_value=-1.0,
-            risk_normalized_expectancy=-0.01,
-            defined_risk=True,
+            credit_or_debit=-50.0,
             max_loss=100.0,
+            max_profit=50.0,
+            prob_profit=0.45,
+            suggested_quantity=1,
+            defined_risk=True,
+            rationale="candidate rebuilt from live data",
+            reward_risk=0.5,
+            expected_value=-1.0,
         ),
+        rationale="candidate rebuilt from live data",
     )
     scan_result = SimpleNamespace(snapshot_id=snapshot_id, scored=(selected,))
     settings = SimpleNamespace(
