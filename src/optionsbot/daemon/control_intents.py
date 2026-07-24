@@ -239,13 +239,13 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
     account_value = (
         float(summary.net_liquidation_usd) if summary.net_liquidation_usd is not None else None
     )
-    eligible = rank_alert_candidates(
+    preliminary_eligible = rank_alert_candidates(
         [(symbol, scored, result.snapshot_id) for scored in matching],
         context.settings.scan.score_threshold,
         account_value,
         context.settings.execution.max_single_trade_risk_pct,
     )
-    selected = eligible[0][1] if eligible else matching[0]
+    selected = preliminary_eligible[0][1] if preliminary_eligible else matching[0]
     with context.engine.connect() as conn:
         score_id = conn.execute(
             select(strategy_scores.c.id)
@@ -285,8 +285,6 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
         reasons = evidence.get("reasons")
         detail = ",".join(str(reason) for reason in reasons) if isinstance(reasons, list) else ""
         admission_blockers.append(f"execution_evidence_not_ready({detail or 'unspecified'})")
-    if not eligible and not admission_blockers:
-        admission_blockers.append("candidate_not_ranked_for_alert")
 
     alert_id: int | None = None
     bot_eligible = not admission_blockers

@@ -611,6 +611,164 @@ async def test_declined_entry_proposal_does_not_create_alertless_review(
         assert conn.execute(select(entry_reviews.c.id)).fetchall() == []
 
 
+@pytest.mark.asyncio
+async def test_entry_proposal_uses_fresh_economics_after_preliminary_rejection(
+    mcp_engine: Engine,
+) -> None:
+    now = datetime.now(UTC)
+    with mcp_engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=now,
+                    spot=500.0,
+                    regime_dir="bull",
+                    regime_iv="neutral",
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_call_spread",
+                    score=80.0,
+                    rationale="candidate rebuilt from live data",
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(alerts).values(
+                strategy_score_id=score_id,
+                ts=now,
+                symbol="SPY",
+                strategy="bull_call_spread",
+                score=80.0,
+                status="sent",
+                sent_ts=now,
+                telegram_msg_id=12345,
+            )
+        )
+
+    selected = ScoredStrategy(
+        strategy_name="bull_call_spread",
+        score=80.0,
+        factors=FactorBreakdown(0.7, 0.6, 0.8, 0.9, 1.0, 0.5),
+        suggestion=StrategySuggestion(
+            strategy_name="bull_call_spread",
+            legs=(),
+            credit_or_debit=-150.0,
+            max_loss=None,
+            max_profit=None,
+            prob_profit=0.45,
+            suggested_quantity=1,
+            defined_risk=True,
+            rationale="preliminary scan economics",
+            expected_value=-10.0,
+        ),
+        rationale="candidate rebuilt from live data",
+    )
+    scan_result = SimpleNamespace(snapshot_id=snapshot_id, scored=(selected,))
+    settings = SimpleNamespace(
+        screener=SimpleNamespace(universe=["SPY"]),
+        execution=SimpleNamespace(
+            paper_only=True,
+            zero_dte_only=True,
+            zero_dte_entry_cutoff_minutes=30,
+            max_single_trade_risk_pct=0.10,
+        ),
+        ibkr=SimpleNamespace(paper=True),
+        scan=SimpleNamespace(scan_symbol_timeout_s=5.0, score_threshold=70.0),
+    )
+    context = cast(
+        "DaemonContext",
+        SimpleNamespace(
+            engine=mcp_engine,
+            settings=settings,
+            ibkr=object(),
+            ibkr_lock=asyncio.Lock(),
+            resolver=None,
+        ),
+    )
+    positions_client = SimpleNamespace(
+        get_account_summary=AsyncMock(
+            return_value=SimpleNamespace(net_liquidation_usd=10_000.0)
+        )
+    )
+    payload = {
+        "proposed_at": now.isoformat(),
+        "symbol": "SPY",
+        "direction": "bull",
+        "iv_regime": "neutral",
+        "strategy": "auto",
+        "confidence": 0.8,
+        "sources": ["FRED macro snapshot", "Finnhub SPY news"],
+        "thesis": "Bounded paper hypothesis.",
+        "checks": {
+            "bot_health": True,
+            "regime_history": True,
+            "catalysts": True,
+        },
+    }
+    evidence = {
+        "ready": True,
+        "economics": {
+            "credit_or_debit": -40.0,
+            "max_loss": 40.0,
+            "max_profit": 60.0,
+            "reward_risk": 1.5,
+            "expected_value": 15.0,
+        },
+    }
+
+    with (
+        patch(
+            "optionsbot.daemon.market_hours.is_market_open",
+            return_value=True,
+        ),
+        patch(
+            "optionsbot.daemon.market_hours.minutes_to_nyse_close",
+            return_value=120.0,
+        ),
+        patch(
+            "optionsbot.scan.scan_symbol",
+            new=AsyncMock(return_value=scan_result),
+        ),
+        patch(
+            "optionsbot.ibkr.positions.PositionsClient",
+            return_value=positions_client,
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner.rank_alert_candidates",
+            return_value=[],
+        ),
+        patch(
+            "optionsbot.daemon.candidate_evidence.capture_candidate_evidence",
+            new=AsyncMock(return_value=evidence),
+        ),
+        patch(
+            "optionsbot.daemon.alert_pipeline.enqueue_alert",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "optionsbot.daemon.auto_executor.auto_execute_candidates",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        result = await _consume_entry_proposal(context, payload)
+
+    assert "OptionsBot submitted=False" in result
+    with mcp_engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.strategy_score_id == score_id
+    assert review.verdict == "vetted_paper_candidate"
+    assert review.status == "held"
+
+
 def test_halt_is_queued_then_monotonically_consumed_by_daemon(
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
