@@ -60,7 +60,6 @@ log = logging.getLogger(__name__)
 # Statuses that count as "this pick already has live exposure": anything not
 # failed-terminal. `filled` stays active until IBK-129 introduces closes.
 _ACTIVE_STATUSES = ("staged", "submitting", "submitted", "partial", "filled")
-_WORKING_STATUSES = ("staged", "submitting", "submitted", "partial")
 
 LegSpec = tuple[str, float, str]
 
@@ -260,24 +259,6 @@ async def execute_pick(
         if existing is not None:
             return _reject(
                 f"pick {score_id} already has order #{existing.id} ({existing.status})"
-            )
-        # A working close means the portfolio is actively reducing risk. Do
-        # not race that liquidation by adding a fresh 0DTE position. This is
-        # global rather than per-symbol because a stop/forced close is also
-        # evidence that the account state used to admit another entry is
-        # changing underneath us.
-        working_close = conn.execute(
-            select(orders.c.id, orders.c.symbol)
-            .where(orders.c.intent == "close")
-            .where(orders.c.status.in_(_WORKING_STATUSES))
-            .order_by(orders.c.staged_ts)
-            .limit(1)
-        ).first()
-        if working_close is not None:
-            return _reject(
-                "risk-reduction close in progress "
-                f"(order #{working_close.id}, {working_close.symbol}) — "
-                "new entries resume after it reaches a terminal state"
             )
         # 7. Ledger-based caps (bot-attributed exposure; portfolio-wide gates
         # arrive with full-auto IBK-130). Entries whose close has FILLED are
