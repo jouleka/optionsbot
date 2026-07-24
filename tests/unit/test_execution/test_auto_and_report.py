@@ -179,6 +179,26 @@ async def test_closed_round_trip_frees_the_symbol_cap(tmp_db: Engine) -> None:
     assert outcome.ok, outcome.message
 
 
+async def test_active_risk_reduction_close_blocks_new_entry(tmp_db: Engine) -> None:
+    """Do not add 0DTE risk while an existing position is being liquidated."""
+    _, close_id = _pair(tmp_db)
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == close_id)
+            .values(status="submitted")
+        )
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert not outcome.ok
+    assert "risk-reduction close" in outcome.message
+    deps.order_client.place_combo_limit.assert_not_awaited()  # type: ignore[attr-defined]
+
+
 async def test_entry_walk_stops_on_kill(tmp_db: Engine) -> None:
     # Opus IBK-130 #3: a kill mid-walk must stop ENTRY walks before they fill.
     from unittest.mock import AsyncMock, MagicMock
@@ -990,3 +1010,35 @@ def test_no_loss_streak_still_floors_to_min1() -> None:
         single_trade_cap_pct=0.10,
     )
     assert d.quantity == 1 and "min-1" in d.note
+
+
+def test_learned_0dte_caps_prevent_repeating_july_24_sizing() -> None:
+    """Replay the two July 24 candidates under the next-session risk profile."""
+    from optionsbot.execution.sizing import dynamic_quantity
+
+    qqq = dynamic_quantity(
+        equity=8_481.63,
+        max_loss_unit=63.50,
+        max_profit_unit=336.50,
+        prob_profit=0.4451,
+        open_heat=273.0,
+        recent_pnls=[-126.31, -60.67, 30.51, -18.64, -67.84],
+        base_risk_pct=0.01,
+        heat_cap_pct=0.06,
+        single_trade_cap_pct=0.01,
+    )
+    nflx = dynamic_quantity(
+        equity=8_529.85,
+        max_loss_unit=273.0,
+        max_profit_unit=27.0,
+        prob_profit=0.7264,
+        open_heat=0.0,
+        recent_pnls=[],
+        base_risk_pct=0.01,
+        heat_cap_pct=0.06,
+        single_trade_cap_pct=0.01,
+    )
+
+    assert qqq.quantity == 1
+    assert nflx.quantity == 0
+    assert "single-trade cap" in nflx.note
