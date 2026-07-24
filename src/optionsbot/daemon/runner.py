@@ -475,9 +475,20 @@ class Daemon:
         # minutes after start so the ledger updates without waiting a full day.
         oeh = self._settings.validation.outcomes_eval_hours
         if oeh > 0:
+            # Same-day learning cannot wait an hour (or the normal daily
+            # cadence) after the bell: the EOD analyst needs settled call
+            # outcomes before its report. The runner itself advances today's
+            # evaluation date only after the official exchange close, so
+            # pre-close 15-minute ticks are cheap no-ops and never score an
+            # incomplete bar.
+            outcomes_trigger = (
+                IntervalTrigger(minutes=15)
+                if self._settings.execution.zero_dte_only
+                else IntervalTrigger(hours=oeh)
+            )
             self._scheduler.add_job(
                 self._outcomes_tick,
-                trigger=IntervalTrigger(hours=oeh),
+                trigger=outcomes_trigger,
                 id="outcomes",
                 max_instances=1,
                 coalesce=True,
