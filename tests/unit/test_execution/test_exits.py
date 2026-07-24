@@ -116,6 +116,31 @@ def test_zero_dte_mode_holds_until_dedicated_close_guard() -> None:
     assert reason is not None and "0DTE" in reason
 
 
+def test_zero_dte_debit_ignores_intraday_soft_stop_until_close_guard() -> None:
+    """A same-day directional debit thesis gets the session to work."""
+    settings = _settings(zero_dte_only=True, exit_stop_enabled=True)
+    assert evaluate_exit(
+        entry_net=-0.64,
+        current_net=-0.30,
+        dte=0,
+        settings=settings,
+        minutes_to_close=120,
+    ) is None
+
+
+def test_zero_dte_credit_soft_stop_remains_enabled() -> None:
+    """Short-premium losses still receive the configured risk exit."""
+    settings = _settings(zero_dte_only=True, exit_stop_enabled=True)
+    reason = evaluate_exit(
+        entry_net=0.27,
+        current_net=0.94,
+        dte=0,
+        settings=settings,
+        minutes_to_close=120,
+    )
+    assert reason is not None and "soft stop" in reason
+
+
 # --- stage_close_order ----------------------------------------------------------------
 
 

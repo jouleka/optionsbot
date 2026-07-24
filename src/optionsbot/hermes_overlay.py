@@ -133,6 +133,8 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 entries.c.strategy_score_id,
                 entries.c.symbol,
                 entries.c.strategy,
+                closes.c.id.label("close_order_id"),
+                closes.c.last_error.label("exit_reason"),
                 (entry_cash.c.cash + close_cash.c.cash).label("actual_pnl"),
             )
             .select_from(
@@ -155,26 +157,79 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
             "symbol": str(row.symbol),
             "strategy": str(row.strategy),
             "pnl": float(row.actual_pnl),
+            "close_order_id": int(row.close_order_id),
+            "exit_reason": row.exit_reason,
         }
         for row in rows
         if row.actual_pnl is not None
     ]
 
 
+def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
+    """Aggregate every settled candidate by entry-thesis outcome.
+
+    This is intentionally broader than actual fills: the scanner produces many
+    forward-tested 0DTE hypotheses, so Hermes can learn which strategy/symbol
+    families have worked without needing the broker to risk money on each one.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                pick_outcomes.c.symbol,
+                pick_outcomes.c.strategy,
+                pick_outcomes.c.win,
+                pick_outcomes.c.realized_pnl,
+            )
+        ).fetchall()
+
+    def grouped(field: str) -> dict[str, dict[str, int | float]]:
+        groups: dict[str, dict[str, int | float]] = {}
+        for row in rows:
+            key = str(getattr(row, field))
+            group = groups.setdefault(
+                key,
+                {"calls": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+            )
+            group["calls"] += 1
+            group["wins" if bool(row.win) else "losses"] += 1
+            group["net_pnl"] += float(row.realized_pnl)
+        for group in groups.values():
+            calls = int(group["calls"])
+            group["win_rate"] = float(group["wins"]) / calls if calls else 0.0
+            group["net_pnl"] = round(float(group["net_pnl"]), 2)
+            group["avg_pnl"] = round(float(group["net_pnl"]) / calls, 2) if calls else 0.0
+        return groups
+
+    wins = sum(bool(row.win) for row in rows)
+    net_pnl = sum(float(row.realized_pnl) for row in rows)
+    return {
+        "calls": len(rows),
+        "wins": wins,
+        "losses": len(rows) - wins,
+        "win_rate": wins / len(rows) if rows else None,
+        "net_pnl": round(net_pnl, 2),
+        "avg_pnl": round(net_pnl / len(rows), 2) if rows else None,
+        "by_strategy": grouped("strategy"),
+        "by_symbol": grouped("symbol"),
+    }
+
+
 def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, Any]:
     """Actual and counterfactual lessons fed back to every Hermes review pass.
 
-    Completed fill cashflows take precedence over theoretical expiry outcomes.
-    A theoretical expiry winner is still useful evidence about a forecast, but
-    does not invalidate a refusal caused by stale quotes or untradeable spreads.
-    Those operational guards and reviews made after an order already existed
-    are reported separately from forecast accuracy.
+    Completed fill cashflows are the truth about money made or lost. Expiry-close
+    counterfactuals are separately the truth about whether the original call
+    ultimately worked. Keeping both prevents a profitable early exit from
+    teaching "good call" when the thesis later failed, or a premature stop from
+    teaching "bad call" when the structure ultimately won.
     """
     rows = _review_outcome_rows(engine)
     actual_results = _actual_round_trip_results(engine)
-    actual_pnl = {result["pick_id"]: result["pnl"] for result in actual_results}
+    actual_by_pick = {result["pick_id"]: result for result in actual_results}
     evaluated = [
-        row for row in rows if row.win is not None or int(row.strategy_score_id) in actual_pnl
+        row
+        for row in rows
+        if row.win is not None or int(row.strategy_score_id) in actual_by_pick
     ]
     lessons: list[dict[str, Any]] = []
     mistakes = guarded_winners = 0
@@ -186,8 +241,25 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         # especially important for reviews that arrived after the order was
         # already filled: Hermes must learn the realized result without that
         # hindsight observation being scored as a pre-trade forecast.
-        filled_pnl = actual_pnl.get(int(row.strategy_score_id))
-        observed_pnl = filled_pnl if filled_pnl is not None else float(row.realized_pnl)
+        actual_result = actual_by_pick.get(int(row.strategy_score_id))
+        filled_pnl = actual_result["pnl"] if actual_result is not None else None
+        call_pnl = float(row.realized_pnl) if row.realized_pnl is not None else None
+        call_won = bool(row.win) if row.win is not None else None
+        execution_won = filled_pnl > 0.0 if filled_pnl is not None else None
+        diagnosis: str | None = None
+        if call_won is not None and execution_won is not None:
+            diagnosis = {
+                (True, True): "good_call_good_execution",
+                (True, False): "good_call_bad_execution",
+                (False, True): "bad_call_good_execution",
+                (False, False): "bad_call_bad_execution",
+            }[(call_won, execution_won)]
+        observed_pnl = (
+            call_pnl
+            if context == "pre_trade_forecast" and call_pnl is not None
+            else filled_pnl if filled_pnl is not None else call_pnl
+        )
+        assert observed_pnl is not None
         won = observed_pnl > 0.0
         outcome_basis = (
             "actual_filled_round_trip" if filled_pnl is not None else "expiry_close_counterfactual"
@@ -206,10 +278,12 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         elif context == "operational_guard" and won:
             guarded_winners += 1
             lesson = "theoretical_winner_but_execution_guard_was_not_overruled"
+        elif context == "post_trade_observation" and diagnosis is not None:
+            lesson = diagnosis
         elif context == "post_trade_observation" and filled_pnl is not None:
             lesson = (
                 "actual_trade_winner_post_trade_observation"
-                if won
+                if execution_won
                 else "actual_trade_loser_post_trade_observation"
             )
         lessons.append(
@@ -228,7 +302,17 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 "theoretical_pnl": (
                     float(row.realized_pnl) if row.realized_pnl is not None else None
                 ),
+                "call_pnl": call_pnl,
+                "call_won": call_won,
                 "actual_trade_pnl": filled_pnl,
+                "execution_won": execution_won,
+                "close_order_id": (
+                    actual_result["close_order_id"] if actual_result is not None else None
+                ),
+                "exit_reason": (
+                    actual_result["exit_reason"] if actual_result is not None else None
+                ),
+                "diagnosis": diagnosis,
                 "outcome_basis": outcome_basis,
                 "observed_win": won,
                 "observed_pnl": observed_pnl,
@@ -260,9 +344,9 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
     actual_wins = sum(result["pnl"] > 0 for result in actual_results)
     return {
         "meaning": (
-            "Completed actual fill P&L (including commissions) takes precedence; "
-            "expiry-close counterfactuals are used otherwise. Learn forecast "
-            "mistakes, but never waive stale-quote, liquidity, or risk guards."
+            "Actual fill P&L (including commissions) measures execution; expiry-close "
+            "counterfactual P&L measures call quality. Learn the correct side of a "
+            "disagreement, but never waive stale-quote, liquidity, or risk guards."
         ),
         "review_calls": len(rows),
         "outcomes_available": len(evaluated),
@@ -280,6 +364,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "by_strategy": by_strategy,
             "by_symbol": by_symbol,
         },
+        "terminal_call_summary": _terminal_call_summary(engine),
         "recent_lessons": lessons[: max(1, min(recent_limit, 100))],
     }
 

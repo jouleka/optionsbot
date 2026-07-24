@@ -738,6 +738,11 @@ async def _manage_entry(
         if exit_request_id is not None:
             _mark_exit_request(engine, exit_request_id, "refused", str(exc), now)
         return 0
+    # Persist the decision attribution on the durable close row. This is not
+    # an error despite the legacy column name; set_order_note is the existing
+    # audit-note mechanism. Post-trade learning can now distinguish a stop,
+    # take-profit, time guard, manual close, and Hermes-requested close.
+    set_order_note(engine, close.id, f"exit trigger: {reason}")
     try:
         assert_atomic_close_legs(entry_legs=entry.legs, close_legs=close.legs)
     except NonAtomicCloseError as exc:

@@ -63,7 +63,16 @@ def evaluate_exit(
     else:  # debit structure
         if pnl >= manage.debit_take_profit_pct * basis:
             return f"take-profit (+{pnl / basis * 100:.0f}% on debit)"
-        if execution.exit_stop_enabled and pnl <= -(manage.debit_stop_pct * basis):
+        # Exact-0DTE debit spreads are already sized from their full structural
+        # max loss and can whipsaw through a percentage-of-premium stop before
+        # the directional thesis resolves. Keep take-profit and the mandatory
+        # pre-close flatten, but do not confuse an intraday premium drawdown
+        # with a disproven same-session call.
+        if (
+            execution.exit_stop_enabled
+            and not zero_dte_session
+            and pnl <= -(manage.debit_stop_pct * basis)
+        ):
             return f"soft stop (-{abs(pnl) / basis * 100:.0f}% of debit)"
 
     if not zero_dte_session and dte <= manage.manage_dte:

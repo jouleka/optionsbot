@@ -294,3 +294,39 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
     assert lesson["theoretical_pnl"] is None
     assert lesson["forecast_useful"] is None
     assert lesson["lesson"] == "actual_trade_loser_post_trade_observation"
+
+    # Once the expiry-close counterfactual arrives, the learning loop must
+    # separate entry-call quality from realized execution/exit quality.
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(pick_outcomes).values(
+                strategy_score_id=score_id,
+                symbol="IWM",
+                strategy="bull_call_spread",
+                expiry="2026-07-24",
+                entry_spot=295.0,
+                terminal_spot=300.0,
+                realized_pnl=150.0,
+                win=1,
+                evaluated_at=now,
+            )
+        )
+
+    feedback = learning_feedback(daemon_context.engine)
+    lesson = feedback["recent_lessons"][0]
+    assert lesson["call_pnl"] == 150.0
+    assert lesson["actual_trade_pnl"] == -32.0
+    assert lesson["call_won"] is True
+    assert lesson["execution_won"] is False
+    assert lesson["diagnosis"] == "good_call_bad_execution"
+    assert lesson["lesson"] == "good_call_bad_execution"
+    assert feedback["terminal_call_summary"]["calls"] == 1
+    assert feedback["terminal_call_summary"]["wins"] == 1
+    assert feedback["terminal_call_summary"]["by_strategy"]["bull_call_spread"] == {
+        "calls": 1,
+        "wins": 1,
+        "losses": 0,
+        "net_pnl": 150.0,
+        "win_rate": 1.0,
+        "avg_pnl": 150.0,
+    }

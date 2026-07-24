@@ -349,6 +349,14 @@ async def test_soft_stop_submission_emits_operational_event(
     order_client.place_combo_limit.assert_awaited_once()
     daemon_context.events.emit.assert_called_once()
     assert daemon_context.events.emit.call_args.args[0] == "stop-hit"
+    with daemon_context.engine.connect() as conn:
+        close = conn.execute(
+            select(orders.c.last_error)
+            .where(orders.c.intent == "close")
+            .where(orders.c.closes_order_id.is_not(None))
+        ).one()
+    assert close.last_error is not None
+    assert close.last_error.startswith("exit trigger: soft stop")
 
 
 async def test_request_exit_adverse_loser_submits_audited_close(
