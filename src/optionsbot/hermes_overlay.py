@@ -20,6 +20,7 @@ from optionsbot.storage.schema import (
     hermes_overlay_state,
     orders,
     pick_outcomes,
+    position_settlements,
     snapshots,
     strategy_scores,
 )
@@ -198,6 +199,55 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 "max_profit_at_entry": max_profit,
                 "realized_profit_capture_pct": (
                     actual_pnl / max_profit if max_profit is not None and max_profit > 0 else None
+                ),
+            }
+        )
+    with engine.connect() as conn:
+        settled_rows = conn.execute(
+            select(
+                orders.c.strategy_score_id,
+                orders.c.symbol,
+                orders.c.strategy,
+                orders.c.quantity,
+                strategy_scores.c.suggestion_json,
+                position_settlements.c.pnl,
+                entry_cash.c.gross_cash.label("entry_gross_cash"),
+            )
+            .select_from(
+                position_settlements.join(
+                    orders,
+                    orders.c.id == position_settlements.c.entry_order_id,
+                )
+                .join(
+                    strategy_scores,
+                    strategy_scores.c.id == orders.c.strategy_score_id,
+                )
+                .join(entry_cash, entry_cash.c.order_id == orders.c.id)
+            )
+            .where(position_settlements.c.kind == "expired_worthless")
+        ).fetchall()
+    for row in settled_rows:
+        if row.strategy_score_id is None:
+            continue
+        actual_pnl = float(row.pnl)
+        entry_gross = (
+            float(row.entry_gross_cash)
+            if row.entry_gross_cash is not None
+            else None
+        )
+        results.append(
+            {
+                "pick_id": int(row.strategy_score_id),
+                "symbol": str(row.symbol),
+                "strategy": str(row.strategy),
+                "pnl": actual_pnl,
+                "close_order_id": None,
+                "exit_reason": "expired worthless after broker clearing",
+                "max_profit_at_entry": entry_gross,
+                "realized_profit_capture_pct": (
+                    actual_pnl / entry_gross
+                    if entry_gross is not None and entry_gross > 0
+                    else None
                 ),
             }
         )
@@ -391,6 +441,59 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             group["net_pnl"] = round(float(group["net_pnl"]), 2)
 
     actual_wins = sum(result["pnl"] > 0 for result in actual_results)
+
+    guarded = [
+        lesson
+        for lesson in lessons
+        if lesson["review_context"] == "operational_guard"
+        and lesson["call_pnl"] is not None
+    ]
+
+    def guarded_groups(field: str) -> dict[str, dict[str, int | float | None]]:
+        groups: dict[str, list[float]] = {}
+        for lesson in guarded:
+            groups.setdefault(str(lesson[field]), []).append(
+                float(lesson["call_pnl"])
+            )
+        result: dict[str, dict[str, int | float | None]] = {}
+        for key, pnls in groups.items():
+            wins = [pnl for pnl in pnls if pnl > 0]
+            losses = [pnl for pnl in pnls if pnl <= 0]
+            net = sum(pnls)
+            result[key] = {
+                "calls": len(pnls),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": len(wins) / len(pnls) if pnls else None,
+                "net_pnl": round(net, 2),
+                "avg_pnl": round(net / len(pnls), 2) if pnls else None,
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+                "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            }
+        return result
+
+    guarded_pnls = [float(lesson["call_pnl"]) for lesson in guarded]
+    guarded_win_pnls = [pnl for pnl in guarded_pnls if pnl > 0]
+    guarded_loss_pnls = [pnl for pnl in guarded_pnls if pnl <= 0]
+    largest_winners = sorted(
+        guarded,
+        key=lambda lesson: float(lesson["call_pnl"]),
+        reverse=True,
+    )[:5]
+    largest_losers = sorted(
+        guarded,
+        key=lambda lesson: float(lesson["call_pnl"]),
+    )[:5]
+
+    def compact_guarded(lesson: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "pick_id": lesson["pick_id"],
+            "symbol": lesson["symbol"],
+            "strategy": lesson["strategy"],
+            "pnl": lesson["call_pnl"],
+            "verdict": lesson["verdict"],
+        }
+
     return {
         "meaning": (
             "Actual fill P&L (including commissions) measures execution; expiry-close "
@@ -412,6 +515,46 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "net_pnl": round(sum(result["pnl"] for result in actual_results), 2),
             "by_strategy": by_strategy,
             "by_symbol": by_symbol,
+        },
+        "guarded_call_summary": {
+            "meaning": (
+                "Counterfactual expiry outcomes for candidates blocked by an "
+                "operational/execution guard. Use payoff-aware aggregates as a "
+                "prior for future unblocked hypotheses; never use them to waive "
+                "the guard that prevented execution."
+            ),
+            "calls": len(guarded_pnls),
+            "wins": len(guarded_win_pnls),
+            "losses": len(guarded_loss_pnls),
+            "win_rate": (
+                len(guarded_win_pnls) / len(guarded_pnls)
+                if guarded_pnls
+                else None
+            ),
+            "net_pnl": round(sum(guarded_pnls), 2),
+            "avg_pnl": (
+                round(sum(guarded_pnls) / len(guarded_pnls), 2)
+                if guarded_pnls
+                else None
+            ),
+            "avg_win": (
+                round(sum(guarded_win_pnls) / len(guarded_win_pnls), 2)
+                if guarded_win_pnls
+                else None
+            ),
+            "avg_loss": (
+                round(sum(guarded_loss_pnls) / len(guarded_loss_pnls), 2)
+                if guarded_loss_pnls
+                else None
+            ),
+            "by_strategy": guarded_groups("strategy"),
+            "by_symbol": guarded_groups("symbol"),
+            "largest_winners": [
+                compact_guarded(lesson) for lesson in largest_winners
+            ],
+            "largest_losers": [
+                compact_guarded(lesson) for lesson in largest_losers
+            ],
         },
         "terminal_call_summary": _terminal_call_summary(engine),
         "recent_lessons": lessons[: max(1, min(recent_limit, 100))],

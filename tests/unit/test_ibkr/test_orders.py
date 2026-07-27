@@ -133,6 +133,37 @@ async def test_place_condor_builds_guaranteed_smart_bag(
     )
 
 
+async def test_zero_price_atomic_close_acknowledges_riskless_combo_warning(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    await order_client.place_combo_limit(
+        "SPY",
+        CONDOR_LEGS,
+        quantity=1,
+        limit_price=0.0,
+        order_ref="obot-70",
+        is_closing=True,
+    )
+
+    _, order = order_ib.placeOrder.call_args.args
+    assert order.advancedErrorOverride == "8229=COMBOPAYOUT"
+
+
+async def test_zero_price_entry_never_bypasses_riskless_combo_warning(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    await order_client.place_combo_limit(
+        "SPY",
+        CONDOR_LEGS,
+        quantity=1,
+        limit_price=0.0,
+        order_ref="obot-71",
+    )
+
+    _, order = order_ib.placeOrder.call_args.args
+    assert not order.advancedErrorOverride
+
+
 async def test_stk_legs_are_filtered_out(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:

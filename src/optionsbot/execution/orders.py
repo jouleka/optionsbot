@@ -32,6 +32,7 @@ from optionsbot.storage.schema import (
     fills,
     order_quotes,
     orders,
+    position_settlements,
     snapshots,
     strategy_scores,
     walk_state,
@@ -679,10 +680,10 @@ def net_premium(engine: Engine, order_id: int) -> float | None:
 
 @dataclass(frozen=True, slots=True)
 class ClosedPair:
-    """One realized round-trip: a filled entry and its filled close (IBK-130/131)."""
+    """One realized trade: broker close fill or all-OTM expiration settlement."""
 
     entry_id: int
-    close_id: int
+    close_id: int | None
     symbol: str
     strategy: str
     quantity: int
@@ -797,6 +798,126 @@ def _complete_order_accounting(engine: Engine, order_id: int) -> tuple[float, fl
     return premium, commissions
 
 
+def settled_entry_ids(engine: Engine) -> set[int]:
+    """Entry IDs whose expiration was durably reconciled after broker clearing."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(position_settlements.c.entry_order_id)
+        ).fetchall()
+    return {int(row.entry_order_id) for row in rows}
+
+
+def record_expired_worthless_settlement(
+    engine: Engine,
+    entry: OrderRecord,
+    *,
+    expiry: str,
+    terminal_spot: float,
+    settled_at: datetime,
+) -> ClosedPair:
+    """Record an all-OTM expiration after the broker no longer reports its legs.
+
+    This deliberately refuses any ITM/ATM, mixed-expiry, malformed, or already
+    closed structure.  Those cases may involve assignment and require broker
+    evidence rather than a theoretical payoff.
+    """
+    if entry.intent != "open" or entry.status != "filled":
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: filled entry unavailable for expiration settlement"
+        )
+    if (
+        not isinstance(terminal_spot, (int, float))
+        or isinstance(terminal_spot, bool)
+        or not math.isfinite(float(terminal_spot))
+        or terminal_spot <= 0
+    ):
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: terminal spot unavailable for expiration settlement"
+        )
+    option_legs = [
+        leg for leg in entry.legs if leg.get("sec_type", "OPT") == "OPT"
+    ]
+    if not option_legs or {str(leg.get("expiry")) for leg in option_legs} != {expiry}:
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: exact expiration structure unavailable"
+        )
+    for leg in option_legs:
+        try:
+            strike = float(leg["strike"])
+            right = str(leg["right"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RealizedPnLUnavailable(
+                f"order {entry.id}: expiration leg terms unavailable"
+            ) from exc
+        strictly_otm = (
+            terminal_spot < strike if right == "C"
+            else terminal_spot > strike if right == "P"
+            else False
+        )
+        if not strictly_otm:
+            raise RealizedPnLUnavailable(
+                f"order {entry.id}: expiration is not provably all OTM"
+            )
+    with engine.connect() as conn:
+        filled_close = conn.execute(
+            select(orders.c.id)
+            .where(orders.c.closes_order_id == entry.id)
+            .where(orders.c.status == "filled")
+            .limit(1)
+        ).first()
+    if filled_close is not None:
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: filled close already exists"
+        )
+    premium, commissions = _complete_order_accounting(engine, entry.id)
+    pnl = premium - commissions
+    if not math.isfinite(pnl):
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: expiration accounting unavailable"
+        )
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(position_settlements).where(
+                position_settlements.c.entry_order_id == entry.id
+            )
+        ).first()
+        if existing is None:
+            conn.execute(
+                insert(position_settlements).values(
+                    entry_order_id=entry.id,
+                    kind="expired_worthless",
+                    expiry=expiry,
+                    terminal_spot=float(terminal_spot),
+                    pnl=pnl,
+                    commissions=commissions,
+                    settled_at=settled_at,
+                )
+            )
+        else:
+            if (
+                existing.kind != "expired_worthless"
+                or existing.expiry != expiry
+                or float(existing.terminal_spot) != float(terminal_spot)
+                or not math.isclose(float(existing.pnl), pnl, abs_tol=1e-9)
+                or not math.isclose(
+                    float(existing.commissions), commissions, abs_tol=1e-9
+                )
+            ):
+                raise RealizedPnLUnavailable(
+                    f"order {entry.id}: expiration settlement evidence drifted"
+                )
+            settled_at = _aware(existing.settled_at) or settled_at
+    return ClosedPair(
+        entry_id=entry.id,
+        close_id=None,
+        symbol=entry.symbol,
+        strategy=entry.strategy,
+        quantity=entry.quantity,
+        pnl=pnl,
+        closed_ts=settled_at,
+    )
+
+
 def realized_close_pairs(
     engine: Engine, *, since: datetime | None = None
 ) -> list[ClosedPair]:
@@ -853,7 +974,38 @@ def realized_close_pairs(
                 closed_ts=closed_ts,
             )
         )
-    return pairs
+    with engine.connect() as conn:
+        settlements = conn.execute(
+            select(position_settlements).order_by(
+                position_settlements.c.settled_at
+            )
+        ).fetchall()
+    for settlement in settlements:
+        settled_at = _aware(settlement.settled_at)
+        if since is not None and (
+            settled_at is None or settled_at <= since
+        ):
+            continue
+        entry = get_order(engine, int(settlement.entry_order_id))
+        if entry is None or entry.status != "filled":
+            raise RealizedPnLUnavailable(
+                f"settled entry {settlement.entry_order_id}: order unavailable"
+            )
+        pairs.append(
+            ClosedPair(
+                entry_id=entry.id,
+                close_id=None,
+                symbol=entry.symbol,
+                strategy=entry.strategy,
+                quantity=entry.quantity,
+                pnl=float(settlement.pnl),
+                closed_ts=settled_at,
+            )
+        )
+    return sorted(
+        pairs,
+        key=lambda pair: pair.closed_ts or datetime.min.replace(tzinfo=UTC),
+    )
 
 
 def open_orders(engine: Engine) -> list[OrderRecord]:
@@ -868,6 +1020,8 @@ def open_orders(engine: Engine) -> list[OrderRecord]:
 
 def open_position_exposure(
     engine: Engine,
+    *,
+    as_of: datetime | None = None,
 ) -> dict[int, tuple[tuple[str, str, float, str], int]] | None:
     """Reconstruct exact signed option exposure from every persisted execution.
 
@@ -893,13 +1047,28 @@ def open_position_exposure(
                 fills.c.leg_con_id,
             )
         ).fetchall()
+        settled_ids = {
+            int(row.entry_order_id)
+            for row in conn.execute(
+                select(position_settlements.c.entry_order_id)
+            ).fetchall()
+        }
 
-    orders_by_id = {int(row.id): row for row in order_rows}
+    orders_by_id = {
+        int(row.id): row
+        for row in order_rows
+        if int(row.id) not in settled_ids
+    }
     fills_by_order: dict[int, list[Any]] = {}
     for fill in fill_rows:
+        if int(fill.order_id) in settled_ids:
+            continue
         fills_by_order.setdefault(int(fill.order_id), []).append(fill)
 
+    current_expiry = (as_of or datetime.now(UTC)).strftime("%Y%m%d")
     for row in order_rows:
+        if int(row.id) in settled_ids:
+            continue
         option_legs: list[dict[str, Any]] = []
         for leg in row.legs_json or []:
             if not isinstance(leg, dict):
@@ -909,6 +1078,18 @@ def open_position_exposure(
                 continue
             if sec_type != "OPT":
                 return None
+            expiry = leg.get("expiry")
+            if (
+                isinstance(expiry, str)
+                and len(expiry) == 8
+                and expiry.isascii()
+                and expiry.isdecimal()
+                and expiry < current_expiry
+            ):
+                # Expired contracts legitimately disappear from the broker on
+                # clearing. Assignment stock, if any, remains visible as an
+                # unexpected broker position and reconciliation still halts.
+                continue
             option_legs.append(leg)
         if (
             option_legs
@@ -925,6 +1106,7 @@ def open_position_exposure(
         leg_specs: dict[int, tuple[str, str, float, str]] = {}
         expected_fills: dict[tuple[int, str], int] = {}
         actual_fills: dict[tuple[int, str], int] = {}
+        expired_con_ids: set[int] = set()
         raw_order_quantity = order_row.quantity
         if type(raw_order_quantity) is not int or raw_order_quantity <= 0:
             return None
@@ -943,6 +1125,17 @@ def open_position_exposure(
                 raw_currency = leg["currency"]
             except (KeyError, TypeError, ValueError, OverflowError):
                 return None
+            if (
+                isinstance(raw_expiry, str)
+                and len(raw_expiry) == 8
+                and raw_expiry.isascii()
+                and raw_expiry.isdecimal()
+                and raw_expiry < current_expiry
+            ):
+                if type(raw_con_id) is not int or raw_con_id <= 0:
+                    return None
+                expired_con_ids.add(raw_con_id)
+                continue
             if (
                 type(raw_con_id) is not int
                 or raw_con_id <= 0
@@ -985,6 +1178,8 @@ def open_position_exposure(
                 qty = int(raw_qty)
             except (TypeError, ValueError, OverflowError):
                 return None
+            if con_id in expired_con_ids:
+                continue
             side = str(fill.side).upper()
             fill_spec = leg_specs.get(con_id)
             if (

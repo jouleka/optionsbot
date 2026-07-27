@@ -12,10 +12,14 @@ from sqlalchemy import Engine, delete, insert, select, update
 from optionsbot.execution.engine import execute_pick
 from optionsbot.execution.orders import (
     RealizedPnLUnavailable,
+    get_order,
+    open_position_exposure,
     realized_close_pairs,
+    record_expired_worthless_settlement,
     record_fill,
     record_order_quotes,
     set_order_leg_contracts,
+    settled_entry_ids,
     stage_order,
     total_commissions,
     transition,
@@ -96,6 +100,47 @@ async def test_paper_profile_uses_structural_max_loss_when_whatif_margin_missing
 
     assert outcome.ok, outcome.message
     assert "structural max loss" in outcome.message.lower()
+
+
+async def test_zero_dte_physical_settlement_caps_quantity_before_margin_fallback(
+    tmp_db: Engine,
+) -> None:
+    same_day_legs = [
+        {**leg, "expiry": ENGINE_NOW.strftime("%Y%m%d")}
+        for leg in CONDOR_LEGS
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=same_day_legs,
+        credit_or_debit=450.0,
+        max_loss=50.0,
+        max_profit=450.0,
+    )
+    deps = _deps(
+        tmp_db,
+        available_funds=10_000.0,
+        net_liquidation=10_000.0,
+        md_mids={(580.0, "P"): 5.0, (575.0, "P"): 0.5},
+    )
+    deps.settings.execution.zero_dte_only = True
+    deps.settings.execution.allow_structural_margin_fallback = True
+    deps.order_client.whatif_combo.return_value = MarginPreview(
+        init_margin_change=None,
+        maint_margin_change=None,
+        equity_with_loan_change=None,
+        commission=None,
+        max_commission=None,
+        warning="paper BAG omitted margin",
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
+    placed = deps.order_client.place_combo_limit.await_args
+    assert placed.kwargs["quantity"] == 1
+    assert "physical-settlement fallback capped" in outcome.message
+    assert deps.order_client.whatif_combo.await_count == 2
 
 
 @pytest.mark.parametrize("quality_flag", ["delayed", "warming_up"])
@@ -866,6 +911,185 @@ def test_realized_close_pairs_math(tmp_db: Engine) -> None:
     # (1.20 - 0.50) * 100 - 2 x 0.65 commissions = 68.70
     assert pair.pnl == pytest.approx(68.70)
     assert total_commissions(tmp_db, entry_id) == pytest.approx(0.65)
+
+
+def test_all_otm_expiration_settlement_is_durable_and_idempotent(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": "20260731",
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 580031,
+            "multiplier": 100,
+            "currency": "USD",
+        }
+    ]
+    with tmp_db.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    legs_json=legs,
+                    quantity=1,
+                    status="filled",
+                    staged_ts=NOW,
+                    submitted_ts=NOW,
+                    terminal_ts=NOW,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+    record_fill(
+        tmp_db,
+        entry_id,
+        exec_id="expiry-credit",
+        side="SELL",
+        price=1.20,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580031,
+    )
+    from optionsbot.execution.orders import set_fill_commission
+
+    set_fill_commission(tmp_db, "expiry-credit", 0.65)
+    entry = get_order(tmp_db, entry_id)
+    assert entry is not None
+
+    first = record_expired_worthless_settlement(
+        tmp_db,
+        entry,
+        expiry="20260731",
+        terminal_spot=600.0,
+        settled_at=NOW,
+    )
+    second = record_expired_worthless_settlement(
+        tmp_db,
+        entry,
+        expiry="20260731",
+        terminal_spot=600.0,
+        settled_at=NOW,
+    )
+
+    assert first == second
+    assert first.close_id is None
+    assert first.pnl == pytest.approx(119.35)
+    assert settled_entry_ids(tmp_db) == {entry_id}
+    assert realized_close_pairs(tmp_db) == [first]
+    assert open_position_exposure(tmp_db) == {}
+
+
+def test_expiration_settlement_rejects_any_in_the_money_leg(tmp_db: Engine) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": "20260731",
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 580032,
+            "multiplier": 100,
+            "currency": "USD",
+        }
+    ]
+    with tmp_db.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    legs_json=legs,
+                    quantity=1,
+                    status="filled",
+                    staged_ts=NOW,
+                    submitted_ts=NOW,
+                    terminal_ts=NOW,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+    record_fill(
+        tmp_db,
+        entry_id,
+        exec_id="expiry-itm",
+        side="SELL",
+        price=1.20,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580032,
+    )
+    from optionsbot.execution.orders import set_fill_commission
+
+    set_fill_commission(tmp_db, "expiry-itm", 0.65)
+    entry = get_order(tmp_db, entry_id)
+    assert entry is not None
+
+    with pytest.raises(RealizedPnLUnavailable, match="not provably all OTM"):
+        record_expired_worthless_settlement(
+            tmp_db,
+            entry,
+            expiry="20260731",
+            terminal_spot=575.0,
+            settled_at=NOW,
+        )
+
+
+def test_reconciliation_does_not_expect_expired_option_contracts(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": "20200102",
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 580020,
+            "multiplier": 100,
+            "currency": "USD",
+        }
+    ]
+    with tmp_db.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    legs_json=legs,
+                    quantity=1,
+                    status="filled",
+                    staged_ts=NOW,
+                    submitted_ts=NOW,
+                    terminal_ts=NOW,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+    record_fill(
+        tmp_db,
+        entry_id,
+        exec_id="cleared-expiry",
+        side="SELL",
+        price=1.20,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580020,
+    )
+
+    assert open_position_exposure(tmp_db) == {}
 
 
 def test_realized_close_pairs_requires_exact_inverse_structure(tmp_db: Engine) -> None:

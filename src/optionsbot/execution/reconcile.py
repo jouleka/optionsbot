@@ -682,7 +682,7 @@ async def _reconcile_once(
             mismatches += 1
             await _send(notify, f"🛑 KILL SWITCH: {reason}")
         else:
-            ledger_exposure = open_position_exposure(engine)
+            ledger_exposure = open_position_exposure(engine, as_of=ts_now)
             broker_map: dict[
                 int, tuple[tuple[str, str, float, str], int]
             ] = {}

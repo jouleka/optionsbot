@@ -337,3 +337,86 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
         "win_rate": 1.0,
         "avg_pnl": 150.0,
     }
+
+
+def test_guarded_learning_is_payoff_aware_not_just_hit_rate(
+    daemon_context: DaemonContext,
+) -> None:
+    now = datetime.now(UTC)
+    with daemon_context.engine.begin() as conn:
+        for index, pnl in enumerate((10.0, -100.0), start=1):
+            snapshot_id = int(
+                conn.execute(
+                    insert(snapshots).values(
+                        symbol="NVDA",
+                        ts=now + timedelta(seconds=index),
+                        spot=195.0,
+                        raw_json={},
+                    )
+                ).inserted_primary_key[0]
+            )
+            score_id = int(
+                conn.execute(
+                    insert(strategy_scores).values(
+                        snapshot_id=snapshot_id,
+                        strategy="iron_condor",
+                        score=70.0 + index,
+                        legs_json=[],
+                        suggestion_json={
+                            "review_evidence": {
+                                "ready": False,
+                                "reason": "market data unavailable",
+                            }
+                        },
+                    )
+                ).inserted_primary_key[0]
+            )
+            alert_id = int(
+                conn.execute(
+                    insert(alerts).values(
+                        strategy_score_id=score_id,
+                        ts=now,
+                        symbol="NVDA",
+                        strategy="iron_condor",
+                        score=70.0 + index,
+                        status="sent",
+                        sent_ts=now,
+                        telegram_msg_id=1_100 + index,
+                    )
+                ).inserted_primary_key[0]
+            )
+            conn.execute(
+                insert(entry_reviews).values(
+                    strategy_score_id=score_id,
+                    alert_id=alert_id,
+                    reviewed_at=now,
+                    verdict="no_trade",
+                    confidence=0.9,
+                    sources_json=[],
+                    reason="evidence unavailable",
+                    checks_json={"bot_health": False},
+                    status="refused",
+                )
+            )
+            conn.execute(
+                insert(pick_outcomes).values(
+                    strategy_score_id=score_id,
+                    symbol="NVDA",
+                    strategy="iron_condor",
+                    expiry="2026-07-27",
+                    entry_spot=195.0,
+                    terminal_spot=196.0,
+                    realized_pnl=pnl,
+                    win=int(pnl > 0),
+                    evaluated_at=now,
+                )
+            )
+
+    summary = learning_feedback(daemon_context.engine)["guarded_call_summary"]
+
+    assert summary["calls"] == 2
+    assert summary["win_rate"] == 0.5
+    assert summary["net_pnl"] == -90.0
+    assert summary["avg_pnl"] == -45.0
+    assert summary["avg_win"] == 10.0
+    assert summary["avg_loss"] == -100.0

@@ -12,6 +12,7 @@ from sqlalchemy import insert, select, update
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import (
     _exec_md,
+    _settle_cleared_expirations,
     assert_no_naked_short_after_close,
     force_close_entry,
     run_exits_tick,
@@ -22,7 +23,14 @@ from optionsbot.execution.exit_requests import HermesLossCapDecision
 from optionsbot.execution.orders import get_order, record_fill, set_fill_commission
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import OptionQuote, PlacedOrder, PortfolioPosition
-from optionsbot.storage.schema import exit_requests, orders
+from optionsbot.storage.schema import (
+    exit_requests,
+    orders,
+    pick_outcomes,
+    position_settlements,
+    snapshots,
+    strategy_scores,
+)
 
 NOW = datetime.now(UTC)
 FAR = (NOW + timedelta(days=36)).strftime("%Y%m%d")
@@ -201,6 +209,77 @@ def test_exit_quotes_use_the_single_daemon_market_data_session(
     assert md is not None
     assert md.client is daemon_context.ibkr
     assert md.client is not daemon_context.exec_ibkr
+
+
+async def test_cleared_all_otm_expiration_is_settled_from_terminal_outcome(
+    daemon_context: DaemonContext,
+) -> None:
+    expiry = (nyse_session_date(NOW) - timedelta(days=1)).strftime("%Y%m%d")
+    entry_id = _filled_entry(daemon_context, expiry=expiry)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=NOW,
+                    spot=600.0,
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    legs_json=_legs(expiry),
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == entry_id)
+            .values(strategy_score_id=score_id)
+        )
+        conn.execute(
+            insert(pick_outcomes).values(
+                strategy_score_id=score_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                expiry=expiry,
+                entry_spot=590.0,
+                terminal_spot=600.0,
+                realized_pnl=120.0,
+                win=1,
+                evaluated_at=NOW,
+            )
+        )
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    daemon_context.exec_ibkr = MagicMock()
+
+    with patch(
+        "optionsbot.ibkr.positions.PositionsClient",
+        autospec=True,
+    ) as positions_client:
+        positions_client.return_value.get_portfolio = AsyncMock(return_value=[])
+        settled = await _settle_cleared_expirations(
+            daemon_context,
+            [entry],
+            NOW,
+        )
+
+    assert settled == 1
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(
+            select(position_settlements).where(
+                position_settlements.c.entry_order_id == entry_id
+            )
+        ).one()
+    assert row.pnl == pytest.approx(118.70)
+    assert row.settled_at.replace(tzinfo=UTC) == NOW
 
 
 async def test_exit_quote_set_is_serialized_on_daemon_ibkr_lock(

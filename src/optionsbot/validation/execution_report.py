@@ -72,7 +72,8 @@ def execution_report(engine: Engine) -> ExecutionReport:
     from optionsbot.execution.orders import total_commissions as _commissions
 
     commissions = sum(
-        _commissions(engine, p.entry_id) + _commissions(engine, p.close_id)
+        _commissions(engine, p.entry_id)
+        + (_commissions(engine, p.close_id) if p.close_id is not None else 0.0)
         for p in pairs
     )
     by_strategy: dict[str, tuple[int, float]] = {}

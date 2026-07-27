@@ -343,6 +343,31 @@ position_exit_state = Table(
 )
 
 
+# A filled option entry can expire without a broker close fill.  Keep that
+# economic terminal state separate from executions: fills remain broker facts,
+# while this row records a post-clearing, all-OTM expiration settlement.
+position_settlements = Table(
+    "position_settlements",
+    metadata,
+    Column(
+        "entry_order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("kind", Text, nullable=False),
+    Column("expiry", Text, nullable=False),
+    Column("terminal_spot", Float, nullable=False),
+    Column("pnl", Float, nullable=False),
+    Column("commissions", Float, nullable=False),
+    Column("settled_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint(
+        "kind IN ('expired_worthless')",
+        name="ck_position_settlements_kind",
+    ),
+)
+
+
 # IBK-138: audited Hermes-originated close requests. MCP writes only a request;
 # the daemon owns the trading-soundness gate and converts at most approved
 # requests into close orders.

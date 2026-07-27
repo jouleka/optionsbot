@@ -19,7 +19,12 @@ from typing import Any
 from sqlalchemy import Engine, select
 
 from optionsbot.execution.risk_structure import structural_max_loss_dollars
-from optionsbot.storage.schema import fills, orders, strategy_scores
+from optionsbot.storage.schema import (
+    fills,
+    orders,
+    position_settlements,
+    strategy_scores,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +205,12 @@ def open_heat_dollars(engine: Engine) -> float:
                 .where(orders.c.status == "filled")
             ).fetchall()
         }
+        settled_ids = {
+            int(row.entry_order_id)
+            for row in conn.execute(
+                select(position_settlements.c.entry_order_id)
+            ).fetchall()
+        }
         rows = conn.execute(
             select(
                 orders.c.id,
@@ -216,7 +227,7 @@ def open_heat_dollars(engine: Engine) -> float:
         ).fetchall()
     heat = 0.0
     for row in rows:
-        if row.id in closed_ids:
+        if row.id in closed_ids or row.id in settled_ids:
             continue
         suggestion = row.suggestion_json
         if isinstance(suggestion, str):  # defensive: JSON column round-trip

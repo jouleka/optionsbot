@@ -214,6 +214,14 @@ class ExecutionSettings(BaseModel):
     # paper profile may reserve the independently reconstructed full max loss
     # instead; live-capable profiles must keep broker margin authoritative.
     allow_structural_margin_fallback: bool = False
+    # When a paper BAG what-if omits margin, cap physically-settled 0DTE
+    # contracts by their share-delivery notional before falling back to max
+    # option loss. This is a broker-feasibility cap, not a risk-budget change:
+    # it prevents a cheap multi-lot spread from creating an expiry assignment
+    # notional that IBKR will reject despite its small defined option loss.
+    physical_settlement_notional_cap_multiple: float = Field(
+        default=10.0, ge=1.0, le=100.0
+    )
     # Portfolio caps consumed by the entry gates (IBK-126/130).
     max_open_positions: int = Field(default=6, ge=1)
     max_per_symbol: int = Field(default=1, ge=1)

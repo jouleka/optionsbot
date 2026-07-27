@@ -480,6 +480,7 @@ class OrderClient:
         limit_price: float,
         order_ref: str,
         tif: str = "DAY",
+        is_closing: bool = False,
     ) -> PlacedOrder:
         """Submit a limit order for the structure. ``limit_price`` is the
         signed net price per unit (negative = net credit)."""
@@ -503,6 +504,14 @@ class OrderClient:
             else quantity
         )
         order = LimitOrder(action, broker_quantity, price, tif=tif, orderRef=order_ref)
+        if is_closing and len(option_legs) > 1 and math.isclose(
+            float(price), 0.0, abs_tol=1e-9
+        ):
+            # IBKR rejects a zero-cost combo as "riskless" unless the API
+            # transmits the exact advanced-error acknowledgement it returns.
+            # Scope this narrowly to atomic CLOSES; entries never bypass the
+            # warning and non-zero closes do not need it.
+            order.advancedErrorOverride = "8229=COMBOPAYOUT"
         await self._rate.acquire()
         trade = self._client.ib.placeOrder(contract, order)
         raw_ib_order_id = trade.order.orderId

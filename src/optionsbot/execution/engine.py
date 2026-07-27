@@ -53,7 +53,12 @@ from optionsbot.ibkr.orders import OrderClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.ibkr.types import OptionQuote
 from optionsbot.review_evidence import snapshot_ready_for_auto
-from optionsbot.storage.schema import orders, snapshots, strategy_scores
+from optionsbot.storage.schema import (
+    orders,
+    position_settlements,
+    snapshots,
+    strategy_scores,
+)
 
 log = logging.getLogger(__name__)
 
@@ -283,7 +288,17 @@ async def execute_pick(
                 .where(orders.c.status == "filled")
             ).fetchall()
         }
-    active_rows = [row for row in raw_active if row.id not in closed_entry_ids]
+        settled_entry_ids = {
+            int(row.entry_order_id)
+            for row in conn.execute(
+                select(position_settlements.c.entry_order_id)
+            ).fetchall()
+        }
+    active_rows = [
+        row
+        for row in raw_active
+        if row.id not in closed_entry_ids and row.id not in settled_entry_ids
+    ]
     if len(active_rows) >= settings.execution.max_open_positions:
         return _reject(
             f"max_open_positions reached ({settings.execution.max_open_positions}) "
@@ -477,8 +492,64 @@ async def execute_pick(
     structural_margin_fallback = False
     if needed is None:
         if settings.execution.allow_structural_margin_fallback:
+            if (
+                settings.execution.zero_dte_only
+                and symbol.upper() not in {"SPX", "SPXW", "XSP"}
+            ):
+                strikes = [
+                    float(leg["strike"])
+                    for leg in option_legs
+                    if isinstance(leg.get("strike"), (int, float))
+                    and not isinstance(leg.get("strike"), bool)
+                    and math.isfinite(float(leg["strike"]))
+                    and float(leg["strike"]) > 0
+                ]
+                if not strikes:
+                    return _reject(
+                        "physical-settlement notional unavailable — refusing "
+                        "structural margin fallback"
+                    )
+                per_contract_notional = max(strikes) * 100.0
+                notional_cap = (
+                    equity
+                    * settings.execution.physical_settlement_notional_cap_multiple
+                )
+                max_feasible_quantity = math.floor(
+                    notional_cap / per_contract_notional
+                )
+                if max_feasible_quantity < 1:
+                    return _reject(
+                        "physical-settlement notional "
+                        f"${per_contract_notional:,.0f}/contract exceeds the "
+                        f"{settings.execution.physical_settlement_notional_cap_multiple:.0f}x "
+                        f"net-liq broker-feasibility cap (${notional_cap:,.0f}) "
+                        "while IBKR margin preview is unavailable"
+                    )
+                if quantity > max_feasible_quantity:
+                    original_quantity = quantity
+                    quantity = max_feasible_quantity
+                    sizing_note += (
+                        f"; physical-settlement fallback capped "
+                        f"{original_quantity}x→{quantity}x"
+                    )
+                    async with deps.ibkr_lock:
+                        try:
+                            preview = await deps.order_client.whatif_combo(
+                                symbol,
+                                legs,
+                                quantity=quantity,
+                                limit_price=limit_price,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            return _reject(
+                                "reduced-size whatIf margin preview failed: "
+                                f"{exc}"
+                            )
+                    needed = preview.init_margin_change
             needed = max_loss_unit * quantity
-            structural_margin_fallback = True
+            structural_margin_fallback = preview.init_margin_change is None
+            if preview.init_margin_change is not None:
+                needed = preview.init_margin_change
         else:
             return _reject(
                 "margin preview incomplete (init-margin or available funds unknown) "

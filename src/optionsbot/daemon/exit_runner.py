@@ -47,8 +47,10 @@ from optionsbot.execution.orders import (
     net_premium,
     open_close_for,
     realized_close_pairs,
+    record_expired_worthless_settlement,
     set_order_leg_contracts,
     set_order_note,
+    settled_entry_ids,
     stage_close_order,
     transition,
 )
@@ -63,7 +65,13 @@ from optionsbot.execution.walk import (
 )
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import execution_state, exit_requests, fills, orders
+from optionsbot.storage.schema import (
+    execution_state,
+    exit_requests,
+    fills,
+    orders,
+    pick_outcomes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -100,14 +108,108 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
                 .where(orders.c.status == "filled")
             ).fetchall()
         }
+    settled_ids = settled_entry_ids(engine)
     records = []
     for row in entry_rows:
-        if row.id in closed_ids:
+        if row.id in closed_ids or row.id in settled_ids:
             continue
         record = get_order(engine, row.id)
         if record is not None:
             records.append(record)
     return records
+
+
+async def _settle_cleared_expirations(
+    context: DaemonContext,
+    entries: list[OrderRecord],
+    now: datetime,
+) -> int:
+    """Settle prior-session all-OTM entries after IBKR drops every option leg."""
+    if context.exec_ibkr is None:
+        return 0
+    session_expiry = nyse_session_date(now).strftime("%Y%m%d")
+    candidates: list[tuple[OrderRecord, str]] = []
+    for entry in entries:
+        expiries = {
+            str(leg.get("expiry"))
+            for leg in entry.legs
+            if leg.get("sec_type", "OPT") == "OPT"
+        }
+        if len(expiries) == 1:
+            expiry = next(iter(expiries))
+            if len(expiry) == 8 and expiry.isdigit() and expiry < session_expiry:
+                candidates.append((entry, expiry))
+    if not candidates:
+        return 0
+
+    from optionsbot.ibkr.positions import PositionsClient
+
+    portfolio = await PositionsClient(
+        context.exec_ibkr, cache_ttl_seconds=0
+    ).get_portfolio()
+    open_con_ids = {
+        int(position.con_id)
+        for position in portfolio
+        if position.sec_type == "OPT"
+        and position.con_id is not None
+        and abs(float(position.position)) > 1e-9
+    }
+    settled = 0
+    for entry, expiry in candidates:
+        try:
+            entry_con_ids = {
+                int(leg["con_id"])
+                for leg in entry.legs
+                if leg.get("sec_type", "OPT") == "OPT"
+            }
+        except (KeyError, TypeError, ValueError, OverflowError):
+            log.error(
+                "expiration settlement deferred for #%s: contract identities unavailable",
+                entry.id,
+            )
+            continue
+        if not entry_con_ids or entry_con_ids & open_con_ids:
+            continue
+        with context.engine.connect() as conn:
+            outcome = conn.execute(
+                select(
+                    pick_outcomes.c.expiry,
+                    pick_outcomes.c.terminal_spot,
+                    pick_outcomes.c.evaluated_at,
+                ).where(
+                    pick_outcomes.c.strategy_score_id == entry.strategy_score_id
+                )
+            ).first()
+        if outcome is None or outcome.expiry != expiry:
+            log.warning(
+                "expiration settlement deferred for #%s: terminal outcome unavailable",
+                entry.id,
+            )
+            continue
+        try:
+            pair = record_expired_worthless_settlement(
+                context.engine,
+                entry,
+                expiry=expiry,
+                terminal_spot=float(outcome.terminal_spot),
+                # Attribute the economic result to expiry, not to the following
+                # morning when IBKR finally removes the contracts.
+                settled_at=outcome.evaluated_at,
+            )
+        except RealizedPnLUnavailable as exc:
+            log.warning(
+                "expiration settlement requires manual review for #%s: %s",
+                entry.id,
+                exc,
+            )
+            continue
+        settled += 1
+        await _send(
+            context,
+            f"✅ settled #{entry.id} {entry.symbol} {entry.strategy} expired "
+            f"all OTM — P&L ${pair.pnl:+.2f} after commissions",
+        )
+    return settled
 
 
 def _half_closed(engine: Engine, entry_id: int) -> bool:
@@ -517,6 +619,14 @@ async def run_exits_tick(context: DaemonContext) -> ExitsTickSummary:
     if context.order_client is None:
         return ExitsTickSummary(0, 0, 0)
     entries = _open_entries(context)
+    if entries:
+        try:
+            settled = await _settle_cleared_expirations(context, entries, now)
+            if settled:
+                entries = _open_entries(context)
+                log.info("expiration settlements recorded: %d", settled)
+        except Exception:  # noqa: BLE001 -- settlement never blocks protective exits
+            log.exception("expiration settlement sweep failed")
     if not entries:
         return ExitsTickSummary(0, 0, 0)
 
@@ -864,6 +974,7 @@ async def _manage_entry(
             quantity=close.quantity,
             limit_price=limit_price,
             order_ref=close.order_ref or f"obot-{close.id}",
+            is_closing=True,
         )
     except Exception as exc:  # noqa: BLE001 -- placement outcome may be unknown
         halt_reason = f"close #{close.id} broker placement outcome unknown after exception: {exc}"

@@ -21,7 +21,7 @@ from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import combo_bid_ask, combo_spread_issue
 from optionsbot.ibkr import MarketDataClient, PositionsClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import orders, strategy_scores
+from optionsbot.storage.schema import orders, position_settlements, strategy_scores
 from optionsbot.strategies import StrategySuggestion
 
 
@@ -95,7 +95,17 @@ def _active_position_counts(context: DaemonContext, symbol: str) -> tuple[int, i
                 .where(orders.c.closes_order_id.is_not(None))
             ).fetchall()
         }
-    active = [row for row in entries if int(row.id) not in closed]
+        settled = {
+            int(row.entry_order_id)
+            for row in conn.execute(
+                select(position_settlements.c.entry_order_id)
+            ).fetchall()
+        }
+    active = [
+        row
+        for row in entries
+        if int(row.id) not in closed and int(row.id) not in settled
+    ]
     return len(active), sum(1 for row in active if row.symbol == symbol)
 
 
