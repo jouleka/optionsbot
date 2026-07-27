@@ -176,19 +176,23 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             )
 
         retries_dispatched = await sweep_retries(context)
+        # Resolve the dynamic universe under the shared IBKR lock because the
+        # screener may request underlying data.  Do not retain the lock for the
+        # entire multi-symbol scan: protective exits use the same market-data
+        # session and must be able to run between symbols.
         async with context.ibkr_lock:
             symbols = await _resolve_scan_symbols(context)
-            tickers_scanned = 0
-            errors: list[str] = []
-            all_picks: list[tuple[str, ScoredStrategy, int]] = []
+        tickers_scanned = 0
+        errors: list[str] = []
+        all_picks: list[tuple[str, ScoredStrategy, int]] = []
 
-            for sym, override in symbols:
-                with bind_log_context(symbol=sym):
-                    try:
-                        # IBK-149: bound each symbol so one wedged dependency
-                        # (a hung IB Gateway option lookup) can't stall the whole
-                        # tick and starve orders management. TimeoutError is
-                        # caught below -> the symbol is skipped, the tick proceeds.
+        for sym, override in symbols:
+            with bind_log_context(symbol=sym):
+                try:
+                    # Serialize one complete symbol quote set, then release the
+                    # session so a queued exit check takes priority before the
+                    # next symbol.  asyncio.Lock wakes waiters FIFO.
+                    async with context.ibkr_lock:
                         result = await asyncio.wait_for(
                             scan_symbol(
                                 sym, context.ibkr, context.engine, context.settings,
@@ -197,30 +201,31 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                             ),
                             timeout=context.settings.scan.scan_symbol_timeout_s,
                         )
-                    except TimeoutError:
-                        log.warning(
-                            "scan_symbol(%s) exceeded %.0fs budget; skipping",
-                            sym,
-                            context.settings.scan.scan_symbol_timeout_s,
-                        )
-                        # Suffix is the shared constant so gateway_health's
-                        # wedge detection can never drift from this format.
-                        errors.append(f"{sym}: {BUDGET_TIMEOUT_SUFFIX}")
-                        continue
-                    except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
-                        log.exception("scan_symbol failed for %s", sym)
-                        errors.append(f"{sym}: {type(e).__name__}: {e}")
-                        continue
-                    tickers_scanned += 1
-                    for scored in result.scored:
-                        all_picks.append((sym, scored, result.snapshot_id))
+                except TimeoutError:
+                    log.warning(
+                        "scan_symbol(%s) exceeded %.0fs budget; skipping",
+                        sym,
+                        context.settings.scan.scan_symbol_timeout_s,
+                    )
+                    # Suffix is the shared constant so gateway_health's
+                    # wedge detection can never drift from this format.
+                    errors.append(f"{sym}: {BUDGET_TIMEOUT_SUFFIX}")
+                    continue
+                except Exception as e:  # noqa: BLE001 -- per-symbol failures are heterogeneous
+                    log.exception("scan_symbol failed for %s", sym)
+                    errors.append(f"{sym}: {type(e).__name__}: {e}")
+                    continue
+                tickers_scanned += 1
+                for scored in result.scored:
+                    all_picks.append((sym, scored, result.snapshot_id))
 
-            # Live net-liq (USD), fetched once per tick under the same lock, so
-            # the affordability filter can drop picks that exceed the single-trade
-            # cap (e.g. a $36k CSP on a $5k account). Fail-closed on error:
-            # account_value_usd stays None and rank_alert_candidates drops
-            # everything that requires an affordability check.
-            account_value_usd: float | None = None
+        # Live net-liq (USD), fetched once per tick under the same lock, so
+        # the affordability filter can drop picks that exceed the single-trade
+        # cap (e.g. a $36k CSP on a $5k account). Fail-closed on error:
+        # account_value_usd stays None and rank_alert_candidates drops
+        # everything that requires an affordability check.
+        account_value_usd: float | None = None
+        async with context.ibkr_lock:
             try:
                 # IBK-149: bound this end-of-tick IBKR await too -- it runs under
                 # ibkr_lock after the symbol loop, so a Gateway that wedges here

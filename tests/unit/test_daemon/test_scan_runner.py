@@ -448,8 +448,7 @@ async def test_run_scan_tick_scans_screened_and_watchlist_symbols(
 async def test_run_scan_tick_holds_ibkr_lock_during_scan(
     daemon_context: DaemonContext,
 ) -> None:
-    """The scan section runs under context.ibkr_lock (so on-demand /scan can't
-    race a scheduled tick for the market-data line)."""
+    """Each symbol runs under the lock so quote sets cannot interleave."""
     with daemon_context.engine.begin() as conn:
         conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
 
@@ -465,6 +464,46 @@ async def test_run_scan_tick_holds_ibkr_lock_during_scan(
 
     assert held["during"] is True  # the lock was held while scanning
     assert daemon_context.ibkr_lock.locked() is False  # released afterward
+
+
+async def test_run_scan_tick_yields_ibkr_lock_between_symbols(
+    daemon_context: DaemonContext,
+) -> None:
+    """A queued protective exit can acquire market data between symbols."""
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="AAPL", added_at=datetime.now(UTC)))
+        conn.execute(insert(watchlist).values(symbol="MSFT", added_at=datetime.now(UTC)))
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    exit_acquired = asyncio.Event()
+    calls = 0
+
+    async def fake_scan(symbol, *a, **kw):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            assert exit_acquired.is_set()
+        return _fake_scan_result(symbol)
+
+    async def queued_exit() -> None:
+        await first_started.wait()
+        async with daemon_context.ibkr_lock:
+            exit_acquired.set()
+
+    with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
+         patch("optionsbot.daemon.scan_runner.scan_symbol", new=AsyncMock(side_effect=fake_scan)):
+        scan_task = asyncio.create_task(run_scan_tick(daemon_context))
+        exit_task = asyncio.create_task(queued_exit())
+        await first_started.wait()
+        await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(scan_task, exit_task)
+
+    assert exit_acquired.is_set()
 
 
 async def test_run_scan_tick_suppresses_alerts_when_paused(
