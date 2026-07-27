@@ -193,6 +193,16 @@ class ExecutionSettings(BaseModel):
     zero_dte_only: bool = False
     zero_dte_entry_cutoff_minutes: int = Field(default=90, ge=30, le=240)
     zero_dte_force_exit_minutes: int = Field(default=30, ge=10, le=120)
+    # Crossing the generic debit target arms a durable winner trail rather
+    # than immediately dumping an exact-0DTE debit structure. A bounded spread
+    # is harvested once it captures the configured share of maximum profit.
+    zero_dte_debit_max_profit_take_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    zero_dte_debit_trail_early_giveback_pct: float = Field(
+        default=0.35, gt=0.0, lt=1.0
+    )
+    zero_dte_debit_trail_late_giveback_pct: float = Field(
+        default=0.10, gt=0.0, lt=1.0
+    )
     # Optional analyst overlay for entries. Production paper discovery may
     # execute a trusted ready evidence packet directly; disabling the review
     # is forbidden unless the paper-only interlock remains enabled.
@@ -288,6 +298,14 @@ class ExecutionSettings(BaseModel):
             raise ValueError(
                 "execution.zero_dte_force_exit_minutes must be less than "
                 "execution.zero_dte_entry_cutoff_minutes"
+            )
+        if (
+            self.zero_dte_debit_trail_late_giveback_pct
+            > self.zero_dte_debit_trail_early_giveback_pct
+        ):
+            raise ValueError(
+                "execution.zero_dte_debit_trail_late_giveback_pct must be less than "
+                "or equal to zero_dte_debit_trail_early_giveback_pct"
             )
         if not self.require_hermes_entry_review and not self.paper_only:
             raise ValueError(

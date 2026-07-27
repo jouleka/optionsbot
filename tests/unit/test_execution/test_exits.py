@@ -128,6 +128,65 @@ def test_zero_dte_debit_ignores_intraday_soft_stop_until_close_guard() -> None:
     ) is None
 
 
+def test_zero_dte_debit_half_gain_arms_trail_instead_of_closing() -> None:
+    """The old +50%-of-debit trigger is now a winner-trail arming point."""
+    settings = _settings(zero_dte_only=True)
+    assert evaluate_exit(
+        entry_net=-1.39,
+        current_net=-2.08,
+        dte=0,
+        settings=settings,
+        minutes_to_close=370,
+        max_profit_per_unit=361.0,
+        peak_pnl_per_unit=0.69,
+    ) is None
+
+
+def test_zero_dte_debit_harvests_half_of_defined_max_profit() -> None:
+    settings = _settings(zero_dte_only=True)
+    reason = evaluate_exit(
+        entry_net=-1.39,
+        current_net=-3.20,
+        dte=0,
+        settings=settings,
+        minutes_to_close=240,
+        max_profit_per_unit=361.0,
+        peak_pnl_per_unit=1.81,
+    )
+    assert reason is not None
+    assert "50% of max profit" in reason
+    assert "+130% on debit" in reason
+
+
+def test_zero_dte_debit_trails_armed_winner_from_durable_peak() -> None:
+    settings = _settings(zero_dte_only=True)
+    reason = evaluate_exit(
+        entry_net=-1.39,
+        current_net=-1.99,  # current profit 0.60 after a 1.00 peak
+        dte=0,
+        settings=settings,
+        minutes_to_close=200,
+        max_profit_per_unit=361.0,
+        peak_pnl_per_unit=1.00,
+    )
+    assert reason is not None
+    assert "profit trail" in reason
+    assert "peak +72%" in reason
+
+
+def test_zero_dte_debit_trail_holds_inside_allowed_giveback() -> None:
+    settings = _settings(zero_dte_only=True)
+    assert evaluate_exit(
+        entry_net=-1.39,
+        current_net=-2.19,  # current profit 0.80 after a 1.00 peak
+        dte=0,
+        settings=settings,
+        minutes_to_close=200,
+        max_profit_per_unit=361.0,
+        peak_pnl_per_unit=1.00,
+    ) is None
+
+
 def test_zero_dte_credit_soft_stop_remains_enabled() -> None:
     """Short-premium losses still receive the configured risk exit."""
     settings = _settings(zero_dte_only=True, exit_stop_enabled=True)

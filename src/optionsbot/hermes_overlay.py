@@ -7,6 +7,7 @@ broker or execution code.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -108,16 +109,15 @@ def _review_context(row: Any) -> tuple[bool, bool, str]:
 
 def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
     """Completed fill cashflows by trade, commissions included."""
+    gross_cash = case(
+        (fills.c.side == "SELL", fills.c.price * fills.c.qty * 100.0),
+        else_=-(fills.c.price * fills.c.qty * 100.0),
+    )
     fill_cash = (
         select(
             fills.c.order_id,
-            func.sum(
-                case(
-                    (fills.c.side == "SELL", fills.c.price * fills.c.qty * 100.0),
-                    else_=-(fills.c.price * fills.c.qty * 100.0),
-                )
-                - func.coalesce(fills.c.commission, 0.0)
-            ).label("cash"),
+            func.sum(gross_cash - func.coalesce(fills.c.commission, 0.0)).label("cash"),
+            func.sum(gross_cash).label("gross_cash"),
         )
         .group_by(fills.c.order_id)
         .having(func.count() == func.count(fills.c.commission))
@@ -133,14 +133,21 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 entries.c.strategy_score_id,
                 entries.c.symbol,
                 entries.c.strategy,
+                entries.c.quantity,
+                strategy_scores.c.suggestion_json,
                 closes.c.id.label("close_order_id"),
                 closes.c.last_error.label("exit_reason"),
+                entry_cash.c.gross_cash.label("entry_gross_cash"),
                 (entry_cash.c.cash + close_cash.c.cash).label("actual_pnl"),
             )
             .select_from(
                 entries.join(
                     closes,
                     closes.c.closes_order_id == entries.c.id,
+                )
+                .join(
+                    strategy_scores,
+                    strategy_scores.c.id == entries.c.strategy_score_id,
                 )
                 .join(entry_cash, entry_cash.c.order_id == entries.c.id)
                 .join(close_cash, close_cash.c.order_id == closes.c.id)
@@ -151,18 +158,50 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
             .where(closes.c.status == "filled")
             .where(entries.c.strategy_score_id.is_not(None))
         ).fetchall()
-    return [
-        {
-            "pick_id": int(row.strategy_score_id),
-            "symbol": str(row.symbol),
-            "strategy": str(row.strategy),
-            "pnl": float(row.actual_pnl),
-            "close_order_id": int(row.close_order_id),
-            "exit_reason": row.exit_reason,
-        }
-        for row in rows
-        if row.actual_pnl is not None
-    ]
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        if row.actual_pnl is None:
+            continue
+        quantity = int(row.quantity)
+        entry_cash_per_unit = (
+            float(row.entry_gross_cash) / quantity
+            if row.entry_gross_cash is not None and quantity > 0
+            else None
+        )
+        suggestion = row.suggestion_json if isinstance(row.suggestion_json, dict) else {}
+        try:
+            scan_max_profit = float(suggestion["max_profit"])
+            scan_cashflow = float(suggestion["credit_or_debit"])
+            max_profit_unit = (
+                scan_max_profit + entry_cash_per_unit - scan_cashflow
+                if entry_cash_per_unit is not None
+                else None
+            )
+            if (
+                max_profit_unit is None
+                or not math.isfinite(max_profit_unit)
+                or max_profit_unit <= 0
+            ):
+                max_profit_unit = None
+        except (KeyError, TypeError, ValueError):
+            max_profit_unit = None
+        max_profit = max_profit_unit * quantity if max_profit_unit is not None else None
+        actual_pnl = float(row.actual_pnl)
+        results.append(
+            {
+                "pick_id": int(row.strategy_score_id),
+                "symbol": str(row.symbol),
+                "strategy": str(row.strategy),
+                "pnl": actual_pnl,
+                "close_order_id": int(row.close_order_id),
+                "exit_reason": row.exit_reason,
+                "max_profit_at_entry": max_profit,
+                "realized_profit_capture_pct": (
+                    actual_pnl / max_profit if max_profit is not None and max_profit > 0 else None
+                ),
+            }
+        )
+    return results
 
 
 def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
@@ -311,6 +350,16 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 ),
                 "exit_reason": (
                     actual_result["exit_reason"] if actual_result is not None else None
+                ),
+                "max_profit_at_entry": (
+                    actual_result["max_profit_at_entry"]
+                    if actual_result is not None
+                    else None
+                ),
+                "realized_profit_capture_pct": (
+                    actual_result["realized_profit_capture_pct"]
+                    if actual_result is not None
+                    else None
                 ),
                 "diagnosis": diagnosis,
                 "outcome_basis": outcome_basis,

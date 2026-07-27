@@ -52,6 +52,8 @@ from optionsbot.execution.orders import (
     stage_close_order,
     transition,
 )
+from optionsbot.execution.profit_state import observe_pnl, peak_pnl_for
+from optionsbot.execution.risk_structure import structural_max_profit_dollars
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.execution.walk import (
     combo_bid_ask,
@@ -312,12 +314,18 @@ async def _quote_gate_state(
         current_net = None
     deterministic_reason = None
     if dte is not None:
+        max_profit = structural_max_profit_dollars(
+            entry.legs,
+            entry_net_per_share=entry_net,
+        )
         deterministic_reason = evaluate_exit(
             entry_net=entry_net,
             current_net=current_net,
             dte=dte,
             settings=context.settings,
             minutes_to_close=minutes_to_nyse_close(now),
+            max_profit_per_unit=max_profit,
+            peak_pnl_per_unit=peak_pnl_for(context.engine, entry.id),
         )
     return QuoteGateState(
         entry_net=entry_net,
@@ -687,6 +695,17 @@ async def _manage_entry(
     else:
         context.exit_stale_warned.discard(entry.id)
 
+    pnl = entry_net - current_net if current_net is not None else None
+    peak_pnl = (
+        observe_pnl(engine, entry.id, pnl, now=now)
+        if pnl is not None
+        else peak_pnl_for(engine, entry.id)
+    )
+    max_profit = structural_max_profit_dollars(
+        entry.legs,
+        entry_net_per_share=entry_net,
+    )
+
     reason: str | None
     if forced_reason is not None:
         reason = forced_reason
@@ -700,13 +719,14 @@ async def _manage_entry(
             dte=dte,
             settings=context.settings,
             minutes_to_close=minutes_to_nyse_close(now),
+            max_profit_per_unit=max_profit,
+            peak_pnl_per_unit=peak_pnl,
         )
-    pnl = entry_net - current_net if current_net is not None else None
     pnl_pct = pnl / abs(entry_net) * 100.0 if pnl is not None and abs(entry_net) > 1e-9 else None
     log.info(
         "exit decision entry_id=%s symbol=%s strategy=%s action=%s reason=%s "
-        "entry_net=%.4f current_net=%s pnl_pct=%s dte=%s minutes_to_close=%s "
-        "quote_status=%s",
+        "entry_net=%.4f current_net=%s pnl_pct=%s peak_pnl_pct=%s "
+        "max_profit_per_unit=%s dte=%s minutes_to_close=%s quote_status=%s",
         entry.id,
         entry.symbol,
         entry.strategy,
@@ -715,6 +735,12 @@ async def _manage_entry(
         entry_net,
         f"{current_net:.4f}" if current_net is not None else "unavailable",
         f"{pnl_pct:.2f}" if pnl_pct is not None else "unavailable",
+        (
+            f"{peak_pnl / abs(entry_net) * 100.0:.2f}"
+            if peak_pnl is not None and abs(entry_net) > 1e-9
+            else "unavailable"
+        ),
+        f"{max_profit:.2f}" if max_profit is not None else "unavailable",
         dte,
         minutes_to_nyse_close(now),
         quote_issue or "ready",

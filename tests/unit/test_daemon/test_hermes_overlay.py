@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import delete, insert
 
 from optionsbot.daemon.context import DaemonContext
@@ -173,7 +174,11 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
                     strategy="bull_call_spread",
                     score=75.0,
                     legs_json=[],
-                    suggestion_json={"review_evidence": {"ready": True}},
+                    suggestion_json={
+                        "review_evidence": {"ready": True},
+                        "credit_or_debit": -80.0,
+                        "max_profit": 420.0,
+                    },
                 )
             ).inserted_primary_key[0]
         )
@@ -291,6 +296,8 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
     assert lesson["review_context"] == "post_trade_observation"
     assert lesson["outcome_basis"] == "actual_filled_round_trip"
     assert lesson["actual_trade_pnl"] == -32.0
+    assert lesson["max_profit_at_entry"] == 420.0
+    assert lesson["realized_profit_capture_pct"] == pytest.approx(-32.0 / 420.0)
     assert lesson["theoretical_pnl"] is None
     assert lesson["forecast_useful"] is None
     assert lesson["lesson"] == "actual_trade_loser_post_trade_observation"

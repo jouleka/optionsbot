@@ -26,6 +26,8 @@ def evaluate_exit(
     dte: int,
     settings: Settings,
     minutes_to_close: float | None = None,
+    max_profit_per_unit: float | None = None,
+    peak_pnl_per_unit: float | None = None,
 ) -> str | None:
     """Return a human-readable close reason, or None to keep holding."""
     execution = settings.execution
@@ -61,7 +63,54 @@ def evaluate_exit(
         if execution.exit_stop_enabled and pnl <= -(manage.stop_loss_mult * basis):
             return f"soft stop (loss {abs(pnl) / basis:.1f}x credit)"
     else:  # debit structure
-        if pnl >= manage.debit_take_profit_pct * basis:
+        if zero_dte_session:
+            # +50%-of-debit is an arming threshold, not an immediate sale.
+            # A bounded spread can run until it captures a meaningful share
+            # of its full payoff; otherwise a durable high-water trail protects
+            # the winner and tightens as expiry approaches.
+            activation = manage.debit_take_profit_pct * basis
+            peak = max(pnl, peak_pnl_per_unit if peak_pnl_per_unit is not None else pnl)
+            max_profit_target = (
+                execution.zero_dte_debit_max_profit_take_pct
+                * max_profit_per_unit
+                / 100.0
+                if max_profit_per_unit is not None and max_profit_per_unit > 0
+                else None
+            )
+            if (
+                max_profit_target is not None
+                and pnl >= max(activation, max_profit_target)
+            ):
+                assert max_profit_per_unit is not None
+                captured = pnl * 100.0 / max_profit_per_unit
+                return (
+                    "take-profit (0DTE adaptive: "
+                    f"{captured:.0%} of max profit; +{pnl / basis * 100:.0f}% on debit)"
+                )
+            if peak >= activation:
+                assert minutes_to_close is not None  # close guard handled None above
+                session_minutes = 390.0
+                force_minutes = float(execution.zero_dte_force_exit_minutes)
+                progress = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (minutes_to_close - force_minutes)
+                        / (session_minutes - force_minutes),
+                    ),
+                )
+                early = execution.zero_dte_debit_trail_early_giveback_pct
+                late = execution.zero_dte_debit_trail_late_giveback_pct
+                giveback = late + (early - late) * progress
+                trail_floor = peak * (1.0 - giveback)
+                if pnl <= trail_floor:
+                    return (
+                        "profit trail (0DTE adaptive: "
+                        f"+{pnl / basis * 100:.0f}% on debit, "
+                        f"peak +{peak / basis * 100:.0f}%, "
+                        f"{giveback * 100:.0f}% giveback limit)"
+                    )
+        elif pnl >= manage.debit_take_profit_pct * basis:
             return f"take-profit (+{pnl / basis * 100:.0f}% on debit)"
         # Exact-0DTE debit spreads are already sized from their full structural
         # max loss and can whipsaw through a percentage-of-premium stop before

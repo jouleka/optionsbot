@@ -22,6 +22,9 @@ def test_default_settings_are_valid() -> None:
     assert s.hermes_webhook.enabled is False
     assert isinstance(s.scan, ScanSettings)
     assert isinstance(s.storage, StorageSettings)
+    assert s.execution.zero_dte_debit_max_profit_take_pct == 0.50
+    assert s.execution.zero_dte_debit_trail_early_giveback_pct == 0.35
+    assert s.execution.zero_dte_debit_trail_late_giveback_pct == 0.10
 
 
 def test_manage_settings_defaults() -> None:

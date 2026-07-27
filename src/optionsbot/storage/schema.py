@@ -325,6 +325,23 @@ Index(
     ),
 )
 
+# Durable high-water mark for adaptive winner management. The value is stored
+# per combo unit in the same signed-net space used by execution.exits, so a
+# daemon restart cannot forget that a 0DTE debit trade had already armed its
+# profit trail.
+position_exit_state = Table(
+    "position_exit_state",
+    metadata,
+    Column(
+        "entry_order_id",
+        Integer,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("peak_pnl_per_unit", Float, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
 
 # IBK-138: audited Hermes-originated close requests. MCP writes only a request;
 # the daemon owns the trading-soundness gate and converts at most approved
