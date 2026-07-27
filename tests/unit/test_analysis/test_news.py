@@ -9,7 +9,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy import insert, select
 
-from optionsbot.analysis.news import Headline, recent_news, refresh_news_if_stale
+from optionsbot.analysis.news import (
+    Headline,
+    news_cache_is_stale,
+    recent_news,
+    refresh_news_if_stale,
+    replace_news,
+)
 from optionsbot.storage.db import create_engine_for_path
 from optionsbot.storage.schema import symbol_news
 
@@ -81,6 +87,33 @@ def test_refresh_fetches_when_missing(news_engine) -> None:  # type: ignore[no-u
         ).first()
     assert row is not None
     assert row.headlines_json[0]["title"] == "T"
+
+
+def test_replace_news_supports_ibkr_provider_metadata(news_engine) -> None:  # type: ignore[no-untyped-def]
+    fetched_at = datetime.now(UTC)
+    replace_news(
+        "NVDA",
+        news_engine,
+        [
+            {
+                "title": "Material catalyst",
+                "publisher": "Dow Jones",
+                "published_ts": fetched_at.isoformat(),
+                "source": "IBKR_API_NEWS",
+                "provider_code": "DJ-N",
+                "article_id": "DJ-N$1",
+            }
+        ],
+        fetched_at=fetched_at,
+    )
+
+    assert not news_cache_is_stale("NVDA", news_engine, throttle_minutes=5)
+    with news_engine.connect() as conn:
+        row = conn.execute(
+            select(symbol_news).where(symbol_news.c.symbol == "NVDA")
+        ).first()
+    assert row.headlines_json[0]["source"] == "IBKR_API_NEWS"
+    assert row.headlines_json[0]["article_id"] == "DJ-N$1"
 
 
 def test_refresh_skips_when_fresh(news_engine) -> None:  # type: ignore[no-untyped-def]

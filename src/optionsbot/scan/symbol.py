@@ -14,7 +14,11 @@ import pandas as pd
 from sqlalchemy import Engine, insert
 
 from optionsbot.analysis.events import next_earnings
-from optionsbot.analysis.news import refresh_news_if_stale
+from optionsbot.analysis.news import (
+    news_cache_is_stale,
+    refresh_news_if_stale,
+    replace_news,
+)
 from optionsbot.analysis.relative_strength import relative_strength
 from optionsbot.analysis.types import Direction, EarningsInfo, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
@@ -25,6 +29,7 @@ from optionsbot.ibkr import (
     HistoryClient,
     IBKRClient,
     MarketDataClient,
+    NewsClient,
     PositionsClient,
 )
 from optionsbot.ibkr.contracts import ContractResolver
@@ -341,18 +346,42 @@ async def scan_symbol(
                 ],
             )
 
-    # Best-effort catalyst refresh (throttled inside, never raises). Run it
-    # off-loop + time-bounded too: recent_news is the same blocking yfinance
-    # path as earnings, so a slow Yahoo response must not freeze the loop or
-    # stall the scan (IBK-149).
-    await _bounded_to_thread(
-        refresh_news_if_stale,
+    # Prefer the Gateway's entitled API news: it is timely, source-attributed,
+    # and available independently of the quote feed. Refresh once per scan
+    # interval. Yahoo remains a slow-path fallback for accounts with no API
+    # news entitlement or a transient news-provider failure.
+    news_refresh_due = news_cache_is_stale(
         symbol,
         engine,
-        timeout=settings.scan.external_data_timeout_s,
-        default=None,
-        label=f"refresh_news({symbol})",
+        throttle_minutes=settings.scan.interval_minutes,
     )
+    news_ready = not news_refresh_due
+    if news_refresh_due:
+        try:
+            headlines = await asyncio.wait_for(
+                NewsClient(ibkr, resolver=resolver).headlines(symbol, limit=10),
+                timeout=settings.scan.external_data_timeout_s,
+            )
+            if headlines:
+                replace_news(symbol, engine, headlines)
+                news_ready = True
+        except TimeoutError:
+            log.warning(
+                "IBKR news refresh for %s timed out after %.1fs",
+                symbol,
+                settings.scan.external_data_timeout_s,
+            )
+        except Exception:  # noqa: BLE001 -- catalyst data is best-effort
+            log.exception("IBKR news refresh failed for %s", symbol)
+    if not news_ready:
+        await _bounded_to_thread(
+            refresh_news_if_stale,
+            symbol,
+            engine,
+            timeout=settings.scan.external_data_timeout_s,
+            default=None,
+            label=f"refresh_news({symbol})",
+        )
 
     return ScanResult(
         symbol=symbol,

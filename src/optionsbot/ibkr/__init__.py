@@ -9,6 +9,7 @@ from optionsbot.ibkr.client import IBKRClient
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.market_data import MarketDataClient
+from optionsbot.ibkr.news import NewsClient
 from optionsbot.ibkr.orders import OrderClient
 from optionsbot.ibkr.pacing import ConcurrencyLimiter, RateLimiter
 from optionsbot.ibkr.positions import PositionsClient
@@ -36,6 +37,7 @@ __all__ = [
     "IBKRClient",
     "MarginPreview",
     "MarketDataClient",
+    "NewsClient",
     "OptionChainLeg",
     "OptionQuote",
     "OrderClient",

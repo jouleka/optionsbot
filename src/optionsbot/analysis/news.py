@@ -97,6 +97,46 @@ def _headline_dict(h: Headline) -> dict[str, Any]:
     }
 
 
+def news_cache_is_stale(
+    symbol: str,
+    engine: Engine,
+    *,
+    throttle_minutes: int,
+) -> bool:
+    """Whether the persisted headline packet needs a provider refresh."""
+    now = datetime.now(UTC)
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(symbol_news.c.fetched_at).where(symbol_news.c.symbol == symbol)
+        ).first()
+    if row is None or row.fetched_at is None:
+        return True
+    fetched_at = row.fetched_at
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    return bool(now - fetched_at >= timedelta(minutes=throttle_minutes))
+
+
+def replace_news(
+    symbol: str,
+    engine: Engine,
+    headlines: list[dict[str, object]],
+    *,
+    fetched_at: datetime | None = None,
+) -> None:
+    """Atomically replace one symbol's cached, JSON-safe headline packet."""
+    observed_at = fetched_at or datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(delete(symbol_news).where(symbol_news.c.symbol == symbol))
+        conn.execute(
+            insert(symbol_news).values(
+                symbol=symbol,
+                fetched_at=observed_at,
+                headlines_json=headlines,
+            )
+        )
+
+
 def refresh_news_if_stale(symbol: str, engine: Engine, throttle_hours: int = 6) -> None:
     """Refresh ``symbol``'s cached headlines if missing or older than throttle_hours.
 
@@ -105,24 +145,13 @@ def refresh_news_if_stale(symbol: str, engine: Engine, throttle_hours: int = 6) 
     per symbol regardless of scan cadence.
     """
     try:
-        now = datetime.now(UTC)
-        with engine.connect() as conn:
-            row = conn.execute(
-                select(symbol_news.c.fetched_at).where(symbol_news.c.symbol == symbol)
-            ).first()
-        if row is not None and row.fetched_at is not None:
-            fetched_at = row.fetched_at
-            if fetched_at.tzinfo is None:
-                fetched_at = fetched_at.replace(tzinfo=UTC)
-            if now - fetched_at < timedelta(hours=throttle_hours):
-                return
+        if not news_cache_is_stale(
+            symbol,
+            engine,
+            throttle_minutes=throttle_hours * 60,
+        ):
+            return
         payload = [_headline_dict(h) for h in recent_news(symbol)]
-        with engine.begin() as conn:
-            conn.execute(delete(symbol_news).where(symbol_news.c.symbol == symbol))
-            conn.execute(
-                insert(symbol_news).values(
-                    symbol=symbol, fetched_at=now, headlines_json=payload
-                )
-            )
+        replace_news(symbol, engine, payload)
     except Exception:  # noqa: BLE001 -- news is best-effort; never break the caller
         log.exception("refresh_news_if_stale failed for %s", symbol)

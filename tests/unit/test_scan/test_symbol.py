@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from optionsbot.scan import ScanResult, scan_symbol
-from optionsbot.storage.schema import snapshots, strategy_scores
+from optionsbot.storage.schema import snapshots, strategy_scores, symbol_news
 
 
 async def test_scan_symbol_returns_scan_result(
@@ -207,6 +207,39 @@ async def test_scan_symbol_survives_news_failure(
     monkeypatch.setattr(symbol_mod, "refresh_news_if_stale", _boom, raising=False)
     result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
     assert result.snapshot_id > 0  # scan completed despite the news failure
+
+
+async def test_scan_symbol_prefers_and_persists_ibkr_api_news(
+    mock_ibkr_for_scan: object,
+    scan_engine: object,
+    scan_settings: object,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    import optionsbot.scan.symbol as symbol_mod
+
+    api_news = [
+        {
+            "title": "SPY catalyst",
+            "publisher": "Dow Jones",
+            "published_ts": "2026-07-27T17:44:00+00:00",
+            "link": None,
+            "source": "IBKR_API_NEWS",
+            "provider_code": "DJ-N",
+            "article_id": "DJ-N$1",
+        }
+    ]
+    news_client = MagicMock()
+    news_client.headlines = AsyncMock(return_value=api_news)
+    monkeypatch.setattr(symbol_mod, "NewsClient", MagicMock(return_value=news_client))
+    yahoo_fallback = MagicMock()
+    monkeypatch.setattr(symbol_mod, "refresh_news_if_stale", yahoo_fallback)
+
+    await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
+
+    with scan_engine.connect() as conn:  # type: ignore[union-attr]
+        row = conn.execute(select(symbol_news)).one()
+    assert row.headlines_json == api_news
+    yahoo_fallback.assert_not_called()
 
 
 async def test_scan_symbol_persists_relative_strength(

@@ -159,3 +159,8 @@ def _stub_news_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         symbol_mod, "refresh_news_if_stale", lambda *a, **k: None, raising=False
     )
+    news_client = MagicMock()
+    news_client.headlines = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        symbol_mod, "NewsClient", MagicMock(return_value=news_client), raising=False
+    )
