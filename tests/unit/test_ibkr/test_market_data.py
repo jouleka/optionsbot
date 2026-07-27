@@ -220,6 +220,30 @@ async def test_get_snapshot_option_extracts_greeks(
     assert quote.volume == 42
 
 
+async def test_option_snapshot_normalizes_negative_no_bid_sentinel(
+    md: MarketDataClient, mock_ib: MagicMock
+) -> None:
+    """IBKR -1 means no buyer, not a negative-valued option."""
+    opt_contract = MagicMock(
+        symbol="NVDA",
+        secType="OPT",
+        lastTradeDateOrContractMonth="20260727",
+        strike=187.5,
+        right="P",
+    )
+    mock_ib.qualifyContractsAsync.return_value = [opt_contract]
+    mock_ib.reqTickersAsync.return_value = [
+        _ticker(bid=-1.0, ask=0.02, last=-1.0)
+    ]
+
+    quote = await md.get_option_snapshot("NVDA", "20260727", 187.5, "P")
+
+    assert quote.bid == 0.0
+    assert quote.ask == 0.02
+    assert quote.mid == 0.01
+    assert quote.last is None
+
+
 async def test_option_review_snapshot_requests_volume_and_open_interest(
     md: MarketDataClient, mock_ib: MagicMock
 ) -> None:

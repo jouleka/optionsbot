@@ -105,10 +105,15 @@ def combo_mid(
             continue
         spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
         quote = quotes.get(spec)
-        if quote is None or quote.mid is None:
+        if quote is None or quote.bid is None or quote.ask is None:
             return None
+        bid = max(quote.bid, 0.0)
+        ask = quote.ask
+        if ask < 0 or ask < bid:
+            return None
+        mid = (bid + ask) / 2.0
         sign = 1.0 if leg["side"] == "sell" else -1.0
-        total += sign * quote.mid * int(leg.get("quantity", 1))
+        total += sign * mid * int(leg.get("quantity", 1))
     return total
 
 

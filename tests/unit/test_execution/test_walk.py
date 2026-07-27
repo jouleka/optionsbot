@@ -81,6 +81,18 @@ def test_combo_bid_ask_none_when_leg_missing() -> None:
     assert combo_bid_ask(LEGS, quotes) is None
 
 
+def test_combo_bid_ask_defensively_normalizes_negative_option_bid() -> None:
+    quotes = dict(GOOD_QUOTES)
+    quotes[("20260717", 575.0, "P")] = _quote(
+        575.0,
+        "P",
+        bid=-1.0,
+        ask=0.45,
+    )
+    # No-bid long wing contributes a zero sale value, never a negative dollar.
+    assert combo_bid_ask(LEGS, quotes) == pytest.approx((1.10, 1.65))
+
+
 def test_slippage_budget_min_of_frac_and_abs() -> None:
     # spread 0.20: 25% = 0.05 < abs cap 0.10 -> 0.05
     assert slippage_budget(1.10, 1.30, frac=0.25, abs_cap=0.10, increment=0.01) == (

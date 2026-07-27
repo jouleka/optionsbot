@@ -47,6 +47,31 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (bid + ask) / 2
 
 
+def _option_bid(value: float | None) -> float | None:
+    """Normalize IBKR's -1 "no bid" sentinel to an executable zero bid.
+
+    A same-day far-OTM wing commonly has an ask but no buyer. Its economic bid
+    is zero, not missing and never negative. Keeping the ask lets the exit
+    engine conservatively price an atomic multi-leg close instead of inventing
+    a negative option value.
+    """
+    cleaned = clean_float(value)
+    if cleaned is None:
+        return None
+    return max(cleaned, 0.0)
+
+
+def _option_ask(value: float | None) -> float | None:
+    """Normalize a negative/unset option ask to missing (fail closed)."""
+    cleaned = clean_float(value)
+    return None if cleaned is None or cleaned < 0 else cleaned
+
+
+def _option_last(value: float | None) -> float | None:
+    cleaned = clean_float(value)
+    return None if cleaned is None or cleaned < 0 else cleaned
+
+
 def _greek(greeks: object, name: str) -> float | None:
     """A model-Greek value with IBKR's -2.0 'not computed' sentinel mapped to None.
 
@@ -187,9 +212,9 @@ class MarketDataClient:
     ) -> OptionQuote:
         contract = await self._resolver.option(symbol, expiry, strike, right)
         ticker, observed_market_data_type = await self._fetch_ticker(contract)
-        bid = clean_float(getattr(ticker, "bid", None))
-        ask = clean_float(getattr(ticker, "ask", None))
-        last = clean_float(getattr(ticker, "last", None))
+        bid = _option_bid(getattr(ticker, "bid", None))
+        ask = _option_ask(getattr(ticker, "ask", None))
+        last = _option_last(getattr(ticker, "last", None))
         greeks = getattr(ticker, "modelGreeks", None)
         iv = _greek(greeks, "impliedVol") if greeks is not None else None
         delta = _greek(greeks, "delta") if greeks is not None else None
@@ -261,8 +286,8 @@ class MarketDataClient:
         observed = self._take_observed_market_data_type(
             ticker, after_sequence=start_sequence
         )
-        bid = clean_float(getattr(ticker, "bid", None))
-        ask = clean_float(getattr(ticker, "ask", None))
+        bid = _option_bid(getattr(ticker, "bid", None))
+        ask = _option_ask(getattr(ticker, "ask", None))
         greeks = getattr(ticker, "modelGreeks", None)
         return OptionQuote(
             symbol=symbol,
@@ -271,7 +296,7 @@ class MarketDataClient:
             right=right,
             bid=bid,
             ask=ask,
-            last=clean_float(getattr(ticker, "last", None)),
+            last=_option_last(getattr(ticker, "last", None)),
             mid=_mid(bid, ask),
             iv=_greek(greeks, "impliedVol") if greeks is not None else None,
             delta=_greek(greeks, "delta") if greeks is not None else None,

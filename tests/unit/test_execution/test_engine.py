@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -168,6 +169,21 @@ def test_combo_mid_signed_credit_positive() -> None:
 def test_combo_mid_missing_quote_returns_none() -> None:
     quotes = {("20260717", 580.0, "P"): _quote(580.0, "P", 1.60)}
     assert combo_mid(CONDOR_LEGS, quotes) is None
+
+
+def test_combo_mid_defensively_normalizes_negative_option_bid() -> None:
+    long_quote = _quote(575.0, "P", 0.40)
+    quotes = {
+        ("20260717", 580.0, "P"): _quote(580.0, "P", 1.60),
+        ("20260717", 575.0, "P"): replace(
+            long_quote,
+            bid=-1.0,
+            ask=0.45,
+            mid=-0.275,
+        ),
+    }
+    # Sell-leg mid 1.60 less the no-bid long's conservative 0.225 mid.
+    assert combo_mid(CONDOR_LEGS, quotes) == pytest.approx(1.375)
 
 
 def test_combo_mid_skips_stk_legs() -> None:

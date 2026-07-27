@@ -74,13 +74,17 @@ def combo_bid_ask(
         quote = quotes.get(spec)
         if quote is None or quote.bid is None or quote.ask is None:
             return None
+        quote_bid = max(quote.bid, 0.0)
+        quote_ask = quote.ask
+        if quote_ask < 0 or quote_ask < quote_bid:
+            return None
         ratio = int(leg.get("quantity", 1))
         if leg["side"] == "sell":
-            bid += quote.bid * ratio
-            ask += quote.ask * ratio
+            bid += quote_bid * ratio
+            ask += quote_ask * ratio
         else:
-            bid -= quote.ask * ratio
-            ask -= quote.bid * ratio
+            bid -= quote_ask * ratio
+            ask -= quote_bid * ratio
     return bid, ask
 
 
