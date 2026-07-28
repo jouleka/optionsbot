@@ -540,7 +540,7 @@ async def _reconcile_once(
         if (
             not isinstance(sec_type, str)
             or sec_type not in {"OPT", "BAG"}
-            or not isinstance(order_ref, str)
+            or (order_ref is not None and not isinstance(order_ref, str))
             or not isinstance(exec_id, str)
             or not exec_id.strip()
             or side not in {"BUY", "SELL"}

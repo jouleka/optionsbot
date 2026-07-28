@@ -989,6 +989,32 @@ async def test_bot_execution_without_ledger_row_halts(tmp_db: Engine) -> None:
     assert load_state(tmp_db).killed
 
 
+async def test_unreferenced_expiration_execution_is_ignored(
+    tmp_db: Engine,
+) -> None:
+    expiration = ExecutionFill(
+        ib_order_id=0,
+        order_ref=None,
+        exec_id="broker-expiration",
+        side="BUY",
+        price=0.0,
+        qty=1,
+        ts=NOW,
+        con_id=1580,
+        sec_type="OPT",
+        commission=None,
+    )
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[expiration]),
+        now=NOW,
+    )
+
+    assert summary.mismatches == 0
+    assert not load_state(tmp_db).killed
+
+
 async def test_malformed_bag_execution_halts(tmp_db: Engine) -> None:
     malformed = ExecutionFill(
         ib_order_id=11,
