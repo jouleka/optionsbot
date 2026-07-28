@@ -47,6 +47,9 @@ log = logging.getLogger(__name__)
 _UNSET_DOUBLE = 1.7976931348623157e308
 
 _IB_SIDE = {"BOT": "BUY", "SLD": "SELL"}
+_KNOWN_FOREIGN_EXECUTION_TYPES = frozenset(
+    {"STK", "FUT", "FOP", "CASH", "CFD", "BOND", "CMDTY", "FUND"}
+)
 
 LegMapping = Mapping[str, Any]
 LegContract = tuple[int, int, str]
@@ -864,6 +867,32 @@ class OrderClient:
             commission=commission,
         )
 
+    @staticmethod
+    def _is_manual_foreign_execution(
+        fill: Fill,
+        *,
+        fallback_ref: str | None = None,
+    ) -> bool:
+        """Whether a known non-options execution is clearly not bot-owned.
+
+        The paper account can contain manual futures/stock activity. Those
+        executions must not poison OptionsBot's option-ledger reconciliation,
+        while a non-option fill carrying an ``obot-*`` reference still reaches
+        strict validation and trips the safety boundary.
+        """
+        try:
+            sec_type = fill.contract.secType
+            raw_ref = fill.execution.orderRef
+        except AttributeError:
+            return False
+        if sec_type not in _KNOWN_FOREIGN_EXECUTION_TYPES:
+            return False
+        if raw_ref is not None and not isinstance(raw_ref, str):
+            return False
+        if fallback_ref is not None and not isinstance(fallback_ref, str):
+            return False
+        return ledger_row_id_from_ref(raw_ref or fallback_ref) is None
+
     async def adopt_open_orders(self) -> list[OpenOrderSnapshot]:
         """Snapshot every open order and stage canonical bot rows for review.
 
@@ -912,9 +941,18 @@ class OrderClient:
         # few hours is irrelevant at this window size.
         since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y%m%d %H:%M:%S")
         fills_ = await self._client.ib.reqExecutionsAsync(ExecutionFilter(time=since))
-        return [self._to_execution_fill(f) for f in fills_]
+        return [
+            self._to_execution_fill(fill)
+            for fill in fills_
+            if not self._is_manual_foreign_execution(fill)
+        ]
 
     def _handle_exec_details(self, trade: Trade, fill: Fill) -> None:
+        if self._is_manual_foreign_execution(
+            fill,
+            fallback_ref=trade.order.orderRef,
+        ):
+            return
         try:
             record = self._to_execution_fill(
                 fill,

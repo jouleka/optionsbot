@@ -1253,6 +1253,80 @@ async def test_recent_executions_translates_with_commission(
     assert record.sec_type == "OPT"
 
 
+async def test_manual_futures_execution_is_ignored_by_replay_and_live_callback(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="manual-future",
+        time=datetime(2026, 7, 28, 1, 42, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=113_500.0,
+        permId=101,
+        orderId=0,
+        orderRef="",
+    )
+    fill = Fill(
+        contract=Contract(secType="FUT", symbol="BTC", conId=999001),
+        execution=execution,
+        commissionReport=CommissionReport(
+            execId="manual-future",
+            commission=2.25,
+        ),
+        time=execution.time,
+    )
+    order_ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
+
+    assert await order_client.recent_executions() == []
+
+    seen: list[ExecutionFill] = []
+    callback_error = MagicMock()
+    order_client._fill_callbacks.append(seen.append)  # noqa: SLF001
+    order_client._callback_error_handler = callback_error  # noqa: SLF001
+    order_client._handle_exec_details(  # noqa: SLF001
+        _make_trade(order_id=0, ref=""),
+        fill,
+    )
+
+    assert seen == []
+    callback_error.assert_not_called()
+
+
+async def test_foreign_security_with_bot_reference_remains_fail_closed(
+    order_client: OrderClient,
+    order_ib: MagicMock,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="forged-bot-future",
+        time=datetime(2026, 7, 28, 1, 42, tzinfo=UTC),
+        side="BOT",
+        shares=1.0,
+        price=113_500.0,
+        permId=102,
+        orderId=77,
+        orderRef="obot-42",
+    )
+    fill = Fill(
+        contract=Contract(secType="FUT", symbol="BTC", conId=999002),
+        execution=execution,
+        commissionReport=CommissionReport(),
+        time=execution.time,
+    )
+    order_ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
+
+    with pytest.raises(ValueError, match="unknown execution security type"):
+        await order_client.recent_executions()
+
+
 def test_commission_event_translates(order_client: OrderClient) -> None:
     from ib_async import CommissionReport
 
