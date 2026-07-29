@@ -307,8 +307,17 @@ Index(
     "uq_orders_ib_order_id",
     orders.c.ib_order_id,
     unique=True,
-    sqlite_where=orders.c.ib_order_id.is_not(None),
-    postgresql_where=orders.c.ib_order_id.is_not(None),
+    # IBKR orderId is local to a client session and may be reused after a
+    # Gateway reset.  It is unique only among orders the broker can still act
+    # on; terminal history is durably identified by order_ref / permId / fills.
+    sqlite_where=(
+        orders.c.ib_order_id.is_not(None)
+        & orders.c.status.in_(["staged", "submitting", "submitted", "partial"])
+    ),
+    postgresql_where=(
+        orders.c.ib_order_id.is_not(None)
+        & orders.c.status.in_(["staged", "submitting", "submitted", "partial"])
+    ),
 )
 
 Index(

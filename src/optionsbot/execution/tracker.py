@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from optionsbot.execution.orders import (
     FAILED_TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
     IllegalOrderTransition,
     get_order,
     record_fill,
@@ -117,6 +118,7 @@ class OrderTracker:
                 select(orders.c.id).where(
                     orders.c.ib_order_id == update.ib_order_id,
                     orders.c.id != row_id,
+                    orders.c.status.not_in(sorted(TERMINAL_STATUSES)),
                 )
             ).first()
         if existing_owner is not None:

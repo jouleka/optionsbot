@@ -251,3 +251,38 @@ def test_status_rejects_broker_id_already_owned_by_another_row(tmp_db: Engine) -
 
     assert load_state(tmp_db).killed
     assert get_order(tmp_db, second).ib_order_id is None  # type: ignore[union-attr]
+
+
+def test_status_accepts_broker_id_reused_after_terminal_owner(
+    tmp_db: Engine,
+) -> None:
+    prior = _insert_order(tmp_db, "cancelled")
+    current = _insert_order(tmp_db, "submitting")
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders).where(orders.c.id == prior).values(
+                ib_order_id=77,
+                ib_perm_id=1234,
+            )
+        )
+
+    tracker = OrderTracker(tmp_db)
+    tracker.handle_status(
+        OrderStatusUpdate(
+            ib_order_id=77,
+            perm_id=5678,
+            order_ref=f"obot-{current}",
+            status="Submitted",
+            filled=0.0,
+            remaining=1.0,
+            avg_fill_price=None,
+        )
+    )
+
+    assert not load_state(tmp_db).killed
+    assert get_order(tmp_db, prior).ib_order_id == 77  # type: ignore[union-attr]
+    record = get_order(tmp_db, current)
+    assert record is not None
+    assert record.status == "submitted"
+    assert record.ib_order_id == 77
+    assert record.ib_perm_id == 5678

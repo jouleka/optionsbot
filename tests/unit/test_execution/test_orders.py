@@ -373,10 +373,22 @@ def test_open_and_working_order_queries(tmp_db: Engine) -> None:
     assert working_ids == {by_status["submitted"], by_status["partial"]}
 
 
-def test_broker_order_id_has_one_ledger_owner(tmp_db: Engine) -> None:
+def test_broker_order_id_has_one_active_ledger_owner(tmp_db: Engine) -> None:
     _insert_order(tmp_db, "submitted", ib_order_id=77)
     with pytest.raises(IntegrityError):
         _insert_order(tmp_db, "submitted", ib_order_id=77)
+
+
+def test_broker_order_id_can_be_reused_after_prior_owner_is_terminal(
+    tmp_db: Engine,
+) -> None:
+    prior = _insert_order(tmp_db, "cancelled", ib_order_id=77)
+    current = _insert_order(tmp_db, "submitting")
+
+    transition(tmp_db, current, "submitted", ib_order_id=77, now=NOW)
+
+    assert get_order(tmp_db, prior).ib_order_id == 77  # type: ignore[union-attr]
+    assert get_order(tmp_db, current).ib_order_id == 77  # type: ignore[union-attr]
 
 
 def test_get_order_unknown_returns_none(tmp_db: Engine) -> None:
