@@ -1221,6 +1221,70 @@ async def test_duplicate_broker_identity_is_not_pending(
     assert not order_client._pending_adoptions  # noqa: SLF001
 
 
+async def test_duplicate_manual_futures_orders_are_ignored_before_identity_validation(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    """TWS reports multiple manual/OCA futures orders with the placeholder ID 0."""
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    def manual_future(order_type: str, *, limit: float, aux: float) -> Trade:
+        return Trade(
+            contract=Contract(
+                secType="FUT",
+                symbol="MNQ",
+                conId=793356225,
+                lastTradeDateOrContractMonth="20260918",
+                multiplier="2",
+                exchange="CME",
+                currency="USD",
+            ),
+            order=Order(
+                orderId=0,
+                permId=1730615100,
+                orderRef="",
+                action="BUY",
+                totalQuantity=1,
+                orderType=order_type,
+                lmtPrice=limit,
+                auxPrice=aux,
+                tif="GTC",
+                ocaGroup="1730615099",
+                ocaType=3,
+            ),
+            orderStatus=OrderStatus(orderId=0, status="Submitted"),
+        )
+
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[
+            manual_future("STP", limit=0.0, aux=28157.0),
+            manual_future("LMT", limit=27660.5, aux=0.0),
+        ]
+    )
+
+    assert await order_client.adopt_open_orders() == []
+    assert not order_client._pending_adoptions  # noqa: SLF001
+
+
+async def test_nonoption_order_with_bot_reference_remains_fail_closed(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    from ib_async import Contract, Order, OrderStatus, Trade
+
+    order_ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[
+            Trade(
+                contract=Contract(secType="FUT", symbol="MNQ", conId=793356225),
+                order=Order(orderId=55, orderRef="obot-1"),
+                orderStatus=OrderStatus(orderId=55, status="Submitted"),
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unknown security type"):
+        await order_client.adopt_open_orders()
+    assert not order_client._pending_adoptions  # noqa: SLF001
+
+
 async def test_recent_executions_translates_with_commission(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:

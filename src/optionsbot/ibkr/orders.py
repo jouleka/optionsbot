@@ -894,10 +894,17 @@ class OrderClient:
         return ledger_row_id_from_ref(raw_ref or fallback_ref) is None
 
     async def adopt_open_orders(self) -> list[OpenOrderSnapshot]:
-        """Snapshot every open order and stage canonical bot rows for review.
+        """Snapshot option-relevant open orders and stage canonical bot rows.
 
         All prior mutation authority is revoked before the first await. Exact
         reconciliation must later authorize a snapshot batch atomically.
+        Clearly manual, known non-option orders are outside OptionsBot's book
+        and are discarded before broker-identity validation. TWS can report
+        several such external/OCA orders with the placeholder ``orderId=0``;
+        treating that representation as a duplicate bot identity would
+        incorrectly halt options execution. A non-option order carrying a
+        canonical ``obot-*`` reference remains in the strict path and fails
+        closed.
         """
         self.revoke_adoptions()
         await self._client.ensure_connected()
@@ -914,6 +921,9 @@ class OrderClient:
             order_id = snapshot.ib_order_id
             ref = snapshot.order_ref
             row_id = ledger_row_id_from_ref(ref)
+            sec_type = getattr(getattr(trade, "contract", None), "secType", None)
+            if row_id is None and sec_type in _KNOWN_FOREIGN_EXECUTION_TYPES:
+                continue
             if order_id in seen_order_ids or (row_id is not None and row_id in seen_row_ids):
                 raise ValueError("open-order snapshot contains duplicate broker identity")
             seen_order_ids.add(order_id)
