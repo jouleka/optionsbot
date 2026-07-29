@@ -173,6 +173,11 @@ def _broker_order_matches_ledger(snapshot: OpenOrderSnapshot, record: Any) -> bo
         (leg["con_id"], leg["quantity"], str(leg["side"]).upper(), "SMART")
         for leg in option_legs
     )
+    # IBKR may canonicalize BAG legs by contract ID when an order is
+    # re-snapshotted, rather than preserving submission order. Contract ID,
+    # ratio, side, and exchange are the economic/mutation authority; sequence
+    # is not. Both collections have already passed unique-conId validation.
+    combo_matches = sorted(snapshot.combo_legs) == sorted(expected_combo)
     return (
         snapshot.sec_type == "BAG"
         and snapshot.contract_con_id is None
@@ -180,7 +185,7 @@ def _broker_order_matches_ledger(snapshot: OpenOrderSnapshot, record: Any) -> bo
         and snapshot.expiry is None
         and snapshot.strike is None
         and snapshot.right is None
-        and snapshot.combo_legs == expected_combo
+        and combo_matches
         and snapshot.order_action == "BUY"
         and snapshot.total_quantity == record.quantity
         and snapshot.limit_price is not None

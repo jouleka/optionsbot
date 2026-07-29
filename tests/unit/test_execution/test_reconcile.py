@@ -155,6 +155,19 @@ async def test_exact_broker_terms_matching_ledger_are_accepted(tmp_db: Engine) -
     client.authorize_adoptions.assert_called_once_with((_broker_order(order_id),))
 
 
+async def test_broker_normalized_combo_leg_order_is_accepted(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    exact = _broker_order(order_id)
+    normalized = replace(exact, combo_legs=tuple(reversed(exact.combo_legs)))
+    client = _client(open_orders=[normalized])
+
+    summary = await reconcile(tmp_db, client, now=NOW)
+
+    assert summary.mismatches == 0
+    assert not load_state(tmp_db).killed
+    client.authorize_adoptions.assert_called_once_with((normalized,))
+
+
 @pytest.mark.parametrize(
     "snapshot",
     [
