@@ -280,9 +280,11 @@ class ExecutionSettings(BaseModel):
     # time-based expiry/DTE guard is unaffected and always fires. A positive
     # bounded window is mandatory so quote freshness cannot be disabled.
     exit_quote_max_age_seconds: int = Field(default=45, ge=1, le=120)
-    # IBK-130 full-auto gates: reject new auto entries once this fraction of
-    # net liquidation is already deployed ((net_liq - available)/net_liq).
-    # Confirm-mode /execute is NOT bound by it — the human decides.
+    # IBK-130 full-auto gates: reject new auto entries once OptionsBot's own
+    # open defined-risk heat reaches this fraction of net liquidation.
+    # Manual futures/stock margin is excluded; broker available funds remains
+    # a separate hard affordability gate. Confirm-mode /execute is not bound
+    # by this cap — the human decides.
     max_bp_usage_pct: float = Field(default=0.30, gt=0.0, le=1.0)
     # IBK-133 dynamic sizing (authoritative at execution; scan.risk_pct only
     # shapes the alert's indicative size): base risk × quarter-Kelly edge

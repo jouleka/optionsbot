@@ -436,6 +436,7 @@ async def execute_pick(
     except RealizedPnLUnavailable as exc:
         return _reject(f"realized P&L accounting unavailable — refusing new risk: {exc}")
 
+    open_heat = open_heat_dollars(engine)
     decision = dynamic_quantity(
         equity=equity,
         max_loss_unit=max_loss_unit,
@@ -443,7 +444,7 @@ async def execute_pick(
         prob_profit=(
             float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
         ),
-        open_heat=open_heat_dollars(engine),
+        open_heat=open_heat,
         recent_pnls=recent_pnls,
         base_risk_pct=settings.execution.base_risk_pct,
         heat_cap_pct=settings.execution.max_portfolio_heat_pct,
@@ -467,20 +468,18 @@ async def execute_pick(
             f"execution interlock closed after margin preview: {execution_verdict.reason}"
         )
     available = float(summary.available_funds) if summary.available_funds is not None else None
-    # IBK-130: portfolio-wide buying-power deployment cap (auto mode only).
+    # IBK-130: cap OptionsBot's own defined-risk deployment in auto mode.
+    # Account-wide (net-liq - available) includes manual futures margin and
+    # would couple unrelated futures trading into options entry selection.
+    # Broker available funds remains an independent hard affordability gate
+    # below, so ignoring foreign margin here cannot place an unaffordable order.
     if settings.execution.mode == "auto":
-        net_liq = (
-            float(summary.net_liquidation)
-            if summary.net_liquidation is not None
-            else None
-        )
-        if net_liq and available is not None and net_liq > 0:
-            deployed = (net_liq - available) / net_liq
-            if deployed >= settings.execution.max_bp_usage_pct:
-                return _reject(
-                    f"buying-power deployment {deployed * 100:.0f}% is at/over the "
-                    f"{settings.execution.max_bp_usage_pct * 100:.0f}% auto-mode cap"
-                )
+        deployed = open_heat / equity
+        if deployed >= settings.execution.max_bp_usage_pct:
+            return _reject(
+                f"OptionsBot risk deployment {deployed * 100:.0f}% is at/over the "
+                f"{settings.execution.max_bp_usage_pct * 100:.0f}% auto-mode cap"
+            )
     needed = preview.init_margin_change
     if available is None:
         # IBK-122 fail-closed: never place blind. If IBKR gives no init-margin

@@ -191,18 +191,53 @@ async def test_confirm_mode_allows_earnings_window(tmp_db: Engine) -> None:
     assert outcome.ok
 
 
-async def test_auto_mode_rejects_at_bp_cap(tmp_db: Engine) -> None:
+async def test_auto_mode_rejects_when_bot_option_heat_reaches_bp_cap(
+    tmp_db: Engine,
+) -> None:
+    existing_score_id = _insert_pick(
+        tmp_db,
+        symbol="QQQ",
+        legs=[{**leg, "symbol": "QQQ"} for leg in CONDOR_LEGS],
+        raw_json={"delayed": False, "warming_up": False},
+        max_loss=40_000.0,
+    )
+    existing = stage_order(tmp_db, existing_score_id, quantity=1, now=ENGINE_NOW)
+    with tmp_db.begin() as conn:
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == existing.id)
+            .values(limit_price=-1.20)
+        )
     score_id = _insert_pick(
         tmp_db,
         raw_json={"delayed": False, "warming_up": False},
     )
-    # net_liq 100k, available 60k -> 40% deployed >= 30% cap.
     deps = _deps(tmp_db, available_funds=60_000.0, net_liquidation=100_000.0)
     deps.settings.execution.mode = "auto"
+    deps.settings.execution.max_portfolio_heat_pct = 0.50
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
     assert not outcome.ok
-    assert "buying-power" in outcome.message.lower()
+    assert "optionsbot risk deployment" in outcome.message.lower()
+
+
+async def test_auto_mode_ignores_foreign_margin_in_bp_deployment(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={"delayed": False, "warming_up": False},
+    )
+    # Forty percent of account buying power is consumed outside OptionsBot
+    # (for example by a manual MNQ position). The independent affordability
+    # gate still sees $60k available, but the bot-owned deployment is zero.
+    deps = _deps(tmp_db, available_funds=60_000.0, net_liquidation=100_000.0)
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+
+    assert outcome.ok, outcome.message
 
 
 async def test_confirm_mode_ignores_bp_cap(tmp_db: Engine) -> None:
