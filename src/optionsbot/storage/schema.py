@@ -354,7 +354,9 @@ position_exit_state = Table(
 
 # A filled option entry can expire without a broker close fill.  Keep that
 # economic terminal state separate from executions: fills remain broker facts,
-# while this row records a post-clearing, all-OTM expiration settlement.
+# while this row records a post-clearing expiration settlement.  ITM structures
+# use their intrinsic payoff at the official terminal spot; any resulting stock
+# assignment is a separate broker position that must be flattened/reconciled.
 position_settlements = Table(
     "position_settlements",
     metadata,
@@ -371,7 +373,7 @@ position_settlements = Table(
     Column("commissions", Float, nullable=False),
     Column("settled_at", DateTime(timezone=True), nullable=False, index=True),
     CheckConstraint(
-        "kind IN ('expired_worthless')",
+        "kind IN ('expired_worthless','expired_intrinsic')",
         name="ck_position_settlements_kind",
     ),
 )

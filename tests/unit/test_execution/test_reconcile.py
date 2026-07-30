@@ -557,6 +557,32 @@ async def test_broker_position_with_no_ledger_row_alerts_and_kills(tmp_db: Engin
     assert any("KILL SWITCH" in m and "position" in m.lower() for m in sent)
 
 
+async def test_expired_broker_position_is_left_to_settlement_sweep(
+    tmp_db: Engine,
+) -> None:
+    expired = _portfolio_pos(
+        "SPY",
+        strike=580.0,
+        right="P",
+        position=-1.0,
+        expiry="20260610",
+    )
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return [expired]
+
+    summary = await reconcile(
+        tmp_db,
+        _client(open_orders=[], executions=[]),
+        now=NOW,
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 0
+    assert summary.orphan_positions == 0
+    assert not load_state(tmp_db).killed
+
+
 async def test_broker_position_matching_a_filled_ledger_order_is_fine(tmp_db: Engine) -> None:
     # A filled open-intent order in the ledger that matches the broker position:
     # no orphan, no kill.

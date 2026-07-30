@@ -807,20 +807,13 @@ def settled_entry_ids(engine: Engine) -> set[int]:
     return {int(row.entry_order_id) for row in rows}
 
 
-def record_expired_worthless_settlement(
-    engine: Engine,
+def _expiration_economics(
     entry: OrderRecord,
     *,
     expiry: str,
     terminal_spot: float,
-    settled_at: datetime,
-) -> ClosedPair:
-    """Record an all-OTM expiration after the broker no longer reports its legs.
-
-    This deliberately refuses any ITM/ATM, mixed-expiry, malformed, or already
-    closed structure.  Those cases may involve assignment and require broker
-    evidence rather than a theoretical payoff.
-    """
+) -> tuple[float, int, bool]:
+    """Return intrinsic cashflow, assigned shares, and strict-all-OTM evidence."""
     if entry.intent != "open" or entry.status != "filled":
         raise RealizedPnLUnavailable(
             f"order {entry.id}: filled entry unavailable for expiration settlement"
@@ -841,23 +834,101 @@ def record_expired_worthless_settlement(
         raise RealizedPnLUnavailable(
             f"order {entry.id}: exact expiration structure unavailable"
         )
+    intrinsic_cashflow = 0.0
+    assigned_shares = 0
+    all_strictly_otm = True
     for leg in option_legs:
         try:
             strike = float(leg["strike"])
             right = str(leg["right"])
+            side = str(leg["side"])
+            raw_ratio = leg.get("quantity", 1)
+            ratio = int(raw_ratio)
+            multiplier = int(leg.get("multiplier", _OPTION_MULTIPLIER))
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise RealizedPnLUnavailable(
                 f"order {entry.id}: expiration leg terms unavailable"
             ) from exc
+        if (
+            side not in {"buy", "sell"}
+            or right not in {"C", "P"}
+            or isinstance(raw_ratio, bool)
+            or ratio <= 0
+            or ratio != raw_ratio
+            or multiplier != _OPTION_MULTIPLIER
+            or not math.isfinite(strike)
+            or strike <= 0
+        ):
+            raise RealizedPnLUnavailable(
+                f"order {entry.id}: expiration leg terms unavailable"
+            )
         strictly_otm = (
             terminal_spot < strike if right == "C"
-            else terminal_spot > strike if right == "P"
-            else False
+            else terminal_spot > strike
         )
-        if not strictly_otm:
-            raise RealizedPnLUnavailable(
-                f"order {entry.id}: expiration is not provably all OTM"
+        all_strictly_otm = all_strictly_otm and strictly_otm
+        intrinsic = (
+            max(terminal_spot - strike, 0.0)
+            if right == "C"
+            else max(strike - terminal_spot, 0.0)
+        )
+        signed_contracts = (
+            (1 if side == "buy" else -1)
+            * ratio
+            * entry.quantity
+        )
+        intrinsic_cashflow += (
+            signed_contracts * intrinsic * _OPTION_MULTIPLIER
+        )
+        if intrinsic > 0:
+            share_direction = 1 if right == "C" else -1
+            assigned_shares += (
+                signed_contracts * share_direction * _OPTION_MULTIPLIER
             )
+    if (
+        not math.isfinite(intrinsic_cashflow)
+        or type(assigned_shares) is not int
+    ):
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: expiration accounting unavailable"
+        )
+    return intrinsic_cashflow, assigned_shares, all_strictly_otm
+
+
+def expiration_assignment_shares(
+    entry: OrderRecord,
+    *,
+    expiry: str,
+    terminal_spot: float,
+) -> int:
+    """Net shares created by automatic exercise/assignment at expiration."""
+    _, shares, _ = _expiration_economics(
+        entry,
+        expiry=expiry,
+        terminal_spot=terminal_spot,
+    )
+    return shares
+
+
+def record_expiration_settlement(
+    engine: Engine,
+    entry: OrderRecord,
+    *,
+    expiry: str,
+    terminal_spot: float,
+    settled_at: datetime,
+) -> ClosedPair:
+    """Record an expired structure at its terminal intrinsic value.
+
+    The broker must already have removed every option leg.  Physical stock
+    created by exercise/assignment remains separate exposure; callers inspect
+    and halt on that position before allowing new risk.
+    """
+    intrinsic_cashflow, _, all_strictly_otm = _expiration_economics(
+        entry,
+        expiry=expiry,
+        terminal_spot=terminal_spot,
+    )
     with engine.connect() as conn:
         filled_close = conn.execute(
             select(orders.c.id)
@@ -870,11 +941,12 @@ def record_expired_worthless_settlement(
             f"order {entry.id}: filled close already exists"
         )
     premium, commissions = _complete_order_accounting(engine, entry.id)
-    pnl = premium - commissions
+    pnl = premium + intrinsic_cashflow - commissions
     if not math.isfinite(pnl):
         raise RealizedPnLUnavailable(
             f"order {entry.id}: expiration accounting unavailable"
         )
+    kind = "expired_worthless" if all_strictly_otm else "expired_intrinsic"
     with engine.begin() as conn:
         existing = conn.execute(
             select(position_settlements).where(
@@ -885,7 +957,7 @@ def record_expired_worthless_settlement(
             conn.execute(
                 insert(position_settlements).values(
                     entry_order_id=entry.id,
-                    kind="expired_worthless",
+                    kind=kind,
                     expiry=expiry,
                     terminal_spot=float(terminal_spot),
                     pnl=pnl,
@@ -895,7 +967,7 @@ def record_expired_worthless_settlement(
             )
         else:
             if (
-                existing.kind != "expired_worthless"
+                existing.kind != kind
                 or existing.expiry != expiry
                 or float(existing.terminal_spot) != float(terminal_spot)
                 or not math.isclose(float(existing.pnl), pnl, abs_tol=1e-9)
@@ -915,6 +987,33 @@ def record_expired_worthless_settlement(
         quantity=entry.quantity,
         pnl=pnl,
         closed_ts=settled_at,
+    )
+
+
+def record_expired_worthless_settlement(
+    engine: Engine,
+    entry: OrderRecord,
+    *,
+    expiry: str,
+    terminal_spot: float,
+    settled_at: datetime,
+) -> ClosedPair:
+    """Backward-compatible strict all-OTM settlement surface."""
+    _, _, all_strictly_otm = _expiration_economics(
+        entry,
+        expiry=expiry,
+        terminal_spot=terminal_spot,
+    )
+    if not all_strictly_otm:
+        raise RealizedPnLUnavailable(
+            f"order {entry.id}: expiration is not provably all OTM"
+        )
+    return record_expiration_settlement(
+        engine,
+        entry,
+        expiry=expiry,
+        terminal_spot=terminal_spot,
+        settled_at=settled_at,
     )
 
 

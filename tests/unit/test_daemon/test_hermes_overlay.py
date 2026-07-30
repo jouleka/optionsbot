@@ -21,6 +21,7 @@ from optionsbot.storage.schema import (
     hermes_overlay_state,
     orders,
     pick_outcomes,
+    position_settlements,
     snapshots,
     strategy_scores,
 )
@@ -337,6 +338,79 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
         "win_rate": 1.0,
         "avg_pnl": 150.0,
     }
+
+
+def test_learning_feedback_includes_intrinsic_expiration_settlement(
+    daemon_context: DaemonContext,
+) -> None:
+    now = datetime.now(UTC)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="NVDA",
+                    ts=now,
+                    spot=190.0,
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="iron_butterfly",
+                    score=80.0,
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    strategy_score_id=score_id,
+                    intent="open",
+                    symbol="NVDA",
+                    strategy="iron_butterfly",
+                    legs_json=[],
+                    quantity=1,
+                    status="filled",
+                    staged_ts=now,
+                    terminal_ts=now,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(fills).values(
+                order_id=entry_id,
+                ib_exec_id="intrinsic-entry",
+                side="SELL",
+                price=2.70,
+                qty=1,
+                ts=now,
+                commission=2.49,
+            )
+        )
+        conn.execute(
+            insert(position_settlements).values(
+                entry_order_id=entry_id,
+                kind="expired_intrinsic",
+                expiry="20260729",
+                terminal_spot=190.01,
+                pnl=18.51,
+                commissions=2.49,
+                settled_at=now,
+            )
+        )
+
+    feedback = learning_feedback(daemon_context.engine)
+
+    summary = feedback["actual_trade_summary"]
+    assert summary["trades"] == 1
+    assert summary["wins"] == 1
+    assert summary["net_pnl"] == 18.51
+    assert summary["by_strategy"]["iron_butterfly"]["net_pnl"] == 18.51
 
 
 def test_guarded_learning_is_payoff_aware_not_just_hit_rate(

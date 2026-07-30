@@ -12,9 +12,11 @@ from sqlalchemy import Engine, delete, insert, select, update
 from optionsbot.execution.engine import execute_pick
 from optionsbot.execution.orders import (
     RealizedPnLUnavailable,
+    expiration_assignment_shares,
     get_order,
     open_position_exposure,
     realized_close_pairs,
+    record_expiration_settlement,
     record_expired_worthless_settlement,
     record_fill,
     record_order_quotes,
@@ -25,7 +27,7 @@ from optionsbot.execution.orders import (
     transition,
 )
 from optionsbot.ibkr.types import MarginPreview
-from optionsbot.storage.schema import fills, orders
+from optionsbot.storage.schema import fills, orders, position_settlements
 from optionsbot.validation.execution_report import execution_report
 from tests.unit.test_execution.test_engine import (
     CONDOR_LEGS,
@@ -1077,6 +1079,79 @@ def test_expiration_settlement_rejects_any_in_the_money_leg(tmp_db: Engine) -> N
             terminal_spot=575.0,
             settled_at=NOW,
         )
+
+
+def test_intrinsic_expiration_settlement_values_assignment(tmp_db: Engine) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "sec_type": "OPT",
+            "expiry": "20260731",
+            "strike": 580.0,
+            "right": "P",
+            "quantity": 1,
+            "con_id": 580033,
+            "multiplier": 100,
+            "currency": "USD",
+        }
+    ]
+    with tmp_db.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="short_put",
+                    legs_json=legs,
+                    quantity=1,
+                    status="filled",
+                    staged_ts=NOW,
+                    submitted_ts=NOW,
+                    terminal_ts=NOW,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+    record_fill(
+        tmp_db,
+        entry_id,
+        exec_id="expiry-itm-valued",
+        side="SELL",
+        price=1.20,
+        qty=1,
+        ts=NOW,
+        leg_con_id=580033,
+    )
+    from optionsbot.execution.orders import set_fill_commission
+
+    set_fill_commission(tmp_db, "expiry-itm-valued", 0.65)
+    entry = get_order(tmp_db, entry_id)
+    assert entry is not None
+
+    pair = record_expiration_settlement(
+        tmp_db,
+        entry,
+        expiry="20260731",
+        terminal_spot=575.0,
+        settled_at=NOW,
+    )
+
+    assert pair.pnl == pytest.approx(-380.65)
+    assert expiration_assignment_shares(
+        entry,
+        expiry="20260731",
+        terminal_spot=575.0,
+    ) == 100
+    with tmp_db.connect() as conn:
+        settlement = conn.execute(
+            select(position_settlements).where(
+                position_settlements.c.entry_order_id == entry_id
+            )
+        ).one()
+    assert settlement.kind == "expired_intrinsic"
+    assert settlement.terminal_spot == 575.0
+    assert open_position_exposure(tmp_db) == {}
 
 
 def test_reconciliation_does_not_expect_expired_option_contracts(

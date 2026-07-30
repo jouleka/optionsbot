@@ -210,6 +210,7 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 orders.c.strategy,
                 orders.c.quantity,
                 strategy_scores.c.suggestion_json,
+                position_settlements.c.kind,
                 position_settlements.c.pnl,
                 entry_cash.c.gross_cash.label("entry_gross_cash"),
             )
@@ -224,7 +225,6 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 )
                 .join(entry_cash, entry_cash.c.order_id == orders.c.id)
             )
-            .where(position_settlements.c.kind == "expired_worthless")
         ).fetchall()
     for row in settled_rows:
         if row.strategy_score_id is None:
@@ -242,7 +242,11 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 "strategy": str(row.strategy),
                 "pnl": actual_pnl,
                 "close_order_id": None,
-                "exit_reason": "expired worthless after broker clearing",
+                "exit_reason": (
+                    "expired worthless after broker clearing"
+                    if row.kind == "expired_worthless"
+                    else "expired at intrinsic value after broker clearing"
+                ),
                 "max_profit_at_entry": entry_gross,
                 "realized_profit_capture_pct": (
                     actual_pnl / entry_gross

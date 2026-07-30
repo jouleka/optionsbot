@@ -723,10 +723,21 @@ async def _reconcile_once(
                 if raw_position == 0:
                     continue
                 if (
+                    not isinstance(expiry, str)
+                    or len(expiry) != 8
+                    or not expiry.isdigit()
+                ):
+                    broker_valid = False
+                    break
+                # OCC clearing can leave yesterday's expired contracts in an
+                # IBKR portfolio snapshot for hours. The ledger deliberately
+                # excludes them as of today, so exclude them symmetrically
+                # here and let the expiration settlement sweep own them.
+                if expiry < ts_now.strftime("%Y%m%d"):
+                    continue
+                if (
                     type(raw_con_id) is not int
                     or raw_con_id <= 0
-                    or not isinstance(expiry, str)
-                    or not expiry
                     or not isinstance(raw_strike, (int, float))
                     or isinstance(raw_strike, bool)
                     or not math.isfinite(float(raw_strike))

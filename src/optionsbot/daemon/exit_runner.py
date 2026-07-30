@@ -43,11 +43,12 @@ from optionsbot.execution.orders import (
     CloseAlreadyClaimed,
     OrderRecord,
     RealizedPnLUnavailable,
+    expiration_assignment_shares,
     get_order,
     net_premium,
     open_close_for,
     realized_close_pairs,
-    record_expired_worthless_settlement,
+    record_expiration_settlement,
     set_order_leg_contracts,
     set_order_note,
     settled_entry_ids,
@@ -124,7 +125,7 @@ async def _settle_cleared_expirations(
     entries: list[OrderRecord],
     now: datetime,
 ) -> int:
-    """Settle prior-session all-OTM entries after IBKR drops every option leg."""
+    """Settle prior-session entries after IBKR drops every option leg."""
     if context.exec_ibkr is None:
         return 0
     session_expiry = nyse_session_date(now).strftime("%Y%m%d")
@@ -154,6 +155,19 @@ async def _settle_cleared_expirations(
         and position.con_id is not None
         and abs(float(position.position)) > 1e-9
     }
+    stock_positions: dict[str, int] = {}
+    for position in portfolio:
+        if position.sec_type != "STK" or abs(float(position.position)) <= 1e-9:
+            continue
+        quantity = float(position.position)
+        if not quantity.is_integer():
+            raise RealizedPnLUnavailable(
+                f"fractional stock position for {position.symbol} cannot be "
+                "attributed after option expiration"
+            )
+        stock_positions[position.symbol] = (
+            stock_positions.get(position.symbol, 0) + int(quantity)
+        )
     settled = 0
     for entry, expiry in candidates:
         try:
@@ -187,11 +201,17 @@ async def _settle_cleared_expirations(
             )
             continue
         try:
-            pair = record_expired_worthless_settlement(
+            terminal_spot = float(outcome.terminal_spot)
+            assigned_shares = expiration_assignment_shares(
+                entry,
+                expiry=expiry,
+                terminal_spot=terminal_spot,
+            )
+            pair = record_expiration_settlement(
                 context.engine,
                 entry,
                 expiry=expiry,
-                terminal_spot=float(outcome.terminal_spot),
+                terminal_spot=terminal_spot,
                 # Attribute the economic result to expiry, not to the following
                 # morning when IBKR finally removes the contracts.
                 settled_at=outcome.evaluated_at,
@@ -204,11 +224,26 @@ async def _settle_cleared_expirations(
             )
             continue
         settled += 1
-        await _send(
-            context,
-            f"✅ settled #{entry.id} {entry.symbol} {entry.strategy} expired "
-            f"all OTM — P&L ${pair.pnl:+.2f} after commissions",
-        )
+        actual_shares = stock_positions.get(entry.symbol, 0)
+        if assigned_shares == 0:
+            await _send(
+                context,
+                f"✅ settled #{entry.id} {entry.symbol} {entry.strategy} at "
+                f"expiration — P&L ${pair.pnl:+.2f} after commissions; no "
+                "assignment exposure",
+            )
+        else:
+            reason = (
+                f"expiration assignment exposure for entry #{entry.id}: "
+                f"expected {assigned_shares:+d} {entry.symbol} shares, broker "
+                f"holds {actual_shares:+d}"
+            )
+            trip_kill(context.engine, reason, now=now)
+            await _send(
+                context,
+                f"🛑 KILL SWITCH: {reason}. Confirm assignment processing and "
+                "flatten any stock exposure before /arm.",
+            )
     return settled
 
 
@@ -738,6 +773,23 @@ async def _manage_entry(
             )
         return 0
     dte = _min_dte(entry.legs, now)
+    if dte is not None and dte < 0:
+        expired_reason = "expired option contracts cannot be submitted"
+        log.warning(
+            "expired entry #%s %s has dte=%s; order placement prohibited",
+            entry.id,
+            entry.symbol,
+            dte,
+        )
+        if exit_request_id is not None:
+            _mark_exit_request(
+                engine,
+                exit_request_id,
+                "refused",
+                expired_reason,
+                now,
+            )
+        return 0
     if dte is None and forced_reason is None:
         return 0
 

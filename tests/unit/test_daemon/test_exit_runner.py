@@ -12,6 +12,7 @@ from sqlalchemy import insert, select, update
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import (
     _exec_md,
+    _manage_entry,
     _settle_cleared_expirations,
     assert_no_naked_short_after_close,
     force_close_entry,
@@ -280,6 +281,97 @@ async def test_cleared_all_otm_expiration_is_settled_from_terminal_outcome(
         ).one()
     assert row.pnl == pytest.approx(118.70)
     assert row.settled_at.replace(tzinfo=UTC) == NOW
+
+
+async def test_cleared_itm_expiration_settles_and_halts_on_assignment(
+    daemon_context: DaemonContext,
+) -> None:
+    expiry = (nyse_session_date(NOW) - timedelta(days=1)).strftime("%Y%m%d")
+    entry_id = _filled_entry(daemon_context, expiry=expiry)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=NOW,
+                    spot=577.0,
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    legs_json=_legs(expiry),
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == entry_id)
+            .values(strategy_score_id=score_id)
+        )
+        conn.execute(
+            insert(pick_outcomes).values(
+                strategy_score_id=score_id,
+                symbol="SPY",
+                strategy="bull_put_spread",
+                expiry=expiry,
+                entry_spot=590.0,
+                terminal_spot=577.0,
+                realized_pnl=-180.0,
+                win=0,
+                evaluated_at=NOW,
+            )
+        )
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    daemon_context.exec_ibkr = MagicMock()
+    assigned_stock = PortfolioPosition(
+        account="DU123",
+        symbol="SPY",
+        sec_type="STK",
+        expiry=None,
+        strike=None,
+        right=None,
+        multiplier=1,
+        position=100.0,
+        avg_cost=580.0,
+        market_price=577.0,
+        market_value=57_700.0,
+        unrealized_pnl=-300.0,
+        realized_pnl=0.0,
+        con_id=756733,
+    )
+
+    with patch(
+        "optionsbot.ibkr.positions.PositionsClient",
+        autospec=True,
+    ) as positions_client:
+        positions_client.return_value.get_portfolio = AsyncMock(
+            return_value=[assigned_stock]
+        )
+        settled = await _settle_cleared_expirations(
+            daemon_context,
+            [entry],
+            NOW,
+        )
+
+    assert settled == 1
+    assert load_state(daemon_context.engine).killed
+    assert "expected +100 SPY shares" in str(load_state(daemon_context.engine).reason)
+    with daemon_context.engine.connect() as conn:
+        row = conn.execute(
+            select(position_settlements).where(
+                position_settlements.c.entry_order_id == entry_id
+            )
+        ).one()
+    assert row.kind == "expired_intrinsic"
+    assert row.pnl == pytest.approx(-181.30)
 
 
 async def test_exit_quote_set_is_serialized_on_daemon_ibkr_lock(
@@ -1133,6 +1225,29 @@ async def test_expiry_guard_forces_close(daemon_context: DaemonContext) -> None:
         summary = await run_exits_tick(daemon_context)
     assert summary.closes_submitted == 1
     order_client.place_combo_limit.assert_awaited_once()
+
+
+async def test_expired_contracts_are_never_submitted(
+    daemon_context: DaemonContext,
+) -> None:
+    expiry = (nyse_session_date(NOW) - timedelta(days=1)).strftime("%Y%m%d")
+    entry_id = _filled_entry(daemon_context, expiry=expiry)
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    order_client = _wire(
+        daemon_context,
+        {(580.0, "P"): 1.40, (575.0, "P"): 0.30},
+    )
+
+    submitted = await _manage_entry(
+        daemon_context,
+        daemon_context._test_md,  # type: ignore[attr-defined]
+        entry,
+        NOW,
+    )
+
+    assert submitted == 0
+    order_client.place_combo_limit.assert_not_awaited()
 
 
 async def test_delayed_expiry_guard_is_quote_blind_and_does_not_walk(
