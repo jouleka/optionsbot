@@ -161,6 +161,28 @@ async def test_auto_does_not_execute_unreviewed_candidate(
     run.assert_not_awaited()
 
 
+async def test_hermes_required_blocks_even_ready_trusted_daemon_packet(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.execution.mode = "auto"
+    daemon_context.settings.execution.require_hermes_entry_review = True
+    daemon_context.order_client = MagicMock()
+    snap, score = _pick(daemon_context)
+    _mark_trusted_evidence_ready(daemon_context, score)
+    scored = MagicMock(strategy_name="bull_put_spread")
+
+    with patch("optionsbot.execution.engine.execute_pick", new=AsyncMock()) as run:
+        submitted = await auto_execute_candidates(
+            daemon_context,
+            [("SPY", scored, snap)],
+        )
+
+    assert submitted == 0
+    run.assert_not_awaited()
+    with daemon_context.engine.connect() as conn:
+        assert conn.execute(select(entry_intent_consumptions)).fetchall() == []
+
+
 def _mark_trusted_evidence_ready(context: DaemonContext, score_id: int) -> None:
     with context.engine.begin() as conn:
         suggestion = dict(

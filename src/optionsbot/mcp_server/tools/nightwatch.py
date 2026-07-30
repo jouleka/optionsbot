@@ -1,9 +1,10 @@
 """IBK-138 MCP tools for Hermes nightwatch supervision.
 
 These tools deliberately split read-only analyst packets from write-gated actions:
-``pending_picks`` is read-only, ``request_exit`` only queues an audited request
-for the daemon to evaluate, and ``halt`` trips the existing persisted kill
-switch with an exact confirmation token.
+``pending_picks`` is a compact read-only queue, ``pick_review_packet`` returns
+one complete candidate without transport truncation, ``request_exit`` only
+queues an audited request for the daemon to evaluate, and ``halt`` trips the
+existing persisted kill switch with an exact confirmation token.
 """
 
 from __future__ import annotations
@@ -85,6 +86,28 @@ ALLOWED_CATALYST_TYPES = frozenset(
     }
 )
 
+_LESSON_SUMMARY_KEYS = (
+    "review_id",
+    "pick_id",
+    "symbol",
+    "strategy",
+    "score",
+    "verdict",
+    "review_context",
+    "evidence_ready",
+    "call_pnl",
+    "call_won",
+    "actual_trade_pnl",
+    "execution_won",
+    "diagnosis",
+    "outcome_basis",
+    "forecast_useful",
+    "lesson",
+    "exit_reason",
+    "max_profit_at_entry",
+    "realized_profit_capture_pct",
+)
+
 
 def _raw(row: Any) -> dict[str, Any]:
     return dict(row.raw_json or {})
@@ -161,6 +184,95 @@ def _pick_dict(row: Any) -> dict[str, Any]:
     }
 
 
+def _pick_summary(row: Any) -> dict[str, Any]:
+    suggestion = dict(row.suggestion_json or {})
+    evidence = suggestion.get("review_evidence")
+    evidence_dict = evidence if isinstance(evidence, dict) else {}
+    return {
+        "pick_id": row.score_id,
+        "alert_id": row.alert_id,
+        "symbol": row.symbol,
+        "strategy": row.strategy,
+        "score": row.score,
+        "snapshot_ts": iso_utc(row.ts),
+        "age_minutes": row.age_minutes,
+        "suggestion": {
+            "defined_risk": suggestion.get("defined_risk"),
+            "credit_or_debit": suggestion.get("credit_or_debit"),
+            "max_loss": suggestion.get("max_loss"),
+            "max_profit": suggestion.get("max_profit"),
+            "prob_profit": suggestion.get("prob_profit"),
+            "expected_value": suggestion.get("expected_value"),
+            "suggested_quantity": suggestion.get("suggested_quantity"),
+        },
+        "evidence_ready": evidence_dict.get("ready") is True,
+        "evidence_captured_at": evidence_dict.get("captured_at"),
+        "leg_count": len(list(row.legs_json or [])),
+        "full_packet_embedded": False,
+        "next_tool": "pick_review_packet",
+    }
+
+
+def _compact_learning_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
+    """Bound verbose analyst prose while preserving every learning signal.
+
+    Review reasons can be several thousand characters each. Returning ten of
+    them beside ten full option packets exceeded Hermes's 50 KiB tool budget
+    and cut a candidate off in the middle of ``review_evidence``. The compact
+    queue retains all aggregate statistics and structured lesson fields; the
+    exact candidate is fetched separately through ``pick_review_packet``.
+    """
+    compact = dict(feedback)
+    lessons: list[dict[str, Any]] = []
+    raw_lessons = feedback.get("recent_lessons")
+    if isinstance(raw_lessons, list):
+        for raw_lesson in raw_lessons:
+            if not isinstance(raw_lesson, dict):
+                continue
+            lesson = {
+                key: raw_lesson.get(key)
+                for key in _LESSON_SUMMARY_KEYS
+            }
+            review_reason = raw_lesson.get("review_reason")
+            if isinstance(review_reason, str) and review_reason:
+                lesson["review_reason_summary"] = review_reason[:500]
+            lessons.append(lesson)
+    compact["recent_lessons"] = lessons
+    return compact
+
+
+def _candidate_select() -> Any:
+    return (
+        select(
+            strategy_scores.c.id.label("score_id"),
+            alerts.c.id.label("alert_id"),
+            alerts.c.status.label("alert_status"),
+            strategy_scores.c.snapshot_id,
+            strategy_scores.c.strategy,
+            strategy_scores.c.score,
+            strategy_scores.c.rationale,
+            strategy_scores.c.legs_json,
+            strategy_scores.c.suggestion_json,
+            snapshots.c.symbol,
+            snapshots.c.ts,
+            snapshots.c.spot,
+            snapshots.c.iv_rank,
+            snapshots.c.hv20,
+            snapshots.c.iv_hv_ratio,
+            snapshots.c.expected_move,
+            snapshots.c.regime_dir,
+            snapshots.c.regime_iv,
+            snapshots.c.raw_json,
+        )
+        .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+        .join(alerts, alerts.c.strategy_score_id == strategy_scores.c.id)
+        .outerjoin(
+            entry_reviews,
+            entry_reviews.c.strategy_score_id == strategy_scores.c.id,
+        )
+    )
+
+
 def _is_positive_defined_risk_candidate(row: Any) -> bool:
     legs = row.legs_json
     suggestion = row.suggestion_json
@@ -198,44 +310,18 @@ def register(server: FastMCP) -> None:
         max_age_minutes: int,
         ctx: Context[ServerSession, ServerContext],
     ) -> dict[str, Any]:
-        """Return recent persisted option candidates for Hermes pre-trade review.
+        """Return a compact queue of candidates for Hermes pre-trade review.
 
-        Read-only. This does not scan IBKR, place orders, or reserve picks. Use
-        the returned rubric to check bid/ask, greeks, volume, news/catalysts,
-        history, and portfolio context before any human-triggered execution.
+        Read-only. Call ``pick_review_packet`` for each queue item before
+        deciding it. Splitting the queue from exact packets keeps transport
+        output bounded and prevents option evidence from being truncated.
         """
         lifespan = ctx.request_context.lifespan_context
         lim = max(1, min(int(limit or 10), 50))
         cutoff = datetime.now(UTC) - timedelta(minutes=max(1, int(max_age_minutes or 60)))
         with lifespan.engine.connect() as conn:
             rows = conn.execute(
-                select(
-                    strategy_scores.c.id.label("score_id"),
-                    alerts.c.id.label("alert_id"),
-                    alerts.c.status.label("alert_status"),
-                    strategy_scores.c.snapshot_id,
-                    strategy_scores.c.strategy,
-                    strategy_scores.c.score,
-                    strategy_scores.c.rationale,
-                    strategy_scores.c.legs_json,
-                    strategy_scores.c.suggestion_json,
-                    snapshots.c.symbol,
-                    snapshots.c.ts,
-                    snapshots.c.spot,
-                    snapshots.c.iv_rank,
-                    snapshots.c.hv20,
-                    snapshots.c.iv_hv_ratio,
-                    snapshots.c.expected_move,
-                    snapshots.c.regime_dir,
-                    snapshots.c.regime_iv,
-                    snapshots.c.raw_json,
-                )
-                .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
-                .join(alerts, alerts.c.strategy_score_id == strategy_scores.c.id)
-                .outerjoin(
-                    entry_reviews,
-                    entry_reviews.c.strategy_score_id == strategy_scores.c.id,
-                )
+                _candidate_select()
                 .where(strategy_scores.c.score >= float(min_score or 0.0))
                 .where(snapshots.c.ts >= cutoff)
                 .where(alerts.c.status == "sent")
@@ -249,7 +335,7 @@ def register(server: FastMCP) -> None:
             ts = row.ts.replace(tzinfo=UTC) if row.ts.tzinfo is None else row.ts
             data = dict(row._mapping)
             data["age_minutes"] = round((now - ts).total_seconds() / 60, 1)
-            picks.append(_pick_dict(SimpleNamespace(**data)))
+            picks.append(_pick_summary(SimpleNamespace(**data)))
         feedback = learning_feedback(lifespan.engine, recent_limit=10)
         intent_engine = getattr(lifespan, "intent_engine", None)
         feedback["recent_proposal_decisions"] = (
@@ -257,15 +343,59 @@ def register(server: FastMCP) -> None:
             if intent_engine is not None
             else []
         )
+        compact_feedback = _compact_learning_feedback(feedback)
         return {
             "ok": True,
             "count": len(picks),
             "picks": picks,
-            "rubric": RUBRIC,
+            "packet_tool": "pick_review_packet",
+            "instructions": (
+                "Call pick_review_packet once for every pick_id/alert_id before "
+                "submitting its review."
+            ),
             # Aggregate statistics retain the full history. A compact recent
             # lesson window keeps the five-minute analyst pass from spending
             # its whole context budget before it reaches independent ideas.
-            "learning_feedback": feedback,
+            "learning_feedback": compact_feedback,
+        }
+
+    @server.tool()
+    def pick_review_packet(
+        pick_id: int,
+        alert_id: int,
+        ctx: Context[ServerSession, ServerContext],
+    ) -> dict[str, Any]:
+        """Return one complete, exact candidate packet for a Hermes verdict.
+
+        Read-only. Identity is bound to a delivered alert and an unreviewed
+        score. A single packet remains safely below the Hermes transport limit.
+        """
+        lifespan = ctx.request_context.lifespan_context
+        with lifespan.engine.connect() as conn:
+            row = conn.execute(
+                _candidate_select()
+                .where(strategy_scores.c.id == int(pick_id))
+                .where(alerts.c.id == int(alert_id))
+                .where(alerts.c.status == "sent")
+                .where(entry_reviews.c.id.is_(None))
+            ).one_or_none()
+        if row is None:
+            return {
+                "ok": False,
+                "error": "pending_candidate_not_found",
+                "pick_id": int(pick_id),
+                "alert_id": int(alert_id),
+            }
+        ts = row.ts.replace(tzinfo=UTC) if row.ts.tzinfo is None else row.ts
+        data = dict(row._mapping)
+        data["age_minutes"] = round(
+            (datetime.now(UTC) - ts).total_seconds() / 60,
+            1,
+        )
+        return {
+            "ok": True,
+            "pick": _pick_dict(SimpleNamespace(**data)),
+            "rubric": RUBRIC,
         }
 
     @server.tool()

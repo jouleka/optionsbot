@@ -64,6 +64,7 @@ async def test_restricted_server_exposes_only_bounded_surface() -> None:
         "hermes_metrics",
         "latest_snapshot",
         "list_watchlist",
+        "pick_review_packet",
         "pending_picks",
         "positions",
         "propose_entry",

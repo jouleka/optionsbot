@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import insert, select, update
@@ -157,11 +158,35 @@ def test_pending_picks_returns_grounded_pre_trade_packet(server_context: ServerC
     assert pick["symbol"] == "SPY"
     assert pick["strategy"] == "bull_put_spread"
     assert pick["suggestion"]["expected_value"] == 14.5
+    assert pick["evidence_ready"] is True
+    assert pick["full_packet_embedded"] is False
+    assert pick["next_tool"] == "pick_review_packet"
+    assert result["packet_tool"] == "pick_review_packet"
+    assert result["learning_feedback"]["review_calls"] == 0
+    assert len(json.dumps(result, default=str)) < 50_000
+
+
+def test_pick_review_packet_returns_complete_exact_evidence(
+    server_context: ServerContext,
+) -> None:
+    score_id = _snapshot_with_score(server_context)
+    packet = get_tools(register)["pick_review_packet"](
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
+        ctx=FakeCtx(server_context),
+    )
+
+    assert packet["ok"] is True
+    pick = packet["pick"]
+    assert pick["pick_id"] == score_id
+    assert pick["alert_id"] == _alert_id_for_score(server_context, score_id)
     assert pick["market"]["iv_rank"] == 0.62
     assert pick["market"]["relative_strength"] == 0.03
     assert pick["review_evidence"]["source"] == "trusted_daemon"
-    assert "news/catalyst corroboration" in result["rubric"]["must_check"]
-    assert result["learning_feedback"]["review_calls"] == 0
+    assert pick["review_evidence"]["option_quotes"]
+    assert pick["legs"] == LEGS
+    assert "news/catalyst corroboration" in packet["rubric"]["must_check"]
+    assert len(json.dumps(packet, default=str)) < 50_000
 
 
 def test_pending_picks_omits_unalerted_scores(server_context: ServerContext) -> None:
@@ -178,6 +203,31 @@ def test_pending_picks_omits_unalerted_scores(server_context: ServerContext) -> 
     assert result["ok"] is True
     assert result["count"] == 0
     assert result["picks"] == []
+
+
+def test_pending_picks_ten_item_queue_stays_below_transport_budget(
+    server_context: ServerContext,
+) -> None:
+    score_ids = [
+        _snapshot_with_score(server_context, score=90.0 - index)
+        for index in range(10)
+    ]
+
+    result = get_tools(register)["pending_picks"](
+        limit=10,
+        min_score=50.0,
+        max_age_minutes=60,
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result["count"] == 10
+    assert {pick["pick_id"] for pick in result["picks"]} == set(score_ids)
+    assert all(
+        pick["full_packet_embedded"] is False
+        and pick["next_tool"] == "pick_review_packet"
+        for pick in result["picks"]
+    )
+    assert len(json.dumps(result, default=str)) < 50_000
 
 
 def test_submit_entry_review_queues_complete_vetted_candidate(
