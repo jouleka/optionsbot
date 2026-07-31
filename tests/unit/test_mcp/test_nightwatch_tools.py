@@ -271,6 +271,35 @@ def test_compact_feedback_keeps_only_relevant_exact_tuple_groups() -> None:
         assert compact[name]["calls"] == 18
 
 
+def test_compact_feedback_bounds_verbose_recent_rows() -> None:
+    feedback = {
+        "recent_lessons": [
+            {"review_id": index, "review_reason": "r" * 1_000}
+            for index in range(10)
+        ],
+        "recent_proposal_decisions": [
+            {
+                "intent_id": index,
+                "symbol": "SPY",
+                "status": "processed",
+                "decision": "d" * 1_000,
+            }
+            for index in range(10)
+        ],
+    }
+
+    compact = _compact_learning_feedback(
+        feedback,
+        relevant_pairs=set(),
+        independent_symbols={"SPY", "QQQ", "IWM"},
+    )
+
+    assert len(compact["recent_lessons"]) == 5
+    assert len(compact["recent_lessons"][0]["review_reason_summary"]) == 240
+    assert len(compact["recent_proposal_decisions"]) == 5
+    assert len(compact["recent_proposal_decisions"][0]["decision_summary"]) == 300
+
+
 def test_submit_entry_review_queues_complete_vetted_candidate(
     server_context: ServerContext,
 ) -> None:

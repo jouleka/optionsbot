@@ -244,6 +244,16 @@ def _compact_learning_feedback(
         if not isinstance(raw_summary, dict):
             continue
         summary = dict(raw_summary)
+        relevant_symbols = independent_symbols | {
+            pair.partition("|")[0] for pair in relevant_pairs
+        }
+        raw_symbols = raw_summary.get("by_symbol")
+        if isinstance(raw_symbols, dict):
+            summary["by_symbol"] = {
+                key: value
+                for key, value in raw_symbols.items()
+                if key in relevant_symbols
+            }
         raw_pairs = raw_summary.get("by_strategy_symbol")
         if isinstance(raw_pairs, dict):
             summary["by_strategy_symbol"] = {
@@ -256,7 +266,7 @@ def _compact_learning_feedback(
     lessons: list[dict[str, Any]] = []
     raw_lessons = feedback.get("recent_lessons")
     if isinstance(raw_lessons, list):
-        for raw_lesson in raw_lessons:
+        for raw_lesson in raw_lessons[:5]:
             if not isinstance(raw_lesson, dict):
                 continue
             lesson = {
@@ -265,9 +275,32 @@ def _compact_learning_feedback(
             }
             review_reason = raw_lesson.get("review_reason")
             if isinstance(review_reason, str) and review_reason:
-                lesson["review_reason_summary"] = review_reason[:500]
+                lesson["review_reason_summary"] = review_reason[:240]
             lessons.append(lesson)
     compact["recent_lessons"] = lessons
+    proposals: list[dict[str, Any]] = []
+    raw_proposals = feedback.get("recent_proposal_decisions")
+    if isinstance(raw_proposals, list):
+        for raw_proposal in raw_proposals[:5]:
+            if not isinstance(raw_proposal, dict):
+                continue
+            proposal = {
+                key: raw_proposal.get(key)
+                for key in (
+                    "intent_id",
+                    "symbol",
+                    "direction",
+                    "iv_regime",
+                    "strategy",
+                    "confidence",
+                    "status",
+                )
+            }
+            decision = raw_proposal.get("decision")
+            if isinstance(decision, str) and decision:
+                proposal["decision_summary"] = decision[:300]
+            proposals.append(proposal)
+    compact["recent_proposal_decisions"] = proposals
     return compact
 
 
