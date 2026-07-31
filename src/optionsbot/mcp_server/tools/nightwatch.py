@@ -216,7 +216,12 @@ def _pick_summary(row: Any) -> dict[str, Any]:
     }
 
 
-def _compact_learning_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
+def _compact_learning_feedback(
+    feedback: dict[str, Any],
+    *,
+    relevant_pairs: set[str],
+    independent_symbols: set[str],
+) -> dict[str, Any]:
     """Bound verbose analyst prose while preserving every learning signal.
 
     Review reasons can be several thousand characters each. Returning ten of
@@ -226,6 +231,28 @@ def _compact_learning_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
     exact candidate is fetched separately through ``pick_review_packet``.
     """
     compact = dict(feedback)
+    # Exact tuple priors are substantially more useful than conflicting broad
+    # marginals, but the complete cross-product can grow without bound. Keep
+    # exact rows for queued candidates plus every strategy observed for the
+    # three independent-origination symbols used by the analyst pass.
+    for summary_name in (
+        "terminal_call_summary",
+        "actual_trade_summary",
+        "guarded_call_summary",
+    ):
+        raw_summary = feedback.get(summary_name)
+        if not isinstance(raw_summary, dict):
+            continue
+        summary = dict(raw_summary)
+        raw_pairs = raw_summary.get("by_strategy_symbol")
+        if isinstance(raw_pairs, dict):
+            summary["by_strategy_symbol"] = {
+                key: value
+                for key, value in raw_pairs.items()
+                if key in relevant_pairs
+                or key.partition("|")[0] in independent_symbols
+            }
+        compact[summary_name] = summary
     lessons: list[dict[str, Any]] = []
     raw_lessons = feedback.get("recent_lessons")
     if isinstance(raw_lessons, list):
@@ -346,7 +373,13 @@ def register(server: FastMCP) -> None:
             if intent_engine is not None
             else []
         )
-        compact_feedback = _compact_learning_feedback(feedback)
+        compact_feedback = _compact_learning_feedback(
+            feedback,
+            relevant_pairs={
+                f"{pick['symbol']}|{pick['strategy']}" for pick in picks
+            },
+            independent_symbols={"SPY", "QQQ", "IWM"},
+        )
         return {
             "ok": True,
             "count": len(picks),

@@ -9,7 +9,7 @@ from sqlalchemy import insert, select, update
 
 from optionsbot.execution.state import load_state
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.tools.nightwatch import register
+from optionsbot.mcp_server.tools.nightwatch import _compact_learning_feedback, register
 from optionsbot.storage.schema import (
     alerts,
     entry_reviews,
@@ -237,6 +237,38 @@ def test_pending_picks_ten_item_queue_stays_below_transport_budget(
         for pick in result["picks"]
     )
     assert len(json.dumps(result, default=str)) < 50_000
+
+
+def test_compact_feedback_keeps_only_relevant_exact_tuple_groups() -> None:
+    groups = {
+        "META|iron_condor": {"calls": 3},
+        "SPY|bull_put_spread": {"calls": 4},
+        "QQQ|iron_condor": {"calls": 5},
+        "AAPL|long_call": {"calls": 6},
+    }
+    feedback = {
+        name: {"calls": 18, "by_strategy_symbol": groups}
+        for name in (
+            "terminal_call_summary",
+            "actual_trade_summary",
+            "guarded_call_summary",
+        )
+    }
+
+    compact = _compact_learning_feedback(
+        feedback,
+        relevant_pairs={"META|iron_condor"},
+        independent_symbols={"SPY", "QQQ", "IWM"},
+    )
+
+    expected = {
+        "META|iron_condor",
+        "SPY|bull_put_spread",
+        "QQQ|iron_condor",
+    }
+    for name in feedback:
+        assert set(compact[name]["by_strategy_symbol"]) == expected
+        assert compact[name]["calls"] == 18
 
 
 def test_submit_entry_review_queues_complete_vetted_candidate(
