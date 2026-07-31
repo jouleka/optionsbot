@@ -205,6 +205,10 @@ async def test_capture_candidate_evidence_persists_ready_packet(
     assert evidence["candidate_greeks"]["complete"] is True
     assert evidence["candidate_greeks"]["net_delta_share_equivalent"] == 0.0
     assert evidence["exposure"]["complete"] is True
+    assert evidence["exposure"]["beta_delta_hard_cap_configured"] is False
+    assert evidence["exposure"][
+        "incremental_beta_weighted_delta_pct_of_net_liq"
+    ] == pytest.approx(0.0)
     assert evidence["risk"]["candidate_affordable"] is True
     assert evidence["risk"]["bp_deployment_allowed"] is True
     assert evidence["market_timing"]["entry_window_open"] is True

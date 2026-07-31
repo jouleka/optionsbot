@@ -449,6 +449,13 @@ async def capture_candidate_evidence(
         if candidate_dollar_delta is not None and beta_value is not None
         else None
     )
+    incremental_beta_weighted_delta_pct_of_net_liq = (
+        incremental_beta_weighted_dollar_delta / net_liq_usd
+        if incremental_beta_weighted_dollar_delta is not None
+        and net_liq_usd is not None
+        and net_liq_usd > 0
+        else None
+    )
     beta_delta_complete = (
         candidate_share_delta is not None
         and candidate_spot is not None
@@ -542,6 +549,13 @@ async def capture_candidate_evidence(
             "candidate_dollar_delta": candidate_dollar_delta,
             "incremental_beta_weighted_dollar_delta": (
                 incremental_beta_weighted_dollar_delta
+            ),
+            "incremental_beta_weighted_delta_pct_of_net_liq": (
+                incremental_beta_weighted_delta_pct_of_net_liq
+            ),
+            "beta_delta_hard_cap_configured": False,
+            "beta_delta_policy": (
+                "measured analyst input; daemon has no separate beta/delta hard cap"
             ),
             "existing_portfolio_greeks": existing_greeks,
             "existing_share_delta_by_symbol": existing_delta_by_symbol,
