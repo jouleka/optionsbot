@@ -13,6 +13,7 @@ from typing import cast
 import pandas as pd
 from sqlalchemy import Engine, insert
 
+from optionsbot.analysis.beta_weighting import beta
 from optionsbot.analysis.events import next_earnings
 from optionsbot.analysis.news import (
     news_cache_is_stale,
@@ -274,9 +275,11 @@ async def scan_symbol(
 
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
     relative_strength_value: float | None = None
+    beta_to_benchmark: float | None = None
     try:
         if symbol == settings.scan.benchmark_symbol:
             relative_strength_value = 0.0
+            beta_to_benchmark = 1.0
         else:
             benchmark_bars = await history_client.get_history(
                 settings.scan.benchmark_symbol, days=252
@@ -284,16 +287,41 @@ async def scan_symbol(
             relative_strength_value = relative_strength(
                 bars, benchmark_bars, settings.scan.relative_strength_window
             )
+            beta_to_benchmark = beta(
+                bars,
+                benchmark_bars,
+                window=settings.portfolio.beta_window,
+            )
     except Exception:  # noqa: BLE001 -- benchmark data is best-effort
         log.exception("relative strength failed for %s", symbol)
+
+    recent_price_history: list[dict[str, object]] = []
+    if "close" in bars:
+        for index, value in bars["close"].tail(20).items():
+            close = float(value)
+            if not math.isfinite(close):
+                continue
+            iso = index.isoformat() if hasattr(index, "isoformat") else str(index)
+            recent_price_history.append({"ts": iso, "close": close})
 
     raw_extra: dict[str, object] = {
         "delayed": stock.delayed,
         "n_chain_legs": len(chain),
         "warming_up": view.warming_up,
         "iv_rank_is_proxy": view.iv_rank_is_proxy,
+        # The analysis-window flag and exact event date are deliberately
+        # separate. Execution compares the latter with the candidate's actual
+        # expiries instead of treating "earnings within 14 days" as "earnings
+        # before this 0DTE contract expires".
         "earnings_in_window": view.earnings_in_window,
+        "next_earnings_date": (
+            earnings.next_date.isoformat() if earnings.next_date is not None else None
+        ),
+        "earnings_source": earnings.source,
         "relative_strength": relative_strength_value,
+        "beta_to_benchmark": beta_to_benchmark,
+        "beta_benchmark": settings.scan.benchmark_symbol,
+        "recent_price_history": recent_price_history,
         "front_expiry": front_expiry,
         "front_dte": front_dte,
         "expected_move": expected_move,

@@ -40,6 +40,7 @@ LEGS = [
         "quantity": 1,
     },
 ]
+NOW = datetime(2026, 7, 16, 15, 0, tzinfo=UTC)
 
 
 def test_with_reconciled_economics_replaces_frozen_suggestion() -> None:
@@ -80,7 +81,13 @@ def test_with_reconciled_economics_replaces_frozen_suggestion() -> None:
     assert original.expected_value == 10.0
 
 
-def _quote(strike: float, *, bid: float, ask: float) -> OptionQuote:
+def _quote(
+    strike: float,
+    *,
+    bid: float,
+    ask: float,
+    ts: datetime = NOW,
+) -> OptionQuote:
     return OptionQuote(
         symbol="SPY",
         expiry="20260828",
@@ -97,7 +104,7 @@ def _quote(strike: float, *, bid: float, ask: float) -> OptionQuote:
         vega=0.10,
         open_interest=500,
         volume=50,
-        ts=datetime.now(UTC),
+        ts=ts,
         delayed=False,
     )
 
@@ -114,8 +121,16 @@ async def test_capture_candidate_evidence_persists_ready_packet(
             conn.execute(
                 insert(snapshots).values(
                     symbol="SPY",
-                    ts=datetime.now(UTC),
-                    raw_json={"delayed": False, "warming_up": False},
+                    ts=NOW,
+                    spot=600.0,
+                    raw_json={
+                        "delayed": False,
+                        "warming_up": False,
+                        "next_earnings_date": None,
+                        "earnings_source": "unknown",
+                        "beta_to_benchmark": 1.0,
+                        "beta_benchmark": "SPY",
+                    },
                 )
             ).inserted_primary_key[0]
         )
@@ -169,6 +184,7 @@ async def test_capture_candidate_evidence_persists_ready_packet(
         score_id=score_id,
         symbol="SPY",
         legs=LEGS,
+        now=NOW,
     )
 
     assert evidence["ready"] is True, evidence["readiness_issues"]
@@ -181,10 +197,22 @@ async def test_capture_candidate_evidence_persists_ready_packet(
     assert evidence["economics"]["expected_value"] == pytest.approx(30.0)
     assert evidence["risk"]["single_trade_risk_allowed"] is True
     assert evidence["risk"]["portfolio_heat_allowed"] is True
+    assert evidence["schema_version"] == 2
+    assert evidence["combo"]["spread_fraction_of_net_premium"] == pytest.approx(
+        0.2 / 1.2
+    )
+    assert evidence["combo"]["spread_allowed"] is True
+    assert evidence["candidate_greeks"]["complete"] is True
+    assert evidence["candidate_greeks"]["net_delta_share_equivalent"] == 0.0
+    assert evidence["exposure"]["complete"] is True
+    assert evidence["risk"]["candidate_affordable"] is True
+    assert evidence["risk"]["bp_deployment_allowed"] is True
+    assert evidence["market_timing"]["entry_window_open"] is True
+    assert evidence["expiration_assignment"]["handling"]
     assert review_evidence_ready(
         evidence,
         score_id=score_id,
-        now=datetime.now(UTC),
+        now=NOW,
         max_age_minutes=20,
     )
     with daemon_context.engine.connect() as conn:

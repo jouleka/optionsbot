@@ -292,6 +292,15 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
                 "win_rate": 0.0,
             }
         },
+        "by_strategy_symbol": {
+            "IWM|bull_call_spread": {
+                "trades": 1,
+                "wins": 0,
+                "losses": 1,
+                "net_pnl": -32.0,
+                "win_rate": 0.0,
+            }
+        },
     }
     lesson = feedback["recent_lessons"][0]
     assert lesson["review_context"] == "post_trade_observation"
@@ -338,6 +347,9 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
         "win_rate": 1.0,
         "avg_pnl": 150.0,
     }
+    assert feedback["terminal_call_summary"]["by_strategy_symbol"][
+        "IWM|bull_call_spread"
+    ]["net_pnl"] == 150.0
 
 
 def test_learning_feedback_includes_intrinsic_expiration_settlement(
@@ -494,3 +506,4 @@ def test_guarded_learning_is_payoff_aware_not_just_hit_rate(
     assert summary["avg_pnl"] == -45.0
     assert summary["avg_win"] == 10.0
     assert summary["avg_loss"] == -100.0
+    assert summary["by_strategy_symbol"]["NVDA|iron_condor"]["calls"] == 2

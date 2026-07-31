@@ -193,6 +193,10 @@ async def test_scan_symbol_persists_earnings_in_window(
         row = conn.execute(select(snapshots)).fetchone()
     assert "earnings_in_window" in row.raw_json
     assert isinstance(row.raw_json["earnings_in_window"], bool)
+    assert "next_earnings_date" in row.raw_json
+    assert "earnings_source" in row.raw_json
+    assert row.raw_json["beta_to_benchmark"] == 1.0
+    assert row.raw_json["beta_benchmark"] == "SPY"
 
 
 async def test_scan_symbol_survives_news_failure(

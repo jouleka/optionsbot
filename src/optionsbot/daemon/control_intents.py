@@ -101,7 +101,12 @@ def _consume_entry_review(context: DaemonContext, payload: dict[str, Any]) -> st
             raise
         return f"entry review already existed as #{int(existing)}"
     assert pk is not None
-    suffix = " and held by the overlay breaker" if status == "held" else ""
+    if verdict == "watch_only":
+        suffix = " (watch-only; no order authority)"
+    elif status == "held":
+        suffix = " and held by the overlay breaker"
+    else:
+        suffix = ""
     return f"entry review imported as #{int(pk[0])}{suffix}"
 
 

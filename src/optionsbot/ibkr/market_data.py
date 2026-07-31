@@ -34,6 +34,10 @@ _STREAM_TIMEOUT_S = 6.0
 _STREAM_POLL_S = 0.4
 
 
+class CompetingLiveSessionError(RuntimeError):
+    """IBKR denied live data because another session owns the entitlement."""
+
+
 def _has_quote(ticker: object) -> bool:
     return (
         clean_float(getattr(ticker, "bid", None)) is not None
@@ -288,6 +292,10 @@ class MarketDataClient:
         )
         bid = _option_bid(getattr(ticker, "bid", None))
         ask = _option_ask(getattr(ticker, "ask", None))
+        if (bid is None or ask is None) and self._client.competing_live_session_recent():
+            raise CompetingLiveSessionError(
+                "IBKR 10197: live market data is owned by a competing session"
+            )
         greeks = getattr(ticker, "modelGreeks", None)
         return OptionQuote(
             symbol=symbol,
@@ -331,7 +339,15 @@ class MarketDataClient:
             observed = self._take_observed_market_data_type(
                 ticker, after_sequence=start_sequence
             )
+            if self._client.competing_live_session_recent():
+                raise CompetingLiveSessionError(
+                    "IBKR 10197: live market data is owned by a competing session"
+                )
             return ticker, observed  # empty, but real; caller sees None bid/ask
+        if self._client.competing_live_session_recent():
+            raise CompetingLiveSessionError(
+                "IBKR 10197: live market data is owned by a competing session"
+            )
         raise ValueError(f"No ticker returned for {contract!r}")
 
     async def _stream_until_quote(self, contract: Contract) -> Ticker | None:

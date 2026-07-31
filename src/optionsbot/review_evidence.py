@@ -17,7 +17,7 @@ def review_evidence_ready(
     if not isinstance(evidence, dict):
         return False
     if (
-        evidence.get("schema_version") != 1
+        evidence.get("schema_version") != 2
         or evidence.get("source") != "trusted_daemon"
         or evidence.get("score_id") != score_id
         or evidence.get("ready") is not True
@@ -39,9 +39,22 @@ def review_evidence_ready(
     quotes = evidence.get("option_quotes")
     account = evidence.get("account")
     risk = evidence.get("risk")
+    combo = evidence.get("combo")
+    greeks = evidence.get("candidate_greeks")
+    exposure = evidence.get("exposure")
+    expiration = evidence.get("expiration_assignment")
+    timing = evidence.get("market_timing")
     if not isinstance(quotes, list) or not quotes:
         return False
-    if not isinstance(account, dict) or not isinstance(risk, dict):
+    if (
+        not isinstance(account, dict)
+        or not isinstance(risk, dict)
+        or not isinstance(combo, dict)
+        or not isinstance(greeks, dict)
+        or not isinstance(exposure, dict)
+        or not isinstance(expiration, dict)
+        or not isinstance(timing, dict)
+    ):
         return False
     for field in ("net_liquidation_usd", "buying_power", "available_funds"):
         value = account.get(field)
@@ -53,6 +66,14 @@ def review_evidence_ready(
         risk.get("execution_allowed") is True
         and risk.get("paper_only") is True
         and risk.get("entry_loss_guard_allowed") is True
+        and risk.get("single_trade_risk_allowed") is True
+        and risk.get("portfolio_heat_allowed") is True
+        and risk.get("candidate_affordable") is True
+        and risk.get("bp_deployment_allowed") is True
+        and combo.get("spread_allowed") is True
+        and greeks.get("complete") is True
+        and exposure.get("complete") is True
+        and timing.get("entry_window_open") is True
     )
 
 

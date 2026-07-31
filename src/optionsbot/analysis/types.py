@@ -14,12 +14,13 @@ class EarningsInfo:
     ``source`` indicates where the date came from:
       * ``"manual"`` -- caller-supplied override
       * ``"yfinance"`` -- looked up via the yfinance package
+      * ``"not_applicable"`` -- an ETF/index product with no issuer earnings
       * ``"unknown"`` -- no date could be determined (network failure,
         missing calendar, or symbol has no upcoming earnings)
     """
 
     next_date: _date_type | None
-    source: Literal["yfinance", "manual", "unknown"]
+    source: Literal["yfinance", "manual", "not_applicable", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)

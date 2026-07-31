@@ -74,6 +74,7 @@ class GatewayHealthMonitor:
         budget_timeouts: int,
         open_positions: int,
         settings: MonitorSettings,
+        competing_live_session: bool = False,
     ) -> list[str]:
         """One health evaluation; returns 0 or 1 Telegram messages to send."""
         if not settings.enabled:
@@ -91,6 +92,8 @@ class GatewayHealthMonitor:
         # DISCONNECTED with open positions during RTH: protection is DOWN.
         if market_open and not connected and open_positions >= 1:
             reasons.add("disconnected")
+        if market_open and competing_live_session:
+            reasons.add("competing_live_session")
 
         if reasons:
             first = not self._active_reasons
@@ -142,6 +145,12 @@ class GatewayHealthMonitor:
                 "🚨 GATEWAY DISCONNECTED during market hours — exit protection "
                 "is DOWN until it reconnects."
             )
+        if "competing_live_session" in reasons:
+            parts.append(
+                "🚨 IBKR MARKET DATA CONFLICT (10197): another IBKR session "
+                "currently owns the live-data entitlement. New entries fail "
+                "closed until IBKR restores this API session's live feed."
+            )
         parts.append(f"Open positions: {open_positions}. {_ACTION}")
         return "\n".join(parts)
 
@@ -165,6 +174,10 @@ async def page_gateway_health(
             budget_timeouts=count_budget_timeouts(summary.errors),
             open_positions=len(_open_entries(context)),
             settings=context.settings.monitor,
+            competing_live_session=context.ibkr.competing_live_session_recent(
+                max_age_seconds=600.0,
+                now=now,
+            ),
         )
         for text in messages:
             await context.telegram.send_message(text, parse_mode=None)

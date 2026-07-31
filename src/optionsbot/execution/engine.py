@@ -16,12 +16,13 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
+from optionsbot.analysis.events import earnings_before_option_expiry
 from optionsbot.config import Settings
 from optionsbot.daemon.market_hours import (
     is_market_open,
@@ -213,12 +214,33 @@ async def execute_pick(
                 "snapshot data not explicitly live and ready — auto mode requires "
                 "delayed=false; warming up requires an explicit HV-rank proxy"
             )
-        if (
-            settings.execution.auto_skip_earnings
-            and snapshot_raw.get("earnings_in_window")
-        ):
+        next_earnings_raw = snapshot_raw.get("next_earnings_date")
+        try:
+            next_earnings = (
+                date.fromisoformat(next_earnings_raw)
+                if isinstance(next_earnings_raw, str)
+                else None
+            )
+        except ValueError:
+            next_earnings = None
+        option_expiries = {
+            str(leg.get("expiry"))
+            for leg in legs
+            if leg.get("sec_type", "OPT") == "OPT" and leg.get("expiry")
+        }
+        event_inside_trade = earnings_before_option_expiry(
+            next_earnings,
+            option_expiries,
+            today=nyse_session_date(ts_now),
+        )
+        # Legacy snapshots predate the exact event date. Preserve their
+        # conservative behavior; new snapshots compare the event with the
+        # actual option expiry instead of reusing the 14-day analysis flag.
+        if "next_earnings_date" not in snapshot_raw:
+            event_inside_trade = bool(snapshot_raw.get("earnings_in_window"))
+        if settings.execution.auto_skip_earnings and event_inside_trade is True:
             return _reject(
-                "earnings inside the expiry window — auto mode skips "
+                "earnings occur before the option expiry — auto mode skips "
                 "(use /execute to override deliberately)"
             )
     if (

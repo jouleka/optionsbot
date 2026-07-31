@@ -26,13 +26,19 @@ class RestrictedServerContext:
     engine: Engine
     intent_engine: Engine
     max_pick_age_minutes: int
+    zero_dte_only: bool = False
+    zero_dte_entry_cutoff_minutes: int = 90
     broker_access: bool = field(default=False, init=False)
 
     @property
     def settings(self) -> Any:
         """Minimal compatibility view; deliberately contains no credentials."""
         return SimpleNamespace(
-            execution=SimpleNamespace(max_pick_age_minutes=self.max_pick_age_minutes)
+            execution=SimpleNamespace(
+                max_pick_age_minutes=self.max_pick_age_minutes,
+                zero_dte_only=self.zero_dte_only,
+                zero_dte_entry_cutoff_minutes=self.zero_dte_entry_cutoff_minutes,
+            )
         )
 
     async def shutdown(self) -> None:
@@ -57,10 +63,22 @@ async def restricted_app_lifespan(
     max_age = int(os.environ.get("OPTIONSBOT_MCP_MAX_PICK_AGE_MINUTES", "20"))
     if not 1 <= max_age <= 60:
         raise RuntimeError("OPTIONSBOT_MCP_MAX_PICK_AGE_MINUTES must be within 1..60")
+    zero_dte_raw = os.environ.get("OPTIONSBOT_MCP_ZERO_DTE_ONLY", "false").lower()
+    if zero_dte_raw not in {"true", "false"}:
+        raise RuntimeError("OPTIONSBOT_MCP_ZERO_DTE_ONLY must be true or false")
+    cutoff = int(
+        os.environ.get("OPTIONSBOT_MCP_ZERO_DTE_ENTRY_CUTOFF_MINUTES", "90")
+    )
+    if not 30 <= cutoff <= 240:
+        raise RuntimeError(
+            "OPTIONSBOT_MCP_ZERO_DTE_ENTRY_CUTOFF_MINUTES must be within 30..240"
+        )
     ctx = RestrictedServerContext(
         engine=create_readonly_engine_for_path(primary_path),
         intent_engine=create_intent_engine(intent_path),
         max_pick_age_minutes=max_age,
+        zero_dte_only=zero_dte_raw == "true",
+        zero_dte_entry_cutoff_minutes=cutoff,
     )
     try:
         yield ctx

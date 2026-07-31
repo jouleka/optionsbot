@@ -5,7 +5,11 @@ from __future__ import annotations
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-from optionsbot.analysis.events import earnings_within, next_earnings
+from optionsbot.analysis.events import (
+    earnings_before_option_expiry,
+    earnings_within,
+    next_earnings,
+)
 from optionsbot.analysis.types import EarningsInfo
 
 
@@ -36,7 +40,7 @@ def test_etf_skips_inapplicable_earnings_lookup() -> None:
         info = next_earnings("QQQ")
     mock_yf.Ticker.assert_not_called()
     assert info.next_date is None
-    assert info.source == "unknown"
+    assert info.source == "not_applicable"
 
 
 def test_yfinance_missing_returns_unknown() -> None:
@@ -76,3 +80,25 @@ def test_earnings_within_false_when_unknown() -> None:
 def test_earnings_within_past_dates_treated_as_no_upcoming() -> None:
     manual = {"AAPL": date.today() - timedelta(days=5)}  # in the past
     assert earnings_within("AAPL", days=14, manual_overrides=manual) is False
+
+
+def test_exact_option_life_does_not_confuse_analysis_horizon() -> None:
+    today = date(2026, 7, 31)
+    assert (
+        earnings_before_option_expiry(
+            date(2026, 8, 4), ["20260731"], today=today
+        )
+        is False
+    )
+    assert (
+        earnings_before_option_expiry(
+            date(2026, 8, 4), ["20260807"], today=today
+        )
+        is True
+    )
+
+
+def test_exact_option_life_preserves_unknown_calendar() -> None:
+    today = date(2026, 7, 31)
+    assert earnings_before_option_expiry(None, ["20260731"], today=today) is None
+    assert earnings_before_option_expiry(date(2026, 8, 4), [], today=today) is None

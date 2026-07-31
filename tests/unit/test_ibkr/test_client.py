@@ -158,3 +158,19 @@ async def test_connect_uses_configured_market_data_type(mock_ib) -> None:
     mock_ib.isConnected.return_value = False
     await client.connect()
     mock_ib.reqMarketDataType.assert_called_once_with(1)
+
+
+async def test_competing_live_session_incident_is_exposed_and_reset_on_reconnect(
+    mock_ib,
+) -> None:
+    client = IBKRClient(role="daemon", settings=Settings(), ib=mock_ib, backoff_seconds=())
+    client._observe_api_error(7, 10197, "competing live session", None)
+
+    assert client.competing_live_session_recent()
+    assert client.competing_live_session_status["count_since_connect"] == 1
+
+    mock_ib.isConnected.return_value = False
+    await client.connect()
+
+    assert not client.competing_live_session_recent()
+    assert client.competing_live_session_status["count_since_connect"] == 0

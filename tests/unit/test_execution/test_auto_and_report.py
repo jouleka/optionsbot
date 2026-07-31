@@ -61,6 +61,45 @@ async def test_auto_mode_rejects_earnings_window(tmp_db: Engine) -> None:
     assert "earnings" in outcome.message.lower()
 
 
+async def test_auto_mode_uses_exact_expiry_not_fourteen_day_analysis_flag(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={
+            "delayed": False,
+            "warming_up": False,
+            "earnings_in_window": True,
+            "next_earnings_date": "2026-08-04",
+        },
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+    assert outcome.ok, outcome.message
+
+
+async def test_auto_mode_rejects_exact_event_inside_option_life(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_pick(
+        tmp_db,
+        raw_json={
+            "delayed": False,
+            "warming_up": False,
+            "earnings_in_window": True,
+            "next_earnings_date": "2026-06-20",
+        },
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
+    assert not outcome.ok
+    assert "before the option expiry" in outcome.message
+
+
 async def test_auto_paper_profile_can_trade_defined_risk_through_earnings(
     tmp_db: Engine,
 ) -> None:

@@ -13,6 +13,7 @@ handles both shapes for forward/backward compatibility.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
 
@@ -105,7 +106,7 @@ def next_earnings(
     # scan even though the scan correctly continues. Skip that inapplicable
     # request so operational error logs retain signal.
     if symbol.upper() in _NO_EARNINGS_ETFS:
-        return EarningsInfo(next_date=None, source="unknown")
+        return EarningsInfo(next_date=None, source="not_applicable")
     try:
         ticker = yf.Ticker(symbol)
         calendar = ticker.calendar
@@ -137,3 +138,30 @@ def earnings_within(
     reference = today if today is not None else date.today()
     delta = (info.next_date - reference).days
     return 0 <= delta <= days
+
+
+def earnings_before_option_expiry(
+    next_date: date | None,
+    option_expiries: Iterable[str],
+    *,
+    today: date,
+) -> bool | None:
+    """Whether the next earnings event falls inside an option trade's life.
+
+    ``earnings_in_window`` is an analysis feature meaning "within the next N
+    calendar days".  It must not be reused as an execution fact for a shorter
+    option trade (especially 0DTE).  This helper answers the exact execution
+    question instead.  ``None`` preserves uncertainty when either the event or
+    the option expiry cannot be established.
+    """
+    if next_date is None:
+        return None
+    parsed: list[date] = []
+    for raw in option_expiries:
+        try:
+            parsed.append(datetime.strptime(str(raw), "%Y%m%d").date())
+        except ValueError:
+            return None
+    if not parsed:
+        return None
+    return today <= next_date <= max(parsed)

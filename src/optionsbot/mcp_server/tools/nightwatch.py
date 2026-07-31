@@ -166,6 +166,9 @@ def _pick_dict(row: Any) -> dict[str, Any]:
             "volume": raw.get("volume"),
             "average_volume": raw.get("average_volume"),
             "iv_rank_is_proxy": raw.get("iv_rank_is_proxy"),
+            "beta_to_benchmark": raw.get("beta_to_benchmark"),
+            "beta_benchmark": raw.get("beta_benchmark"),
+            "recent_price_history": raw.get("recent_price_history"),
         },
         "suggestion": {
             "defined_risk": suggestion.get("defined_risk"),

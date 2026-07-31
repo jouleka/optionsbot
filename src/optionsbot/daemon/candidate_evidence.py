@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select, update
 
+from optionsbot.analysis.events import earnings_before_option_expiry
+from optionsbot.analysis.positions import per_underlying_share_delta, portfolio_greeks
 from optionsbot.daemon.context import DaemonContext
+from optionsbot.daemon.market_hours import is_market_open, minutes_to_nyse_close, nyse_session_date
 from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.equity_guard import new_entry_allowed
 from optionsbot.execution.gate import can_execute
@@ -21,7 +24,12 @@ from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import combo_bid_ask, combo_spread_issue
 from optionsbot.ibkr import MarketDataClient, PositionsClient
 from optionsbot.ibkr.types import OptionQuote
-from optionsbot.storage.schema import orders, position_settlements, strategy_scores
+from optionsbot.storage.schema import (
+    orders,
+    position_settlements,
+    snapshots,
+    strategy_scores,
+)
 from optionsbot.strategies import StrategySuggestion
 
 
@@ -33,6 +41,16 @@ def _number(value: Decimal | float | int | None) -> float | None:
 
 
 def _quote_dict(quote: OptionQuote, side: object, quantity: object) -> dict[str, Any]:
+    spread = (
+        quote.ask - quote.bid
+        if quote.bid is not None and quote.ask is not None and quote.ask >= quote.bid
+        else None
+    )
+    spread_fraction = (
+        spread / quote.mid
+        if spread is not None and quote.mid is not None and quote.mid > 0
+        else None
+    )
     return {
         "symbol": quote.symbol,
         "expiry": quote.expiry,
@@ -43,6 +61,8 @@ def _quote_dict(quote: OptionQuote, side: object, quantity: object) -> dict[str,
         "bid": quote.bid,
         "ask": quote.ask,
         "mid": quote.mid,
+        "spread": spread,
+        "spread_fraction_of_mid": spread_fraction,
         "iv": quote.iv,
         "delta": quote.delta,
         "gamma": quote.gamma,
@@ -53,6 +73,59 @@ def _quote_dict(quote: OptionQuote, side: object, quantity: object) -> dict[str,
         "quote_ts": quote.ts.isoformat() if quote.ts is not None else None,
         "delayed": quote.delayed,
     }
+
+
+def _candidate_greeks(
+    legs: list[dict[str, Any]],
+    quotes: dict[tuple[str, float, str], OptionQuote],
+) -> dict[str, Any]:
+    """Aggregate one strategy unit with explicit signs, multiplier, and units."""
+    totals = {name: 0.0 for name in ("delta", "gamma", "theta", "vega")}
+    option_legs = 0
+    complete_legs = 0
+    for leg in legs:
+        if leg.get("sec_type", "OPT") != "OPT":
+            continue
+        option_legs += 1
+        spec = (str(leg["expiry"]), float(leg["strike"]), str(leg["right"]))
+        quote = quotes.get(spec)
+        if quote is None:
+            continue
+        values = {name: getattr(quote, name) for name in totals}
+        if any(value is None for value in values.values()):
+            continue
+        side = str(leg.get("side", "")).upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        sign = 1.0 if side == "BUY" else -1.0
+        quantity = float(leg.get("quantity", 1) or 1)
+        scale = sign * quantity * 100.0
+        for name, value in values.items():
+            assert value is not None
+            totals[name] += float(value) * scale
+        complete_legs += 1
+    complete = option_legs > 0 and complete_legs == option_legs
+    return {
+        "scope": "one_strategy_unit_all_option_legs",
+        "option_multiplier": 100,
+        "sign_convention": "BUY=+1, SELL=-1",
+        "net_delta_share_equivalent": totals["delta"] if complete else None,
+        "net_gamma_share_equivalent_per_dollar": totals["gamma"] if complete else None,
+        "net_theta_dollars_per_day": totals["theta"] if complete else None,
+        "net_vega_dollars_per_vol_point": totals["vega"] if complete else None,
+        "option_legs_total": option_legs,
+        "option_legs_with_complete_greeks": complete_legs,
+        "complete": complete,
+    }
+
+
+def _parse_date(value: object) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def with_reconciled_economics(
@@ -115,10 +188,26 @@ async def capture_candidate_evidence(
     score_id: int,
     symbol: str,
     legs: list[dict[str, Any]],
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Read evidence on the trusted daemon connection and persist it with the score."""
     issues: list[str] = []
+    with context.engine.connect() as conn:
+        stored = conn.execute(
+            select(
+                strategy_scores.c.suggestion_json,
+                snapshots.c.raw_json,
+                snapshots.c.spot,
+            )
+            .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+            .where(strategy_scores.c.id == score_id)
+        ).one()
+    stored_suggestion = dict(stored.suggestion_json or {})
+    snapshot_raw = dict(stored.raw_json or {})
+    candidate_spot = _number(stored.spot)
+
     quote_map: dict[tuple[str, float, str], OptionQuote] = {}
+    portfolio_quote_map: dict[tuple[str, str, float, str], OptionQuote] = {}
     md = MarketDataClient(context.ibkr, resolver=context.resolver)
     positions_client = PositionsClient(context.ibkr)
     summary = None
@@ -154,7 +243,38 @@ async def capture_candidate_evidence(
         except Exception as exc:  # noqa: BLE001
             issues.append(f"portfolio unavailable: {type(exc).__name__}")
 
-    captured_at = datetime.now(UTC)
+        # Existing option exposure needs the same explicit Greek scope as the
+        # candidate. Reuse candidate quotes where identities overlap; fetch
+        # only the remaining non-zero portfolio legs.
+        for item in portfolio:
+            if (
+                item.sec_type != "OPT"
+                or not item.position
+                or item.expiry is None
+                or item.strike is None
+                or item.right is None
+            ):
+                continue
+            key = (item.symbol, item.expiry, float(item.strike), str(item.right))
+            candidate_key = (item.expiry, float(item.strike), str(item.right))
+            if item.symbol == symbol and candidate_key in quote_map:
+                portfolio_quote_map[key] = quote_map[candidate_key]
+                continue
+            try:
+                portfolio_quote_map[key] = await md.get_option_snapshot(
+                    item.symbol,
+                    item.expiry,
+                    float(item.strike),
+                    item.right,
+                )
+            except Exception as exc:  # noqa: BLE001
+                issues.append(
+                    "portfolio Greek quote unavailable for "
+                    f"{item.symbol} {item.expiry} {item.strike}{item.right}: "
+                    f"{type(exc).__name__}"
+                )
+
+    captured_at = now if now is not None else datetime.now(UTC)
 
     quote_rows: list[dict[str, Any]] = []
     for leg in legs:
@@ -202,13 +322,9 @@ async def capture_candidate_evidence(
         )
         if combo_issue is not None:
             issues.append("liquidity: " + combo_issue)
-        with context.engine.connect() as conn:
-            stored_suggestion = conn.execute(
-                select(strategy_scores.c.suggestion_json).where(strategy_scores.c.id == score_id)
-            ).scalar_one()
         economics = reconcile_entry_economics(
             legs,
-            dict(stored_suggestion or {}),
+            stored_suggestion,
             fresh_net_per_share=mid,
         )
         if economics is None:
@@ -270,6 +386,33 @@ async def capture_candidate_evidence(
     )
     position_count_allowed = active_count < context.settings.execution.max_open_positions
     symbol_count_allowed = symbol_count < context.settings.execution.max_per_symbol
+    candidate_bp_reserve = candidate_max_loss
+    candidate_bp_usage_pct = (
+        candidate_bp_reserve / net_liq_usd
+        if candidate_bp_reserve is not None and net_liq_usd is not None and net_liq_usd > 0
+        else None
+    )
+    available_funds = _number(summary.available_funds) if summary is not None else None
+    candidate_affordable = (
+        candidate_bp_reserve <= available_funds
+        if candidate_bp_reserve is not None and available_funds is not None
+        else False
+    )
+    deployment_after = (
+        open_heat + candidate_max_loss
+        if open_heat is not None and candidate_max_loss is not None
+        else None
+    )
+    deployment_after_pct = (
+        deployment_after / net_liq_usd
+        if deployment_after is not None and net_liq_usd is not None and net_liq_usd > 0
+        else None
+    )
+    bp_deployment_allowed = (
+        deployment_after_pct <= context.settings.execution.max_bp_usage_pct
+        if deployment_after_pct is not None
+        else False
+    )
     if not single_trade_risk_allowed:
         issues.append("candidate exceeds or cannot prove the single-trade risk cap")
     if not portfolio_heat_allowed:
@@ -278,8 +421,94 @@ async def capture_candidate_evidence(
         issues.append("maximum open-position count reached")
     if not symbol_count_allowed:
         issues.append(f"maximum active {symbol} position count reached")
+    if not candidate_affordable:
+        issues.append("candidate structural BP reserve exceeds or cannot prove available funds")
+    if not bp_deployment_allowed:
+        issues.append("candidate exceeds or cannot prove the OptionsBot BP deployment cap")
+
+    candidate_greeks = _candidate_greeks(legs, quote_map)
+    if candidate_greeks["complete"] is not True:
+        issues.append("candidate aggregate Greeks incomplete")
+    active_portfolio = [item for item in portfolio if item.position]
+    existing_greeks = portfolio_greeks(active_portfolio, portfolio_quote_map)
+    if existing_greeks["complete"] is not True:
+        issues.append("existing portfolio aggregate Greeks incomplete")
+    existing_delta_by_symbol = per_underlying_share_delta(
+        active_portfolio,
+        portfolio_quote_map,
+    )
+    candidate_share_delta = candidate_greeks["net_delta_share_equivalent"]
+    beta_value = _number(snapshot_raw.get("beta_to_benchmark"))
+    candidate_dollar_delta = (
+        candidate_share_delta * candidate_spot
+        if isinstance(candidate_share_delta, float) and candidate_spot is not None
+        else None
+    )
+    incremental_beta_weighted_dollar_delta = (
+        candidate_dollar_delta * beta_value
+        if candidate_dollar_delta is not None and beta_value is not None
+        else None
+    )
+    beta_delta_complete = (
+        candidate_share_delta is not None
+        and candidate_spot is not None
+        and beta_value is not None
+    )
+    if not beta_delta_complete:
+        issues.append("candidate incremental beta/delta impact incomplete")
+
+    now_session = nyse_session_date(captured_at)
+    minutes_to_close = minutes_to_nyse_close(captured_at)
+    market_open = is_market_open(captured_at)
+    entry_window_open = market_open and (
+        not context.settings.execution.zero_dte_only
+        or (
+            minutes_to_close is not None
+            and minutes_to_close
+            > context.settings.execution.zero_dte_entry_cutoff_minutes
+        )
+    )
+    if not entry_window_open:
+        issues.append("market or configured 0DTE entry window is closed")
+
+    option_expiries = sorted(
+        {
+            str(leg["expiry"])
+            for leg in legs
+            if leg.get("sec_type", "OPT") == "OPT" and leg.get("expiry")
+        }
+    )
+    next_earnings = _parse_date(snapshot_raw.get("next_earnings_date"))
+    earnings_before_expiry = earnings_before_option_expiry(
+        next_earnings,
+        option_expiries,
+        today=now_session,
+    )
+    short_option_legs = sum(
+        1
+        for leg in legs
+        if leg.get("sec_type", "OPT") == "OPT"
+        and str(leg.get("side", "")).upper() == "SELL"
+    )
+    physically_settled = symbol.upper() not in {"SPX", "SPXW", "XSP"}
+    expires_this_session = option_expiries == [now_session.strftime("%Y%m%d")]
+
+    combo_spread = combo[1] - combo[0] if combo is not None else None
+    combo_spread_fraction = (
+        combo_spread / abs(mid)
+        if combo_spread is not None and mid is not None and mid != 0
+        else None
+    )
+    incident = getattr(context.ibkr, "competing_live_session_status", None)
+    if not isinstance(incident, dict):
+        incident = {
+            "active_recently": False,
+            "last_observed_at": None,
+            "count_since_connect": 0,
+            "error_code": 10197,
+        }
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "trusted_daemon",
         "score_id": score_id,
         "captured_at": captured_at.isoformat(),
@@ -290,9 +519,78 @@ async def capture_candidate_evidence(
             "bid": combo[0] if combo is not None else None,
             "ask": combo[1] if combo is not None else None,
             "mid": mid,
+            "spread": combo_spread,
+            "spread_fraction_of_net_premium": combo_spread_fraction,
+            "max_spread_fraction": context.settings.execution.max_combo_spread_frac,
+            "spread_allowed": combo_issue is None and combo is not None,
             "liquidity_issue": combo_issue,
         },
         "economics": economics.to_dict() if economics is not None else None,
+        "candidate_scope": {
+            "strategy_units_reviewed": 1,
+            "economics_scope": "one_strategy_unit",
+            "risk_scope": "one_strategy_unit",
+            "greeks_scope": "one_strategy_unit",
+            "execution_quantity_recomputed_by_daemon": True,
+        },
+        "candidate_greeks": candidate_greeks,
+        "exposure": {
+            "beta_benchmark": snapshot_raw.get("beta_benchmark"),
+            "candidate_spot": candidate_spot,
+            "candidate_beta_to_benchmark": beta_value,
+            "candidate_share_delta": candidate_share_delta,
+            "candidate_dollar_delta": candidate_dollar_delta,
+            "incremental_beta_weighted_dollar_delta": (
+                incremental_beta_weighted_dollar_delta
+            ),
+            "existing_portfolio_greeks": existing_greeks,
+            "existing_share_delta_by_symbol": existing_delta_by_symbol,
+            "existing_candidate_symbol_share_delta": existing_delta_by_symbol.get(
+                symbol, 0.0
+            ),
+            "after_candidate_symbol_share_delta": (
+                existing_delta_by_symbol.get(symbol, 0.0) + candidate_share_delta
+                if isinstance(candidate_share_delta, float)
+                else None
+            ),
+            "complete": beta_delta_complete and existing_greeks["complete"] is True,
+        },
+        "expiration_assignment": {
+            "option_expiries": option_expiries,
+            "expires_this_session": expires_this_session,
+            "short_option_legs": short_option_legs,
+            "physically_settled": physically_settled,
+            "early_assignment_possible": physically_settled and short_option_legs > 0,
+            "pin_risk_present": expires_this_session and short_option_legs > 0,
+            "force_exit_minutes_before_close": (
+                context.settings.execution.zero_dte_force_exit_minutes
+            ),
+            "handling": (
+                "daemon force-exit and expiration settlement/assignment reconciliation "
+                "remain authoritative"
+            ),
+        },
+        "catalysts": {
+            "analysis_earnings_window": snapshot_raw.get("earnings_in_window"),
+            "next_earnings_date": snapshot_raw.get("next_earnings_date"),
+            "earnings_source": snapshot_raw.get("earnings_source"),
+            "issuer_earnings_applicable": (
+                snapshot_raw.get("earnings_source") != "not_applicable"
+            ),
+            "earnings_before_option_expiry": earnings_before_expiry,
+        },
+        "market_timing": {
+            "captured_at": captured_at.isoformat(),
+            "nyse_session": now_session.isoformat(),
+            "market_open": market_open,
+            "minutes_to_close": minutes_to_close,
+            "zero_dte_only": context.settings.execution.zero_dte_only,
+            "zero_dte_entry_cutoff_minutes": (
+                context.settings.execution.zero_dte_entry_cutoff_minutes
+            ),
+            "entry_window_open": entry_window_open,
+        },
+        "market_data_incident": incident,
         "account": account,
         "positions": [
             {
@@ -325,6 +623,19 @@ async def capture_candidate_evidence(
             "max_portfolio_heat_pct": context.settings.execution.max_portfolio_heat_pct,
             "max_single_trade_risk_pct": context.settings.execution.max_single_trade_risk_pct,
             "max_bp_usage_pct": context.settings.execution.max_bp_usage_pct,
+            "candidate_bp_reserve_method": "structural_max_loss_pre_review",
+            "candidate_bp_reserve": candidate_bp_reserve,
+            "candidate_bp_usage_pct_of_net_liq": candidate_bp_usage_pct,
+            "available_funds_after_candidate_reserve": (
+                available_funds - candidate_bp_reserve
+                if available_funds is not None and candidate_bp_reserve is not None
+                else None
+            ),
+            "candidate_affordable": candidate_affordable,
+            "optionsbot_deployment_after": deployment_after,
+            "optionsbot_deployment_after_pct": deployment_after_pct,
+            "bp_deployment_allowed": bp_deployment_allowed,
+            "broker_whatif_required_at_execution": True,
             "candidate_max_loss": candidate_max_loss,
             "single_trade_cap": single_trade_cap,
             "single_trade_risk_allowed": single_trade_risk_allowed,

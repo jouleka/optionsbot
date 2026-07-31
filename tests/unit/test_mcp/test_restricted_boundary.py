@@ -78,6 +78,36 @@ async def test_restricted_server_exposes_only_bounded_surface() -> None:
     )
 
 
+def test_restricted_health_attests_zero_dte_entry_window(
+    mcp_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    context = RestrictedServerContext(
+        engine=mcp_engine,
+        intent_engine=create_intent_engine(tmp_path / "health-intents.db"),
+        max_pick_age_minutes=20,
+        zero_dte_only=True,
+        zero_dte_entry_cutoff_minutes=90,
+    )
+    with patch(
+        "optionsbot.mcp_server.tools.restricted.is_market_open",
+        return_value=True,
+    ), patch(
+        "optionsbot.mcp_server.tools.restricted.minutes_to_nyse_close",
+        return_value=180.0,
+    ):
+        result = get_tools(restricted.register)["health"](FakeCtx(context))
+
+    assert result["market_timing"] == {
+        "nyse_session": result["market_timing"]["nyse_session"],
+        "market_open": True,
+        "minutes_to_close": 180.0,
+        "zero_dte_only": True,
+        "zero_dte_entry_cutoff_minutes": 90,
+        "entry_window_open": True,
+    }
+
+
 def test_hermes_metrics_uses_only_judgeable_calls_and_reports_churn(
     mcp_engine: Engine,
 ) -> None:
@@ -314,6 +344,63 @@ def test_disabled_overlay_holds_newly_imported_vetted_review(
         review = conn.execute(select(entry_reviews)).one()
     assert review.status == "held"
     assert "test correctness trip" in review.decision_reason
+
+
+def test_watch_only_result_does_not_claim_overlay_breaker(
+    mcp_engine: Engine,
+) -> None:
+    daemon_context = cast(DaemonContext, SimpleNamespace(engine=mcp_engine))
+    now = datetime.now(UTC)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY", ts=now, spot=600.0, raw_json={}
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        alert_id = int(
+            conn.execute(
+                insert(alerts).values(
+                    strategy_score_id=score_id,
+                    ts=now,
+                    symbol="SPY",
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    status="sent",
+                    sent_ts=now,
+                    telegram_msg_id=124,
+                )
+            ).inserted_primary_key[0]
+        )
+
+    result = _consume_entry_review(
+        daemon_context,
+        {
+            "pick_id": score_id,
+            "alert_id": alert_id,
+            "reviewed_at": now.isoformat(),
+            "verdict": "watch_only",
+            "confidence": 0.9,
+            "sources": ["source A", "source B"],
+            "reason": "credible thesis with an explicit current guard",
+            "checks": {"candidate": True, "microstructure": False},
+        },
+    )
+
+    assert "watch-only; no order authority" in result
+    assert "overlay breaker" not in result
 
 
 def test_restricted_server_imports_no_broker_or_execution_modules() -> None:

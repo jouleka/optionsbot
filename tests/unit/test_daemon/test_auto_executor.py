@@ -193,13 +193,18 @@ def _mark_trusted_evidence_ready(context: DaemonContext, score_id: int) -> None:
             ).scalar_one()
         )
         suggestion["review_evidence"] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "source": "trusted_daemon",
             "score_id": score_id,
             "captured_at": datetime.now(UTC).isoformat(),
             "ready": True,
             "readiness_issues": [],
             "option_quotes": [{"bid": 1.0, "ask": 1.1}],
+            "combo": {"spread_allowed": True},
+            "candidate_greeks": {"complete": True},
+            "exposure": {"complete": True},
+            "expiration_assignment": {},
+            "market_timing": {"entry_window_open": True},
             "account": {
                 "net_liquidation_usd": 100_000.0,
                 "buying_power": 100_000.0,
@@ -209,6 +214,10 @@ def _mark_trusted_evidence_ready(context: DaemonContext, score_id: int) -> None:
                 "execution_allowed": True,
                 "paper_only": True,
                 "entry_loss_guard_allowed": True,
+                "single_trade_risk_allowed": True,
+                "portfolio_heat_allowed": True,
+                "candidate_affordable": True,
+                "bp_deployment_allowed": True,
             },
         }
         conn.execute(

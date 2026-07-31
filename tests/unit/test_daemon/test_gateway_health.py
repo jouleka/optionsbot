@@ -96,6 +96,14 @@ def test_disconnected_without_positions_does_not_page() -> None:
     assert _eval(m, connected=False, tickers_scanned=0, open_positions=0) == []
 
 
+def test_competing_live_session_pages_and_names_ibkr_code() -> None:
+    m = GatewayHealthMonitor()
+    msgs = _eval(m, competing_live_session=True, open_positions=0)
+    assert len(msgs) == 1
+    assert "10197" in msgs[0]
+    assert "MARKET DATA CONFLICT" in msgs[0]
+
+
 # --- persist / re-page / clear --------------------------------------------------
 
 

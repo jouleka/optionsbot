@@ -12,6 +12,7 @@ from mcp.server.session import ServerSession
 from sqlalchemy import desc, func, select
 
 from optionsbot.hermes_overlay import breaker_report, correctness_report
+from optionsbot.market_hours import is_market_open, minutes_to_nyse_close, nyse_session_date
 from optionsbot.mcp_server.intent_queue import control_intents, recent_intents
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.storage.schema import (
@@ -352,9 +353,21 @@ def register(server: FastMCP) -> None:
             ).first()
             last_snapshot = conn.execute(select(func.max(snapshots.c.ts))).scalar_one()
             state = conn.execute(select(execution_state).limit(1)).first()
+        now = datetime.now(UTC)
+        minutes_left = minutes_to_nyse_close(now)
+        market_open = is_market_open(now)
+        execution_settings = lifespan.settings.execution
+        entry_window_open = market_open and (
+            not execution_settings.zero_dte_only
+            or (
+                minutes_left is not None
+                and minutes_left
+                > execution_settings.zero_dte_entry_cutoff_minutes
+            )
+        )
         return {
             "ok": True,
-            "as_of": datetime.now(UTC).isoformat(),
+            "as_of": now.isoformat(),
             "last_scan": None
             if last_scan is None
             else {
@@ -365,6 +378,16 @@ def register(server: FastMCP) -> None:
             "last_snapshot_ts": iso_utc(last_snapshot),
             "execution_killed": bool(state.killed) if state is not None else False,
             "execution_kill_reason": state.reason if state is not None else None,
+            "market_timing": {
+                "nyse_session": nyse_session_date(now).isoformat(),
+                "market_open": market_open,
+                "minutes_to_close": minutes_left,
+                "zero_dte_only": execution_settings.zero_dte_only,
+                "zero_dte_entry_cutoff_minutes": (
+                    execution_settings.zero_dte_entry_cutoff_minutes
+                ),
+                "entry_window_open": entry_window_open,
+            },
             "broker_access": False,
         }
 

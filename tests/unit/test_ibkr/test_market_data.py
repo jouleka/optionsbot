@@ -11,7 +11,7 @@ from ib_async import Ticker
 
 from optionsbot.config import Settings
 from optionsbot.ibkr.client import IBKRClient
-from optionsbot.ibkr.market_data import MarketDataClient
+from optionsbot.ibkr.market_data import CompetingLiveSessionError, MarketDataClient
 from optionsbot.ibkr.types import OptionQuote, StockQuote
 
 
@@ -168,6 +168,24 @@ async def test_get_snapshot_stock(md: MarketDataClient, mock_ib: MagicMock) -> N
     assert quote.ask == 400.2
     assert quote.mid == pytest.approx(400.1)
     assert quote.delayed is True  # paper mode default
+
+
+async def test_empty_quote_after_10197_raises_explicit_conflict(
+    md: MarketDataClient,
+    mock_ib: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stock_contract = MagicMock(symbol="SPY", secType="STK")
+    mock_ib.qualifyContractsAsync.return_value = [stock_contract]
+    mock_ib.reqTickersAsync.return_value = []
+    mock_ib.reqMktData.return_value = _ticker(
+        bid=float("nan"), ask=float("nan"), last=float("nan")
+    )
+    monkeypatch.setattr("optionsbot.ibkr.market_data._STREAM_TIMEOUT_S", 0.0)
+    md.client._observe_api_error(7, 10197, "competing live session", stock_contract)
+
+    with pytest.raises(CompetingLiveSessionError, match="10197"):
+        await md.get_stock_snapshot("SPY")
 
 
 async def test_option_snapshot_preserves_missing_timestamp_as_unknown(

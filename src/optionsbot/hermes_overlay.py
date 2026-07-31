@@ -293,6 +293,26 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
             group["avg_pnl"] = round(float(group["net_pnl"]) / calls, 2) if calls else 0.0
         return groups
 
+    def grouped_pair() -> dict[str, dict[str, int | float]]:
+        groups: dict[str, dict[str, int | float]] = {}
+        for row in rows:
+            key = f"{row.symbol}|{row.strategy}"
+            group = groups.setdefault(
+                key,
+                {"calls": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+            )
+            group["calls"] += 1
+            group["wins" if bool(row.win) else "losses"] += 1
+            group["net_pnl"] += float(row.realized_pnl)
+        for group in groups.values():
+            calls = int(group["calls"])
+            group["win_rate"] = float(group["wins"]) / calls if calls else 0.0
+            group["net_pnl"] = round(float(group["net_pnl"]), 2)
+            group["avg_pnl"] = (
+                round(float(group["net_pnl"]) / calls, 2) if calls else 0.0
+            )
+        return groups
+
     wins = sum(bool(row.win) for row in rows)
     net_pnl = sum(float(row.realized_pnl) for row in rows)
     return {
@@ -304,6 +324,7 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
         "avg_pnl": round(net_pnl / len(rows), 2) if rows else None,
         "by_strategy": grouped("strategy"),
         "by_symbol": grouped("symbol"),
+        "by_strategy_symbol": grouped_pair(),
     }
 
 
@@ -438,11 +459,25 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             group["trades"] += 1
             group["wins" if result["pnl"] > 0 else "losses"] += 1
             group["net_pnl"] += result["pnl"]
+    by_strategy_symbol: dict[str, dict[str, int | float]] = {}
+    for result in actual_results:
+        key = f"{result['symbol']}|{result['strategy']}"
+        group = by_strategy_symbol.setdefault(
+            key,
+            {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+        )
+        group["trades"] += 1
+        group["wins" if result["pnl"] > 0 else "losses"] += 1
+        group["net_pnl"] += result["pnl"]
     for groups in (by_strategy, by_symbol):
         for group in groups.values():
             trades = int(group["trades"])
             group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
             group["net_pnl"] = round(float(group["net_pnl"]), 2)
+    for group in by_strategy_symbol.values():
+        trades = int(group["trades"])
+        group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
+        group["net_pnl"] = round(float(group["net_pnl"]), 2)
 
     actual_wins = sum(result["pnl"] > 0 for result in actual_results)
 
@@ -459,6 +494,28 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             groups.setdefault(str(lesson[field]), []).append(
                 float(lesson["call_pnl"])
             )
+        result: dict[str, dict[str, int | float | None]] = {}
+        for key, pnls in groups.items():
+            wins = [pnl for pnl in pnls if pnl > 0]
+            losses = [pnl for pnl in pnls if pnl <= 0]
+            net = sum(pnls)
+            result[key] = {
+                "calls": len(pnls),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": len(wins) / len(pnls) if pnls else None,
+                "net_pnl": round(net, 2),
+                "avg_pnl": round(net / len(pnls), 2) if pnls else None,
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+                "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            }
+        return result
+
+    def guarded_pair_groups() -> dict[str, dict[str, int | float | None]]:
+        groups: dict[str, list[float]] = {}
+        for lesson in guarded:
+            key = f"{lesson['symbol']}|{lesson['strategy']}"
+            groups.setdefault(key, []).append(float(lesson["call_pnl"]))
         result: dict[str, dict[str, int | float | None]] = {}
         for key, pnls in groups.items():
             wins = [pnl for pnl in pnls if pnl > 0]
@@ -519,6 +576,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "net_pnl": round(sum(result["pnl"] for result in actual_results), 2),
             "by_strategy": by_strategy,
             "by_symbol": by_symbol,
+            "by_strategy_symbol": by_strategy_symbol,
         },
         "guarded_call_summary": {
             "meaning": (
@@ -553,6 +611,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             ),
             "by_strategy": guarded_groups("strategy"),
             "by_symbol": guarded_groups("symbol"),
+            "by_strategy_symbol": guarded_pair_groups(),
             "largest_winners": [
                 compact_guarded(lesson) for lesson in largest_winners
             ],

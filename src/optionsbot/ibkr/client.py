@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal
 
@@ -56,6 +57,49 @@ class IBKRClient:
             backoff_seconds if backoff_seconds is not None else self._DEFAULT_BACKOFF_SECONDS
         )
         self._connect_lock = asyncio.Lock()
+        self._last_competing_live_session_at: datetime | None = None
+        self._competing_live_session_count = 0
+        error_event = getattr(self._ib, "errorEvent", None)
+        if error_event is not None:
+            error_event += self._observe_api_error
+
+    def _observe_api_error(
+        self,
+        _req_id: object,
+        error_code: object,
+        _error_string: object,
+        _contract: object,
+    ) -> None:
+        """Capture IBKR's live-feed ownership conflict for fail-closed callers."""
+        if error_code != 10197:
+            return
+        self._last_competing_live_session_at = datetime.now(UTC)
+        self._competing_live_session_count += 1
+
+    def competing_live_session_recent(
+        self,
+        *,
+        max_age_seconds: float = 30.0,
+        now: datetime | None = None,
+    ) -> bool:
+        observed = self._last_competing_live_session_at
+        if observed is None:
+            return False
+        checked = now if now is not None else datetime.now(UTC)
+        return checked - observed <= timedelta(seconds=max_age_seconds)
+
+    @property
+    def competing_live_session_status(self) -> dict[str, object]:
+        return {
+            "active_recently": self.competing_live_session_recent(),
+            "last_observed_at": (
+                self._last_competing_live_session_at.isoformat()
+                if self._last_competing_live_session_at is not None
+                else None
+            ),
+            "count_since_connect": self._competing_live_session_count,
+            "error_code": 10197,
+        }
 
     @property
     def ib(self) -> IB:
@@ -125,6 +169,10 @@ class IBKRClient:
                     await asyncio.sleep(delay)
                 try:
                     await self._ib.connectAsync(host=host, port=port, clientId=client_id)
+                    # A reconnect starts a new observation window. 10197 is an
+                    # entitlement-ownership incident, not permanent client state.
+                    self._last_competing_live_session_at = None
+                    self._competing_live_session_count = 0
                     # IBK-122: in paper mode request the configured market-data
                     # type (default 3 = delayed-streaming; 1 = live once real-time
                     # data is shared into the paper account).
