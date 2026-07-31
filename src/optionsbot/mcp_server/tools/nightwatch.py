@@ -102,6 +102,7 @@ _LESSON_SUMMARY_KEYS = (
     "diagnosis",
     "outcome_basis",
     "forecast_useful",
+    "decision_value",
     "lesson",
     "exit_reason",
     "max_profit_at_entry",
@@ -236,6 +237,7 @@ def _compact_learning_feedback(
     # exact rows for queued candidates plus every strategy observed for the
     # three independent-origination symbols used by the analyst pass.
     for summary_name in (
+        "forecast_call_summary",
         "terminal_call_summary",
         "actual_trade_summary",
         "guarded_call_summary",
@@ -244,23 +246,25 @@ def _compact_learning_feedback(
         if not isinstance(raw_summary, dict):
             continue
         summary = dict(raw_summary)
-        relevant_symbols = independent_symbols | {
-            pair.partition("|")[0] for pair in relevant_pairs
-        }
+        relevant_symbols = independent_symbols | {pair.partition("|")[0] for pair in relevant_pairs}
         raw_symbols = raw_summary.get("by_symbol")
         if isinstance(raw_symbols, dict):
             summary["by_symbol"] = {
-                key: value
-                for key, value in raw_symbols.items()
-                if key in relevant_symbols
+                key: value for key, value in raw_symbols.items() if key in relevant_symbols
             }
         raw_pairs = raw_summary.get("by_strategy_symbol")
         if isinstance(raw_pairs, dict):
             summary["by_strategy_symbol"] = {
                 key: value
                 for key, value in raw_pairs.items()
-                if key in relevant_pairs
-                or key.partition("|")[0] in independent_symbols
+                if key in relevant_pairs or key.partition("|")[0] in independent_symbols
+            }
+        raw_pair_sessions = raw_summary.get("by_strategy_symbol_sessions")
+        if isinstance(raw_pair_sessions, dict):
+            summary["by_strategy_symbol_sessions"] = {
+                key: value
+                for key, value in raw_pair_sessions.items()
+                if key in relevant_pairs or key.partition("|")[0] in independent_symbols
             }
         compact[summary_name] = summary
     lessons: list[dict[str, Any]] = []
@@ -269,10 +273,7 @@ def _compact_learning_feedback(
         for raw_lesson in raw_lessons[:5]:
             if not isinstance(raw_lesson, dict):
                 continue
-            lesson = {
-                key: raw_lesson.get(key)
-                for key in _LESSON_SUMMARY_KEYS
-            }
+            lesson = {key: raw_lesson.get(key) for key in _LESSON_SUMMARY_KEYS}
             review_reason = raw_lesson.get("review_reason")
             if isinstance(review_reason, str) and review_reason:
                 lesson["review_reason_summary"] = review_reason[:240]
@@ -339,10 +340,7 @@ def _candidate_select() -> Any:
 def _is_positive_defined_risk_candidate(row: Any) -> bool:
     legs = row.legs_json
     suggestion = row.suggestion_json
-    if (
-        not has_structurally_defined_option_risk(legs)
-        or not isinstance(suggestion, dict)
-    ):
+    if not has_structurally_defined_option_risk(legs) or not isinstance(suggestion, dict):
         return False
     if suggestion.get("defined_risk") is not True:
         return False
@@ -402,15 +400,11 @@ def register(server: FastMCP) -> None:
         feedback = learning_feedback(lifespan.engine, recent_limit=10)
         intent_engine = getattr(lifespan, "intent_engine", None)
         feedback["recent_proposal_decisions"] = (
-            recent_proposal_decisions(intent_engine, limit=10)
-            if intent_engine is not None
-            else []
+            recent_proposal_decisions(intent_engine, limit=10) if intent_engine is not None else []
         )
         compact_feedback = _compact_learning_feedback(
             feedback,
-            relevant_pairs={
-                f"{pick['symbol']}|{pick['strategy']}" for pick in picks
-            },
+            relevant_pairs={f"{pick['symbol']}|{pick['strategy']}" for pick in picks},
             independent_symbols={"SPY", "QQQ", "IWM"},
         )
         return {
@@ -637,13 +631,10 @@ def register(server: FastMCP) -> None:
                     alerts.c.ts,
                     alerts.c.sent_ts,
                     alerts.c.telegram_msg_id,
-                )
-                .where(alerts.c.id == int(alert_id))
+                ).where(alerts.c.id == int(alert_id))
             ).first()
             any_alert = conn.execute(
-                select(alerts.c.id)
-                .where(alerts.c.strategy_score_id == int(pick_id))
-                .limit(1)
+                select(alerts.c.id).where(alerts.c.strategy_score_id == int(pick_id)).limit(1)
             ).first()
         if pick is None:
             return {"ok": False, "error": "unknown_pick"}
@@ -668,9 +659,7 @@ def register(server: FastMCP) -> None:
             return {"ok": False, "error": "alert_delivery_unproven"}
         alert_ts = alert.ts.replace(tzinfo=UTC) if alert.ts.tzinfo is None else alert.ts
         sent_ts = (
-            alert.sent_ts.replace(tzinfo=UTC)
-            if alert.sent_ts.tzinfo is None
-            else alert.sent_ts
+            alert.sent_ts.replace(tzinfo=UTC) if alert.sent_ts.tzinfo is None else alert.sent_ts
         )
         if sent_ts < alert_ts or sent_ts > now + timedelta(minutes=1):
             return {"ok": False, "error": "alert_delivery_time_invalid"}
@@ -752,9 +741,7 @@ def register(server: FastMCP) -> None:
         except IntegrityError:
             with lifespan.engine.connect() as conn:
                 raced = conn.execute(
-                    select(entry_reviews).where(
-                        entry_reviews.c.strategy_score_id == int(pick_id)
-                    )
+                    select(entry_reviews).where(entry_reviews.c.strategy_score_id == int(pick_id))
                 ).first()
             if raced is None:
                 raise

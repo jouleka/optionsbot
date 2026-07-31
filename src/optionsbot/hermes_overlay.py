@@ -27,6 +27,7 @@ from optionsbot.storage.schema import (
 
 MIN_JUDGEABLE = 20
 ACCURACY_THRESHOLD = 0.5
+PAYOFF_EFFICIENCY_THRESHOLD = 0.5
 STATE_ID = 1
 
 
@@ -106,6 +107,148 @@ def _review_context(row: Any) -> tuple[bool, bool, str]:
     if not evidence_ready:
         return False, False, "operational_guard"
     return True, False, "pre_trade_forecast"
+
+
+def _decision_payoff(rows: list[Any]) -> dict[str, int | float | None]:
+    """Dollar-weight a forecast decision instead of counting signs alone."""
+    captured_profit = incurred_loss = missed_profit = avoided_loss = 0.0
+    for row in rows:
+        pnl = float(row.realized_pnl)
+        approved = row.verdict == "vetted_paper_candidate"
+        if approved and pnl > 0:
+            captured_profit += pnl
+        elif approved:
+            incurred_loss += -pnl
+        elif pnl > 0:
+            missed_profit += pnl
+        else:
+            avoided_loss += -pnl
+    helpful = captured_profit + avoided_loss
+    harmful = missed_profit + incurred_loss
+    total = helpful + harmful
+    return {
+        "captured_profit": round(captured_profit, 2),
+        "avoided_loss": round(avoided_loss, 2),
+        "missed_profit": round(missed_profit, 2),
+        "incurred_loss": round(incurred_loss, 2),
+        "helpful_dollars": round(helpful, 2),
+        "harmful_dollars": round(harmful, 2),
+        "decision_value": round(helpful - harmful, 2),
+        "payoff_efficiency": helpful / total if total else None,
+    }
+
+
+def _lesson_call_summary(lessons: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate only ready, pre-trade forecasts with session-aware priors."""
+
+    def decision_payoff(items: list[dict[str, Any]]) -> dict[str, float | None]:
+        captured = sum(
+            float(item["call_pnl"])
+            for item in items
+            if item["verdict"] == "vetted_paper_candidate"
+            and float(item["call_pnl"]) > 0
+        )
+        incurred = sum(
+            -float(item["call_pnl"])
+            for item in items
+            if item["verdict"] == "vetted_paper_candidate"
+            and float(item["call_pnl"]) <= 0
+        )
+        missed = sum(
+            float(item["call_pnl"])
+            for item in items
+            if item["verdict"] != "vetted_paper_candidate"
+            and float(item["call_pnl"]) > 0
+        )
+        avoided = sum(
+            -float(item["call_pnl"])
+            for item in items
+            if item["verdict"] != "vetted_paper_candidate"
+            and float(item["call_pnl"]) <= 0
+        )
+        helpful = captured + avoided
+        harmful = missed + incurred
+        total = helpful + harmful
+        return {
+            "captured_profit": round(captured, 2),
+            "avoided_loss": round(avoided, 2),
+            "missed_profit": round(missed, 2),
+            "incurred_loss": round(incurred, 2),
+            "decision_value": round(helpful - harmful, 2),
+            "payoff_efficiency": helpful / total if total else None,
+        }
+
+    def summarize(items: list[dict[str, Any]]) -> dict[str, int | float | None]:
+        pnls = [float(item["call_pnl"]) for item in items]
+        wins = [pnl for pnl in pnls if pnl > 0]
+        net = sum(pnls)
+        return {
+            "calls": len(pnls),
+            "wins": len(wins),
+            "losses": len(pnls) - len(wins),
+            "win_rate": len(wins) / len(pnls) if pnls else None,
+            "net_pnl": round(net, 2),
+            "avg_pnl": round(net / len(pnls), 2) if pnls else None,
+        }
+
+    def grouped(key_fn: Any) -> dict[str, dict[str, int | float | None]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for lesson in lessons:
+            groups.setdefault(str(key_fn(lesson)), []).append(lesson)
+        return {key: summarize(items) for key, items in groups.items()}
+
+    sessions: dict[str, dict[str, list[float]]] = {}
+    decision_sessions: dict[str, dict[str, list[float]]] = {}
+    for lesson in lessons:
+        pair = f"{lesson['symbol']}|{lesson['strategy']}"
+        expiry = str(lesson["expiry"])
+        sessions.setdefault(pair, {}).setdefault(expiry, []).append(float(lesson["call_pnl"]))
+        decision_sessions.setdefault(pair, {}).setdefault(expiry, []).append(
+            float(lesson["decision_value"])
+        )
+    session_groups: dict[str, dict[str, int | float | None]] = {}
+    for pair, by_expiry in sessions.items():
+        # Repeated intraday scans are observations of one 0DTE session, not
+        # independent trades. Average them within expiry before scoring days.
+        session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
+        session_decisions = [
+            sum(values) / len(values)
+            for values in decision_sessions[pair].values()
+        ]
+        winning = sum(pnl > 0 for pnl in session_pnls)
+        net = sum(session_pnls)
+        session_groups[pair] = {
+            "observations": sum(len(pnls) for pnls in by_expiry.values()),
+            "sessions": len(session_pnls),
+            "winning_sessions": winning,
+            "losing_sessions": len(session_pnls) - winning,
+            "session_win_rate": winning / len(session_pnls) if session_pnls else None,
+            "net_session_avg_pnl": round(net, 2),
+            "avg_pnl_per_session": (round(net / len(session_pnls), 2) if session_pnls else None),
+            "net_session_decision_value": round(sum(session_decisions), 2),
+            "avg_decision_value_per_session": (
+                round(sum(session_decisions) / len(session_decisions), 2)
+                if session_decisions
+                else None
+            ),
+        }
+
+    summary: dict[str, Any] = summarize(lessons)
+    summary.update(
+        {
+            "meaning": (
+                "Expiry outcomes only for evidence-ready pre-trade Hermes forecasts. "
+                "Raw calls are overlapping scan observations; use session-normalized "
+                "exact-pair results before broad marginals."
+            ),
+            "by_strategy": grouped(lambda item: item["strategy"]),
+            "by_symbol": grouped(lambda item: item["symbol"]),
+            "by_strategy_symbol": grouped(lambda item: f"{item['symbol']}|{item['strategy']}"),
+            "by_strategy_symbol_sessions": session_groups,
+            "decision_payoff": decision_payoff(lessons),
+        }
+    )
+    return summary
 
 
 def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
@@ -213,8 +356,7 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 position_settlements.c.kind,
                 position_settlements.c.pnl,
                 entry_cash.c.gross_cash.label("entry_gross_cash"),
-            )
-            .select_from(
+            ).select_from(
                 position_settlements.join(
                     orders,
                     orders.c.id == position_settlements.c.entry_order_id,
@@ -230,11 +372,7 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
         if row.strategy_score_id is None:
             continue
         actual_pnl = float(row.pnl)
-        entry_gross = (
-            float(row.entry_gross_cash)
-            if row.entry_gross_cash is not None
-            else None
-        )
+        entry_gross = float(row.entry_gross_cash) if row.entry_gross_cash is not None else None
         results.append(
             {
                 "pick_id": int(row.strategy_score_id),
@@ -270,6 +408,7 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
             select(
                 pick_outcomes.c.symbol,
                 pick_outcomes.c.strategy,
+                pick_outcomes.c.expiry,
                 pick_outcomes.c.win,
                 pick_outcomes.c.realized_pnl,
             )
@@ -308,14 +447,39 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
             calls = int(group["calls"])
             group["win_rate"] = float(group["wins"]) / calls if calls else 0.0
             group["net_pnl"] = round(float(group["net_pnl"]), 2)
-            group["avg_pnl"] = (
-                round(float(group["net_pnl"]) / calls, 2) if calls else 0.0
-            )
+            group["avg_pnl"] = round(float(group["net_pnl"]) / calls, 2) if calls else 0.0
         return groups
 
     wins = sum(bool(row.win) for row in rows)
     net_pnl = sum(float(row.realized_pnl) for row in rows)
+    pair_sessions: dict[str, dict[str, list[float]]] = {}
+    for row in rows:
+        pair = f"{row.symbol}|{row.strategy}"
+        pair_sessions.setdefault(pair, {}).setdefault(str(row.expiry), []).append(
+            float(row.realized_pnl)
+        )
+    session_summary: dict[str, dict[str, int | float | None]] = {}
+    for pair, by_expiry in pair_sessions.items():
+        session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
+        winning = sum(pnl > 0 for pnl in session_pnls)
+        session_net = sum(session_pnls)
+        session_summary[pair] = {
+            "observations": sum(len(pnls) for pnls in by_expiry.values()),
+            "sessions": len(session_pnls),
+            "winning_sessions": winning,
+            "losing_sessions": len(session_pnls) - winning,
+            "session_win_rate": winning / len(session_pnls) if session_pnls else None,
+            "net_session_avg_pnl": round(session_net, 2),
+            "avg_pnl_per_session": (
+                round(session_net / len(session_pnls), 2) if session_pnls else None
+            ),
+        }
     return {
+        "meaning": (
+            "All settled scanner observations, including candidates that were never "
+            "executable. Raw calls overlap; exact-pair session aggregates average "
+            "same-expiry observations before comparing days."
+        ),
         "calls": len(rows),
         "wins": wins,
         "losses": len(rows) - wins,
@@ -325,6 +489,7 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
         "by_strategy": grouped("strategy"),
         "by_symbol": grouped("symbol"),
         "by_strategy_symbol": grouped_pair(),
+        "by_strategy_symbol_sessions": session_summary,
     }
 
 
@@ -341,9 +506,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
     actual_results = _actual_round_trip_results(engine)
     actual_by_pick = {result["pick_id"]: result for result in actual_results}
     evaluated = [
-        row
-        for row in rows
-        if row.win is not None or int(row.strategy_score_id) in actual_by_pick
+        row for row in rows if row.win is not None or int(row.strategy_score_id) in actual_by_pick
     ]
     lessons: list[dict[str, Any]] = []
     mistakes = guarded_winners = 0
@@ -371,7 +534,9 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         observed_pnl = (
             call_pnl
             if context == "pre_trade_forecast" and call_pnl is not None
-            else filled_pnl if filled_pnl is not None else call_pnl
+            else filled_pnl
+            if filled_pnl is not None
+            else call_pnl
         )
         assert observed_pnl is not None
         won = observed_pnl > 0.0
@@ -379,10 +544,12 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "actual_filled_round_trip" if filled_pnl is not None else "expiry_close_counterfactual"
         )
         useful: bool | None = None
+        decision_value: float | None = None
         lesson = "not_forecast_judgeable"
         if context == "pre_trade_forecast":
             forecast_judgeable += 1
             useful = won == approved
+            decision_value = observed_pnl if approved else -observed_pnl
             forecast_useful += int(useful)
             if not useful:
                 mistakes += 1
@@ -427,9 +594,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                     actual_result["exit_reason"] if actual_result is not None else None
                 ),
                 "max_profit_at_entry": (
-                    actual_result["max_profit_at_entry"]
-                    if actual_result is not None
-                    else None
+                    actual_result["max_profit_at_entry"] if actual_result is not None else None
                 ),
                 "realized_profit_capture_pct": (
                     actual_result["realized_profit_capture_pct"]
@@ -441,6 +606,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 "observed_win": won,
                 "observed_pnl": observed_pnl,
                 "forecast_useful": useful,
+                "decision_value": decision_value,
                 "lesson": lesson,
                 "review_reason": row.reason,
             }
@@ -484,16 +650,13 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
     guarded = [
         lesson
         for lesson in lessons
-        if lesson["review_context"] == "operational_guard"
-        and lesson["call_pnl"] is not None
+        if lesson["review_context"] == "operational_guard" and lesson["call_pnl"] is not None
     ]
 
     def guarded_groups(field: str) -> dict[str, dict[str, int | float | None]]:
         groups: dict[str, list[float]] = {}
         for lesson in guarded:
-            groups.setdefault(str(lesson[field]), []).append(
-                float(lesson["call_pnl"])
-            )
+            groups.setdefault(str(lesson[field]), []).append(float(lesson["call_pnl"]))
         result: dict[str, dict[str, int | float | None]] = {}
         for key, pnls in groups.items():
             wins = [pnl for pnl in pnls if pnl > 0]
@@ -555,6 +718,12 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "verdict": lesson["verdict"],
         }
 
+    ready_forecasts = [
+        lesson
+        for lesson in lessons
+        if lesson["review_context"] == "pre_trade_forecast" and lesson["call_pnl"] is not None
+    ]
+
     return {
         "meaning": (
             "Actual fill P&L (including commissions) measures execution; expiry-close "
@@ -567,6 +736,9 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         "forecast_useful": forecast_useful,
         "forecast_accuracy": (forecast_useful / forecast_judgeable if forecast_judgeable else None),
         "forecast_mistakes": mistakes,
+        "forecast_decision_value": round(
+            sum(float(lesson["decision_value"]) for lesson in ready_forecasts), 2
+        ),
         "guarded_theoretical_winners": guarded_winners,
         "actual_trade_summary": {
             "trades": len(actual_results),
@@ -588,17 +760,9 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "calls": len(guarded_pnls),
             "wins": len(guarded_win_pnls),
             "losses": len(guarded_loss_pnls),
-            "win_rate": (
-                len(guarded_win_pnls) / len(guarded_pnls)
-                if guarded_pnls
-                else None
-            ),
+            "win_rate": (len(guarded_win_pnls) / len(guarded_pnls) if guarded_pnls else None),
             "net_pnl": round(sum(guarded_pnls), 2),
-            "avg_pnl": (
-                round(sum(guarded_pnls) / len(guarded_pnls), 2)
-                if guarded_pnls
-                else None
-            ),
+            "avg_pnl": (round(sum(guarded_pnls) / len(guarded_pnls), 2) if guarded_pnls else None),
             "avg_win": (
                 round(sum(guarded_win_pnls) / len(guarded_win_pnls), 2)
                 if guarded_win_pnls
@@ -612,13 +776,10 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "by_strategy": guarded_groups("strategy"),
             "by_symbol": guarded_groups("symbol"),
             "by_strategy_symbol": guarded_pair_groups(),
-            "largest_winners": [
-                compact_guarded(lesson) for lesson in largest_winners
-            ],
-            "largest_losers": [
-                compact_guarded(lesson) for lesson in largest_losers
-            ],
+            "largest_winners": [compact_guarded(lesson) for lesson in largest_winners],
+            "largest_losers": [compact_guarded(lesson) for lesson in largest_losers],
         },
+        "forecast_call_summary": _lesson_call_summary(ready_forecasts),
         "terminal_call_summary": _terminal_call_summary(engine),
         "recent_lessons": lessons[: max(1, min(recent_limit, 100))],
     }
@@ -629,7 +790,7 @@ def correctness_report(engine: Engine) -> dict[str, Any]:
     rows = _review_outcome_rows(engine)
 
     verdicts = ("no_trade", "vetted_paper_candidate", "watch_only")
-    by_verdict: dict[str, dict[str, int | float | None]] = {}
+    by_verdict: dict[str, dict[str, Any]] = {}
     judgeable = 0
     useful = 0
     for verdict in verdicts:
@@ -649,12 +810,23 @@ def correctness_report(engine: Engine) -> dict[str, Any]:
             "judgeable": len(judged),
             "useful": verdict_useful,
             "accuracy": verdict_useful / len(judged) if judged else None,
+            "payoff": _decision_payoff(judged),
         }
 
     accuracy = useful / judgeable if judgeable else None
+    judged_rows = [
+        row
+        for row in rows
+        if row.win is not None and _review_context(row)[2] == "pre_trade_forecast"
+    ]
+    payoff = _decision_payoff(judged_rows)
     if accuracy is None:
         recommendation = "CHANGE"
-    elif accuracy < ACCURACY_THRESHOLD:
+    elif (
+        accuracy < ACCURACY_THRESHOLD
+        and payoff["payoff_efficiency"] is not None
+        and float(payoff["payoff_efficiency"]) < PAYOFF_EFFICIENCY_THRESHOLD
+    ):
         recommendation = "DISABLE"
     else:
         recommendation = "KEEP"
@@ -664,6 +836,8 @@ def correctness_report(engine: Engine) -> dict[str, Any]:
         "useful": useful,
         "accuracy": accuracy,
         "threshold": ACCURACY_THRESHOLD,
+        "payoff": payoff,
+        "payoff_efficiency_threshold": PAYOFF_EFFICIENCY_THRESHOLD,
         "recommendation": recommendation,
         "small_sample": judgeable < MIN_JUDGEABLE,
         "unmatched_calls": len(rows) - judgeable,
@@ -724,6 +898,8 @@ def evaluate_overlay(
     report = correctness_report(engine)
     judgeable = int(report["judgeable"])
     accuracy = report["accuracy"]
+    payoff = report["payoff"]
+    payoff_efficiency = payoff["payoff_efficiency"]
     if judgeable == current.judgeable:
         return current, False
 
@@ -736,12 +912,16 @@ def evaluate_overlay(
         and judgeable >= MIN_JUDGEABLE
         and accuracy is not None
         and float(accuracy) < ACCURACY_THRESHOLD
+        and payoff_efficiency is not None
+        and float(payoff_efficiency) < PAYOFF_EFFICIENCY_THRESHOLD
     ):
         enabled = False
         tripped = True
         reason = (
-            f"Hermes overlay accuracy {float(accuracy):.1%} is below "
-            f"{ACCURACY_THRESHOLD:.0%} after {judgeable} judgeable outcomes"
+            f"Hermes overlay accuracy {float(accuracy):.1%} and payoff efficiency "
+            f"{float(payoff_efficiency):.1%} are below their "
+            f"{ACCURACY_THRESHOLD:.0%} thresholds after {judgeable} judgeable outcomes; "
+            f"decision value ${float(payoff['decision_value']):.2f}"
         )
     state = HermesOverlayState(
         enabled=enabled,
@@ -792,6 +972,7 @@ def hold_pending_reviews(engine: Engine, state: HermesOverlayState) -> int:
 
 def breaker_report(engine: Engine) -> dict[str, Any]:
     state = load_overlay_state(engine)
+    correctness = correctness_report(engine)
     return {
         "enabled": state.enabled,
         "reason": state.reason,
@@ -800,5 +981,7 @@ def breaker_report(engine: Engine) -> dict[str, Any]:
         "last_evaluated_accuracy": state.accuracy,
         "minimum_judgeable": MIN_JUDGEABLE,
         "accuracy_threshold": ACCURACY_THRESHOLD,
+        "current_payoff": correctness["payoff"],
+        "payoff_efficiency_threshold": PAYOFF_EFFICIENCY_THRESHOLD,
         "reset_required": not state.enabled,
     }

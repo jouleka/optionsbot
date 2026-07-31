@@ -73,9 +73,7 @@ async def test_restricted_server_exposes_only_bounded_surface() -> None:
         "submit_entry_review",
         "track_record",
     }
-    assert {"add_to_watchlist", "remove_from_watchlist", "set_view_override"}.isdisjoint(
-        names
-    )
+    assert {"add_to_watchlist", "remove_from_watchlist", "set_view_override"}.isdisjoint(names)
 
 
 def test_restricted_health_attests_zero_dte_entry_window(
@@ -89,12 +87,15 @@ def test_restricted_health_attests_zero_dte_entry_window(
         zero_dte_only=True,
         zero_dte_entry_cutoff_minutes=90,
     )
-    with patch(
-        "optionsbot.mcp_server.tools.restricted.is_market_open",
-        return_value=True,
-    ), patch(
-        "optionsbot.mcp_server.tools.restricted.minutes_to_nyse_close",
-        return_value=180.0,
+    with (
+        patch(
+            "optionsbot.mcp_server.tools.restricted.is_market_open",
+            return_value=True,
+        ),
+        patch(
+            "optionsbot.mcp_server.tools.restricted.minutes_to_nyse_close",
+            return_value=180.0,
+        ),
     ):
         result = get_tools(restricted.register)["health"](FakeCtx(context))
 
@@ -225,26 +226,29 @@ def test_hermes_metrics_uses_only_judgeable_calls_and_reports_churn(
         FakeCtx(SimpleNamespace(engine=mcp_engine))
     )
 
-    assert metrics["entry_overlay_correctness"] == {
-        "calls": 3,
-        "judgeable": 3,
-        "useful": 1,
-        "accuracy": 1 / 3,
-        "threshold": 0.5,
-        "recommendation": "DISABLE",
-        "small_sample": True,
-        "unmatched_calls": 0,
-        "by_verdict": {
-            "no_trade": {"calls": 1, "judgeable": 1, "useful": 0, "accuracy": 0.0},
-            "vetted_paper_candidate": {
-                "calls": 1,
-                "judgeable": 1,
-                "useful": 1,
-                "accuracy": 1.0,
-            },
-            "watch_only": {"calls": 1, "judgeable": 1, "useful": 0, "accuracy": 0.0},
-        },
+    correctness = metrics["entry_overlay_correctness"]
+    assert correctness["calls"] == 3
+    assert correctness["judgeable"] == 3
+    assert correctness["useful"] == 1
+    assert correctness["accuracy"] == 1 / 3
+    assert correctness["threshold"] == 0.5
+    assert correctness["payoff_efficiency_threshold"] == 0.5
+    assert correctness["recommendation"] == "KEEP"
+    assert correctness["small_sample"] is True
+    assert correctness["unmatched_calls"] == 0
+    assert correctness["payoff"] == {
+        "captured_profit": 125.0,
+        "avoided_loss": 0.0,
+        "missed_profit": 60.0,
+        "incurred_loss": 0.0,
+        "helpful_dollars": 125.0,
+        "harmful_dollars": 60.0,
+        "decision_value": 65.0,
+        "payoff_efficiency": 125 / 185,
     }
+    assert correctness["by_verdict"]["no_trade"]["accuracy"] == 0.0
+    assert correctness["by_verdict"]["vetted_paper_candidate"]["accuracy"] == 1.0
+    assert correctness["by_verdict"]["watch_only"]["accuracy"] == 0.0
     assert metrics["request_churn"]["entry_reviews_by_status"] == {
         "held": 1,
         "refused": 1,
@@ -354,9 +358,7 @@ def test_watch_only_result_does_not_claim_overlay_breaker(
     with daemon_context.engine.begin() as conn:
         snapshot_id = int(
             conn.execute(
-                insert(snapshots).values(
-                    symbol="SPY", ts=now, spot=600.0, raw_json={}
-                )
+                insert(snapshots).values(symbol="SPY", ts=now, spot=600.0, raw_json={})
             ).inserted_primary_key[0]
         )
         score_id = int(
@@ -429,20 +431,14 @@ def test_primary_database_engine_is_physically_read_only(
     mcp_engine: Engine, mcp_settings: Settings
 ) -> None:
     with mcp_engine.begin() as conn:
-        conn.execute(
-            insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC))
-        )
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
     readonly = create_readonly_engine_for_path(mcp_settings.storage.db_path)
     try:
         with readonly.connect() as conn:
             assert conn.execute(select(watchlist.c.symbol)).scalar_one() == "SPY"
         with pytest.raises(OperationalError):
             with readonly.begin() as conn:
-                conn.execute(
-                    insert(watchlist).values(
-                        symbol="QQQ", added_at=datetime.now(UTC)
-                    )
-                )
+                conn.execute(insert(watchlist).values(symbol="QQQ", added_at=datetime.now(UTC)))
     finally:
         readonly.dispose()
 
@@ -543,8 +539,7 @@ def test_terminal_proposal_decision_is_available_to_next_learning_pass(
             "processed_at": proposed_at.isoformat(),
             "status": "processed",
             "decision": (
-                "Hermes proposal declined as score #42: "
-                "non_positive_edge(expected_value=-12.50)"
+                "Hermes proposal declined as score #42: non_positive_edge(expected_value=-12.50)"
             ),
         }
     ]
@@ -646,9 +641,7 @@ async def test_declined_entry_proposal_does_not_create_alertless_review(
         ),
     )
     account = SimpleNamespace(net_liquidation_usd=10_000.0)
-    positions_client = SimpleNamespace(
-        get_account_summary=AsyncMock(return_value=account)
-    )
+    positions_client = SimpleNamespace(get_account_summary=AsyncMock(return_value=account))
     payload = {
         "proposed_at": now.isoformat(),
         "symbol": "SPY",
@@ -783,9 +776,7 @@ async def test_entry_proposal_uses_fresh_economics_after_preliminary_rejection(
         ),
     )
     positions_client = SimpleNamespace(
-        get_account_summary=AsyncMock(
-            return_value=SimpleNamespace(net_liquidation_usd=10_000.0)
-        )
+        get_account_summary=AsyncMock(return_value=SimpleNamespace(net_liquidation_usd=10_000.0))
     )
     payload = {
         "proposed_at": now.isoformat(),

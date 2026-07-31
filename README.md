@@ -225,12 +225,13 @@ Hermes supervision endpoints are implemented; execution remains off by
 default and requires operational acceptance before re-enablement.
 
 Hermes-vetted automatic entries have a separate persistent correctness
-circuit breaker. After at least 20 judgeable review outcomes, accuracy below
-50% disables only the Hermes entry overlay; scans, reconciliation, order
-management, and deterministic exits continue. Telegram `/overlay` reports the
-state and `/overlayreset` is the explicit human re-enable action. A reset
-acknowledges current evidence, and the rule is evaluated again when a new
-judgeable outcome arrives.
+circuit breaker. After at least 20 judgeable review outcomes, both directional
+accuracy and payoff-weighted efficiency below 50% disable only the Hermes entry
+overlay; scans, reconciliation, order management, and deterministic exits
+continue. This prevents a missed small winner from counting the same as an
+avoided large loss. Telegram `/overlay` reports the state and `/overlayreset`
+is the explicit human re-enable action. A reset acknowledges current evidence,
+and the rule is evaluated again when a new judgeable outcome arrives.
 
 Implementation is tracked in YouTrack project
 [IBK](https://tracker.example.invalid/projects/0-2); implementation

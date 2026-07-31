@@ -217,10 +217,7 @@ def test_pending_picks_omits_unalerted_scores(server_context: ServerContext) -> 
 def test_pending_picks_ten_item_queue_stays_below_transport_budget(
     server_context: ServerContext,
 ) -> None:
-    score_ids = [
-        _snapshot_with_score(server_context, score=90.0 - index)
-        for index in range(10)
-    ]
+    score_ids = [_snapshot_with_score(server_context, score=90.0 - index) for index in range(10)]
 
     result = get_tools(register)["pending_picks"](
         limit=10,
@@ -232,8 +229,7 @@ def test_pending_picks_ten_item_queue_stays_below_transport_budget(
     assert result["count"] == 10
     assert {pick["pick_id"] for pick in result["picks"]} == set(score_ids)
     assert all(
-        pick["full_packet_embedded"] is False
-        and pick["next_tool"] == "pick_review_packet"
+        pick["full_packet_embedded"] is False and pick["next_tool"] == "pick_review_packet"
         for pick in result["picks"]
     )
     assert len(json.dumps(result, default=str)) < 50_000
@@ -249,11 +245,13 @@ def test_compact_feedback_keeps_only_relevant_exact_tuple_groups() -> None:
     feedback = {
         name: {"calls": 18, "by_strategy_symbol": groups}
         for name in (
+            "forecast_call_summary",
             "terminal_call_summary",
             "actual_trade_summary",
             "guarded_call_summary",
         )
     }
+    feedback["forecast_call_summary"]["by_strategy_symbol_sessions"] = groups
 
     compact = _compact_learning_feedback(
         feedback,
@@ -269,13 +267,13 @@ def test_compact_feedback_keeps_only_relevant_exact_tuple_groups() -> None:
     for name in feedback:
         assert set(compact[name]["by_strategy_symbol"]) == expected
         assert compact[name]["calls"] == 18
+    assert set(compact["forecast_call_summary"]["by_strategy_symbol_sessions"]) == expected
 
 
 def test_compact_feedback_bounds_verbose_recent_rows() -> None:
     feedback = {
         "recent_lessons": [
-            {"review_id": index, "review_reason": "r" * 1_000}
-            for index in range(10)
+            {"review_id": index, "review_reason": "r" * 1_000} for index in range(10)
         ],
         "recent_proposal_decisions": [
             {
@@ -350,10 +348,18 @@ def test_submit_entry_review_rejects_unalerted_score(
         confidence=0.91,
         sources=["issuer calendar", "independent market-data source"],
         reason="The evidence passes, but the bot did not select this candidate.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -448,10 +454,18 @@ def test_submit_entry_review_rejects_delayed_candidate(
         confidence=0.91,
         sources=["source A", "source B"],
         reason="Claimed pass despite delayed snapshot.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -560,10 +574,18 @@ def test_submit_entry_review_rejects_low_confidence_vetted(
         confidence=0.79,
         sources=["source A", "source B"],
         reason="Evidence is not strong enough.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -585,10 +607,18 @@ def test_submit_entry_review_requires_two_sources_for_vetted(
         confidence=0.90,
         sources=["one source only"],
         reason="Insufficient corroboration.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -610,10 +640,18 @@ def test_submit_entry_review_requires_two_distinct_sources_for_vetted(
         confidence=0.90,
         sources=["same source", "same source"],
         reason="Duplicating one source is not corroboration.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -630,15 +668,17 @@ def test_submit_entry_review_rejects_non_positive_candidate_economics(
         conn.execute(
             update(strategy_scores)
             .where(strategy_scores.c.id == score_id)
-            .values(suggestion_json={
-                "defined_risk": True,
-                "credit_or_debit": 120.0,
-                "max_loss": 380.0,
-                "max_profit": 120.0,
-                "prob_profit": 0.68,
-                "expected_value": -1.0,
-                "suggested_quantity": 1,
-            })
+            .values(
+                suggestion_json={
+                    "defined_risk": True,
+                    "credit_or_debit": 120.0,
+                    "max_loss": 380.0,
+                    "max_profit": 120.0,
+                    "prob_profit": 0.68,
+                    "expected_value": -1.0,
+                    "suggested_quantity": 1,
+                }
+            )
         )
     submit_entry_review = get_tools(register)["submit_entry_review"]
 
@@ -649,10 +689,18 @@ def test_submit_entry_review_rejects_non_positive_candidate_economics(
         confidence=0.90,
         sources=["source A", "source B"],
         reason="Hermes must not override negative persisted EV.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -683,10 +731,18 @@ def test_submit_entry_review_rejects_stale_pick(
         confidence=0.90,
         sources=["source A", "source B"],
         reason="Stale candidates must not be queued.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 
@@ -763,10 +819,18 @@ def test_submit_entry_review_does_not_override_existing_no_trade(
         confidence=0.95,
         sources=["source A", "source B"],
         reason="Must not replace the prior veto for this exact pick.",
-        checks={name: True for name in (
-            "bot_health", "candidate", "microstructure", "greeks",
-            "regime_history", "catalysts", "account_risk",
-        )},
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
         ctx=FakeCtx(server_context),
     )
 

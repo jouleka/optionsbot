@@ -39,16 +39,31 @@ def test_missing_overlay_state_fails_closed(daemon_context: DaemonContext) -> No
     assert reset.enabled is True
 
 
-def _add_judgeable(context: DaemonContext, *, count: int, wins: int, offset: int = 0) -> None:
+def _add_judgeable(
+    context: DaemonContext,
+    *,
+    count: int,
+    wins: int,
+    offset: int = 0,
+    win_pnl: float = 100.0,
+    loss_pnl: float = -100.0,
+    strategy_name: str | None = None,
+    expiry: str = "2026-07-17",
+) -> None:
     now = datetime.now(UTC)
     with context.engine.begin() as conn:
-        snapshot_id = int(
-            conn.execute(
-                insert(snapshots).values(symbol="SPY", ts=now, spot=600.0, raw_json={})
-            ).inserted_primary_key[0]
-        )
         for index in range(count):
-            strategy = f"breaker-test-{offset + index}"
+            snapshot_id = int(
+                conn.execute(
+                    insert(snapshots).values(
+                        symbol="SPY",
+                        ts=now + timedelta(microseconds=offset + index),
+                        spot=600.0,
+                        raw_json={},
+                    )
+                ).inserted_primary_key[0]
+            )
+            strategy = strategy_name or f"breaker-test-{offset + index}"
             score_id = int(
                 conn.execute(
                     insert(strategy_scores).values(
@@ -101,10 +116,10 @@ def _add_judgeable(context: DaemonContext, *, count: int, wins: int, offset: int
                     strategy_score_id=score_id,
                     symbol="SPY",
                     strategy=strategy,
-                    expiry="2026-07-17",
+                    expiry=expiry,
                     entry_spot=600.0,
                     terminal_spot=601.0,
-                    realized_pnl=100.0 if win else -100.0,
+                    realized_pnl=win_pnl if win else loss_pnl,
                     win=win,
                     evaluated_at=now,
                 )
@@ -132,7 +147,7 @@ def test_overlay_trips_persists_and_requires_explicit_reset(
     assert tripped is True
     assert state.enabled is False
     assert state.accuracy == 0.45
-    assert "below 50%" in str(state.reason)
+    assert "below their 50% thresholds" in str(state.reason)
     assert load_overlay_state(daemon_context.engine).enabled is False
 
     reset = reset_overlay(daemon_context.engine)
@@ -154,6 +169,69 @@ def test_overlay_trips_persists_and_requires_explicit_reset(
     assert tripped is False
     assert state.enabled is False
     assert state.accuracy == 21 / 33
+
+
+def test_overlay_does_not_trip_when_low_hit_rate_has_positive_payoff(
+    daemon_context: DaemonContext,
+) -> None:
+    _add_judgeable(
+        daemon_context,
+        count=20,
+        wins=8,
+        win_pnl=100.0,
+        loss_pnl=-10.0,
+    )
+
+    state, tripped = evaluate_overlay(daemon_context.engine)
+
+    assert tripped is False
+    assert state.enabled is True
+    assert state.accuracy == 0.4
+
+
+def test_forecast_learning_normalizes_repeated_scans_by_session(
+    daemon_context: DaemonContext,
+) -> None:
+    _add_judgeable(
+        daemon_context,
+        count=2,
+        wins=1,
+        strategy_name="iron_condor",
+        expiry="2026-07-30",
+    )
+    _add_judgeable(
+        daemon_context,
+        count=1,
+        wins=1,
+        offset=2,
+        strategy_name="iron_condor",
+        expiry="2026-07-31",
+    )
+
+    summary = learning_feedback(daemon_context.engine)["forecast_call_summary"]
+
+    assert summary["calls"] == 3
+    assert summary["wins"] == 2
+    assert summary["net_pnl"] == 100.0
+    assert summary["decision_payoff"] == {
+        "captured_profit": 200.0,
+        "avoided_loss": 0.0,
+        "missed_profit": 0.0,
+        "incurred_loss": 100.0,
+        "decision_value": 100.0,
+        "payoff_efficiency": 2 / 3,
+    }
+    assert summary["by_strategy_symbol_sessions"]["SPY|iron_condor"] == {
+        "observations": 3,
+        "sessions": 2,
+        "winning_sessions": 1,
+        "losing_sessions": 1,
+        "session_win_rate": 0.5,
+        "net_session_avg_pnl": 100.0,
+        "avg_pnl_per_session": 50.0,
+        "net_session_decision_value": 100.0,
+        "avg_decision_value_per_session": 50.0,
+    }
 
 
 def test_learning_feedback_records_actual_post_trade_result_without_outcome(
@@ -347,9 +425,10 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
         "win_rate": 1.0,
         "avg_pnl": 150.0,
     }
-    assert feedback["terminal_call_summary"]["by_strategy_symbol"][
-        "IWM|bull_call_spread"
-    ]["net_pnl"] == 150.0
+    assert (
+        feedback["terminal_call_summary"]["by_strategy_symbol"]["IWM|bull_call_spread"]["net_pnl"]
+        == 150.0
+    )
 
 
 def test_learning_feedback_includes_intrinsic_expiration_settlement(
