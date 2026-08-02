@@ -128,6 +128,32 @@ def test_zero_dte_debit_ignores_intraday_soft_stop_until_close_guard() -> None:
     ) is None
 
 
+def test_opening_range_debit_stop_overrides_generic_zero_dte_hold() -> None:
+    reason = evaluate_exit(
+        entry_net=-2.00,
+        current_net=-1.70,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=300,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.30,
+    )
+    assert reason is not None and "opening-range FVG" in reason and "stop-loss" in reason
+
+
+def test_opening_range_debit_two_r_target() -> None:
+    reason = evaluate_exit(
+        entry_net=-2.00,
+        current_net=-2.60,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=300,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.30,
+    )
+    assert reason is not None and "opening-range FVG" in reason and "take-profit" in reason
+
+
 def test_zero_dte_debit_half_gain_arms_trail_instead_of_closing() -> None:
     """The old +50%-of-debit trigger is now a winner-trail arming point."""
     settings = _settings(zero_dte_only=True)

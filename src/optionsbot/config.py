@@ -81,6 +81,16 @@ class HermesWebhookSettings(BaseModel):
 
 class ScanSettings(BaseModel):
     interval_minutes: int = Field(default=15, ge=1)
+    # Optional 0DTE opening-range playbook. The daemon observes the first
+    # N New York-session minutes, then admits only a close-confirmed breakout
+    # whose newly formed FVG is later retested and respected before the entry
+    # window ends. One-minute bars are the production profile; five-minute is
+    # retained for controlled comparison.
+    opening_range_fvg_enabled: bool = False
+    opening_range_timeframe_minutes: Literal[1, 5] = 1
+    opening_range_minutes: int = Field(default=10, ge=5, le=30)
+    opening_range_entry_window_minutes: int = Field(default=90, ge=30, le=180)
+    opening_range_signal_max_age_minutes: int = Field(default=3, ge=1, le=10)
     # Relative strength (IBK-109): each symbol's return minus this benchmark's over
     # relative_strength_window trading days, surfaced in daily_brief as context.
     benchmark_symbol: str = Field(default="SPY")
@@ -131,6 +141,15 @@ class ScanSettings(BaseModel):
             raise ValueError(
                 "scan DTE settings must satisfy "
                 "dte_window_min <= dte_target <= dte_window_max"
+            )
+        if self.opening_range_minutes % self.opening_range_timeframe_minutes:
+            raise ValueError(
+                "scan.opening_range_minutes must be divisible by "
+                "opening_range_timeframe_minutes"
+            )
+        if self.opening_range_entry_window_minutes <= self.opening_range_minutes:
+            raise ValueError(
+                "scan.opening_range_entry_window_minutes must end after the range"
             )
         return self
 
@@ -193,6 +212,12 @@ class ExecutionSettings(BaseModel):
     zero_dte_only: bool = False
     zero_dte_entry_cutoff_minutes: int = Field(default=90, ge=30, le=240)
     zero_dte_force_exit_minutes: int = Field(default=30, ge=10, le=120)
+    # Opening-range/FVG trade plan. These are option-premium returns, not
+    # account-risk settings: -15% of entry debit and either 1.5R or 2R profit.
+    opening_range_max_entries_per_day: int = Field(default=3, ge=1, le=3)
+    opening_range_stop_pct: float = Field(default=0.15, gt=0.0, lt=1.0)
+    opening_range_target_r_min: float = Field(default=1.5, ge=1.0, le=3.0)
+    opening_range_target_r_max: float = Field(default=2.0, ge=1.0, le=3.0)
     # Crossing the generic debit target arms a durable winner trail rather
     # than immediately dumping an exact-0DTE debit structure. A bounded spread
     # is harvested once it captures the configured share of maximum profit.
@@ -309,6 +334,11 @@ class ExecutionSettings(BaseModel):
                 "execution.zero_dte_force_exit_minutes must be less than "
                 "execution.zero_dte_entry_cutoff_minutes"
             )
+        if self.opening_range_target_r_max < self.opening_range_target_r_min:
+            raise ValueError(
+                "execution.opening_range_target_r_max must be greater than or equal "
+                "to opening_range_target_r_min"
+            )
         if (
             self.zero_dte_debit_trail_late_giveback_pct
             > self.zero_dte_debit_trail_early_giveback_pct
@@ -411,6 +441,14 @@ class Settings(BaseSettings):
     monitor: MonitorSettings = MonitorSettings()
 
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def _validate_strategy_modes(self) -> Settings:
+        if self.scan.opening_range_fvg_enabled and not self.execution.zero_dte_only:
+            raise ValueError(
+                "scan.opening_range_fvg_enabled requires execution.zero_dte_only=true"
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_prefix="OPTIONSBOT_",

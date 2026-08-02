@@ -209,6 +209,84 @@ async def test_enqueue_alert_skips_when_dedup_says_no(
     daemon_context.telegram.send_message.assert_not_awaited()
 
 
+async def test_opening_range_signal_is_alerted_only_once_per_strategy(
+    daemon_context: DaemonContext,
+) -> None:
+    plan = {
+        "status": "entry_confirmed",
+        "signal_id": "2026-07-31:SPY:bull:formed:respected",
+    }
+    with daemon_context.engine.begin() as conn:
+        first_snapshot = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=datetime.now(UTC),
+                    spot=400.0,
+                    regime_dir="bull",
+                    regime_iv="neutral",
+                    raw_json={"opening_range_fvg": plan},
+                )
+            ).inserted_primary_key[0]
+        )
+        first_score = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=first_snapshot,
+                    strategy="iron_condor",
+                    score=80.0,
+                    rationale="first observation",
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(alerts).values(
+                strategy_score_id=first_score,
+                ts=datetime.now(UTC),
+                symbol="SPY",
+                strategy="iron_condor",
+                score=80.0,
+                status="sent",
+            )
+        )
+        second_snapshot = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=datetime.now(UTC),
+                    spot=401.0,
+                    regime_dir="bull",
+                    regime_iv="neutral",
+                    raw_json={"opening_range_fvg": plan},
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=second_snapshot,
+                strategy="iron_condor",
+                score=90.0,
+                rationale="same setup observed again",
+                legs_json=[],
+                suggestion_json={},
+            )
+        )
+
+    with patch("optionsbot.daemon.alert_pipeline.should_alert") as cooldown_gate:
+        was_enqueued = await enqueue_alert(
+            daemon_context,
+            "SPY",
+            _scored(score=90.0),
+            second_snapshot,
+        )
+
+    assert was_enqueued is False
+    cooldown_gate.assert_not_called()
+    daemon_context.telegram.send_message.assert_not_awaited()
+
+
 async def test_enqueue_alert_returns_true_when_actually_enqueued(
     daemon_context: DaemonContext,
 ) -> None:

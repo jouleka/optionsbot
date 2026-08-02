@@ -28,6 +28,9 @@ class RestrictedServerContext:
     max_pick_age_minutes: int
     zero_dte_only: bool = False
     zero_dte_entry_cutoff_minutes: int = 90
+    opening_range_fvg_enabled: bool = False
+    opening_range_minutes: int = 10
+    opening_range_entry_window_minutes: int = 90
     broker_access: bool = field(default=False, init=False)
 
     @property
@@ -38,7 +41,14 @@ class RestrictedServerContext:
                 max_pick_age_minutes=self.max_pick_age_minutes,
                 zero_dte_only=self.zero_dte_only,
                 zero_dte_entry_cutoff_minutes=self.zero_dte_entry_cutoff_minutes,
-            )
+            ),
+            scan=SimpleNamespace(
+                opening_range_fvg_enabled=self.opening_range_fvg_enabled,
+                opening_range_minutes=self.opening_range_minutes,
+                opening_range_entry_window_minutes=(
+                    self.opening_range_entry_window_minutes
+                ),
+            ),
         )
 
     async def shutdown(self) -> None:
@@ -73,12 +83,36 @@ async def restricted_app_lifespan(
         raise RuntimeError(
             "OPTIONSBOT_MCP_ZERO_DTE_ENTRY_CUTOFF_MINUTES must be within 30..240"
         )
+    opening_range_raw = os.environ.get(
+        "OPTIONSBOT_MCP_OPENING_RANGE_FVG_ENABLED", "false"
+    ).lower()
+    if opening_range_raw not in {"true", "false"}:
+        raise RuntimeError(
+            "OPTIONSBOT_MCP_OPENING_RANGE_FVG_ENABLED must be true or false"
+        )
+    opening_range_minutes = int(
+        os.environ.get("OPTIONSBOT_MCP_OPENING_RANGE_MINUTES", "10")
+    )
+    opening_range_entry_window_minutes = int(
+        os.environ.get("OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES", "90")
+    )
+    if not 5 <= opening_range_minutes <= 30:
+        raise RuntimeError("OPTIONSBOT_MCP_OPENING_RANGE_MINUTES must be within 5..30")
+    if not 30 <= opening_range_entry_window_minutes <= 180:
+        raise RuntimeError(
+            "OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES must be within 30..180"
+        )
+    if opening_range_entry_window_minutes <= opening_range_minutes:
+        raise RuntimeError("opening-range entry window must end after the range")
     ctx = RestrictedServerContext(
         engine=create_readonly_engine_for_path(primary_path),
         intent_engine=create_intent_engine(intent_path),
         max_pick_age_minutes=max_age,
         zero_dte_only=zero_dte_raw == "true",
         zero_dte_entry_cutoff_minutes=cutoff,
+        opening_range_fvg_enabled=opening_range_raw == "true",
+        opening_range_minutes=opening_range_minutes,
+        opening_range_entry_window_minutes=opening_range_entry_window_minutes,
     )
     try:
         yield ctx

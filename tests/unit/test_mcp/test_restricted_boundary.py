@@ -105,6 +105,10 @@ def test_restricted_health_attests_zero_dte_entry_window(
         "minutes_to_close": 180.0,
         "zero_dte_only": True,
         "zero_dte_entry_cutoff_minutes": 90,
+        "opening_range_fvg_enabled": False,
+        "opening_range_minutes": 10,
+        "opening_range_entry_window_minutes": 90,
+        "opening_range_window_open": True,
         "entry_window_open": True,
     }
 

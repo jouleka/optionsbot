@@ -27,6 +27,13 @@ def test_default_settings_are_valid() -> None:
     assert s.execution.zero_dte_debit_trail_late_giveback_pct == 0.10
 
 
+def test_opening_range_mode_requires_exact_zero_dte_execution() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="zero_dte_only"):
+        Settings(scan=ScanSettings(opening_range_fvg_enabled=True))
+
+
 def test_manage_settings_defaults() -> None:
     s = Settings()
     assert s.manage.enabled is True

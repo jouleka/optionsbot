@@ -72,6 +72,7 @@ from optionsbot.storage.schema import (
     fills,
     orders,
     pick_outcomes,
+    strategy_scores,
 )
 
 log = logging.getLogger(__name__)
@@ -118,6 +119,38 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
         if record is not None:
             records.append(record)
     return records
+
+
+def _opening_range_exit_plan(
+    engine: Engine, entry: OrderRecord
+) -> tuple[float, float] | None:
+    """Return the persisted stop and take-profit fractions for an ORB entry."""
+    if entry.strategy_score_id is None:
+        return None
+    with engine.connect() as conn:
+        suggestion = conn.execute(
+            select(strategy_scores.c.suggestion_json).where(
+                strategy_scores.c.id == entry.strategy_score_id
+            )
+        ).scalar_one_or_none()
+    if not isinstance(suggestion, dict):
+        return None
+    plan = suggestion.get("opening_range_fvg")
+    if not isinstance(plan, dict) or plan.get("status") != "entry_confirmed":
+        return None
+    try:
+        stop_pct = float(plan["stop_pct"])
+        target_pct = float(plan["target_pct"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(stop_pct)
+        or not math.isfinite(target_pct)
+        or not 0 < stop_pct < 1
+        or not 0 < target_pct < 1
+    ):
+        return None
+    return stop_pct, target_pct
 
 
 async def _settle_cleared_expirations(
@@ -455,6 +488,7 @@ async def _quote_gate_state(
             entry.legs,
             entry_net_per_share=entry_net,
         )
+        opening_range_plan = _opening_range_exit_plan(context.engine, entry)
         deterministic_reason = evaluate_exit(
             entry_net=entry_net,
             current_net=current_net,
@@ -463,6 +497,12 @@ async def _quote_gate_state(
             minutes_to_close=minutes_to_nyse_close(now),
             max_profit_per_unit=max_profit,
             peak_pnl_per_unit=peak_pnl_for(context.engine, entry.id),
+            debit_stop_pct_override=(
+                opening_range_plan[0] if opening_range_plan is not None else None
+            ),
+            debit_take_profit_pct_override=(
+                opening_range_plan[1] if opening_range_plan is not None else None
+            ),
         )
     return QuoteGateState(
         entry_net=entry_net,
@@ -867,6 +907,7 @@ async def _manage_entry(
         entry.legs,
         entry_net_per_share=entry_net,
     )
+    opening_range_plan = _opening_range_exit_plan(engine, entry)
 
     reason: str | None
     if forced_reason is not None:
@@ -883,6 +924,12 @@ async def _manage_entry(
             minutes_to_close=minutes_to_nyse_close(now),
             max_profit_per_unit=max_profit,
             peak_pnl_per_unit=peak_pnl,
+            debit_stop_pct_override=(
+                opening_range_plan[0] if opening_range_plan is not None else None
+            ),
+            debit_take_profit_pct_override=(
+                opening_range_plan[1] if opening_range_plan is not None else None
+            ),
         )
     pnl_pct = pnl / abs(entry_net) * 100.0 if pnl is not None and abs(entry_net) > 1e-9 else None
     log.info(

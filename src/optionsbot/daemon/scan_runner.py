@@ -7,11 +7,15 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import insert, select
 
+from optionsbot.analysis.opening_range_fvg import (
+    OpeningRangeFVGSignal,
+    detect_opening_range_fvg,
+)
 from optionsbot.analysis.types import Direction, IVRegime
 from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
 from optionsbot.daemon.context import DaemonContext
@@ -188,7 +192,72 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
 
         for sym, override in symbols:
             with bind_log_context(symbol=sym):
+                opening_signal: OpeningRangeFVGSignal | None = None
                 try:
+                    if context.settings.scan.opening_range_fvg_enabled:
+                        async with context.ibkr_lock:
+                            intraday = await asyncio.wait_for(
+                                HistoryClient(
+                                    context.ibkr, context.resolver
+                                ).get_intraday_history(
+                                    sym,
+                                    timeframe_minutes=(
+                                        context.settings.scan.opening_range_timeframe_minutes
+                                    ),
+                                ),
+                                timeout=context.settings.scan.scan_symbol_timeout_s,
+                            )
+                        tickers_scanned += 1
+                        signal_checked_at = datetime.now(UTC)
+                        opening_signal = detect_opening_range_fvg(
+                            intraday,
+                            symbol=sym,
+                            now=signal_checked_at,
+                            timeframe_minutes=(
+                                context.settings.scan.opening_range_timeframe_minutes
+                            ),
+                            opening_range_minutes=(
+                                context.settings.scan.opening_range_minutes
+                            ),
+                            entry_window_minutes=(
+                                context.settings.scan.opening_range_entry_window_minutes
+                            ),
+                            stop_pct=context.settings.execution.opening_range_stop_pct,
+                            target_r_min=(
+                                context.settings.execution.opening_range_target_r_min
+                            ),
+                            target_r_max=(
+                                context.settings.execution.opening_range_target_r_max
+                            ),
+                        )
+                        if opening_signal is None:
+                            continue
+                        signal_completed = opening_signal.respected_ts + timedelta(
+                            minutes=opening_signal.timeframe_minutes
+                        )
+                        signal_age = signal_checked_at - signal_completed.astimezone(UTC)
+                        if signal_age < timedelta(0) or signal_age > timedelta(
+                            minutes=(
+                                context.settings.scan.opening_range_signal_max_age_minutes
+                            )
+                        ):
+                            log.info(
+                                "opening-range signal stale: id=%s age=%.1fm",
+                                opening_signal.signal_id,
+                                signal_age.total_seconds() / 60.0,
+                            )
+                            continue
+                        log.info(
+                            "opening-range FVG entry confirmed: direction=%s "
+                            "range=%.4f/%.4f gap=%.4f/%.4f target=%.1fR id=%s",
+                            opening_signal.direction,
+                            opening_signal.opening_range_low,
+                            opening_signal.opening_range_high,
+                            opening_signal.fvg_low,
+                            opening_signal.fvg_high,
+                            opening_signal.target_r,
+                            opening_signal.signal_id,
+                        )
                     # Serialize one complete symbol quote set, then release the
                     # session so a queued exit check takes priority before the
                     # next symbol.  asyncio.Lock wakes waiters FIFO.
@@ -198,6 +267,7 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                                 sym, context.ibkr, context.engine, context.settings,
                                 resolver=context.resolver,
                                 view_override=override,
+                                opening_range_signal=opening_signal,
                             ),
                             timeout=context.settings.scan.scan_symbol_timeout_s,
                         )
@@ -215,7 +285,8 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                     log.exception("scan_symbol failed for %s", sym)
                     errors.append(f"{sym}: {type(e).__name__}: {e}")
                     continue
-                tickers_scanned += 1
+                if not context.settings.scan.opening_range_fvg_enabled:
+                    tickers_scanned += 1
                 for scored in result.scored:
                     all_picks.append((sym, scored, result.snapshot_id))
 

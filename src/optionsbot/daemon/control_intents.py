@@ -149,6 +149,7 @@ def _consume_exit_request(context: DaemonContext, payload: dict[str, Any]) -> st
 
 async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any]) -> str:
     """Rebuild a Hermes idea from live data; OptionsBot remains authoritative."""
+    from optionsbot.analysis.opening_range_fvg import detect_opening_range_fvg
     from optionsbot.daemon.alert_pipeline import enqueue_alert
     from optionsbot.daemon.auto_executor import auto_execute_candidates
     from optionsbot.daemon.candidate_evidence import (
@@ -158,11 +159,13 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
     from optionsbot.daemon.market_hours import (
         is_market_open,
         minutes_to_nyse_close,
+        nyse_session_start_utc,
     )
     from optionsbot.daemon.scan_runner import (
         candidate_admission_blockers,
         rank_alert_candidates,
     )
+    from optionsbot.ibkr.history import HistoryClient
     from optionsbot.ibkr.positions import PositionsClient
     from optionsbot.scan import scan_symbol
     from optionsbot.strategies import get_strategy
@@ -216,7 +219,62 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
     ):
         raise ValueError("proposal arrived after the 0DTE entry cutoff")
 
+    opening_range_enabled = bool(
+        getattr(context.settings.scan, "opening_range_fvg_enabled", False)
+    )
+    opening_signal = None
+    if opening_range_enabled:
+        if direction not in {"bull", "bear"}:
+            return "proposal declined: opening-range/FVG mode requires bull or bear direction"
+        market_open_at = nyse_session_start_utc(now) + timedelta(hours=9, minutes=30)
+        range_end = market_open_at + timedelta(
+            minutes=context.settings.scan.opening_range_minutes
+        )
+        entry_end = market_open_at + timedelta(
+            minutes=context.settings.scan.opening_range_entry_window_minutes
+        )
+        if not range_end <= now <= entry_end:
+            return "proposal declined: outside the 09:40–11:00 ET opening-range window"
+
     async with context.ibkr_lock:
+        if opening_range_enabled:
+            intraday = await asyncio.wait_for(
+                HistoryClient(context.ibkr, context.resolver).get_intraday_history(
+                    symbol,
+                    timeframe_minutes=(
+                        context.settings.scan.opening_range_timeframe_minutes
+                    ),
+                ),
+                timeout=context.settings.scan.scan_symbol_timeout_s,
+            )
+            opening_signal = detect_opening_range_fvg(
+                intraday,
+                symbol=symbol,
+                now=now,
+                timeframe_minutes=context.settings.scan.opening_range_timeframe_minutes,
+                opening_range_minutes=context.settings.scan.opening_range_minutes,
+                entry_window_minutes=(
+                    context.settings.scan.opening_range_entry_window_minutes
+                ),
+                stop_pct=context.settings.execution.opening_range_stop_pct,
+                target_r_min=context.settings.execution.opening_range_target_r_min,
+                target_r_max=context.settings.execution.opening_range_target_r_max,
+            )
+            if opening_signal is None:
+                return "proposal declined: no confirmed opening-range/FVG retest"
+            signal_completed = opening_signal.respected_ts.astimezone(UTC) + timedelta(
+                minutes=opening_signal.timeframe_minutes
+            )
+            signal_age = now - signal_completed
+            if signal_age < timedelta(0) or signal_age > timedelta(
+                minutes=context.settings.scan.opening_range_signal_max_age_minutes
+            ):
+                return "proposal declined: opening-range/FVG confirmation is stale"
+            if opening_signal.direction != direction:
+                return (
+                    "proposal declined: direction conflicts with confirmed "
+                    f"opening-range/FVG {opening_signal.direction} breakout"
+                )
         result = await asyncio.wait_for(
             scan_symbol(
                 symbol,
@@ -225,6 +283,7 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
                 context.settings,
                 resolver=context.resolver,
                 view_override=(direction, iv_regime),  # type: ignore[arg-type]
+                opening_range_signal=opening_signal,
             ),
             timeout=context.settings.scan.scan_symbol_timeout_s,
         )

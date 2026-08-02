@@ -39,6 +39,14 @@ async def enqueue_alert(
     enqueued counter only on True so dedup-skipped attempts don't pad
     scan_runs.alerts_fired with phantom rows.
     """
+    opening_signal_id = _opening_signal_id_for(context, snapshot_id)
+    if opening_signal_id is not None and _opening_signal_was_alerted(
+        context,
+        symbol=symbol,
+        strategy=scored.strategy_name,
+        signal_id=opening_signal_id,
+    ):
+        return False
     if not should_alert(
         context.engine, context.settings, symbol, scored.strategy_name, scored.score
     ):
@@ -95,6 +103,50 @@ async def enqueue_alert(
         log.exception("candidate evidence capture failed for score %s", strategy_score_id)
     await dispatch_alert(context, alert_id, snapshot_id, scored)
     return True
+
+
+def _opening_signal_id_for(context: DaemonContext, snapshot_id: int) -> str | None:
+    with context.engine.connect() as conn:
+        raw = conn.execute(
+            select(snapshots.c.raw_json).where(snapshots.c.id == snapshot_id)
+        ).scalar_one_or_none()
+    if not isinstance(raw, dict):
+        return None
+    plan = raw.get("opening_range_fvg")
+    if not isinstance(plan, dict) or plan.get("status") != "entry_confirmed":
+        return None
+    signal_id = plan.get("signal_id")
+    return signal_id if isinstance(signal_id, str) and signal_id else None
+
+
+def _opening_signal_was_alerted(
+    context: DaemonContext,
+    *,
+    symbol: str,
+    strategy: str,
+    signal_id: str,
+) -> bool:
+    """Deduplicate one deterministic setup independently of time cooldowns."""
+    with context.engine.connect() as conn:
+        rows = conn.execute(
+            select(snapshots.c.raw_json)
+            .select_from(
+                alerts.join(
+                    strategy_scores,
+                    alerts.c.strategy_score_id == strategy_scores.c.id,
+                ).join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
+            )
+            .where(alerts.c.symbol == symbol)
+            .where(alerts.c.strategy == strategy)
+            .order_by(alerts.c.id.desc())
+            .limit(100)
+        ).fetchall()
+    for row in rows:
+        raw = row.raw_json
+        plan = raw.get("opening_range_fvg") if isinstance(raw, dict) else None
+        if isinstance(plan, dict) and plan.get("signal_id") == signal_id:
+            return True
+    return False
 
 
 def _strategy_score_id_for(context: DaemonContext, snapshot_id: int, strategy: str) -> int | None:

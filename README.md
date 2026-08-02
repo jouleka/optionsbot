@@ -27,7 +27,7 @@ and survives restarts.
 ## What it does
 
 - Watches a configurable list of equity symbols.
-- Every ~15 minutes during market hours, scans each ticker: fetches
+- On a configurable cadence during market hours, scans each ticker: fetches
   the option chain, computes IV rank / HV / market view, scores 16
   options strategies against the snapshot, and persists results to
   SQLite.
@@ -41,9 +41,26 @@ Order execution is implemented but opt-in. With `execution.enabled=true`,
 the bot can submit atomic limit orders to the IBKR PAPER account in either
 Telegram-confirmed or automatic mode. Entries pass freshness, market-hours,
 risk, paper-account, and kill-switch gates; orders and executions are written
-to a durable ledger; restart reconciliation compares exact broker orders,
+  to a durable ledger; restart reconciliation compares exact broker orders,
 executions, and positions before granting modify/cancel authority. The default
 remains disabled, and live-account routing is refused.
+
+### Optional 0DTE opening-range/FVG mode
+
+The production paper profile uses one-minute bars to record the 09:30–09:40
+America/New_York opening high and low. It requires a candle close beyond the
+range, a newly completed three-candle fair-value gap after that breakout, and a
+later pullback that holds the gap and closes back in the breakout direction.
+Only then does it build a directional debit structure (bull call spread/long
+call or bear put spread/long put), and entries stop at 11:00 New York time.
+
+Each accepted setup persists its exact signal identity and exit plan. The
+option-premium stop is -15%; stronger confirmations target 2R (+30%) and other
+valid confirmations target 1.5R (+22.5%). The profile permits at most three
+entries per session while preserving the existing account-risk, buying-power,
+portfolio-heat, quote-freshness, paper-only, and kill-switch gates. Hermes may
+review or originate a hypothesis, but the daemon independently revalidates the
+same setup and remains the only component allowed to submit an order.
 
 ## Architecture
 

@@ -78,3 +78,39 @@ class HistoryClient:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         df.to_parquet(cache_path)
         return df
+
+    async def get_intraday_history(
+        self,
+        symbol: str,
+        *,
+        timeframe_minutes: int = 1,
+    ) -> pd.DataFrame:
+        """Fetch today's completed/in-progress RTH bars without daily caching."""
+        if timeframe_minutes not in {1, 5}:
+            raise ValueError("intraday timeframe must be 1 or 5 minutes")
+        contract = await self._resolver.stock(symbol)
+        await self._client.ensure_connected()
+        bar_size = "1 min" if timeframe_minutes == 1 else "5 mins"
+        bars = await self._client.ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr="1 D",
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=2,
+        )
+        if not bars:
+            raise ValueError(f"No intraday bars returned for symbol={symbol!r}")
+        frame = pd.DataFrame(
+            {
+                "date": [bar.date for bar in bars],
+                "open": [bar.open for bar in bars],
+                "high": [bar.high for bar in bars],
+                "low": [bar.low for bar in bars],
+                "close": [bar.close for bar in bars],
+                "volume": [bar.volume for bar in bars],
+            }
+        )
+        frame["date"] = pd.to_datetime(frame["date"], utc=True)
+        return frame.set_index("date").sort_index()

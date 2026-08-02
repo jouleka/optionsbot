@@ -28,6 +28,8 @@ def evaluate_exit(
     minutes_to_close: float | None = None,
     max_profit_per_unit: float | None = None,
     peak_pnl_per_unit: float | None = None,
+    debit_stop_pct_override: float | None = None,
+    debit_take_profit_pct_override: float | None = None,
 ) -> str | None:
     """Return a human-readable close reason, or None to keep holding."""
     execution = settings.execution
@@ -56,6 +58,26 @@ def evaluate_exit(
     if basis <= 0:
         return None
     pnl = entry_net - current_net
+
+    # A confirmed opening-range/FVG debit entry carries its own explicit
+    # premium-return plan. Unlike the generic 0DTE path, this setup's thesis is
+    # invalidated at -15% and realizes either 1.5R or 2R; do not replace it
+    # with the generic +50% trail.
+    if (
+        entry_net < 0
+        and debit_stop_pct_override is not None
+        and debit_take_profit_pct_override is not None
+    ):
+        if pnl >= debit_take_profit_pct_override * basis:
+            return (
+                "take-profit (opening-range FVG: "
+                f"+{pnl / basis * 100:.0f}% on debit)"
+            )
+        if pnl <= -(debit_stop_pct_override * basis):
+            return (
+                "stop-loss (opening-range FVG: "
+                f"-{abs(pnl) / basis * 100:.0f}% on debit)"
+            )
 
     if entry_net > 0:  # credit structure
         if pnl >= manage.take_profit_pct * basis:

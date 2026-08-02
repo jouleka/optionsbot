@@ -28,6 +28,7 @@ from optionsbot.daemon.market_hours import (
     is_market_open,
     minutes_to_nyse_close,
     nyse_session_date,
+    nyse_session_start_utc,
 )
 from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.gate import can_execute
@@ -133,6 +134,115 @@ def _reject(message: str) -> ExecuteOutcome:
     return ExecuteOutcome(ok=False, message=f"❌ {message}")
 
 
+def _opening_range_entry_error(
+    engine: Engine,
+    settings: Settings,
+    *,
+    suggestion: dict[str, Any],
+    snapshot_raw: object,
+    strategy: str,
+    now: datetime,
+) -> str | None:
+    """Validate the exact ORB/FVG authorization and its per-session limits."""
+    if not settings.scan.opening_range_fvg_enabled:
+        return None
+    if not isinstance(snapshot_raw, dict):
+        return "opening-range/FVG evidence is missing"
+    plan = suggestion.get("opening_range_fvg")
+    raw_plan = snapshot_raw.get("opening_range_fvg")
+    if not isinstance(plan, dict) or not isinstance(raw_plan, dict):
+        return "opening-range/FVG entry confirmation is missing"
+    signal_id = plan.get("signal_id")
+    if (
+        plan.get("status") != "entry_confirmed"
+        or raw_plan.get("status") != "entry_confirmed"
+        or plan.get("source") != "trusted_daemon"
+        or raw_plan.get("source") != "trusted_daemon"
+        or not isinstance(signal_id, str)
+        or not signal_id
+        or raw_plan.get("signal_id") != signal_id
+        or raw_plan != plan
+    ):
+        return "opening-range/FVG signal identity is not confirmed"
+    direction = plan.get("direction")
+    allowed = {
+        "bull": {"bull_call_spread", "long_call"},
+        "bear": {"bear_put_spread", "long_put"},
+    }
+    if (
+        not isinstance(direction, str)
+        or direction not in allowed
+        or strategy not in allowed[direction]
+    ):
+        return "option structure does not match the opening-range breakout direction"
+    try:
+        stop_pct = float(plan["stop_pct"])
+        target_r = float(plan["target_r"])
+        target_pct = float(plan["target_pct"])
+        respected_at = datetime.fromisoformat(str(plan["respected_ts"]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "opening-range/FVG trade plan is malformed"
+    if respected_at.tzinfo is None:
+        return "opening-range/FVG confirmation timestamp lacks a timezone"
+    if (
+        not all(math.isfinite(value) for value in (stop_pct, target_r, target_pct))
+        or stop_pct != settings.execution.opening_range_stop_pct
+        or target_r
+        not in {
+            settings.execution.opening_range_target_r_min,
+            settings.execution.opening_range_target_r_max,
+        }
+        or not math.isclose(target_pct, stop_pct * target_r, rel_tol=1e-9)
+    ):
+        return "opening-range/FVG stop or R target does not match configured bounds"
+    session_day_start = nyse_session_start_utc(now)
+    market_open = session_day_start + timedelta(hours=9, minutes=30)
+    range_end = market_open + timedelta(minutes=settings.scan.opening_range_minutes)
+    entry_end = market_open + timedelta(
+        minutes=settings.scan.opening_range_entry_window_minutes
+    )
+    respected_utc = respected_at.astimezone(UTC)
+    signal_completed_at = respected_utc + timedelta(
+        minutes=settings.scan.opening_range_timeframe_minutes
+    )
+    signal_age = now - signal_completed_at
+    if not range_end <= respected_utc <= now <= entry_end:
+        return "opening-range/FVG confirmation is outside the 09:40–11:00 ET window"
+    if signal_age < timedelta(0) or signal_age > timedelta(
+        minutes=settings.scan.opening_range_signal_max_age_minutes
+    ):
+        return "opening-range/FVG confirmation is stale"
+
+    with engine.connect() as conn:
+        session_orders = conn.execute(
+            select(
+                orders.c.id,
+                orders.c.status,
+                strategy_scores.c.suggestion_json,
+            )
+            .outerjoin(
+                strategy_scores,
+                orders.c.strategy_score_id == strategy_scores.c.id,
+            )
+            .where(orders.c.intent == "open")
+            .where(orders.c.staged_ts >= session_day_start)
+            .where(orders.c.status.in_(_ACTIVE_STATUSES))
+        ).fetchall()
+    if len(session_orders) >= settings.execution.opening_range_max_entries_per_day:
+        return (
+            "opening-range daily entry cap reached "
+            f"({settings.execution.opening_range_max_entries_per_day})"
+        )
+    for row in session_orders:
+        prior = row.suggestion_json
+        if not isinstance(prior, dict):
+            continue
+        prior_plan = prior.get("opening_range_fvg")
+        if isinstance(prior_plan, dict) and prior_plan.get("signal_id") == signal_id:
+            return f"opening-range/FVG signal {signal_id} was already consumed"
+    return None
+
+
 async def execute_pick(
     deps: ExecutionDeps, score_id: int, *, now: datetime | None = None
 ) -> ExecuteOutcome:
@@ -185,6 +295,7 @@ async def execute_pick(
     suggestion: dict[str, Any] = pick.suggestion_json or {}
     legs: list[dict[str, Any]] = list(pick.legs_json or [])
     symbol: str = pick.symbol
+    snapshot_raw = pick.raw_json
 
     # 3. Freshness — stale strikes are the wrong trade.
     pick_ts: datetime = pick.ts
@@ -204,7 +315,6 @@ async def execute_pick(
     # are skipped — binary jump risk overwhelms theta edge for neutral
     # structures (the human can still /execute deliberately in confirm mode).
     if settings.execution.mode == "auto":
-        snapshot_raw = pick.raw_json
         if not isinstance(snapshot_raw, dict):
             return _reject(
                 "snapshot data readiness unavailable — auto mode requires audited live data"
@@ -280,6 +390,17 @@ async def execute_pick(
                 f"{remaining} to close (requires more than "
                 f"{settings.execution.zero_dte_entry_cutoff_minutes}m)"
             )
+
+    opening_range_error = _opening_range_entry_error(
+        engine,
+        settings,
+        suggestion=suggestion,
+        snapshot_raw=snapshot_raw,
+        strategy=str(pick.strategy),
+        now=ts_now,
+    )
+    if opening_range_error is not None:
+        return _reject(opening_range_error)
 
     # 6. One active order per pick.
     with engine.connect() as conn:

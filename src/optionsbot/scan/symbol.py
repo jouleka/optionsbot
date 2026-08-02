@@ -20,6 +20,7 @@ from optionsbot.analysis.news import (
     refresh_news_if_stale,
     replace_news,
 )
+from optionsbot.analysis.opening_range_fvg import OpeningRangeFVGSignal
 from optionsbot.analysis.relative_strength import relative_strength
 from optionsbot.analysis.types import Direction, EarningsInfo, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
@@ -41,7 +42,7 @@ from optionsbot.scoring import score_all
 from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
-from optionsbot.strategies import Leg, StrategySnapshot
+from optionsbot.strategies import Leg, StrategySnapshot, get_strategy
 from optionsbot.strategies.strikes import closest_expiry_to_dte
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ async def scan_symbol(
     settings: Settings,
     resolver: ContractResolver | None = None,
     view_override: tuple[Direction | None, IVRegime | None] | None = None,
+    opening_range_signal: OpeningRangeFVGSignal | None = None,
 ) -> ScanResult:
     """Scan one symbol end-to-end and persist snapshot + strategy_scores.
 
@@ -223,6 +225,17 @@ async def scan_symbol(
         bars, current_atm_iv=atm_iv or 0.0, atm_iv_history=iv_history, earnings=earnings
     )
     view = _override_view(view, view_override)
+    if settings.scan.opening_range_fvg_enabled and opening_range_signal is not None:
+        # The price-action setup supplies the directional thesis. A debit
+        # vertical still limits IV exposure when the broad IV regime is high,
+        # so use neutral applicability without falsifying the raw stored IV.
+        scoring_iv = "neutral" if view.iv_regime == "high" else view.iv_regime
+        view = replace(
+            view,
+            direction=opening_range_signal.direction,
+            direction_strength="strong",
+            iv_regime=scoring_iv,
+        )
 
     sym_position = next(
         (p for p in positions if p.symbol == symbol and p.sec_type == "STK"), None
@@ -259,19 +272,32 @@ async def scan_symbol(
     # market-data subscription -- skip scoring rather than emit strategies built
     # off the directional view alone (they'd carry no real strikes/pricing).
     has_option_data = any(leg.iv is not None or leg.delta is not None for leg in chain)
-    if has_option_data:
+    if has_option_data and not settings.scan.opening_range_fvg_enabled:
         scored = score_all(
             snapshot, account_value=account_value, risk_pct=settings.scan.risk_pct
         )
-    else:
-        log.warning(
-            "No option market data for %s (%d chain legs, none with IV/greeks); "
-            "skipping strategy scoring -- check the options (OPRA) market-data "
-            "subscription.",
-            symbol,
-            len(chain),
+    elif has_option_data and opening_range_signal is not None:
+        strategy_names = (
+            ("bull_call_spread", "long_call")
+            if opening_range_signal.direction == "bull"
+            else ("bear_put_spread", "long_put")
         )
+        scored = score_all(
+            snapshot,
+            account_value=account_value,
+            risk_pct=settings.scan.risk_pct,
+            strategies=tuple(get_strategy(name) for name in strategy_names),
+        )
+    else:
         scored = ()
+        if not has_option_data:
+            log.warning(
+                "No option market data for %s (%d chain legs, none with IV/greeks); "
+                "skipping strategy scoring -- check the options (OPRA) market-data "
+                "subscription.",
+                symbol,
+                len(chain),
+            )
 
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
     relative_strength_value: float | None = None
@@ -325,6 +351,16 @@ async def scan_symbol(
         "front_expiry": front_expiry,
         "front_dte": front_dte,
         "expected_move": expected_move,
+        "opening_range_fvg": (
+            opening_range_signal.to_dict()
+            if opening_range_signal is not None
+            else {
+                "status": "not_confirmed",
+                "source": "trusted_daemon",
+            }
+            if settings.scan.opening_range_fvg_enabled
+            else None
+        ),
     }
     with engine.begin() as conn:
         result = conn.execute(
@@ -368,6 +404,11 @@ async def scan_symbol(
                             "reward_risk": s.suggestion.reward_risk,
                             "expected_value": s.suggestion.expected_value,
                             "risk_tier": s.suggestion.risk_tier,
+                            "opening_range_fvg": (
+                                opening_range_signal.to_dict()
+                                if opening_range_signal is not None
+                                else None
+                            ),
                         },
                     }
                     for s in scored

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -14,7 +14,12 @@ from sqlalchemy import select, update
 from optionsbot.analysis.events import earnings_before_option_expiry
 from optionsbot.analysis.positions import per_underlying_share_delta, portfolio_greeks
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.market_hours import is_market_open, minutes_to_nyse_close, nyse_session_date
+from optionsbot.daemon.market_hours import (
+    is_market_open,
+    minutes_to_nyse_close,
+    nyse_session_date,
+    nyse_session_start_utc,
+)
 from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.equity_guard import new_entry_allowed
 from optionsbot.execution.gate import can_execute
@@ -475,8 +480,23 @@ async def capture_candidate_evidence(
             > context.settings.execution.zero_dte_entry_cutoff_minutes
         )
     )
+    opening_range_window_open = True
+    if context.settings.scan.opening_range_fvg_enabled:
+        market_open_at = nyse_session_start_utc(captured_at) + timedelta(
+            hours=9, minutes=30
+        )
+        opening_range_window_open = (
+            market_open_at
+            + timedelta(minutes=context.settings.scan.opening_range_minutes)
+            <= captured_at
+            <= market_open_at
+            + timedelta(
+                minutes=context.settings.scan.opening_range_entry_window_minutes
+            )
+        )
+        entry_window_open = entry_window_open and opening_range_window_open
     if not entry_window_open:
-        issues.append("market or configured 0DTE entry window is closed")
+        issues.append("market or configured strategy entry window is closed")
 
     option_expiries = sorted(
         {
@@ -603,7 +623,9 @@ async def capture_candidate_evidence(
                 context.settings.execution.zero_dte_entry_cutoff_minutes
             ),
             "entry_window_open": entry_window_open,
+            "opening_range_window_open": opening_range_window_open,
         },
+        "opening_range_fvg": snapshot_raw.get("opening_range_fvg"),
         "market_data_incident": incident,
         "account": account,
         "positions": [

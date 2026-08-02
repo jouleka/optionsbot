@@ -170,6 +170,7 @@ def _pick_dict(row: Any) -> dict[str, Any]:
             "beta_to_benchmark": raw.get("beta_to_benchmark"),
             "beta_benchmark": raw.get("beta_benchmark"),
             "recent_price_history": raw.get("recent_price_history"),
+            "opening_range_fvg": raw.get("opening_range_fvg"),
         },
         "suggestion": {
             "defined_risk": suggestion.get("defined_risk"),
@@ -181,6 +182,7 @@ def _pick_dict(row: Any) -> dict[str, Any]:
             "reward_risk": suggestion.get("reward_risk"),
             "suggested_quantity": suggestion.get("suggested_quantity"),
             "risk_tier": suggestion.get("risk_tier"),
+            "opening_range_fvg": suggestion.get("opening_range_fvg"),
         },
         "review_evidence": suggestion.get("review_evidence"),
         "legs": list(row.legs_json or []),
