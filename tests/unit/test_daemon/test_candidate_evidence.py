@@ -148,6 +148,7 @@ async def test_capture_candidate_evidence_persists_ready_packet(
                         "max_profit": 100.0,
                         "prob_profit": 0.65,
                         "expected_value": 10.0,
+                        "suggested_quantity": 2,
                     },
                 )
             ).inserted_primary_key[0]
@@ -211,6 +212,22 @@ async def test_capture_candidate_evidence_persists_ready_packet(
     ] == pytest.approx(0.0)
     assert evidence["risk"]["candidate_affordable"] is True
     assert evidence["risk"]["bp_deployment_allowed"] is True
+    assert evidence["risk"]["opening_range_daily_entry_allowed"] is True
+    assert evidence["risk"]["opening_range_session_entries"] == 0
+    assert evidence["candidate_scope"] == {
+        "review_authorization_units": 1,
+        "strategy_units_reviewed": 1,
+        "economics_scope": "one_strategy_unit",
+        "risk_scope": "one_strategy_unit",
+        "greeks_scope": "one_strategy_unit",
+        "suggested_quantity": 2,
+        "suggested_quantity_role": "non_authoritative_scan_hint",
+        "execution_quantity_recomputed_by_daemon": True,
+        "review_quantity_policy": (
+            "review authorizes at most the proven one-unit candidate; the daemon "
+            "independently sizes and reruns all aggregate risk gates"
+        ),
+    }
     assert evidence["market_timing"]["entry_window_open"] is True
     assert evidence["expiration_assignment"]["handling"]
     assert review_evidence_ready(

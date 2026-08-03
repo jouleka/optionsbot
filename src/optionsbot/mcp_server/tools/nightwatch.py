@@ -55,6 +55,29 @@ RUBRIC: dict[str, list[str]] = {
         "never place a trade from Hermes; use the bot's existing execution gates",
         "never queue request_exit for winners unless deterministic bot risk rules also want out",
     ],
+    "opening_range_fvg_policy": [
+        (
+            "Use opening_range_fvg_v1 playbook-specific session history for this "
+            "setup; legacy or broad strategy/symbol history is context and cannot "
+            "veto an otherwise ready positive-EV candidate."
+        ),
+        (
+            "An absent playbook-specific tuple is a paper-learning cold start, "
+            "not a failed regime/history gate."
+        ),
+        (
+            "candidate_scope.review_authorization_units=1 authorizes only the "
+            "proven one-unit candidate; suggested_quantity is a non-authoritative "
+            "scan hint and the daemon independently resizes and reruns aggregate "
+            "risk gates."
+        ),
+        (
+            "For a 0DTE price-action setup, absence of a positive headline is not "
+            "a blocker; fail catalysts only for a known material conflict, an "
+            "earnings/event-date contradiction, or explicitly required event data "
+            "that is unavailable."
+        ),
+    ],
 }
 
 REQUIRED_ENTRY_CHECKS = {
@@ -91,6 +114,7 @@ _LESSON_SUMMARY_KEYS = (
     "pick_id",
     "symbol",
     "strategy",
+    "playbook",
     "score",
     "verdict",
     "review_context",
@@ -268,6 +292,22 @@ def _compact_learning_feedback(
                 for key, value in raw_pair_sessions.items()
                 if key in relevant_pairs or key.partition("|")[0] in independent_symbols
             }
+        for playbook_key in (
+            "by_playbook_strategy_symbol",
+            "by_playbook_strategy_symbol_sessions",
+        ):
+            raw_playbook_pairs = raw_summary.get(playbook_key)
+            if not isinstance(raw_playbook_pairs, dict):
+                continue
+            filtered: dict[str, Any] = {}
+            for key, value in raw_playbook_pairs.items():
+                parts = key.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                pair = f"{parts[1]}|{parts[2]}"
+                if pair in relevant_pairs or parts[1] in independent_symbols:
+                    filtered[key] = value
+            summary[playbook_key] = filtered
         compact[summary_name] = summary
     lessons: list[dict[str, Any]] = []
     raw_lessons = feedback.get("recent_lessons")
@@ -349,17 +389,33 @@ def _is_positive_defined_risk_candidate(row: Any) -> bool:
     try:
         premium = float(suggestion["credit_or_debit"])
         max_loss = float(suggestion["max_loss"])
-        max_profit = float(suggestion["max_profit"])
         prob_profit = float(suggestion["prob_profit"])
         expected_value = float(suggestion["expected_value"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
-    values = (premium, max_loss, max_profit, prob_profit, expected_value)
+    max_profit_raw = suggestion.get("max_profit")
+    unbounded_long_option = (
+        max_profit_raw is None
+        and len(legs) == 1
+        and str(legs[0].get("sec_type", "OPT")).upper() == "OPT"
+        and str(legs[0].get("side", "")).upper() == "BUY"
+    )
+    if unbounded_long_option:
+        max_profit = None
+    else:
+        if max_profit_raw is None:
+            return False
+        try:
+            max_profit = float(max_profit_raw)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    values = (premium, max_loss, prob_profit, expected_value)
     return (
         all(math.isfinite(value) for value in values)
+        and (unbounded_long_option or (max_profit is not None and math.isfinite(max_profit)))
         and premium != 0
         and max_loss > 0
-        and max_profit > 0
+        and (unbounded_long_option or (max_profit is not None and max_profit > 0))
         and 0 < prob_profit < 1
         and expected_value > 0
     )

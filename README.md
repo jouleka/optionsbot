@@ -62,6 +62,13 @@ portfolio-heat, quote-freshness, paper-only, and kill-switch gates. Hermes may
 review or originate a hypothesis, but the daemon independently revalidates the
 same setup and remains the only component allowed to submit an order.
 
+Hermes learning is segmented by playbook, symbol, strategy, and independent
+0DTE session. Legacy scanner outcomes remain context but cannot veto a new
+opening-range/FVG candidate. Candidate review is deliberately one-unit scoped;
+the daemon recomputes final quantity and reruns aggregate risk gates after a
+positive review. Single-leg long options correctly represent uncapped upside
+with `max_profit=null` while retaining finite defined loss.
+
 ## Architecture
 
 Twelve in-tree code units, each with a single responsibility (a few are

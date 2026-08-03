@@ -709,6 +709,73 @@ def test_submit_entry_review_rejects_non_positive_candidate_economics(
         assert conn.execute(select(entry_reviews)).first() is None
 
 
+def test_submit_entry_review_accepts_positive_ev_long_option_with_unbounded_profit(
+    server_context: ServerContext,
+) -> None:
+    score_id = _snapshot_with_score(server_context)
+    long_call_legs = [
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": "20260717",
+            "strike": 580.0,
+            "right": "C",
+            "quantity": 1,
+        }
+    ]
+    with server_context.engine.begin() as conn:
+        suggestion = conn.execute(
+            select(strategy_scores.c.suggestion_json).where(
+                strategy_scores.c.id == score_id
+            )
+        ).scalar_one()
+        updated = dict(suggestion)
+        updated.update(
+            defined_risk=True,
+            credit_or_debit=-150.0,
+            max_loss=150.0,
+            max_profit=None,
+            prob_profit=0.45,
+            expected_value=20.0,
+        )
+        conn.execute(
+            update(strategy_scores)
+            .where(strategy_scores.c.id == score_id)
+            .values(
+                strategy="long_call",
+                legs_json=long_call_legs,
+                suggestion_json=updated,
+            )
+        )
+    submit_entry_review = get_tools(register)["submit_entry_review"]
+
+    result = submit_entry_review(
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
+        verdict="VETTED PAPER CANDIDATE",
+        confidence=0.90,
+        sources=["source A", "source B"],
+        reason="Positive-EV long call has bounded loss and uncapped profit.",
+        checks={
+            name: True
+            for name in (
+                "bot_health",
+                "candidate",
+                "microstructure",
+                "greeks",
+                "regime_history",
+                "catalysts",
+                "account_risk",
+            )
+        },
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "requested"
+
+
 def test_submit_entry_review_rejects_stale_pick(
     server_context: ServerContext,
 ) -> None:

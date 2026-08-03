@@ -49,6 +49,7 @@ def _add_judgeable(
     loss_pnl: float = -100.0,
     strategy_name: str | None = None,
     expiry: str = "2026-07-17",
+    opening_range_fvg: bool = False,
 ) -> None:
     now = datetime.now(UTC)
     with context.engine.begin() as conn:
@@ -71,7 +72,19 @@ def _add_judgeable(
                         strategy=strategy,
                         score=80.0,
                         legs_json=[],
-                        suggestion_json={"review_evidence": {"ready": True}},
+                        suggestion_json={
+                            "review_evidence": {"ready": True},
+                            **(
+                                {
+                                    "opening_range_fvg": {
+                                        "status": "entry_confirmed",
+                                        "source": "trusted_daemon",
+                                    }
+                                }
+                                if opening_range_fvg
+                                else {}
+                            ),
+                        },
                     )
                 ).inserted_primary_key[0]
             )
@@ -234,6 +247,46 @@ def test_forecast_learning_normalizes_repeated_scans_by_session(
     }
 
 
+def test_learning_separates_opening_range_playbook_from_legacy_history(
+    daemon_context: DaemonContext,
+) -> None:
+    _add_judgeable(
+        daemon_context,
+        count=1,
+        wins=0,
+        strategy_name="long_call",
+        expiry="2026-07-30",
+        loss_pnl=-100.0,
+    )
+    _add_judgeable(
+        daemon_context,
+        count=1,
+        wins=1,
+        offset=1,
+        strategy_name="long_call",
+        expiry="2026-07-31",
+        win_pnl=80.0,
+        opening_range_fvg=True,
+    )
+
+    feedback = learning_feedback(daemon_context.engine)
+    forecast = feedback["forecast_call_summary"]
+    terminal = feedback["terminal_call_summary"]
+
+    assert forecast["by_playbook_strategy_symbol_sessions"][
+        "legacy|SPY|long_call"
+    ]["net_session_avg_pnl"] == -100.0
+    assert forecast["by_playbook_strategy_symbol_sessions"][
+        "opening_range_fvg_v1|SPY|long_call"
+    ]["net_session_avg_pnl"] == 80.0
+    assert terminal["by_playbook_strategy_symbol_sessions"][
+        "legacy|SPY|long_call"
+    ]["net_session_avg_pnl"] == -100.0
+    assert terminal["by_playbook_strategy_symbol_sessions"][
+        "opening_range_fvg_v1|SPY|long_call"
+    ]["net_session_avg_pnl"] == 80.0
+
+
 def test_learning_feedback_records_actual_post_trade_result_without_outcome(
     daemon_context: DaemonContext,
 ) -> None:
@@ -372,6 +425,15 @@ def test_learning_feedback_records_actual_post_trade_result_without_outcome(
         },
         "by_strategy_symbol": {
             "IWM|bull_call_spread": {
+                "trades": 1,
+                "wins": 0,
+                "losses": 1,
+                "net_pnl": -32.0,
+                "win_rate": 0.0,
+            }
+        },
+        "by_playbook_strategy_symbol": {
+            "legacy|IWM|bull_call_spread": {
                 "trades": 1,
                 "wins": 0,
                 "losses": 1,

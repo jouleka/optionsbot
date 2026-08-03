@@ -187,6 +187,23 @@ def _active_position_counts(context: DaemonContext, symbol: str) -> tuple[int, i
     return len(active), sum(1 for row in active if row.symbol == symbol)
 
 
+def _session_entry_count(context: DaemonContext, *, session_start: datetime) -> int:
+    """Mirror the execution gate's count of risk-bearing entries this session."""
+    with context.engine.connect() as conn:
+        return len(
+            conn.execute(
+                select(orders.c.id)
+                .where(orders.c.intent == "open")
+                .where(orders.c.staged_ts >= session_start)
+                .where(
+                    orders.c.status.in_(
+                        ("staged", "submitting", "submitted", "partial", "filled")
+                    )
+                )
+            ).fetchall()
+        )
+
+
 async def capture_candidate_evidence(
     context: DaemonContext,
     *,
@@ -280,6 +297,7 @@ async def capture_candidate_evidence(
                 )
 
     captured_at = now if now is not None else datetime.now(UTC)
+    session_start = nyse_session_start_utc(captured_at)
 
     quote_rows: list[dict[str, Any]] = []
     for leg in legs:
@@ -361,6 +379,15 @@ async def capture_candidate_evidence(
             issues.append(f"account {name} unavailable")
 
     active_count, symbol_count = _active_position_counts(context, symbol)
+    session_entry_count = _session_entry_count(
+        context,
+        session_start=session_start,
+    )
+    daily_entry_cap = context.settings.execution.opening_range_max_entries_per_day
+    daily_entry_allowed = (
+        not context.settings.scan.opening_range_fvg_enabled
+        or session_entry_count < daily_entry_cap
+    )
     try:
         open_heat = open_heat_dollars(context.engine)
     except Exception as exc:  # noqa: BLE001
@@ -426,6 +453,8 @@ async def capture_candidate_evidence(
         issues.append("maximum open-position count reached")
     if not symbol_count_allowed:
         issues.append(f"maximum active {symbol} position count reached")
+    if not daily_entry_allowed:
+        issues.append(f"opening-range daily entry cap reached ({daily_entry_cap})")
     if not candidate_affordable:
         issues.append("candidate structural BP reserve exceeds or cannot prove available funds")
     if not bp_deployment_allowed:
@@ -554,11 +583,18 @@ async def capture_candidate_evidence(
         },
         "economics": economics.to_dict() if economics is not None else None,
         "candidate_scope": {
+            "review_authorization_units": 1,
             "strategy_units_reviewed": 1,
             "economics_scope": "one_strategy_unit",
             "risk_scope": "one_strategy_unit",
             "greeks_scope": "one_strategy_unit",
+            "suggested_quantity": stored_suggestion.get("suggested_quantity"),
+            "suggested_quantity_role": "non_authoritative_scan_hint",
             "execution_quantity_recomputed_by_daemon": True,
+            "review_quantity_policy": (
+                "review authorizes at most the proven one-unit candidate; the daemon "
+                "independently sizes and reruns all aggregate risk gates"
+            ),
         },
         "candidate_greeks": candidate_greeks,
         "exposure": {
@@ -684,6 +720,9 @@ async def capture_candidate_evidence(
             "portfolio_heat_allowed": portfolio_heat_allowed,
             "position_count_allowed": position_count_allowed,
             "symbol_count_allowed": symbol_count_allowed,
+            "opening_range_daily_entry_cap": daily_entry_cap,
+            "opening_range_session_entries": session_entry_count,
+            "opening_range_daily_entry_allowed": daily_entry_allowed,
             "last_reconcile_at": (
                 context.last_reconcile_ts.isoformat()
                 if context.last_reconcile_ts is not None

@@ -31,6 +31,19 @@ PAYOFF_EFFICIENCY_THRESHOLD = 0.5
 STATE_ID = 1
 
 
+def _playbook_name(suggestion: object) -> str:
+    """Classify outcomes so a new playbook is not vetoed by legacy scans."""
+    if isinstance(suggestion, dict):
+        plan = suggestion.get("opening_range_fvg")
+        if (
+            isinstance(plan, dict)
+            and plan.get("status") == "entry_confirmed"
+            and plan.get("source") == "trusted_daemon"
+        ):
+            return "opening_range_fvg_v1"
+    return "legacy"
+
+
 @dataclass(frozen=True, slots=True)
 class HermesOverlayState:
     enabled: bool
@@ -199,39 +212,62 @@ def _lesson_call_summary(lessons: list[dict[str, Any]]) -> dict[str, Any]:
 
     sessions: dict[str, dict[str, list[float]]] = {}
     decision_sessions: dict[str, dict[str, list[float]]] = {}
+    playbook_sessions: dict[str, dict[str, list[float]]] = {}
+    playbook_decision_sessions: dict[str, dict[str, list[float]]] = {}
     for lesson in lessons:
         pair = f"{lesson['symbol']}|{lesson['strategy']}"
+        playbook_pair = f"{lesson['playbook']}|{pair}"
         expiry = str(lesson["expiry"])
         sessions.setdefault(pair, {}).setdefault(expiry, []).append(float(lesson["call_pnl"]))
         decision_sessions.setdefault(pair, {}).setdefault(expiry, []).append(
             float(lesson["decision_value"])
         )
-    session_groups: dict[str, dict[str, int | float | None]] = {}
-    for pair, by_expiry in sessions.items():
-        # Repeated intraday scans are observations of one 0DTE session, not
-        # independent trades. Average them within expiry before scoring days.
-        session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
-        session_decisions = [
-            sum(values) / len(values)
-            for values in decision_sessions[pair].values()
-        ]
-        winning = sum(pnl > 0 for pnl in session_pnls)
-        net = sum(session_pnls)
-        session_groups[pair] = {
-            "observations": sum(len(pnls) for pnls in by_expiry.values()),
-            "sessions": len(session_pnls),
-            "winning_sessions": winning,
-            "losing_sessions": len(session_pnls) - winning,
-            "session_win_rate": winning / len(session_pnls) if session_pnls else None,
-            "net_session_avg_pnl": round(net, 2),
-            "avg_pnl_per_session": (round(net / len(session_pnls), 2) if session_pnls else None),
-            "net_session_decision_value": round(sum(session_decisions), 2),
-            "avg_decision_value_per_session": (
-                round(sum(session_decisions) / len(session_decisions), 2)
-                if session_decisions
-                else None
-            ),
-        }
+        playbook_sessions.setdefault(playbook_pair, {}).setdefault(expiry, []).append(
+            float(lesson["call_pnl"])
+        )
+        playbook_decision_sessions.setdefault(playbook_pair, {}).setdefault(
+            expiry, []
+        ).append(float(lesson["decision_value"]))
+
+    def summarize_sessions(
+        grouped_sessions: dict[str, dict[str, list[float]]],
+        grouped_decisions: dict[str, dict[str, list[float]]],
+    ) -> dict[str, dict[str, int | float | None]]:
+        results: dict[str, dict[str, int | float | None]] = {}
+        for pair, by_expiry in grouped_sessions.items():
+            # Repeated intraday scans are observations of one 0DTE session, not
+            # independent trades. Average them within expiry before scoring days.
+            session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
+            session_decisions = [
+                sum(values) / len(values)
+                for values in grouped_decisions[pair].values()
+            ]
+            winning = sum(pnl > 0 for pnl in session_pnls)
+            net = sum(session_pnls)
+            results[pair] = {
+                "observations": sum(len(pnls) for pnls in by_expiry.values()),
+                "sessions": len(session_pnls),
+                "winning_sessions": winning,
+                "losing_sessions": len(session_pnls) - winning,
+                "session_win_rate": winning / len(session_pnls) if session_pnls else None,
+                "net_session_avg_pnl": round(net, 2),
+                "avg_pnl_per_session": (
+                    round(net / len(session_pnls), 2) if session_pnls else None
+                ),
+                "net_session_decision_value": round(sum(session_decisions), 2),
+                "avg_decision_value_per_session": (
+                    round(sum(session_decisions) / len(session_decisions), 2)
+                    if session_decisions
+                    else None
+                ),
+            }
+        return results
+
+    session_groups = summarize_sessions(sessions, decision_sessions)
+    playbook_session_groups = summarize_sessions(
+        playbook_sessions,
+        playbook_decision_sessions,
+    )
 
     summary: dict[str, Any] = summarize(lessons)
     summary.update(
@@ -245,6 +281,7 @@ def _lesson_call_summary(lessons: list[dict[str, Any]]) -> dict[str, Any]:
             "by_symbol": grouped(lambda item: item["symbol"]),
             "by_strategy_symbol": grouped(lambda item: f"{item['symbol']}|{item['strategy']}"),
             "by_strategy_symbol_sessions": session_groups,
+            "by_playbook_strategy_symbol_sessions": playbook_session_groups,
             "decision_payoff": decision_payoff(lessons),
         }
     )
@@ -336,6 +373,7 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 "pick_id": int(row.strategy_score_id),
                 "symbol": str(row.symbol),
                 "strategy": str(row.strategy),
+                "playbook": _playbook_name(suggestion),
                 "pnl": actual_pnl,
                 "close_order_id": int(row.close_order_id),
                 "exit_reason": row.exit_reason,
@@ -378,6 +416,7 @@ def _actual_round_trip_results(engine: Engine) -> list[dict[str, Any]]:
                 "pick_id": int(row.strategy_score_id),
                 "symbol": str(row.symbol),
                 "strategy": str(row.strategy),
+                "playbook": _playbook_name(row.suggestion_json),
                 "pnl": actual_pnl,
                 "close_order_id": None,
                 "exit_reason": (
@@ -411,6 +450,11 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
                 pick_outcomes.c.expiry,
                 pick_outcomes.c.win,
                 pick_outcomes.c.realized_pnl,
+                strategy_scores.c.suggestion_json,
+            )
+            .join(
+                strategy_scores,
+                strategy_scores.c.id == pick_outcomes.c.strategy_score_id,
             )
         ).fetchall()
 
@@ -453,27 +497,40 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
     wins = sum(bool(row.win) for row in rows)
     net_pnl = sum(float(row.realized_pnl) for row in rows)
     pair_sessions: dict[str, dict[str, list[float]]] = {}
+    playbook_pair_sessions: dict[str, dict[str, list[float]]] = {}
     for row in rows:
         pair = f"{row.symbol}|{row.strategy}"
         pair_sessions.setdefault(pair, {}).setdefault(str(row.expiry), []).append(
             float(row.realized_pnl)
         )
-    session_summary: dict[str, dict[str, int | float | None]] = {}
-    for pair, by_expiry in pair_sessions.items():
-        session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
-        winning = sum(pnl > 0 for pnl in session_pnls)
-        session_net = sum(session_pnls)
-        session_summary[pair] = {
-            "observations": sum(len(pnls) for pnls in by_expiry.values()),
-            "sessions": len(session_pnls),
-            "winning_sessions": winning,
-            "losing_sessions": len(session_pnls) - winning,
-            "session_win_rate": winning / len(session_pnls) if session_pnls else None,
-            "net_session_avg_pnl": round(session_net, 2),
-            "avg_pnl_per_session": (
-                round(session_net / len(session_pnls), 2) if session_pnls else None
-            ),
-        }
+        playbook_pair = f"{_playbook_name(row.suggestion_json)}|{pair}"
+        playbook_pair_sessions.setdefault(playbook_pair, {}).setdefault(
+            str(row.expiry), []
+        ).append(float(row.realized_pnl))
+
+    def summarize_sessions(
+        groups: dict[str, dict[str, list[float]]],
+    ) -> dict[str, dict[str, int | float | None]]:
+        summary: dict[str, dict[str, int | float | None]] = {}
+        for pair, by_expiry in groups.items():
+            session_pnls = [sum(pnls) / len(pnls) for pnls in by_expiry.values()]
+            winning = sum(pnl > 0 for pnl in session_pnls)
+            session_net = sum(session_pnls)
+            summary[pair] = {
+                "observations": sum(len(pnls) for pnls in by_expiry.values()),
+                "sessions": len(session_pnls),
+                "winning_sessions": winning,
+                "losing_sessions": len(session_pnls) - winning,
+                "session_win_rate": winning / len(session_pnls) if session_pnls else None,
+                "net_session_avg_pnl": round(session_net, 2),
+                "avg_pnl_per_session": (
+                    round(session_net / len(session_pnls), 2) if session_pnls else None
+                ),
+            }
+        return summary
+
+    session_summary = summarize_sessions(pair_sessions)
+    playbook_session_summary = summarize_sessions(playbook_pair_sessions)
     return {
         "meaning": (
             "All settled scanner observations, including candidates that were never "
@@ -490,6 +547,7 @@ def _terminal_call_summary(engine: Engine) -> dict[str, Any]:
         "by_symbol": grouped("symbol"),
         "by_strategy_symbol": grouped_pair(),
         "by_strategy_symbol_sessions": session_summary,
+        "by_playbook_strategy_symbol_sessions": playbook_session_summary,
     }
 
 
@@ -573,6 +631,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
                 "pick_id": int(row.strategy_score_id),
                 "symbol": row.symbol,
                 "strategy": row.strategy,
+                "playbook": _playbook_name(row.suggestion_json),
                 "score": float(row.score),
                 "verdict": row.verdict,
                 "review_context": context,
@@ -626,6 +685,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             group["wins" if result["pnl"] > 0 else "losses"] += 1
             group["net_pnl"] += result["pnl"]
     by_strategy_symbol: dict[str, dict[str, int | float]] = {}
+    by_playbook_strategy_symbol: dict[str, dict[str, int | float]] = {}
     for result in actual_results:
         key = f"{result['symbol']}|{result['strategy']}"
         group = by_strategy_symbol.setdefault(
@@ -635,15 +695,24 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         group["trades"] += 1
         group["wins" if result["pnl"] > 0 else "losses"] += 1
         group["net_pnl"] += result["pnl"]
+        playbook_key = f"{result['playbook']}|{key}"
+        playbook_group = by_playbook_strategy_symbol.setdefault(
+            playbook_key,
+            {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0},
+        )
+        playbook_group["trades"] += 1
+        playbook_group["wins" if result["pnl"] > 0 else "losses"] += 1
+        playbook_group["net_pnl"] += result["pnl"]
     for groups in (by_strategy, by_symbol):
         for group in groups.values():
             trades = int(group["trades"])
             group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
             group["net_pnl"] = round(float(group["net_pnl"]), 2)
-    for group in by_strategy_symbol.values():
-        trades = int(group["trades"])
-        group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
-        group["net_pnl"] = round(float(group["net_pnl"]), 2)
+    for pair_groups in (by_strategy_symbol, by_playbook_strategy_symbol):
+        for group in pair_groups.values():
+            trades = int(group["trades"])
+            group["win_rate"] = float(group["wins"]) / trades if trades else 0.0
+            group["net_pnl"] = round(float(group["net_pnl"]), 2)
 
     actual_wins = sum(result["pnl"] > 0 for result in actual_results)
 
@@ -678,6 +747,28 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
         groups: dict[str, list[float]] = {}
         for lesson in guarded:
             key = f"{lesson['symbol']}|{lesson['strategy']}"
+            groups.setdefault(key, []).append(float(lesson["call_pnl"]))
+        result: dict[str, dict[str, int | float | None]] = {}
+        for key, pnls in groups.items():
+            wins = [pnl for pnl in pnls if pnl > 0]
+            losses = [pnl for pnl in pnls if pnl <= 0]
+            net = sum(pnls)
+            result[key] = {
+                "calls": len(pnls),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": len(wins) / len(pnls) if pnls else None,
+                "net_pnl": round(net, 2),
+                "avg_pnl": round(net / len(pnls), 2) if pnls else None,
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+                "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            }
+        return result
+
+    def guarded_playbook_pair_groups() -> dict[str, dict[str, int | float | None]]:
+        groups: dict[str, list[float]] = {}
+        for lesson in guarded:
+            key = f"{lesson['playbook']}|{lesson['symbol']}|{lesson['strategy']}"
             groups.setdefault(key, []).append(float(lesson["call_pnl"]))
         result: dict[str, dict[str, int | float | None]] = {}
         for key, pnls in groups.items():
@@ -749,6 +840,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "by_strategy": by_strategy,
             "by_symbol": by_symbol,
             "by_strategy_symbol": by_strategy_symbol,
+            "by_playbook_strategy_symbol": by_playbook_strategy_symbol,
         },
         "guarded_call_summary": {
             "meaning": (
@@ -776,6 +868,7 @@ def learning_feedback(engine: Engine, *, recent_limit: int = 20) -> dict[str, An
             "by_strategy": guarded_groups("strategy"),
             "by_symbol": guarded_groups("symbol"),
             "by_strategy_symbol": guarded_pair_groups(),
+            "by_playbook_strategy_symbol": guarded_playbook_pair_groups(),
             "largest_winners": [compact_guarded(lesson) for lesson in largest_winners],
             "largest_losers": [compact_guarded(lesson) for lesson in largest_losers],
         },
