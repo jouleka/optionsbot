@@ -1,266 +1,135 @@
 # optionsbot
 
-Personal IBKR options-analysis, alerting, and opt-in paper-only
-automated-execution tool.
+[![CI](https://github.com/jouleka/optionsbot/actions/workflows/ci.yml/badge.svg)](https://github.com/jouleka/optionsbot/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/jouleka/optionsbot/actions/workflows/codeql.yml/badge.svg)](https://github.com/jouleka/optionsbot/actions/workflows/codeql.yml)
+[![Secret scan](https://github.com/jouleka/optionsbot/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/jouleka/optionsbot/actions/workflows/secret-scan.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## ⚠ Safety disclaimer
+An experimental IBKR options research, alerting, and opt-in automated-execution tool for paper accounts.
 
-**This is not financial advice.** optionsbot is a personal analysis +
-alerting tool with an opt-in automated-execution mode for IBKR PAPER
-accounts. Order placement is OFF by default (`execution.enabled=false`).
-When enabled, a hard interlock (`execution.paper_only`, default true)
-refuses to place orders unless the configured connection is a paper
-account on a recognized paper port (4002 Gateway / 7497 TWS), and a
-persisted kill switch (Telegram `/kill`) halts execution at any time
-and survives restarts.
+> [!WARNING]
+> This project is unaudited research software, not financial advice. It supports paper trading only.
+> Order placement is disabled by default, paper fills can be unrealistically favorable, and no result
+> should be treated as evidence of live profitability. Never point it at a live account.
 
-- Paper trading only. Do not point this at a live IBKR account; the
-  paper-only interlock exists precisely to refuse that.
-- All alerts are informational. Past performance is not predictive.
-- The scoring engine is a heuristic. It can be wrong. Verify every
-  suggestion against your own analysis before acting on it.
-- Automated paper trades are an experiment to MEASURE the strategy's
-  edge, not proof of one. Paper fills are optimistic vs live.
-- The author accepts no liability for trading losses incurred from
-  using this tool. Read the source before relying on it.
+## Safety model
 
-## What it does
+- `execution.enabled` defaults to `false`.
+- `execution.paper_only` defaults to `true` and refuses recognized live ports.
+- A persisted kill switch, including Telegram `/kill`, halts execution across restarts.
+- Every entry is subject to market-hours, freshness, risk, buying-power, portfolio-heat, and paper-account gates.
+- Broker orders, executions, positions, and restart reconciliation are stored in a durable ledger.
+- IBKR credentials are owned by IB Gateway or TWS and are never read by this application.
 
-- Watches a configurable list of equity symbols.
-- On a configurable cadence during market hours, scans each ticker: fetches
-  the option chain, computes IV rank / HV / market view, scores 16
-  options strategies against the snapshot, and persists results to
-  SQLite.
-- Sends Telegram alerts when a strategy crosses the configured
-  composite score threshold (default 70), with cooldown + score-delta
-  deduplication so you don't get spammed.
-- Exposes the watchlist + analysis as MCP tools so Claude Code can
-  query the data interactively ("show me the top picks for AAPL").
+These controls reduce accidental misuse; they are not a guarantee. Review the source and configuration before running it.
 
-Order execution is implemented but opt-in. With `execution.enabled=true`,
-the bot can submit atomic limit orders to the IBKR PAPER account in either
-Telegram-confirmed or automatic mode. Entries pass freshness, market-hours,
-risk, paper-account, and kill-switch gates; orders and executions are written
-  to a durable ledger; restart reconciliation compares exact broker orders,
-executions, and positions before granting modify/cancel authority. The default
-remains disabled, and live-account routing is refused.
+## Features
 
-### Optional 0DTE opening-range/FVG mode
+- Scans configurable equity watchlists and option chains during market hours.
+- Computes volatility measures, a market view, and scores 16 options strategies.
+- Persists snapshots and outcomes to SQLite.
+- Sends thresholded, deduplicated Telegram alerts.
+- Exposes analysis, watchlist, position, and supervised-control tools over MCP.
+- Supports opt-in Telegram-confirmed or automatic paper orders using atomic limit orders.
+- Includes an optional 0DTE opening-range/fair-value-gap paper strategy with deterministic stops and targets.
 
-The production paper profile uses one-minute bars to record the 09:30–09:40
-America/New_York opening high and low. It requires a candle close beyond the
-range, a newly completed three-candle fair-value gap after that breakout, and a
-later pullback that holds the gap and closes back in the breakout direction.
-Only then does it build a directional debit structure (bull call spread/long
-call or bear put spread/long put), and entries stop at 11:00 New York time.
-
-Each accepted setup persists its exact signal identity and exit plan. The
-option-premium stop is -15%; stronger confirmations target 2R (+30%) and other
-valid confirmations target 1.5R (+22.5%). The profile permits at most three
-entries per session while preserving the existing account-risk, buying-power,
-portfolio-heat, quote-freshness, paper-only, and kill-switch gates. Hermes may
-review or originate a hypothesis, but the daemon independently revalidates the
-same setup and remains the only component allowed to submit an order.
-
-Hermes learning is segmented by playbook, symbol, strategy, and independent
-0DTE session. Legacy scanner outcomes remain context but cannot veto a new
-opening-range/FVG candidate. Candidate review is deliberately one-unit scoped;
-the daemon recomputes final quantity and reruns aggregate risk gates after a
-positive review. Single-leg long options correctly represent uncapped upside
-with `max_profit=null` while retaining finite defined loss.
+The MCP process cannot mutate broker state; broker mutations remain in the daemon. Live-account routing is intentionally unsupported.
 
 ## Architecture
 
-Twelve in-tree code units, each with a single responsibility (a few are
-modules rather than packages, hence "units" rather than strictly
-"packages"):
-
 | Package | Responsibility |
 |---|---|
-| `optionsbot.config` | pydantic-settings: env > TOML > defaults |
-| `optionsbot.storage` | SQLAlchemy schema + alembic migrations |
-| `optionsbot.ibkr` | adapter dataclasses + clients for `ib_async` |
-| `optionsbot.analysis` | pure-function HV, IV rank, view inference |
-| `optionsbot.strategies` | 16 strategies w/ ABC + factor weights |
-| `optionsbot.scoring` | composite score + top-K selector + rationale |
-| `optionsbot.scan` | end-to-end single-symbol scan helper |
-| `optionsbot.alerts` | markdown alert formatter |
-| `optionsbot.mcp_server` | FastMCP stdio server (14 analysis, watchlist, position, and supervised-control tools) |
-| `optionsbot.daemon` | APScheduler-driven scan loop + Telegram dispatch |
-| `optionsbot.execution` | execution gates, order ledger, sizing, reconciliation, price walking, and exits |
-| `optionsbot.observability` | structlog configuration + contextvars |
+| `optionsbot.config` | Typed configuration: environment, TOML, then defaults |
+| `optionsbot.storage` | SQLAlchemy schema and Alembic migrations |
+| `optionsbot.ibkr` | `ib_async` adapter and broker-facing types |
+| `optionsbot.analysis` | Volatility and market-view calculations |
+| `optionsbot.strategies` | Strategy registry and factor weights |
+| `optionsbot.scoring` | Composite scoring, selection, and rationale |
+| `optionsbot.scan` | End-to-end single-symbol scan |
+| `optionsbot.alerts` | Telegram alert formatting |
+| `optionsbot.mcp_server` | MCP analysis and supervised-control tools |
+| `optionsbot.daemon` | Scheduled scans, alerts, and broker orchestration |
+| `optionsbot.execution` | Safety gates, sizing, order lifecycle, reconciliation, and exits |
+| `optionsbot.observability` | Structured logging and context propagation |
 
-Async at the top (IBKR + Telegram + APScheduler are async). Analysis,
-strategies, and scoring are sync. `optionsbot.ibkr` types are contained
-to the IBKR layer; everything downstream uses the adapter dataclasses
-(`StockQuote`, `OptionChainLeg`, `PositionRecord`, etc.) so a future
-broker swap touches one package.
+Analysis and scoring are synchronous pure logic; broker, scheduler, and Telegram boundaries are asynchronous. Broker-library types stay inside `optionsbot.ibkr`.
 
-## Prerequisites
+## Requirements
 
 - Python 3.12+
-- [uv](https://github.com/astral-sh/uv) for dependency management
-- IB Gateway (or TWS) on a paper account, reachable on the configured port
-- (Optional) Telegram bot for alerts (see [docs/telegram-setup.md](docs/telegram-setup.md))
+- [`uv`](https://docs.astral.sh/uv/)
+- IB Gateway or TWS connected to a paper account
+- Optional Telegram bot for alerts and controls
 
 ## Install
 
 ```bash
-git clone git@github.com:jouleka/optionsbot.git
+git clone https://github.com/jouleka/optionsbot.git
 cd optionsbot
-uv sync --group dev
-```
-
-## First-time setup
-
-```bash
-# Interactive wizard: writes ~/.config/optionsbot/config.toml,
-# runs DB migrations, optionally tests Telegram.
+uv sync --locked --group dev
 uv run optionsbot init
 ```
 
-The wizard is idempotent -- safe to re-run. Use `--non-interactive`
-and `--skip-telegram` flags for CI / scripted setup.
+The initializer writes `~/.config/optionsbot/config.toml`, applies database migrations, and can test Telegram. It is safe to rerun. For scripted setup, use `--non-interactive` and optionally `--skip-telegram`.
 
-For Telegram setup details (BotFather, chat_id), see
-[docs/telegram-setup.md](docs/telegram-setup.md).
+See [Telegram setup](docs/telegram-setup.md) for BotFather and chat ID instructions.
 
-## Daily usage
-
-### Health check
+## Run
 
 ```bash
-uv run optionsbot status         # pretty text, exit 0 if all critical subsystems ok
-uv run optionsbot status --json  # machine-readable for monitoring pipelines
-```
-
-Reports: DB reachability, IB Gateway socket, last scan timestamp,
-last alert timestamp, Telegram bot reachable.
-
-### Run the daemon (foreground)
-
-```bash
+uv run optionsbot status
+uv run optionsbot status --json
 uv run optionsbot-daemon
 ```
 
-For production -- auto-restart, journald logs, etc. -- run under
-systemd-user. See [docs/systemd.md](docs/systemd.md).
+For a generic user-service example, see [systemd setup](docs/systemd.md).
 
-### MCP integration
+### MCP configuration
 
-The MCP server exposes 14 tools for watchlists, analysis, snapshots, positions,
-track record, daily briefing, candidate review, close requests, and monotonic
-halting. Broker mutation remains in the daemon rather than the MCP process. See
-[docs/mcp-claude-code.md](docs/mcp-claude-code.md) for the
-`mcpServers` config snippet.
-
-### Manual watchlist management
-
-The watchlist tools live in the MCP server; ask Claude to add/remove
-tickers. The CLI `optionsbot watch add/remove/list` commands are
-unimplemented stubs in v1 -- file an issue if you want them as a
-non-Claude path.
+Copy [`.mcp.json.example`](.mcp.json.example), replace `/path/to/optionsbot` with the absolute checkout path, and keep the resulting `.mcp.json` local. The server exposes watchlist, analysis, snapshot, position, track-record, daily-briefing, candidate-review, close-request, and monotonic-halt tools.
 
 ## Configuration
 
-Settings live in `~/.config/optionsbot/config.toml` and are overridable
-by env vars with the prefix `OPTIONSBOT_` and nested-section delimiter
-`__`. Examples:
+Settings live in `~/.config/optionsbot/config.toml`. Environment overrides use the `OPTIONSBOT_` prefix and a double underscore between section and field.
 
-| Setting | Env var | Default |
+| Setting | Environment variable | Default |
 |---|---|---|
-| IB Gateway host | `OPTIONSBOT_IBKR__HOST` | `127.0.0.1` |
-| IB Gateway port | `OPTIONSBOT_IBKR__PORT` | `4002` (paper) |
+| IBKR host | `OPTIONSBOT_IBKR__HOST` | `127.0.0.1` |
+| IBKR port | `OPTIONSBOT_IBKR__PORT` | `4002` |
 | Scan interval | `OPTIONSBOT_SCAN__INTERVAL_MINUTES` | `15` |
 | Score threshold | `OPTIONSBOT_SCAN__SCORE_THRESHOLD` | `70` |
-| Alert cooldown | `OPTIONSBOT_SCAN__ALERT_COOLDOWN_HOURS` | `4` |
-| Telegram token | `OPTIONSBOT_TELEGRAM__BOT_TOKEN` | _(unset)_ |
-| Telegram chat | `OPTIONSBOT_TELEGRAM__CHAT_ID` | _(unset)_ |
-| DB path | `OPTIONSBOT_STORAGE__DB_PATH` | `~/.local/share/optionsbot/optionsbot.db` |
-| Log level | `OPTIONSBOT_LOG_LEVEL` | `INFO` |
-| Execution master switch | `OPTIONSBOT_EXECUTION__ENABLED` | `false` |
+| Telegram token | `OPTIONSBOT_TELEGRAM__BOT_TOKEN` | unset |
+| Telegram chat | `OPTIONSBOT_TELEGRAM__CHAT_ID` | unset |
+| Database path | `OPTIONSBOT_STORAGE__DB_PATH` | `~/.local/share/optionsbot/optionsbot.db` |
+| Execution switch | `OPTIONSBOT_EXECUTION__ENABLED` | `false` |
 | Execution mode | `OPTIONSBOT_EXECUTION__MODE` | `confirm` |
 | Paper-only interlock | `OPTIONSBOT_EXECUTION__PAPER_ONLY` | `true` |
 
-**Note the double underscore** between section and field. Bare names
-like `TELEGRAM_BOT_TOKEN` are silently ignored.
+Recognized default ports are 4002/7497 for paper and 4001/7496 for live. The MCP server and daemon use distinct client IDs (1 and 2 by default).
 
-IB Gateway port conventions (override `settings.ibkr.port` in config.toml if your install differs):
+Copy `.env.example` only if environment-based configuration is useful. Never commit the resulting `.env`, API tokens, broker credentials, databases, or production host details.
 
-| App | Paper | Live |
-|---|---|---|
-| IB Gateway | 4002 | 4001 |
-| TWS | 7497 | 7496 |
-
-Distinct `client_id` values are reserved per process role so the MCP server and
-the daemon can hold simultaneous connections without colliding:
-`settings.ibkr.client_id_mcp` (default 1) and `settings.ibkr.client_id_daemon`
-(default 2).
-
-IBKR credentials are deliberately NOT in this repo. IB Gateway holds them.
-
-## Architectural rules
-
-These hold across every epic, including any future contributions:
-
-1. **Execution is opt-in, paper-only, and gated.** `execution.enabled`
-   defaults to false; every order-placing path must pass
-   `optionsbot.execution.gate.can_execute` (paper-only interlock +
-   persisted kill switch) before touching the IBKR order API. The
-   pre-IBK-123 rule here was "no order placement, ever" — the execution
-   epic (IBK-122..131) deliberately supersedes it for PAPER accounts;
-   live trading remains out of scope.
-2. **`optionsbot.ibkr` types stay inside the IBKR layer.** Downstream
-   code imports adapter dataclasses, never `from ib_async`.
-3. **Async at the top.** IBKR + Telegram + scheduler are async;
-   analysis / strategies / scoring are sync.
-4. **TDD.** Tests first, expect FAIL, then implement.
-5. **One commit per task.** Body explains WHY in 1-3 paragraphs.
-
-## Testing
+## Development
 
 ```bash
-uv run pytest -q             # full suite (default excludes live tests)
-uv run pytest -m live        # live IBKR smoke test (requires IB Gateway)
-uv run ruff check .          # lint
-uv run mypy src              # type-check (strict mode on src/)
+uv sync --locked --group dev
+uv run --locked pytest
+uv run --locked ruff check .
+uv run --locked mypy src
+uv run --locked pip-audit
+uv run --locked bandit -q -ll -r src
 ```
 
-## Troubleshooting
+The default test command excludes tests marked `live`. `uv run pytest -m live` requires a running paper IB Gateway and may create paper orders; run it deliberately.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `optionsbot status` ibkr fail | IB Gateway not running | Start IB Gateway on the configured port |
-| Telegram 401 Unauthorized | Wrong bot_token | Re-check via @BotFather, update config.toml |
-| Telegram 400 chat not found | You haven't messaged the bot | Send `/start` to your bot, re-run `optionsbot init --skip-telegram` |
-| Daemon connects then disconnects | client_id collision (MCP also running on id 1) | Daemon uses id 2, MCP uses id 1; verify both with `settings.ibkr.client_id_*` |
-| IV rank always 0.5 / warming_up | No daily ATM IV history yet | This is expected for v1 -- IV history collection is a deferred follow-up |
-| Alerts never fire | Score threshold too high, or strategy doesn't match view | Lower `scan.score_threshold` or check `optionsbot status` for "last scan" |
-| `optionsbot init` overwrites my config | You confirmed the overwrite prompt | Edit your config.toml; init is idempotent on re-run with `--non-interactive` |
-| Market data errors in paper mode | Delayed data not available | `reqMarketDataType(3)` is called on connect; actual availability depends on your IBKR account state |
+## Status and scope
 
-## Project status
+The project is designed for one operator, one IBKR paper account, and one Telegram chat. Paper execution, order tracking, reconciliation, risk gates, deterministic exits, and optional external-review hooks are implemented. Execution remains off by default. Multi-account and live trading are out of scope.
 
-v1: paper trading only, personal use. The scope is intentionally small
--- one user, one IBKR account, one Telegram chat. Multi-account and
-live trading are explicitly out of scope. Paper execution, durable order
-tracking, broker reconciliation, risk gates, deterministic exits, and the
-Hermes supervision endpoints are implemented; execution remains off by
-default and requires operational acceptance before re-enablement.
+## Security
 
-Hermes-vetted automatic entries have a separate persistent correctness
-circuit breaker. After at least 20 judgeable review outcomes, both directional
-accuracy and payoff-weighted efficiency below 50% disable only the Hermes entry
-overlay; scans, reconciliation, order management, and deterministic exits
-continue. This prevents a missed small winner from counting the same as an
-avoided large loss. Telegram `/overlay` reports the state and `/overlayreset`
-is the explicit human re-enable action. A reset acknowledges current evidence,
-and the rule is evaluated again when a new judgeable outcome arrives.
-
-Implementation is tracked in YouTrack project
-[IBK](https://tracker.example.invalid/projects/0-2); implementation
-plans live in [`docs/superpowers/plans/`](docs/superpowers/plans/).
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Do not include credentials or private infrastructure details in a public issue.
 
 ## License
 
-Personal project. Not licensed for redistribution without permission.
+[MIT](LICENSE)

@@ -63,7 +63,9 @@ def create_intent_engine(path: Path | str) -> Engine:
     metadata.create_all(engine)
     if db_path.exists():
         try:
-            os.chmod(db_path, 0o660)
+            # Group write access is the deliberate least-privilege boundary
+            # between the restricted MCP process and the trusted daemon.
+            os.chmod(db_path, 0o660)  # nosec B103
         except PermissionError:
             # The daemon normally opens a queue owned by the MCP identity via
             # their shared control group. Group members may use but not chmod

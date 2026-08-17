@@ -246,6 +246,8 @@ def test_reporter_posts_idempotency_marked_digest(
     monkeypatch.setattr(soak_reporter, "RESULT_PATH", result_path)
     monkeypatch.setattr(soak_reporter, "SOAK_PATH", soak_path)
     monkeypatch.setenv("YOUTRACK_API_TOKEN", "test-token")
+    monkeypatch.setenv("YOUTRACK_BASE_URL", "https://tracker.example.invalid")
+    monkeypatch.setenv("OPTIONSBOT_YOUTRACK_ISSUES", "PROJECT-1,PROJECT-2")
     posts: list[dict[str, Any]] = []
 
     def fake_request(

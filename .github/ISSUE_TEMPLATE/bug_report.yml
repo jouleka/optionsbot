@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem without private account data
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, account identifiers, private hosts, positions, or order data. Report security issues privately."
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide minimal paper-only steps and sanitized logs.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: The affected commit SHA.
+    validations:
+      required: true

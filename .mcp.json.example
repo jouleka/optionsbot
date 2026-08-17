@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/srv/optionsbot/source",
+        "/path/to/optionsbot",
         "optionsbot-mcp"
       ],
       "env": {

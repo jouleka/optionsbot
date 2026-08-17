@@ -11,10 +11,18 @@ __pycache__/
 
 # uv / venv
 .venv/
-uv.lock
 
 # secrets and local state
 .env
+.env.*
+!.env.example
+config.local.toml
+auth.json
+.op.env
+*.pem
+*.key
+credentials/
+secrets/
 *.db
 *.db-journal
 *.db-shm

@@ -1,10 +1,11 @@
 [project]
 name = "optionsbot"
 version = "0.0.1"
-description = "IBKR options analysis and alert tool (paper trading)"
+description = "Paper-only IBKR options research, alerting, and opt-in automated execution"
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "Jurgen", email = "58989038+jouleka@users.noreply.github.com" }]
+license = "MIT"
+authors = [{ name = "Jurgen Leka", email = "58989038+jouleka@users.noreply.github.com" }]
 
 dependencies = [
     "pydantic-settings>=2.5",
@@ -17,12 +18,18 @@ dependencies = [
     "pandas>=2.2",
     "pyarrow>=15",
     "yfinance>=0.2.40",
-    "mcp>=1.13",
+    "mcp>=1.28.1,<2",
     "APScheduler>=3.11",
     "pandas-market-calendars>=5.4",
     "httpx>=0.28",
     "structlog>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jouleka/optionsbot"
+Repository = "https://github.com/jouleka/optionsbot"
+Issues = "https://github.com/jouleka/optionsbot/issues"
+Security = "https://github.com/jouleka/optionsbot/security/policy"
 
 [project.scripts]
 optionsbot = "optionsbot.cli:app"
@@ -48,6 +55,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pandas-stubs>=2.2",
+    "pip-audit>=2.10",
+    "bandit>=1.9",
 ]
 
 [tool.ruff]

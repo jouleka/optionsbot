@@ -1,4 +1,4 @@
-"""Root-only YouTrack reporter for the unprivileged soak evidence ledger."""
+"""Optional YouTrack reporter for the paper-soak evidence ledger."""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ from typing import Any
 
 from optionsbot.daemon.rth_acceptance import RESULT_PATH
 from optionsbot.daemon.soak_evidence import DEFAULT_PATH as SOAK_PATH
-
-ISSUES = ("IBK-137", "IBK-138")
-DEFAULT_BASE_URL = "https://tracker.example.invalid"
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -43,7 +40,8 @@ def _request(
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+    # Callers construct this from the HTTPS-only base URL validated in run().
+    with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
         return json.loads(response.read())
 
 
@@ -98,7 +96,17 @@ def run() -> int:
     token = os.getenv("YOUTRACK_API_TOKEN", "").strip() or os.getenv("YOUTRACK_TOKEN", "").strip()
     if not token:
         raise RuntimeError("YouTrack token is not configured")
-    base = os.getenv("YOUTRACK_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    base = os.getenv("YOUTRACK_BASE_URL", "").strip().rstrip("/")
+    parsed_base = urllib.parse.urlparse(base)
+    if parsed_base.scheme != "https" or not parsed_base.netloc:
+        raise RuntimeError("YOUTRACK_BASE_URL must be an HTTPS URL")
+    issues = tuple(
+        issue.strip()
+        for issue in os.getenv("OPTIONSBOT_YOUTRACK_ISSUES", "").split(",")
+        if issue.strip()
+    )
+    if not issues:
+        raise RuntimeError("OPTIONSBOT_YOUTRACK_ISSUES is not configured")
     result = _load(RESULT_PATH)
     ledger = _load(SOAK_PATH)
     session = str(result.get("session", ""))
@@ -109,7 +117,7 @@ def run() -> int:
     marker = f"[optionsbot-soak:{session}:v1]"
     digest = _format_digest(result, ledger, marker)
     failures: list[str] = []
-    for issue in ISSUES:
+    for issue in issues:
         try:
             if _already_reported(base, token, issue, marker):
                 continue
