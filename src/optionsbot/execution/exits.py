@@ -30,6 +30,7 @@ def evaluate_exit(
     peak_pnl_per_unit: float | None = None,
     debit_stop_pct_override: float | None = None,
     debit_take_profit_pct_override: float | None = None,
+    debit_round_trip_cost_override: float | None = None,
 ) -> str | None:
     """Return a human-readable close reason, or None to keep holding."""
     execution = settings.execution
@@ -59,7 +60,7 @@ def evaluate_exit(
         return None
     pnl = entry_net - current_net
 
-    # A confirmed opening-range/FVG debit entry carries its own explicit
+    # A confirmed opening-range setup debit entry carries its own explicit
     # premium-return plan. Unlike the generic 0DTE path, this setup's thesis is
     # invalidated at -15% and realizes either 1.5R or 2R; do not replace it
     # with the generic +50% trail.
@@ -68,16 +69,62 @@ def evaluate_exit(
         and debit_stop_pct_override is not None
         and debit_take_profit_pct_override is not None
     ):
+        peak = max(
+            pnl,
+            peak_pnl_per_unit if peak_pnl_per_unit is not None else pnl,
+        )
+        target = debit_take_profit_pct_override * basis
         if pnl >= debit_take_profit_pct_override * basis:
             return (
                 "take-profit (opening-range FVG: "
                 f"+{pnl / basis * 100:.0f}% on debit)"
+            )
+        # Once the explicit target has traded, keep trying to flatten until a
+        # close fills.  A cancelled price walk must not silently turn a winner
+        # back into a hold merely because the next quote retraced below target.
+        # The runner's durable peak survives retries and daemon restarts.
+        if peak >= target:
+            current_sign = "+" if pnl >= 0 else "-"
+            return (
+                "take-profit latched (opening-range FVG: "
+                f"peak +{peak / basis * 100:.0f}%, "
+                f"current {current_sign}{abs(pnl) / basis * 100:.0f}% on debit)"
             )
         if pnl <= -(debit_stop_pct_override * basis):
             return (
                 "stop-loss (opening-range FVG: "
                 f"-{abs(pnl) / basis * 100:.0f}% on debit)"
             )
+        target_r = debit_take_profit_pct_override / debit_stop_pct_override
+        extended_lock_activation = (
+            execution.opening_range_extended_profit_lock_activation_r
+        )
+        if target_r > extended_lock_activation:
+            one_r = debit_stop_pct_override * basis
+            lock_activation = extended_lock_activation * one_r
+            lock_floor = (
+                execution.opening_range_extended_profit_lock_floor_r * one_r
+            )
+            if peak >= lock_activation and pnl <= lock_floor:
+                current_sign = "+" if pnl >= 0 else "-"
+                return (
+                    "profit lock (opening-range extended target: "
+                    f"peak +{peak / basis * 100:.0f}%, "
+                    f"current {current_sign}{abs(pnl) / basis * 100:.0f}%, "
+                    f"floor +{lock_floor / basis * 100:.0f}% on debit)"
+                )
+            break_even_activation = (
+                execution.opening_range_extended_break_even_activation_r * one_r
+            )
+            cost_floor = max(0.0, debit_round_trip_cost_override or 0.0)
+            if peak >= break_even_activation and pnl <= cost_floor:
+                current_sign = "+" if pnl >= 0 else "-"
+                return (
+                    "break-even protection (opening-range extended target: "
+                    f"peak +{peak / basis * 100:.0f}%, "
+                    f"current {current_sign}{abs(pnl) / basis * 100:.0f}%, "
+                    f"cost floor +{cost_floor / basis * 100:.0f}% on debit)"
+                )
 
     if entry_net > 0:  # credit structure
         if pnl >= manage.take_profit_pct * basis:

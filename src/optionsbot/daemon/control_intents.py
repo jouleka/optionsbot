@@ -18,6 +18,7 @@ from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
 from optionsbot.execution.state import trip_kill
 from optionsbot.hermes_overlay import load_overlay_state
 from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
+from optionsbot.review_checks import all_entry_checks_pass, normalize_entry_checks
 from optionsbot.storage.schema import alerts, entry_reviews, exit_requests, orders, strategy_scores
 
 _REQUIRED_PROPOSAL_CHECKS = {
@@ -62,6 +63,10 @@ def _consume_entry_review(context: DaemonContext, payload: dict[str, Any]) -> st
     checks = payload["checks"]
     if not reason or not isinstance(checks, dict):
         raise ValueError("review reason/checks are required")
+    canonical_checks = normalize_entry_checks(checks)
+    if verdict == "vetted_paper_candidate" and not all_entry_checks_pass(checks):
+        raise ValueError("all seven review checks must pass")
+    persisted_checks = canonical_checks if canonical_checks is not None else checks
     status = {
         "vetted_paper_candidate": "requested",
         "watch_only": "held",
@@ -86,7 +91,7 @@ def _consume_entry_review(context: DaemonContext, payload: dict[str, Any]) -> st
                     confidence=confidence,
                     sources_json=sources,
                     reason=reason,
-                    checks_json=checks,
+                    checks_json=persisted_checks,
                     status=status,
                     decision_reason=decision_reason,
                     processed_at=datetime.now(UTC) if status == "held" else None,
@@ -234,7 +239,7 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
             minutes=context.settings.scan.opening_range_entry_window_minutes
         )
         if not range_end <= now <= entry_end:
-            return "proposal declined: outside the 09:40–11:00 ET opening-range window"
+            return "proposal declined: outside the configured intraday entry window"
 
     async with context.ibkr_lock:
         if opening_range_enabled:
@@ -261,7 +266,7 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
                 target_r_max=context.settings.execution.opening_range_target_r_max,
             )
             if opening_signal is None:
-                return "proposal declined: no confirmed opening-range/FVG retest"
+                return "proposal declined: no confirmed opening-range retest setup"
             signal_completed = opening_signal.respected_ts.astimezone(UTC) + timedelta(
                 minutes=opening_signal.timeframe_minutes
             )
@@ -269,11 +274,11 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
             if signal_age < timedelta(0) or signal_age > timedelta(
                 minutes=context.settings.scan.opening_range_signal_max_age_minutes
             ):
-                return "proposal declined: opening-range/FVG confirmation is stale"
+                return "proposal declined: opening-range confirmation is stale"
             if opening_signal.direction != direction:
                 return (
                     "proposal declined: direction conflicts with confirmed "
-                    f"opening-range/FVG {opening_signal.direction} breakout"
+                    f"opening-range {opening_signal.direction} setup"
                 )
         result = await asyncio.wait_for(
             scan_symbol(

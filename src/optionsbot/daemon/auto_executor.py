@@ -20,6 +20,7 @@ from optionsbot.execution.state import trip_kill
 from optionsbot.hermes_overlay import hold_pending_reviews, load_overlay_state
 from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.positions import PositionsClient
+from optionsbot.review_checks import all_entry_checks_pass, normalize_entry_checks
 from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.scoring import ScoredStrategy
 from optionsbot.storage.schema import (
@@ -31,17 +32,6 @@ from optionsbot.storage.schema import (
 )
 
 log = logging.getLogger(__name__)
-
-_REQUIRED_ENTRY_CHECKS = {
-    "bot_health",
-    "candidate",
-    "microstructure",
-    "greeks",
-    "regime_history",
-    "catalysts",
-    "account_risk",
-}
-
 
 def _score_id_for(context: DaemonContext, snapshot_id: int, strategy: str) -> int | None:
     with context.engine.connect() as conn:
@@ -81,17 +71,35 @@ def _positive_defined_risk(row: Any) -> bool:
     try:
         premium = float(suggestion["credit_or_debit"])
         max_loss = float(suggestion["max_loss"])
-        max_profit = float(suggestion["max_profit"])
         prob_profit = float(suggestion["prob_profit"])
         expected_value = float(suggestion["expected_value"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
-    values = (premium, max_loss, max_profit, prob_profit, expected_value)
+    max_profit_raw = suggestion.get("max_profit")
+    unbounded_long_option = (
+        max_profit_raw is None
+        and isinstance(legs, list)
+        and len(legs) == 1
+        and isinstance(legs[0], dict)
+        and str(legs[0].get("sec_type", "OPT")).upper() == "OPT"
+        and str(legs[0].get("side", "")).upper() == "BUY"
+    )
+    if unbounded_long_option:
+        max_profit = None
+    else:
+        if max_profit_raw is None:
+            return False
+        try:
+            max_profit = float(max_profit_raw)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    values = (premium, max_loss, prob_profit, expected_value)
     return (
         all(math.isfinite(value) for value in values)
+        and (unbounded_long_option or (max_profit is not None and math.isfinite(max_profit)))
         and premium != 0
         and max_loss > 0
-        and max_profit > 0
+        and (unbounded_long_option or (max_profit is not None and max_profit > 0))
         and 0 < prob_profit < 1
         and expected_value > 0
     )
@@ -179,10 +187,10 @@ def _review_authorization_error(
     ]
     if len({source.casefold() for source in clean_sources}) < 2:
         return "review lacks two distinct corroborating sources"
-    checks = row.checks_json
-    if not isinstance(checks, dict) or set(checks) != _REQUIRED_ENTRY_CHECKS:
+    checks = normalize_entry_checks(row.checks_json)
+    if checks is None:
         return "review check set is incomplete"
-    if any(checks.get(name) is not True for name in _REQUIRED_ENTRY_CHECKS):
+    if not all_entry_checks_pass(checks):
         return "one or more mandatory review checks failed"
     if not isinstance(row.reason, str) or not row.reason.strip():
         return "review reason is missing"
@@ -525,7 +533,7 @@ async def auto_execute_candidates(
     context: DaemonContext,
     candidates: list[tuple[str, ScoredStrategy, int]],
 ) -> int:
-    """Execute only alerted candidates with an exact requested Hermes review."""
+    """Execute alerted candidates through the configured paper authorization path."""
     if context.settings.execution.mode != "auto" or context.order_client is None:
         return 0
     require_review = context.settings.execution.require_hermes_entry_review

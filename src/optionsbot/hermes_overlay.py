@@ -40,6 +40,8 @@ def _playbook_name(suggestion: object) -> str:
             and plan.get("status") == "entry_confirmed"
             and plan.get("source") == "trusted_daemon"
         ):
+            if plan.get("setup_type") == "range_level_retest":
+                return "opening_range_level_retest_v1"
             return "opening_range_fvg_v1"
     return "legacy"
 

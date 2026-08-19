@@ -151,4 +151,22 @@ def test_entry_after_eleven_new_york_is_rejected(tmp_db: Engine) -> None:
         strategy="long_call",
         now=datetime(2026, 7, 31, 15, 1, tzinfo=UTC),
     )
-    assert error is not None and "09:40–11:00" in error
+    assert error is not None and "configured session window" in error
+
+
+def test_production_length_window_accepts_fresh_afternoon_setup(tmp_db: Engine) -> None:
+    plan = _plan()
+    plan["respected_ts"] = "2026-07-31T19:19:00+00:00"
+    settings = _settings()
+    settings.scan.opening_range_entry_window_minutes = 360
+    assert (
+        _opening_range_entry_error(
+            tmp_db,
+            settings,
+            suggestion={"opening_range_fvg": plan},
+            snapshot_raw={"opening_range_fvg": plan},
+            strategy="long_call",
+            now=datetime(2026, 7, 31, 19, 20, tzinfo=UTC),
+        )
+        is None
+    )

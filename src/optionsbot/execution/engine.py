@@ -207,7 +207,7 @@ def _opening_range_entry_error(
     )
     signal_age = now - signal_completed_at
     if not range_end <= respected_utc <= now <= entry_end:
-        return "opening-range/FVG confirmation is outside the 09:40–11:00 ET window"
+        return "intraday opening-range confirmation is outside its configured session window"
     if signal_age < timedelta(0) or signal_age > timedelta(
         minutes=settings.scan.opening_range_signal_max_age_minutes
     ):

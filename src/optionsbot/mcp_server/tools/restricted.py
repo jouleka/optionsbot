@@ -371,19 +371,19 @@ def register(server: FastMCP) -> None:
                 > execution_settings.zero_dte_entry_cutoff_minutes
             )
         )
+        market_open_at = nyse_session_start_utc(now) + timedelta(
+            hours=9, minutes=30
+        )
+        opening_range_entry_from = market_open_at + timedelta(
+            minutes=scan_settings.opening_range_minutes
+        )
+        opening_range_entry_through = market_open_at + timedelta(
+            minutes=scan_settings.opening_range_entry_window_minutes
+        )
         opening_range_window_open = True
         if scan_settings.opening_range_fvg_enabled:
-            market_open_at = nyse_session_start_utc(now) + timedelta(
-                hours=9, minutes=30
-            )
             opening_range_window_open = (
-                market_open_at
-                + timedelta(minutes=scan_settings.opening_range_minutes)
-                <= now
-                <= market_open_at
-                + timedelta(
-                    minutes=scan_settings.opening_range_entry_window_minutes
-                )
+                opening_range_entry_from <= now <= opening_range_entry_through
             )
             entry_window_open = entry_window_open and opening_range_window_open
         return {
@@ -414,8 +414,18 @@ def register(server: FastMCP) -> None:
                 "opening_range_entry_window_minutes": (
                     scan_settings.opening_range_entry_window_minutes
                 ),
+                "opening_range_entry_eligible_from": (
+                    opening_range_entry_from.isoformat()
+                ),
+                "opening_range_entry_eligible_through": (
+                    opening_range_entry_through.isoformat()
+                ),
                 "opening_range_window_open": opening_range_window_open,
                 "entry_window_open": entry_window_open,
+                "timing_authority": (
+                    "trusted daemon configuration; do not apply a remembered or "
+                    "hard-coded analyst cutoff"
+                ),
             },
             "broker_access": False,
         }

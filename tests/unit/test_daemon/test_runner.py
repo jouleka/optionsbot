@@ -144,10 +144,10 @@ async def test_exits_tick_isolated_from_scan_tick(daemon_settings) -> None:
     mock_exits.assert_awaited_once_with(d._context)
 
 
-def test_periodic_jobs_align_exits_to_every_wall_clock_minute(
+def test_periodic_jobs_align_exits_to_every_fifteen_seconds(
     daemon_settings,
 ) -> None:
-    """The exit guard fires at :00 each minute, independent of daemon start."""
+    """The exit guard fires every 15 seconds, independent of daemon start."""
     daemon_settings.telegram.heartbeat_minutes = 0
     daemon_settings.validation.outcomes_eval_hours = 0
     d = Daemon(settings=daemon_settings)
@@ -167,6 +167,10 @@ def test_periodic_jobs_align_exits_to_every_wall_clock_minute(
     after = datetime(2026, 7, 23, 19, 29, 59, tzinfo=UTC)
     assert trigger.get_next_fire_time(None, after) == datetime(
         2026, 7, 23, 19, 30, tzinfo=UTC
+    )
+    after_boundary = datetime(2026, 7, 23, 19, 30, tzinfo=UTC)
+    assert trigger.get_next_fire_time(after_boundary, after_boundary) == datetime(
+        2026, 7, 23, 19, 30, 15, tzinfo=UTC
     )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import Engine, insert, select
@@ -302,6 +302,77 @@ def test_record_fill_and_dedupe_by_exec_id(tmp_db: Engine) -> None:
     with tmp_db.connect() as conn:
         rows = conn.execute(select(fills)).fetchall()
     assert len(rows) == 1
+
+
+def test_record_fill_correction_replaces_older_ibkr_revision(tmp_db: Engine) -> None:
+    """Regression for the cumulative/revised GOOGL close fills on 2026-08-10."""
+    order_id = _insert_order(tmp_db, "filled", quantity=2)
+    prefix = "0000e22a.6a794f7d.01.01"
+    assert record_fill(
+        tmp_db, order_id, exec_id=f"{prefix}.01", side="SELL", price=0.92,
+        qty=1, ts=NOW, leg_con_id=905627718,
+    )
+    assert set_fill_commission(tmp_db, f"{prefix}.01", 0.785245)
+    assert record_fill(
+        tmp_db, order_id, exec_id=f"{prefix}.02", side="SELL", price=0.92,
+        qty=2, ts=NOW + timedelta(seconds=11), leg_con_id=905627718,
+    )
+    assert set_fill_commission(tmp_db, f"{prefix}.02", 0.87049)
+    # A reconnect may replay the superseded .01 after .02; it stays stale.
+    assert not record_fill(
+        tmp_db, order_id, exec_id=f"{prefix}.01", side="SELL", price=0.92,
+        qty=1, ts=NOW, leg_con_id=905627718,
+    )
+
+    with tmp_db.connect() as conn:
+        rows = conn.execute(select(fills).where(fills.c.order_id == order_id)).fetchall()
+    assert len(rows) == 1
+    assert rows[0].ib_exec_id == f"{prefix}.02"
+    assert rows[0].qty == 2
+    assert rows[0].commission == pytest.approx(0.87049)
+
+
+def test_record_fill_replay_repairs_preexisting_revision_double_count(
+    tmp_db: Engine,
+) -> None:
+    """Deployment replay must repair ledgers written by the pre-fix daemon."""
+    order_id = _insert_order(tmp_db, "filled", quantity=2)
+    prefix = "0000e22a.6a794f7c.01.01"
+    with tmp_db.begin() as conn:
+        conn.execute(
+            insert(fills),
+            [
+                {
+                    "order_id": order_id, "ib_exec_id": f"{prefix}.01",
+                    "side": "BUY", "price": 0.29, "qty": 1,
+                    "ts": NOW, "commission": 0.6173, "leg_con_id": 905206190,
+                },
+                {
+                    "order_id": order_id, "ib_exec_id": f"{prefix}.02",
+                    "side": "BUY", "price": 0.29, "qty": 1,
+                    "ts": NOW + timedelta(seconds=11), "commission": 0.6173,
+                    "leg_con_id": 905206190,
+                },
+            ],
+        )
+
+    # Replaying the latest correction coalesces the already-corrupt family.
+    assert record_fill(
+        tmp_db, order_id, exec_id=f"{prefix}.02", side="BUY", price=0.29,
+        qty=1, ts=NOW + timedelta(seconds=11), leg_con_id=905206190,
+    )
+    with tmp_db.connect() as conn:
+        rows = conn.execute(select(fills).where(fills.c.order_id == order_id)).fetchall()
+    assert [row.ib_exec_id for row in rows] == [f"{prefix}.02"]
+
+
+def test_fill_commission_accepts_exchange_rebate(tmp_db: Engine) -> None:
+    order_id = _insert_order(tmp_db, "filled")
+    record_fill(
+        tmp_db, order_id, exec_id="rebate.01", side="BUY", price=0.29,
+        qty=1, ts=NOW, leg_con_id=905206190,
+    )
+    assert set_fill_commission(tmp_db, "rebate.01", -0.0827)
 
 
 def test_set_fill_commission_by_exec_id(tmp_db: Engine) -> None:

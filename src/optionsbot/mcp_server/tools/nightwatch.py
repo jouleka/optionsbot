@@ -27,6 +27,10 @@ from optionsbot.mcp_server.intent_queue import (
     recent_proposal_decisions,
 )
 from optionsbot.mcp_server.serialization import iso_utc
+from optionsbot.review_checks import (
+    all_entry_checks_pass,
+    normalize_entry_checks,
+)
 from optionsbot.review_evidence import review_evidence_ready, snapshot_ready_for_auto
 from optionsbot.risk_structure import has_structurally_defined_option_risk
 from optionsbot.storage.schema import (
@@ -57,9 +61,10 @@ RUBRIC: dict[str, list[str]] = {
     ],
     "opening_range_fvg_policy": [
         (
-            "Use opening_range_fvg_v1 playbook-specific session history for this "
-            "setup; legacy or broad strategy/symbol history is context and cannot "
-            "veto an otherwise ready positive-EV candidate."
+            "Use the candidate's setup-specific opening_range_fvg_v1 or "
+            "opening_range_level_retest_v1 session history; legacy or broad "
+            "strategy/symbol history is context and cannot veto an otherwise "
+            "ready positive-EV candidate."
         ),
         (
             "An absent playbook-specific tuple is a paper-learning cold start, "
@@ -80,15 +85,6 @@ RUBRIC: dict[str, list[str]] = {
     ],
 }
 
-REQUIRED_ENTRY_CHECKS = {
-    "bot_health",
-    "candidate",
-    "microstructure",
-    "greeks",
-    "regime_history",
-    "catalysts",
-    "account_risk",
-}
 REQUIRED_PROPOSAL_CHECKS = {"bot_health", "regime_history", "catalysts"}
 ENTRY_VERDICT_STATUS = {
     "vetted_paper_candidate": "requested",
@@ -660,11 +656,10 @@ def register(server: FastMCP) -> None:
             return {"ok": False, "error": "confidence_must_be_finite_0_to_1"}
         if normalized == "vetted_paper_candidate" and normalized_confidence < 0.80:
             return {"ok": False, "error": "confidence_below_threshold"}
-        if normalized == "vetted_paper_candidate" and (
-            set(checks) != REQUIRED_ENTRY_CHECKS
-            or any(checks.get(name) is not True for name in REQUIRED_ENTRY_CHECKS)
-        ):
+        canonical_checks = normalize_entry_checks(checks)
+        if normalized == "vetted_paper_candidate" and not all_entry_checks_pass(checks):
             return {"ok": False, "error": "all_seven_checks_must_pass"}
+        persisted_checks = canonical_checks if canonical_checks is not None else dict(checks)
         now = datetime.now(UTC)
         with lifespan.engine.connect() as conn:
             pick = conn.execute(
@@ -767,7 +762,7 @@ def register(server: FastMCP) -> None:
                     "confidence": normalized_confidence,
                     "sources": clean_sources,
                     "reason": clean_reason,
-                    "checks": dict(checks),
+                    "checks": persisted_checks,
                     "status": status,
                 },
                 now=now,
@@ -792,7 +787,7 @@ def register(server: FastMCP) -> None:
                         confidence=normalized_confidence,
                         sources_json=clean_sources,
                         reason=clean_reason,
-                        checks_json=dict(checks),
+                        checks_json=persisted_checks,
                         status=status,
                     )
                 ).inserted_primary_key

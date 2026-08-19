@@ -10,6 +10,7 @@ from optionsbot.execution.risk_structure import (
     structural_max_loss_dollars,
     structural_max_profit_dollars,
 )
+from optionsbot.opening_range_economics import managed_expected_value
 
 
 def _finite_number(value: object) -> float | None:
@@ -28,8 +29,13 @@ class ReconciledEntryEconomics:
     max_profit: float | None
     reward_risk: float | None
     expected_value: float | None
+    terminal_expected_value: float | None
+    gross_managed_expected_value: float | None
+    managed_expected_value: float | None
+    estimated_round_trip_cost: float | None
     scan_credit_or_debit: float | None
     scan_expected_value: float | None
+    scan_terminal_expected_value: float | None
     fresh_net_per_share: float
 
     def to_dict(self) -> dict[str, float | None]:
@@ -41,12 +47,14 @@ def reconcile_entry_economics(
     suggestion: dict[str, Any],
     *,
     fresh_net_per_share: float,
+    estimated_round_trip_cost: object = 0.0,
 ) -> ReconciledEntryEconomics | None:
     """Reprice all entry-price-sensitive metrics from one fresh combo mid.
 
     Expected terminal intrinsic value is independent of entry price. Therefore
-    fresh EV equals scan EV plus the exact change in entry cashflow; this keeps
-    the scanner's original distribution/skew model while removing stale price.
+    fresh terminal EV equals scan terminal EV plus the exact change in entry
+    cashflow. Exact ORB/FVG entries additionally use their configured premium
+    stop and R target for the authoritative managed expectancy.
     """
     if not math.isfinite(fresh_net_per_share):
         return None
@@ -63,11 +71,32 @@ def reconcile_entry_economics(
     fresh_cashflow = fresh_net_per_share * 100.0
     scan_cashflow = _finite_number(suggestion.get("credit_or_debit"))
     scan_ev = _finite_number(suggestion.get("expected_value"))
-    expected_value = (
-        scan_ev + fresh_cashflow - scan_cashflow
-        if scan_ev is not None and scan_cashflow is not None
+    scan_terminal_ev = _finite_number(suggestion.get("terminal_expected_value"))
+    if scan_terminal_ev is None and suggestion.get("opening_range_fvg") is None:
+        scan_terminal_ev = scan_ev
+    terminal_expected_value = (
+        scan_terminal_ev + fresh_cashflow - scan_cashflow
+        if scan_terminal_ev is not None and scan_cashflow is not None
         else None
     )
+    opening_range_plan = suggestion.get("opening_range_fvg")
+    opening_range_candidate = (
+        isinstance(opening_range_plan, dict)
+        and opening_range_plan.get("status") == "entry_confirmed"
+    )
+    gross_managed_ev = managed_expected_value(
+        credit_or_debit=fresh_cashflow,
+        prob_profit=suggestion.get("prob_profit"),
+        plan=opening_range_plan,
+    )
+    managed_ev = managed_expected_value(
+        credit_or_debit=fresh_cashflow,
+        prob_profit=suggestion.get("prob_profit"),
+        plan=opening_range_plan,
+        estimated_round_trip_cost=estimated_round_trip_cost,
+    )
+    round_trip_cost = _finite_number(estimated_round_trip_cost)
+    expected_value = managed_ev if opening_range_candidate else terminal_expected_value
     reward_risk = (
         max_profit / max_loss
         if max_profit is not None and math.isfinite(max_profit) and max_profit > 0
@@ -79,7 +108,12 @@ def reconcile_entry_economics(
         max_profit=max_profit,
         reward_risk=reward_risk,
         expected_value=expected_value,
+        terminal_expected_value=terminal_expected_value,
+        gross_managed_expected_value=gross_managed_ev,
+        managed_expected_value=managed_ev,
+        estimated_round_trip_cost=round_trip_cost,
         scan_credit_or_debit=scan_cashflow,
         scan_expected_value=scan_ev,
+        scan_terminal_expected_value=scan_terminal_ev,
         fresh_net_per_share=fresh_net_per_share,
     )

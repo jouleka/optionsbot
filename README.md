@@ -35,6 +35,26 @@ These controls reduce accidental misuse; they are not a guarantee. Review the so
 
 The MCP process cannot mutate broker state; broker mutations remain in the daemon. Live-account routing is intentionally unsupported.
 
+### Optional 0DTE opening-range strategy
+
+The paper-only opening-range mode records the first 10 minutes after the New
+York open on one-minute bars. After a close-confirmed breakout, it can recognize
+either a fair-value-gap pullback or a rejection and retest of the broken range
+boundary. Bullish and bearish breaks are evaluated independently so an early
+false break does not suppress a later reversal.
+
+Confirmed setups use defined-risk long options or debit spreads. Entry
+admission applies the configured premium stop and R-multiple target to the
+probability estimate, then subtracts estimated round-trip commissions and
+spread slippage. A candidate must retain positive managed expectancy after
+those costs and pass the existing freshness, liquidity, sizing, buying-power,
+portfolio-heat, position, daily-entry, market-hours, and kill-switch gates.
+
+Hermes can review or originate hypotheses, but it cannot place broker orders.
+The daemon reconstructs and validates every evidence packet and remains the
+only component authorized to submit an order. Disabling synchronous Hermes
+entry review is permitted only while the paper-account interlock remains on.
+
 ## Architecture
 
 | Package | Responsibility |

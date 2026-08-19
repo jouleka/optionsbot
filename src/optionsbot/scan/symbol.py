@@ -37,12 +37,17 @@ from optionsbot.ibkr import (
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg
 from optionsbot.market_hours import minutes_to_nyse_close
+from optionsbot.opening_range_economics import (
+    estimated_round_trip_cost,
+    managed_expected_value,
+    with_managed_expected_value,
+)
 from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import score_all
 from optionsbot.storage.iv_history import read_atm_iv_history, record_atm_iv
 from optionsbot.storage.schema import snapshots as snapshots_t
 from optionsbot.storage.schema import strategy_scores as scores_t
-from optionsbot.strategies import Leg, StrategySnapshot, get_strategy
+from optionsbot.strategies import Leg, StrategySnapshot, StrategySuggestion, get_strategy
 from optionsbot.strategies.strikes import closest_expiry_to_dte
 
 log = logging.getLogger(__name__)
@@ -103,6 +108,44 @@ def _override_view(
 
 def _serialize_legs(legs: tuple[Leg, ...]) -> list[dict[str, object]]:
     return [asdict(leg) for leg in legs]
+
+
+def _opening_range_round_trip_cost(
+    suggestion: StrategySuggestion,
+    chain: list[OptionChainLeg],
+    settings: Settings,
+) -> float | None:
+    """Estimate one-unit entry+exit costs from the live scan chain."""
+    quotes = {(q.expiry, q.strike, q.right): q for q in chain}
+    contracts = 0
+    combo_spread = 0.0
+    for leg in suggestion.legs:
+        if leg.sec_type != "OPT":
+            continue
+        if leg.expiry is None or leg.strike is None or leg.right is None:
+            return None
+        quote = quotes.get((leg.expiry, leg.strike, leg.right))
+        if (
+            quote is None
+            or quote.bid is None
+            or quote.ask is None
+            or not math.isfinite(quote.bid)
+            or not math.isfinite(quote.ask)
+            or quote.ask < quote.bid
+        ):
+            return None
+        contracts += leg.quantity
+        combo_spread += (quote.ask - quote.bid) * leg.quantity
+    return estimated_round_trip_cost(
+        option_contracts_per_unit=contracts,
+        combo_spread_per_share=combo_spread,
+        commission_per_contract=(
+            settings.execution.opening_range_commission_per_contract
+        ),
+        slippage_spread_fraction=(
+            settings.execution.opening_range_round_trip_slippage_spread_frac
+        ),
+    )
 
 
 async def scan_symbol(
@@ -299,6 +342,38 @@ async def scan_symbol(
                 len(chain),
             )
 
+    terminal_expected_values = {
+        item.strategy_name: item.suggestion.expected_value for item in scored
+    }
+    opening_range_plan = (
+        opening_range_signal.to_dict() if opening_range_signal is not None else None
+    )
+    opening_range_round_trip_costs: dict[str, float | None] = {}
+    gross_managed_expected_values: dict[str, float | None] = {}
+    if opening_range_plan is not None:
+        for item in scored:
+            opening_range_round_trip_costs[item.strategy_name] = (
+                _opening_range_round_trip_cost(item.suggestion, chain, settings)
+            )
+            gross_managed_expected_values[item.strategy_name] = managed_expected_value(
+                credit_or_debit=item.suggestion.credit_or_debit,
+                prob_profit=item.suggestion.prob_profit,
+                plan=opening_range_plan,
+            )
+        scored = tuple(
+            replace(
+                item,
+                suggestion=with_managed_expected_value(
+                    item.suggestion,
+                    opening_range_plan,
+                    estimated_round_trip_cost=opening_range_round_trip_costs.get(
+                        item.strategy_name
+                    ),
+                ),
+            )
+            for item in scored
+        )
+
     ratio = iv_hv_ratio(atm_iv, hv20) if (atm_iv is not None and hv20 is not None) else None
     relative_strength_value: float | None = None
     beta_to_benchmark: float | None = None
@@ -352,8 +427,8 @@ async def scan_symbol(
         "front_dte": front_dte,
         "expected_move": expected_move,
         "opening_range_fvg": (
-            opening_range_signal.to_dict()
-            if opening_range_signal is not None
+            opening_range_plan
+            if opening_range_plan is not None
             else {
                 "status": "not_confirmed",
                 "source": "trusted_daemon",
@@ -403,11 +478,23 @@ async def scan_symbol(
                             "suggested_quantity": s.suggestion.suggested_quantity,
                             "reward_risk": s.suggestion.reward_risk,
                             "expected_value": s.suggestion.expected_value,
+                            "expected_value_model": (
+                                "opening_range_stop_target_after_costs_v2"
+                                if opening_range_plan is not None
+                                else "terminal_expiry_v1"
+                            ),
+                            "terminal_expected_value": terminal_expected_values.get(
+                                s.strategy_name
+                            ),
+                            "gross_managed_expected_value": (
+                                gross_managed_expected_values.get(s.strategy_name)
+                            ),
+                            "estimated_round_trip_cost": (
+                                opening_range_round_trip_costs.get(s.strategy_name)
+                            ),
                             "risk_tier": s.suggestion.risk_tier,
                             "opening_range_fvg": (
-                                opening_range_signal.to_dict()
-                                if opening_range_signal is not None
-                                else None
+                                opening_range_plan
                             ),
                         },
                     }

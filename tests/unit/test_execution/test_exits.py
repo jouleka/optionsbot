@@ -154,6 +154,88 @@ def test_opening_range_debit_two_r_target() -> None:
     assert reason is not None and "opening-range FVG" in reason and "take-profit" in reason
 
 
+def test_opening_range_take_profit_stays_latched_after_cancelled_close() -> None:
+    """A target hit remains an exit request even after price retraces."""
+    reason = evaluate_exit(
+        entry_net=-1.19,
+        current_net=-0.95,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=70,
+        peak_pnl_per_unit=0.33,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.225,
+    )
+    assert reason is not None
+    assert "take-profit latched" in reason
+    assert "peak +28%" in reason
+    assert "current -20%" in reason
+
+
+def test_opening_range_extended_target_protects_cost_floor_after_one_r() -> None:
+    reason = evaluate_exit(
+        entry_net=-2.00,
+        current_net=-2.08,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=180,
+        peak_pnl_per_unit=0.32,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.30,
+        debit_round_trip_cost_override=0.10,
+    )
+    assert reason is not None
+    assert "break-even protection" in reason
+    assert "peak +16%" in reason
+    assert "cost floor +5%" in reason
+
+
+def test_opening_range_extended_target_locks_one_r_after_one_and_half_r() -> None:
+    reason = evaluate_exit(
+        entry_net=-2.00,
+        current_net=-2.28,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=180,
+        peak_pnl_per_unit=0.46,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.30,
+        debit_round_trip_cost_override=0.10,
+    )
+    assert reason is not None
+    assert "profit lock" in reason
+    assert "peak +23%" in reason
+    assert "floor +15%" in reason
+
+
+def test_opening_range_extended_target_holds_above_profit_floor() -> None:
+    assert evaluate_exit(
+        entry_net=-2.00,
+        current_net=-2.40,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=180,
+        peak_pnl_per_unit=0.46,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.30,
+        debit_round_trip_cost_override=0.10,
+    ) is None
+
+
+def test_opening_range_one_and_half_r_does_not_arm_extended_protection() -> None:
+    assert evaluate_exit(
+        entry_net=-2.00,
+        current_net=-2.00,
+        dte=0,
+        settings=_settings(zero_dte_only=True),
+        minutes_to_close=180,
+        peak_pnl_per_unit=0.31,
+        debit_stop_pct_override=0.15,
+        debit_take_profit_pct_override=0.225,
+        debit_round_trip_cost_override=0.10,
+    ) is None
+
+
 def test_zero_dte_debit_half_gain_arms_trail_instead_of_closing() -> None:
     """The old +50%-of-debit trigger is now a winner-trail arming point."""
     settings = _settings(zero_dte_only=True)

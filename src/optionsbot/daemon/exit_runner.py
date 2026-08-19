@@ -1,6 +1,6 @@
 """Automated exit tick (IBK-129): bot positions → closing orders.
 
-Runs on a dedicated wall-clock-aligned one-minute cadence; the separate
+Runs on a dedicated wall-clock-aligned sub-minute cadence; the separate
 one-minute order watcher manages resulting working orders. Only
 ledger-attributed positions are ever touched: a position is a FILLED
 open-intent order with no filled close. Manual positions remain alert-only.
@@ -85,6 +85,13 @@ class ExitsTickSummary:
     errors: int
 
 
+@dataclass(frozen=True, slots=True)
+class OpeningRangeExitPlan:
+    stop_pct: float
+    target_pct: float
+    estimated_round_trip_cost_per_unit: float
+
+
 def _exec_md(context: DaemonContext) -> MarketDataClient | None:
     """Quote source for exit pricing: the daemon's sole market-data session.
 
@@ -123,7 +130,7 @@ def _open_entries(context: DaemonContext) -> list[OrderRecord]:
 
 def _opening_range_exit_plan(
     engine: Engine, entry: OrderRecord
-) -> tuple[float, float] | None:
+) -> OpeningRangeExitPlan | None:
     """Return the persisted stop and take-profit fractions for an ORB entry."""
     if entry.strategy_score_id is None:
         return None
@@ -141,6 +148,7 @@ def _opening_range_exit_plan(
     try:
         stop_pct = float(plan["stop_pct"])
         target_pct = float(plan["target_pct"])
+        estimated_cost_dollars = float(suggestion.get("estimated_round_trip_cost", 0.0))
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
     if (
@@ -148,9 +156,15 @@ def _opening_range_exit_plan(
         or not math.isfinite(target_pct)
         or not 0 < stop_pct < 1
         or not 0 < target_pct < 1
+        or not math.isfinite(estimated_cost_dollars)
+        or estimated_cost_dollars < 0
     ):
         return None
-    return stop_pct, target_pct
+    return OpeningRangeExitPlan(
+        stop_pct=stop_pct,
+        target_pct=target_pct,
+        estimated_round_trip_cost_per_unit=estimated_cost_dollars / 100.0,
+    )
 
 
 async def _settle_cleared_expirations(
@@ -498,10 +512,15 @@ async def _quote_gate_state(
             max_profit_per_unit=max_profit,
             peak_pnl_per_unit=peak_pnl_for(context.engine, entry.id),
             debit_stop_pct_override=(
-                opening_range_plan[0] if opening_range_plan is not None else None
+                opening_range_plan.stop_pct if opening_range_plan is not None else None
             ),
             debit_take_profit_pct_override=(
-                opening_range_plan[1] if opening_range_plan is not None else None
+                opening_range_plan.target_pct if opening_range_plan is not None else None
+            ),
+            debit_round_trip_cost_override=(
+                opening_range_plan.estimated_round_trip_cost_per_unit
+                if opening_range_plan is not None
+                else None
             ),
         )
     return QuoteGateState(
@@ -925,10 +944,15 @@ async def _manage_entry(
             max_profit_per_unit=max_profit,
             peak_pnl_per_unit=peak_pnl,
             debit_stop_pct_override=(
-                opening_range_plan[0] if opening_range_plan is not None else None
+                opening_range_plan.stop_pct if opening_range_plan is not None else None
             ),
             debit_take_profit_pct_override=(
-                opening_range_plan[1] if opening_range_plan is not None else None
+                opening_range_plan.target_pct if opening_range_plan is not None else None
+            ),
+            debit_round_trip_cost_override=(
+                opening_range_plan.estimated_round_trip_cost_per_unit
+                if opening_range_plan is not None
+                else None
             ),
         )
     pnl_pct = pnl / abs(entry_net) * 100.0 if pnl is not None and abs(entry_net) > 1e-9 else None

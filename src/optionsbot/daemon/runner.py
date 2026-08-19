@@ -341,7 +341,7 @@ class Daemon:
             )
         except Exception:
             log.exception("manage tick failed catastrophically")
-        # Protective exits run on their own wall-clock-aligned minute job.
+        # Protective exits run on their own wall-clock-aligned sub-minute job.
         # Keeping them out of the scanner prevents scan duration/restarts from
         # shifting the 0DTE force-exit deadline.
 
@@ -518,12 +518,13 @@ class Daemon:
             coalesce=True,
             replace_existing=True,
         )
-        # Protective exits are deadline-sensitive (especially the 0DTE close
-        # guard). CronTrigger anchors them to each wall-clock minute instead of
-        # inheriting a daemon-start offset or the scanner's variable duration.
+        # Protective exits are deadline-sensitive (especially 0DTE premium
+        # stops). CronTrigger anchors them to stable wall-clock boundaries
+        # instead of inheriting a daemon-start offset or scanner duration.
+        exit_interval = self._settings.execution.exit_check_interval_seconds
         self._scheduler.add_job(
             self._exits_tick,
-            trigger=CronTrigger(second=0, timezone=UTC),
+            trigger=CronTrigger(second=f"*/{exit_interval}", timezone=UTC),
             id="exits",
             max_instances=1,
             coalesce=True,
