@@ -29,6 +29,7 @@ from optionsbot.execution.state import load_state
 from optionsbot.execution.walk import combo_bid_ask, combo_spread_issue
 from optionsbot.ibkr import MarketDataClient, PositionsClient
 from optionsbot.ibkr.types import OptionQuote
+from optionsbot.opening_range_economics import estimated_round_trip_cost
 from optionsbot.storage.schema import (
     orders,
     position_settlements,
@@ -337,6 +338,7 @@ async def capture_candidate_evidence(
     if mid is None:
         issues.append("combo mid unavailable")
     else:
+        assert combo is not None
         combo_issue = combo_spread_issue(
             legs,
             quote_map,
@@ -345,10 +347,26 @@ async def capture_candidate_evidence(
         )
         if combo_issue is not None:
             issues.append("liquidity: " + combo_issue)
+        option_contracts_per_unit = sum(
+            int(leg.get("quantity", 1))
+            for leg in legs
+            if leg.get("sec_type", "OPT") == "OPT"
+        )
+        round_trip_cost = estimated_round_trip_cost(
+            option_contracts_per_unit=option_contracts_per_unit,
+            combo_spread_per_share=combo[1] - combo[0],
+            commission_per_contract=(
+                context.settings.execution.opening_range_commission_per_contract
+            ),
+            slippage_spread_fraction=(
+                context.settings.execution.opening_range_round_trip_slippage_spread_frac
+            ),
+        )
         economics = reconcile_entry_economics(
             legs,
             stored_suggestion,
             fresh_net_per_share=mid,
+            estimated_round_trip_cost=round_trip_cost,
         )
         if economics is None:
             issues.append("fresh executable economics unavailable")
@@ -509,19 +527,19 @@ async def capture_candidate_evidence(
             > context.settings.execution.zero_dte_entry_cutoff_minutes
         )
     )
+    market_open_at = nyse_session_start_utc(captured_at) + timedelta(
+        hours=9, minutes=30
+    )
+    opening_range_entry_from = market_open_at + timedelta(
+        minutes=context.settings.scan.opening_range_minutes
+    )
+    opening_range_entry_through = market_open_at + timedelta(
+        minutes=context.settings.scan.opening_range_entry_window_minutes
+    )
     opening_range_window_open = True
     if context.settings.scan.opening_range_fvg_enabled:
-        market_open_at = nyse_session_start_utc(captured_at) + timedelta(
-            hours=9, minutes=30
-        )
         opening_range_window_open = (
-            market_open_at
-            + timedelta(minutes=context.settings.scan.opening_range_minutes)
-            <= captured_at
-            <= market_open_at
-            + timedelta(
-                minutes=context.settings.scan.opening_range_entry_window_minutes
-            )
+            opening_range_entry_from <= captured_at <= opening_range_entry_through
         )
         entry_window_open = entry_window_open and opening_range_window_open
     if not entry_window_open:
@@ -658,8 +676,22 @@ async def capture_candidate_evidence(
             "zero_dte_entry_cutoff_minutes": (
                 context.settings.execution.zero_dte_entry_cutoff_minutes
             ),
+            "opening_range_minutes": context.settings.scan.opening_range_minutes,
+            "opening_range_entry_window_minutes": (
+                context.settings.scan.opening_range_entry_window_minutes
+            ),
+            "opening_range_entry_eligible_from": (
+                opening_range_entry_from.isoformat()
+            ),
+            "opening_range_entry_eligible_through": (
+                opening_range_entry_through.isoformat()
+            ),
             "entry_window_open": entry_window_open,
             "opening_range_window_open": opening_range_window_open,
+            "timing_authority": (
+                "trusted daemon configuration; do not apply a remembered or "
+                "hard-coded analyst cutoff"
+            ),
         },
         "opening_range_fvg": snapshot_raw.get("opening_range_fvg"),
         "market_data_incident": incident,
@@ -742,6 +774,12 @@ async def capture_candidate_evidence(
                 max_profit=economics.max_profit,
                 reward_risk=economics.reward_risk,
                 expected_value=economics.expected_value,
+                terminal_expected_value=economics.terminal_expected_value,
+                gross_managed_expected_value=(
+                    economics.gross_managed_expected_value
+                ),
+                managed_expected_value=economics.managed_expected_value,
+                estimated_round_trip_cost=economics.estimated_round_trip_cost,
             )
         updated["review_evidence"] = evidence
         conn.execute(

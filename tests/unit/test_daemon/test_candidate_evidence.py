@@ -229,6 +229,16 @@ async def test_capture_candidate_evidence_persists_ready_packet(
         ),
     }
     assert evidence["market_timing"]["entry_window_open"] is True
+    assert evidence["market_timing"]["opening_range_entry_window_minutes"] == 90
+    assert evidence["market_timing"]["opening_range_entry_eligible_from"] == (
+        "2026-07-16T13:40:00+00:00"
+    )
+    assert evidence["market_timing"]["opening_range_entry_eligible_through"] == (
+        "2026-07-16T15:00:00+00:00"
+    )
+    assert "hard-coded analyst cutoff" in evidence["market_timing"][
+        "timing_authority"
+    ]
     assert evidence["expiration_assignment"]["handling"]
     assert review_evidence_ready(
         evidence,
@@ -245,3 +255,5 @@ async def test_capture_candidate_evidence_persists_ready_packet(
     assert suggestion["max_loss"] == pytest.approx(380.0)
     assert suggestion["max_profit"] == pytest.approx(120.0)
     assert suggestion["expected_value"] == pytest.approx(30.0)
+    assert suggestion["terminal_expected_value"] == pytest.approx(30.0)
+    assert suggestion["managed_expected_value"] is None

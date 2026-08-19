@@ -12,7 +12,7 @@ from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import Engine, insert, select, update
+from sqlalchemy import Engine, create_engine, insert, select, update
 from sqlalchemy.exc import OperationalError
 
 from optionsbot.config import Settings
@@ -30,7 +30,10 @@ from optionsbot.mcp_server.intent_queue import (
     enqueue_intent,
     recent_proposal_decisions,
 )
-from optionsbot.mcp_server.restricted_context import RestrictedServerContext
+from optionsbot.mcp_server.restricted_context import (
+    RestrictedServerContext,
+    restricted_app_lifespan,
+)
 from optionsbot.mcp_server.server import build_server
 from optionsbot.mcp_server.tools import nightwatch, restricted
 from optionsbot.scoring import ScoredStrategy
@@ -108,9 +111,37 @@ def test_restricted_health_attests_zero_dte_entry_window(
         "opening_range_fvg_enabled": False,
         "opening_range_minutes": 10,
         "opening_range_entry_window_minutes": 90,
+        "opening_range_entry_eligible_from": result["market_timing"][
+            "opening_range_entry_eligible_from"
+        ],
+        "opening_range_entry_eligible_through": result["market_timing"][
+            "opening_range_entry_eligible_through"
+        ],
         "opening_range_window_open": True,
         "entry_window_open": True,
+        "timing_authority": (
+            "trusted daemon configuration; do not apply a remembered or "
+            "hard-coded analyst cutoff"
+        ),
     }
+
+
+def test_restricted_context_accepts_full_intraday_opening_range_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary.db"
+    intent = tmp_path / "intent.db"
+    create_engine(f"sqlite:///{primary}").dispose()
+    monkeypatch.setenv("OPTIONSBOT_MCP_DB_PATH", str(primary))
+    monkeypatch.setenv("OPTIONSBOT_MCP_INTENT_DB_PATH", str(intent))
+    monkeypatch.setenv("OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES", "360")
+
+    async def load_context() -> int:
+        async with restricted_app_lifespan(None) as context:  # type: ignore[arg-type]
+            return context.opening_range_entry_window_minutes
+
+    assert asyncio.run(load_context()) == 360
 
 
 def test_hermes_metrics_uses_only_judgeable_calls_and_reports_churn(
@@ -352,6 +383,80 @@ def test_disabled_overlay_holds_newly_imported_vetted_review(
         review = conn.execute(select(entry_reviews)).one()
     assert review.status == "held"
     assert "test correctness trip" in review.decision_reason
+
+
+def test_consumer_normalizes_public_review_check_names(
+    mcp_engine: Engine,
+) -> None:
+    daemon_context = cast(DaemonContext, SimpleNamespace(engine=mcp_engine))
+    now = datetime.now(UTC)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(symbol="AMZN", ts=now, spot=220.0, raw_json={})
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bear_put_spread",
+                    score=85.0,
+                    legs_json=[],
+                    suggestion_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        alert_id = int(
+            conn.execute(
+                insert(alerts).values(
+                    strategy_score_id=score_id,
+                    ts=now,
+                    symbol="AMZN",
+                    strategy="bear_put_spread",
+                    score=85.0,
+                    status="sent",
+                    sent_ts=now,
+                    telegram_msg_id=125,
+                )
+            ).inserted_primary_key[0]
+        )
+
+    result = _consume_entry_review(
+        daemon_context,
+        {
+            "pick_id": score_id,
+            "alert_id": alert_id,
+            "reviewed_at": now.isoformat(),
+            "verdict": "vetted_paper_candidate",
+            "confidence": 0.9,
+            "sources": ["source A", "source B"],
+            "reason": "all deterministic and research checks passed",
+            "checks": {
+                "bot_health": True,
+                "candidate_definition": True,
+                "market_microstructure": True,
+                "greeks_and_structure_risk": True,
+                "regime_and_history": True,
+                "catalysts": True,
+                "account_risk_caps": True,
+            },
+        },
+    )
+
+    assert "entry review imported" in result
+    with daemon_context.engine.connect() as conn:
+        review = conn.execute(select(entry_reviews)).one()
+    assert review.status == "requested"
+    assert review.checks_json == {
+        "bot_health": True,
+        "candidate": True,
+        "microstructure": True,
+        "greeks": True,
+        "regime_history": True,
+        "catalysts": True,
+        "account_risk": True,
+    }
 
 
 def test_watch_only_result_does_not_claim_overlay_breaker(

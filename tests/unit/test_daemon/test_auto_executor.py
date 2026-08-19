@@ -253,6 +253,35 @@ async def test_auto_executes_ready_trusted_paper_candidate_without_review(
         assert conn.execute(select(entry_reviews)).fetchall() == []
 
 
+def test_final_authorization_accepts_positive_ev_long_option_with_unbounded_profit() -> None:
+    """A long option's valid ``max_profit=None`` must survive the final daemon gate."""
+    from optionsbot.daemon.auto_executor import _positive_defined_risk
+
+    row = MagicMock(
+        legs_json=[
+            {
+                "symbol": "SPY",
+                "side": "buy",
+                "sec_type": "OPT",
+                "expiry": "20260717",
+                "strike": 600.0,
+                "right": "C",
+                "quantity": 1,
+            }
+        ],
+        suggestion_json={
+            "defined_risk": True,
+            "credit_or_debit": -162.0,
+            "max_loss": 162.0,
+            "max_profit": None,
+            "prob_profit": 0.33,
+            "expected_value": 45.0,
+        },
+    )
+
+    assert _positive_defined_risk(row) is True
+
+
 async def test_auto_direct_paper_path_rejects_unready_evidence(
     daemon_context: DaemonContext,
 ) -> None:

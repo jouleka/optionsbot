@@ -335,6 +335,46 @@ def test_submit_entry_review_queues_complete_vetted_candidate(
     assert row.status == "requested"
 
 
+def test_submit_entry_review_accepts_skill_check_names_and_persists_canonical_names(
+    server_context: ServerContext,
+) -> None:
+    """The Hermes skill's public gate names must interoperate with the MCP contract."""
+    score_id = _snapshot_with_score(server_context)
+    submit_entry_review = get_tools(register)["submit_entry_review"]
+
+    result = submit_entry_review(
+        pick_id=score_id,
+        alert_id=_alert_id_for_score(server_context, score_id),
+        verdict="VETTED PAPER CANDIDATE",
+        confidence=0.91,
+        sources=["trusted daemon evidence", "IBKR live quotes"],
+        reason="All seven public Hermes skill gates pass.",
+        checks={
+            "bot_health": True,
+            "candidate_definition": True,
+            "market_microstructure": True,
+            "greeks_and_structure_risk": True,
+            "regime_and_history": True,
+            "catalysts": True,
+            "account_risk_caps": True,
+        },
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result["ok"] is True
+    with server_context.engine.connect() as conn:
+        row = conn.execute(select(entry_reviews)).one()
+    assert row.checks_json == {
+        "bot_health": True,
+        "candidate": True,
+        "microstructure": True,
+        "greeks": True,
+        "regime_history": True,
+        "catalysts": True,
+        "account_risk": True,
+    }
+
+
 def test_submit_entry_review_rejects_unalerted_score(
     server_context: ServerContext,
 ) -> None:

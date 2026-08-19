@@ -732,6 +732,29 @@ def test_execution_adapter_treats_empty_commission_report_as_unbundled(
     assert translated.commission is None
 
 
+def test_execution_adapter_accepts_negative_exchange_rebate(
+    order_client: OrderClient,
+) -> None:
+    from datetime import UTC, datetime
+
+    from ib_async import CommissionReport, Contract, Execution, Fill
+
+    execution = Execution(
+        execId="rebate.01", time=datetime(2026, 8, 10, 13, 56, 55, tzinfo=UTC),
+        side="BOT", shares=1.0, price=0.29, orderId=588, orderRef="obot-333",
+    )
+    fill = Fill(
+        contract=Contract(secType="OPT", symbol="GOOGL", conId=905206190),
+        execution=execution,
+        commissionReport=CommissionReport(execId="rebate.01", commission=-0.0827),
+        time=execution.time,
+    )
+
+    translated = order_client._to_execution_fill(fill)  # noqa: SLF001
+
+    assert translated.commission == pytest.approx(-0.0827)
+
+
 @pytest.mark.parametrize(
     ("shares", "con_id"),
     [(1.5, 1580), (1.0, 1580.5)],

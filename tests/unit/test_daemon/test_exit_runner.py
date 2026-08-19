@@ -13,6 +13,7 @@ from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.exit_runner import (
     _exec_md,
     _manage_entry,
+    _opening_range_exit_plan,
     _settle_cleared_expirations,
     assert_no_naked_short_after_close,
     force_close_entry,
@@ -210,6 +211,67 @@ def test_exit_quotes_use_the_single_daemon_market_data_session(
     assert md is not None
     assert md.client is daemon_context.ibkr
     assert md.client is not daemon_context.exec_ibkr
+
+
+async def test_opening_range_cost_floor_reaches_exit_evaluator(
+    daemon_context: DaemonContext,
+) -> None:
+    entry_id = _filled_entry(daemon_context)
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = int(
+            conn.execute(
+                insert(snapshots).values(
+                    symbol="SPY",
+                    ts=NOW,
+                    spot=600.0,
+                    raw_json={},
+                )
+            ).inserted_primary_key[0]
+        )
+        score_id = int(
+            conn.execute(
+                insert(strategy_scores).values(
+                    snapshot_id=snapshot_id,
+                    strategy="bull_put_spread",
+                    score=80.0,
+                    legs_json=_legs(FAR),
+                    suggestion_json={
+                        "estimated_round_trip_cost": 16.40,
+                        "opening_range_fvg": {
+                            "status": "entry_confirmed",
+                            "stop_pct": 0.15,
+                            "target_pct": 0.30,
+                        },
+                    },
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            update(orders)
+            .where(orders.c.id == entry_id)
+            .values(strategy_score_id=score_id)
+        )
+    entry = get_order(daemon_context.engine, entry_id)
+    assert entry is not None
+    plan = _opening_range_exit_plan(daemon_context.engine, entry)
+    assert plan is not None
+    assert plan.estimated_round_trip_cost_per_unit == pytest.approx(0.164)
+    _wire(daemon_context, {(580.0, "P"): 1.40, (575.0, "P"): 0.30})
+
+    with patch("optionsbot.daemon.exit_runner.evaluate_exit", return_value=None) as evaluate:
+        submitted = await _manage_entry(
+            daemon_context,
+            daemon_context._test_md,  # type: ignore[attr-defined]
+            entry,
+            NOW,
+        )
+
+    assert submitted == 0
+    assert evaluate.call_args.kwargs["debit_stop_pct_override"] == 0.15
+    assert evaluate.call_args.kwargs["debit_take_profit_pct_override"] == 0.30
+    assert evaluate.call_args.kwargs["debit_round_trip_cost_override"] == pytest.approx(
+        0.164
+    )
 
 
 async def test_cleared_all_otm_expiration_is_settled_from_terminal_outcome(

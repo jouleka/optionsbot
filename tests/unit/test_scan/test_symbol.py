@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -463,6 +463,90 @@ async def test_scan_symbol_no_iv_history_when_no_option_data(
     result = await scan_symbol("SPY", mock_ibkr_for_scan, scan_engine, scan_settings)  # type: ignore[arg-type]
     assert result.view.warming_up is True
     assert len(read_atm_iv_history(scan_engine, "SPY")) == 0  # type: ignore[arg-type]
+
+
+async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    from optionsbot.analysis.opening_range_fvg import OpeningRangeFVGSignal
+    from optionsbot.scan import symbol as symbol_mod
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+    from optionsbot.strategies import Leg, StrategySuggestion
+
+    scan_settings.scan.opening_range_fvg_enabled = True
+    terminal_ev = -20.0
+    suggestion = StrategySuggestion(
+        strategy_name="long_call",
+        legs=(
+            Leg(
+                symbol="SPY",
+                side="buy",
+                expiry=(date.today() + timedelta(days=45)).strftime("%Y%m%d"),
+                strike=400.0,
+                right="C",
+            ),
+        ),
+        credit_or_debit=-100.0,
+        max_loss=100.0,
+        max_profit=None,
+        prob_profit=0.60,
+        suggested_quantity=1,
+        defined_risk=True,
+        rationale="test",
+        expected_value=terminal_ev,
+    )
+    scored = ScoredStrategy(
+        strategy_name="long_call",
+        score=75.0,
+        factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        suggestion=suggestion,
+        rationale="test",
+    )
+    monkeypatch.setattr(symbol_mod, "score_all", MagicMock(return_value=(scored,)))
+    now = datetime.now(UTC)
+    signal = OpeningRangeFVGSignal(
+        signal_id="2026-08-06:SPY:bull:test",
+        session="2026-08-06",
+        timeframe_minutes=1,
+        direction="bull",
+        opening_range_high=401.0,
+        opening_range_low=399.0,
+        breakout_ts=now,
+        fvg_formed_ts=now,
+        fvg_low=401.1,
+        fvg_high=401.2,
+        respected_ts=now,
+        entry_underlying_price=401.3,
+        stop_pct=0.15,
+        target_r=1.5,
+        target_pct=0.225,
+    )
+
+    result = await scan_symbol(
+        "SPY",
+        mock_ibkr_for_scan,
+        scan_engine,
+        scan_settings,
+        opening_range_signal=signal,
+    )
+
+    # Gross managed EV is $7.50.  One $0.10-wide quote plus two $0.70
+    # commissions reserves $11.40, so admission EV is -$3.90.
+    assert result.scored[0].suggestion.expected_value == pytest.approx(-3.9)
+    with scan_engine.connect() as conn:
+        stored = conn.execute(
+            select(strategy_scores).where(
+                strategy_scores.c.snapshot_id == result.snapshot_id
+            )
+        ).one()
+    assert stored.suggestion_json["expected_value"] == pytest.approx(-3.9)
+    assert stored.suggestion_json["gross_managed_expected_value"] == pytest.approx(7.5)
+    assert stored.suggestion_json["estimated_round_trip_cost"] == pytest.approx(11.4)
+    assert stored.suggestion_json["terminal_expected_value"] == terminal_ev
+    assert stored.suggestion_json["expected_value_model"] == (
+        "opening_range_stop_target_after_costs_v2"
+    )
 
 
 async def test_scan_symbol_passes_back_dte_gap_to_get_chain(

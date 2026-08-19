@@ -98,9 +98,9 @@ async def restricted_app_lifespan(
     )
     if not 5 <= opening_range_minutes <= 30:
         raise RuntimeError("OPTIONSBOT_MCP_OPENING_RANGE_MINUTES must be within 5..30")
-    if not 30 <= opening_range_entry_window_minutes <= 180:
+    if not 30 <= opening_range_entry_window_minutes <= 390:
         raise RuntimeError(
-            "OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES must be within 30..180"
+            "OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES must be within 30..390"
         )
     if opening_range_entry_window_minutes <= opening_range_minutes:
         raise RuntimeError("opening-range entry window must end after the range")

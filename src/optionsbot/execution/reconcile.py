@@ -563,7 +563,6 @@ async def _reconcile_once(
                     not isinstance(commission, (int, float))
                     or isinstance(commission, bool)
                     or not math.isfinite(float(commission))
-                    or commission < 0
                 )
             )
         ):

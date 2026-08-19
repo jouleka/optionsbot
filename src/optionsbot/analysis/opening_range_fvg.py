@@ -11,6 +11,7 @@ import pandas as pd
 
 _NEW_YORK = ZoneInfo("America/New_York")
 Direction = Literal["bull", "bear"]
+SetupType = Literal["fvg_retest", "range_level_retest"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,7 @@ class OpeningRangeFVGSignal:
     stop_pct: float
     target_r: float
     target_pct: float
+    setup_type: SetupType = "fvg_retest"
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -63,14 +65,17 @@ def detect_opening_range_fvg(
     target_r_min: float = 1.5,
     target_r_max: float = 2.0,
 ) -> OpeningRangeFVGSignal | None:
-    """Return the newest confirmed same-session ORB/FVG retest, if any.
+    """Return the newest confirmed same-session opening-range retest, if any.
 
     Bar timestamps are interpreted as bar starts. The opening range contains
     exactly the bars starting at 09:30 through 09:39 for the default one-minute
     setup. A breakout requires a completed candle close outside that range.
-    The FVG must form at or after that breakout, and a later candle must enter
-    the gap without violating its far edge and close back through the near edge
-    in the breakout direction.
+    Two independent setup families are supported. An FVG retest must enter the
+    post-breakout gap without violating its far edge and close back through the
+    near edge. A range-level retest must pull back to the broken opening-range
+    boundary, avoid a material re-entry into the range, and close back outside.
+    Every fresh bull or bear breakout is evaluated, so an early false break no
+    longer suppresses a valid reversal later in the session.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
@@ -104,91 +109,178 @@ def detect_opening_range_fvg(
         return None
 
     eligible = frame[(frame.index >= range_end) & (frame.index < entry_end)]
-    if len(eligible) < 4:
+    # A range-level retest needs only a breakout and a later confirmation;
+    # the FVG branch independently waits for its required three-candle shape.
+    if len(eligible) < 2:
         return None
-    breakout_position: int | None = None
-    direction: Direction | None = None
-    for position, (_, bar) in enumerate(eligible.iterrows()):
-        close = float(bar["close"])
-        if close > range_high:
-            breakout_position, direction = position, "bull"
-            break
-        if close < range_low:
-            breakout_position, direction = position, "bear"
-            break
-    if breakout_position is None or direction is None:
-        return None
-
     records = list(eligible.iterrows())
     signals: list[OpeningRangeFVGSignal] = []
     range_size = range_high - range_low
-    breakout_key, breakout_bar = records[breakout_position]
-    breakout_ts = cast(pd.Timestamp, breakout_key)
-    # The pattern cannot be confirmed by the breakout candle itself. The
-    # earliest valid third candle is the candle after a later breakout (where
-    # the breakout is the displacement/middle candle), or two candles after a
-    # breakout in the first post-range slot.
-    for formed in range(max(2, breakout_position + 1), len(records)):
-        _, first = records[formed - 2]
-        formed_key, third = records[formed]
-        formed_ts = cast(pd.Timestamp, formed_key)
-        if direction == "bull":
-            gap_low = float(first["high"])
-            gap_high = float(third["low"])
-            if gap_high <= gap_low:
-                continue
-        else:
-            gap_low = float(third["high"])
-            gap_high = float(first["low"])
-            if gap_high <= gap_low:
-                continue
+    breakouts: list[tuple[int, Direction]] = []
+    previous_close: float | None = None
+    for position, (_, bar) in enumerate(records):
+        close = float(bar["close"])
+        if close > range_high and (previous_close is None or previous_close <= range_high):
+            breakouts.append((position, "bull"))
+        elif close < range_low and (previous_close is None or previous_close >= range_low):
+            breakouts.append((position, "bear"))
+        previous_close = close
 
-        for retest in range(formed + 1, len(records)):
+    for breakout_index, (breakout_position, direction) in enumerate(breakouts):
+        # A later fresh break starts a new thesis. Do not let an older setup
+        # reach through that reset and claim a confirmation from the new leg.
+        segment_end = (
+            breakouts[breakout_index + 1][0]
+            if breakout_index + 1 < len(breakouts)
+            else len(records)
+        )
+        breakout_key, breakout_bar = records[breakout_position]
+        breakout_ts = cast(pd.Timestamp, breakout_key)
+        breakout_body = abs(
+            float(breakout_bar["close"]) - float(breakout_bar["open"])
+        )
+
+        # Setup 1: pull back to the broken opening-range boundary and reject it.
+        # A 10%-of-range penetration allowance tolerates a tick through the
+        # level without accepting a material move back inside the range.
+        boundary = range_high if direction == "bull" else range_low
+        for retest in range(breakout_position + 1, segment_end):
             retest_key, bar = records[retest]
             retest_ts = cast(pd.Timestamp, retest_key)
             low = float(bar["low"])
             high = float(bar["high"])
             open_ = float(bar["open"])
             close = float(bar["close"])
-            overlaps = low <= gap_high and high >= gap_low
+            retest_range = high - low
+            body_fraction = (
+                abs(close - open_) / retest_range if retest_range > 0 else 0.0
+            )
             if direction == "bull":
-                if low < gap_low:
+                if close < range_low:
                     break
-                respected = overlaps and close >= gap_high and close > open_
+                respected = (
+                    low <= boundary
+                    and low >= boundary - 0.10 * range_size
+                    and close > boundary
+                    and close > open_
+                )
             else:
-                if high > gap_high:
+                if close > range_high:
                     break
-                respected = overlaps and close <= gap_low and close < open_
+                respected = (
+                    high >= boundary
+                    and high <= boundary + 0.10 * range_size
+                    and close < boundary
+                    and close < open_
+                )
             if not respected:
                 continue
-
-            breakout_body = abs(float(breakout_bar["close"]) - float(breakout_bar["open"]))
-            retest_range = high - low
-            retest_body_fraction = abs(close - open_) / retest_range if retest_range > 0 else 0.0
-            strong = breakout_body >= 0.25 * range_size and retest_body_fraction >= 0.50
-            target_r = target_r_max if strong else target_r_min
-            signal_id = (
-                f"{session.isoformat()}:{symbol.upper()}:{direction}:"
-                f"{formed_ts.isoformat()}:{retest_ts.isoformat()}"
-            )
+            strong = breakout_body >= 0.25 * range_size and body_fraction >= 0.50
+            if not strong:
+                continue
+            target_r = target_r_max
             signals.append(
                 OpeningRangeFVGSignal(
-                    signal_id=signal_id,
+                    signal_id=(
+                        f"{session.isoformat()}:{symbol.upper()}:{direction}:"
+                        f"range_level_retest:{breakout_ts.isoformat()}:"
+                        f"{retest_ts.isoformat()}"
+                    ),
                     session=session.isoformat(),
                     timeframe_minutes=timeframe_minutes,
                     direction=direction,
                     opening_range_high=range_high,
                     opening_range_low=range_low,
                     breakout_ts=breakout_ts.to_pydatetime(),
-                    fvg_formed_ts=formed_ts.to_pydatetime(),
-                    fvg_low=gap_low,
-                    fvg_high=gap_high,
+                    fvg_formed_ts=breakout_ts.to_pydatetime(),
+                    fvg_low=boundary,
+                    fvg_high=boundary,
                     respected_ts=retest_ts.to_pydatetime(),
                     entry_underlying_price=close,
                     stop_pct=stop_pct,
                     target_r=target_r,
                     target_pct=stop_pct * target_r,
+                    setup_type="range_level_retest",
                 )
             )
             break
-    return max(signals, key=lambda signal: signal.respected_ts) if signals else None
+
+        # Setup 2: post-breakout three-candle FVG pullback and respect.
+        for formed in range(max(2, breakout_position + 1), segment_end):
+            _, first = records[formed - 2]
+            formed_key, third = records[formed]
+            formed_ts = cast(pd.Timestamp, formed_key)
+            if direction == "bull":
+                gap_low = float(first["high"])
+                gap_high = float(third["low"])
+                if gap_high <= gap_low:
+                    continue
+            else:
+                gap_low = float(third["high"])
+                gap_high = float(first["low"])
+                if gap_high <= gap_low:
+                    continue
+
+            for retest in range(formed + 1, segment_end):
+                retest_key, bar = records[retest]
+                retest_ts = cast(pd.Timestamp, retest_key)
+                low = float(bar["low"])
+                high = float(bar["high"])
+                open_ = float(bar["open"])
+                close = float(bar["close"])
+                overlaps = low <= gap_high and high >= gap_low
+                if direction == "bull":
+                    if low < gap_low:
+                        break
+                    respected = overlaps and close >= gap_high and close > open_
+                else:
+                    if high > gap_high:
+                        break
+                    respected = overlaps and close <= gap_low and close < open_
+                if not respected:
+                    continue
+
+                retest_range = high - low
+                body_fraction = (
+                    abs(close - open_) / retest_range if retest_range > 0 else 0.0
+                )
+                strong = (
+                    breakout_body >= 0.25 * range_size and body_fraction >= 0.50
+                )
+                target_r = target_r_max if strong else target_r_min
+                signals.append(
+                    OpeningRangeFVGSignal(
+                        signal_id=(
+                            f"{session.isoformat()}:{symbol.upper()}:{direction}:"
+                            f"fvg_retest:{formed_ts.isoformat()}:"
+                            f"{retest_ts.isoformat()}"
+                        ),
+                        session=session.isoformat(),
+                        timeframe_minutes=timeframe_minutes,
+                        direction=direction,
+                        opening_range_high=range_high,
+                        opening_range_low=range_low,
+                        breakout_ts=breakout_ts.to_pydatetime(),
+                        fvg_formed_ts=formed_ts.to_pydatetime(),
+                        fvg_low=gap_low,
+                        fvg_high=gap_high,
+                        respected_ts=retest_ts.to_pydatetime(),
+                        entry_underlying_price=close,
+                        stop_pct=stop_pct,
+                        target_r=target_r,
+                        target_pct=stop_pct * target_r,
+                        setup_type="fvg_retest",
+                    )
+                )
+                break
+    return (
+        max(
+            signals,
+            key=lambda signal: (
+                signal.respected_ts,
+                signal.setup_type == "fvg_retest",
+            ),
+        )
+        if signals
+        else None
+    )

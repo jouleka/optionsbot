@@ -850,7 +850,6 @@ class OrderClient:
                 not isinstance(report.commission, (int, float))
                 or isinstance(report.commission, bool)
                 or not math.isfinite(float(report.commission))
-                or report.commission < 0
             ):
                 raise ValueError("execution commission is malformed")
             commission = float(report.commission)

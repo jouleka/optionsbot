@@ -202,6 +202,79 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
     assert summary.alerts_enqueued == 3
 
 
+async def test_auto_execution_receives_each_alerted_candidate_once(
+    daemon_context: DaemonContext,
+) -> None:
+    """One delivered alert must never become two automatic entry attempts."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    suggestion = MagicMock(
+        legs=(),
+        credit_or_debit=-100.0,
+        max_loss=100.0,
+        max_profit=150.0,
+        prob_profit=0.5,
+        suggested_quantity=1,
+        defined_risk=True,
+        risk_normalized_expectancy=0.1,
+        expected_value=10.0,
+    )
+    scored = ScoredStrategy(
+        strategy_name="long_call",
+        score=80.0,
+        factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        suggestion=suggestion,
+        rationale="one exact candidate",
+    )
+    base = _fake_scan_result("SPY")
+    result = ScanResult(
+        symbol="SPY",
+        snapshot_id=99,
+        snapshot_ts=base.snapshot_ts,
+        view=base.view,
+        scored=(scored,),
+    )
+    daemon_context.settings.execution.mode = "auto"
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
+    positions = MagicMock()
+    positions.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("50000"),
+            buying_power=None,
+            available_funds=Decimal("50000"),
+            currency="USD",
+        )
+    )
+
+    with (
+        patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True),
+        patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(return_value=result),
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner.enqueue_alert",
+            new=AsyncMock(return_value=True),
+        ),
+        patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=positions),
+        patch(
+            "optionsbot.daemon.auto_executor.auto_execute_candidates",
+            new=AsyncMock(return_value=1),
+        ) as auto_execute,
+    ):
+        await run_scan_tick(daemon_context)
+
+    candidates = auto_execute.await_args.args[1]
+    assert len(candidates) == 1
+    assert candidates[0][0] == "SPY"
+    assert candidates[0][1].strategy_name == "long_call"
+
+
 def test_scan_settings_alert_calibration_defaults() -> None:
     from optionsbot.config import ScanSettings
 

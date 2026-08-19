@@ -83,13 +83,13 @@ class ScanSettings(BaseModel):
     interval_minutes: int = Field(default=15, ge=1)
     # Optional 0DTE opening-range playbook. The daemon observes the first
     # N New York-session minutes, then admits only a close-confirmed breakout
-    # whose newly formed FVG is later retested and respected before the entry
-    # window ends. One-minute bars are the production profile; five-minute is
-    # retained for controlled comparison.
+    # whose newly formed FVG or broken opening-range boundary is later retested
+    # and respected before the entry window ends. One-minute bars are the
+    # production profile; five-minute is retained for controlled comparison.
     opening_range_fvg_enabled: bool = False
     opening_range_timeframe_minutes: Literal[1, 5] = 1
     opening_range_minutes: int = Field(default=10, ge=5, le=30)
-    opening_range_entry_window_minutes: int = Field(default=90, ge=30, le=180)
+    opening_range_entry_window_minutes: int = Field(default=90, ge=30, le=390)
     opening_range_signal_max_age_minutes: int = Field(default=3, ge=1, le=10)
     # Relative strength (IBK-109): each symbol's return minus this benchmark's over
     # relative_strength_window trading days, surfaced in daily_brief as context.
@@ -218,6 +218,29 @@ class ExecutionSettings(BaseModel):
     opening_range_stop_pct: float = Field(default=0.15, gt=0.0, lt=1.0)
     opening_range_target_r_min: float = Field(default=1.5, ge=1.0, le=3.0)
     opening_range_target_r_max: float = Field(default=2.0, ge=1.0, le=3.0)
+    # Protective quotes are checked more often than the scan loop. The value
+    # must divide a wall-clock minute so checks remain predictable after a
+    # restart and APScheduler can coalesce a slow overlapping pass safely.
+    exit_check_interval_seconds: int = Field(default=15, ge=5, le=60)
+    # A target above this activation is an extended (normally 2R) attempt. It
+    # keeps the original -1R stop, but protects a winner after reaching +1R
+    # and locks +1R after reaching +1.5R instead of allowing a full reversal.
+    opening_range_extended_break_even_activation_r: float = Field(
+        default=1.0, ge=0.5, le=2.0
+    )
+    opening_range_extended_profit_lock_activation_r: float = Field(
+        default=1.5, ge=1.0, le=2.5
+    )
+    opening_range_extended_profit_lock_floor_r: float = Field(
+        default=1.0, ge=0.0, le=2.0
+    )
+    # Entry expectancy must survive realistic round-trip trading costs.  The
+    # commission estimate is per option contract, per side; one full current
+    # combo spread reserves half-spread slippage on both entry and exit.
+    opening_range_commission_per_contract: float = Field(default=0.70, ge=0.0)
+    opening_range_round_trip_slippage_spread_frac: float = Field(
+        default=1.0, ge=0.0, le=2.0
+    )
     # Crossing the generic debit target arms a durable winner trail rather
     # than immediately dumping an exact-0DTE debit structure. A bounded spread
     # is harvested once it captures the configured share of maximum profit.
@@ -329,15 +352,32 @@ class ExecutionSettings(BaseModel):
     def _enforce_phase0_ceilings(self) -> ExecutionSettings:
         if self.zero_dte_only and not self.paper_only:
             raise ValueError("execution.zero_dte_only requires execution.paper_only=true")
-        if self.zero_dte_force_exit_minutes >= self.zero_dte_entry_cutoff_minutes:
+        if self.zero_dte_force_exit_minutes > self.zero_dte_entry_cutoff_minutes:
             raise ValueError(
-                "execution.zero_dte_force_exit_minutes must be less than "
+                "execution.zero_dte_force_exit_minutes must be less than or equal to "
                 "execution.zero_dte_entry_cutoff_minutes"
             )
         if self.opening_range_target_r_max < self.opening_range_target_r_min:
             raise ValueError(
                 "execution.opening_range_target_r_max must be greater than or equal "
                 "to opening_range_target_r_min"
+            )
+        if 60 % self.exit_check_interval_seconds != 0:
+            raise ValueError("execution.exit_check_interval_seconds must divide 60")
+        if (
+            self.opening_range_extended_break_even_activation_r
+            >= self.opening_range_extended_profit_lock_activation_r
+        ):
+            raise ValueError(
+                "opening-range break-even activation must be below profit-lock "
+                "activation"
+            )
+        if (
+            self.opening_range_extended_profit_lock_floor_r
+            > self.opening_range_extended_profit_lock_activation_r
+        ):
+            raise ValueError(
+                "opening-range profit-lock floor must not exceed its activation"
             )
         if (
             self.zero_dte_debit_trail_late_giveback_pct

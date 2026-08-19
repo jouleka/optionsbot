@@ -433,8 +433,13 @@ def record_fill(
     ts: datetime,
     leg_con_id: int | None = None,
 ) -> bool:
-    """Persist one per-leg execution. Returns False on a duplicate execId
-    (IBKR re-sends executions on reconnect — replay must be idempotent).
+    """Persist one effective per-leg execution.
+
+    Returns False on a duplicate/stale execId.  IBKR corrections retain the
+    execution ID prefix and increment only the digits after the final period;
+    a newer revision replaces every older row in that correction family.
+    Reconnect replay is therefore idempotent and cannot double-count revised
+    combo-leg quantities or commissions.
 
     ``side`` is an IBKR execution side, uppercase — NOT a legs_json side
     (those are lowercase 'buy'/'sell'); the explicit check turns a wiring
@@ -459,32 +464,100 @@ def record_fill(
         raise ValueError("fill timestamp is malformed")
     if leg_con_id is not None and (type(leg_con_id) is not int or leg_con_id <= 0):
         raise ValueError("fill contract ID must be an exact positive integer")
+
+    def revision_identity(value: str) -> tuple[str, int] | None:
+        prefix, separator, suffix = value.rpartition(".")
+        if (
+            not separator
+            or not prefix
+            or not suffix
+            or not suffix.isascii()
+            or not suffix.isdecimal()
+        ):
+            return None
+        return prefix, int(suffix)
+
     with engine.begin() as conn:
-        exists = conn.execute(
+        existing_rows = conn.execute(
             select(
+                fills.c.id,
+                fills.c.ib_exec_id,
                 fills.c.order_id,
                 fills.c.side,
                 fills.c.price,
                 fills.c.qty,
                 fills.c.ts,
                 fills.c.leg_con_id,
-            ).where(fills.c.ib_exec_id == exec_id)
-        ).first()
-        if exists is not None:
-            existing_ts = exists.ts
+            )
+        ).fetchall()
+        exact = next((row for row in existing_rows if row.ib_exec_id == exec_id), None)
+
+        def same_exact_identity(row: Any) -> bool:
+            existing_ts = row.ts
             incoming_ts = ts
             if existing_ts.tzinfo is not None:
                 existing_ts = existing_ts.astimezone(UTC).replace(tzinfo=None)
             if incoming_ts.tzinfo is not None:
                 incoming_ts = incoming_ts.astimezone(UTC).replace(tzinfo=None)
-            if (
-                exists.order_id == order_id
-                and exists.side == side
-                and exists.price == price
-                and exists.qty == qty
+            return bool(
+                row.order_id == order_id
+                and row.side == side
+                and row.price == price
+                and row.qty == qty
                 and existing_ts == incoming_ts
-                and exists.leg_con_id == leg_con_id
-            ):
+                and row.leg_con_id == leg_con_id
+            )
+
+        revision = revision_identity(exec_id)
+        if revision is not None:
+            prefix, incoming_revision = revision
+            family = [
+                row
+                for row in existing_rows
+                if (identity := revision_identity(row.ib_exec_id)) is not None
+                and identity[0] == prefix
+            ]
+            if family:
+                if any(
+                    row.order_id != order_id
+                    or row.side != side
+                    or row.leg_con_id != leg_con_id
+                    for row in family
+                ):
+                    raise ValueError(
+                        f"execution correction family {prefix!r} conflicts with "
+                        "persisted order/leg identity"
+                    )
+                newest = max(
+                    family,
+                    key=lambda row: revision_identity(row.ib_exec_id)[1],  # type: ignore[index]
+                )
+                newest_revision = revision_identity(newest.ib_exec_id)
+                assert newest_revision is not None
+                if incoming_revision < newest_revision[1]:
+                    return False
+                if incoming_revision == newest_revision[1]:
+                    if exact is None or not same_exact_identity(exact):
+                        raise ValueError(
+                            f"execution ID {exec_id!r} conflicts with persisted "
+                            "fill identity"
+                        )
+                    older_ids = [row.id for row in family if row.id != exact.id]
+                    if older_ids:
+                        conn.execute(delete(fills).where(fills.c.id.in_(older_ids)))
+                        return True
+                    return False
+                conn.execute(delete(fills).where(fills.c.id.in_([row.id for row in family])))
+            elif exact is not None:
+                # Defensive only: an exact numeric-suffix ID is necessarily in
+                # its own family, but retain strict conflict behavior.
+                if same_exact_identity(exact):
+                    return False
+                raise ValueError(
+                    f"execution ID {exec_id!r} conflicts with persisted fill identity"
+                )
+        elif exact is not None:
+            if same_exact_identity(exact):
                 return False
             raise ValueError(
                 f"execution ID {exec_id!r} conflicts with persisted fill identity"

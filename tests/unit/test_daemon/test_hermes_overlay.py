@@ -287,6 +287,27 @@ def test_learning_separates_opening_range_playbook_from_legacy_history(
     ]["net_session_avg_pnl"] == 80.0
 
 
+def test_learning_separates_range_level_retest_from_fvg_retest() -> None:
+    from optionsbot.hermes_overlay import _playbook_name
+
+    base = {
+        "status": "entry_confirmed",
+        "source": "trusted_daemon",
+    }
+    assert _playbook_name({"opening_range_fvg": base}) == "opening_range_fvg_v1"
+    assert (
+        _playbook_name(
+            {
+                "opening_range_fvg": {
+                    **base,
+                    "setup_type": "range_level_retest",
+                }
+            }
+        )
+        == "opening_range_level_retest_v1"
+    )
+
+
 def test_learning_feedback_records_actual_post_trade_result_without_outcome(
     daemon_context: DaemonContext,
 ) -> None:
