@@ -103,6 +103,9 @@ uv run optionsbot-daemon
 ```
 
 For a generic user-service example, see [systemd setup](docs/systemd.md).
+For a hardened paper-only VPS layout with headless IB Gateway, see the
+[deployment templates](DEPLOYMENT.md). Copy the examples and keep all runtime
+credentials outside the checkout.
 
 ### MCP configuration
 

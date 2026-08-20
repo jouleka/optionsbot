@@ -1,0 +1,17 @@
+[Unit]
+Description=Report OptionsBot daily paper-soak evidence to YouTrack
+After=optionsbot-rth-acceptance.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/home/optionsbot
+WorkingDirectory=/home/optionsbot/optionsbot
+ExecStart=/usr/local/libexec/optionsbot-soak-reporter-launcher
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/tmp

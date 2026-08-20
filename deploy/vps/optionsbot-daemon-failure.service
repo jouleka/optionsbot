@@ -1,0 +1,11 @@
+[Unit]
+Description=Notify Hermes when optionsbot-daemon exits unexpectedly
+
+[Service]
+Type=oneshot
+User=optionsbot
+Group=optionsbot
+Environment=HOME=/home/optionsbot
+WorkingDirectory=/home/optionsbot/optionsbot
+ExecStartPre=+/usr/local/libexec/optionsbot-venv-ownership-guard
+ExecStart=/home/optionsbot/optionsbot/.venv/bin/optionsbot-event daemon-down --summary "OptionsBot daemon exited unexpectedly" --severity critical

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OptionsBot paper acceptance after NYSE open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:50:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 10:20:00 America/New_York
+Persistent=true
+Unit=optionsbot-rth-acceptance.service
+
+[Install]
+WantedBy=timers.target

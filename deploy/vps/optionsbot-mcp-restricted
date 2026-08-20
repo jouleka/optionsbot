@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+cd /var/lib/optionsbot-mcp
+exec /usr/sbin/runuser --user optionsbot-mcp -- /usr/bin/env -i \
+    HOME=/var/lib/optionsbot-mcp \
+    PATH=/usr/bin:/bin \
+    OPTIONSBOT_MCP_RESTRICTED=1 \
+    OPTIONSBOT_MCP_DB_PATH=/home/optionsbot/.local/share/optionsbot/optionsbot.db \
+    OPTIONSBOT_MCP_INTENT_DB_PATH=/var/lib/optionsbot-mcp/intents.db \
+    OPTIONSBOT_MCP_MAX_PICK_AGE_MINUTES=20 \
+    OPTIONSBOT_MCP_ZERO_DTE_ONLY=true \
+    OPTIONSBOT_MCP_ZERO_DTE_ENTRY_CUTOFF_MINUTES=30 \
+    OPTIONSBOT_MCP_OPENING_RANGE_FVG_ENABLED=true \
+    OPTIONSBOT_MCP_OPENING_RANGE_MINUTES=10 \
+    OPTIONSBOT_MCP_OPENING_RANGE_ENTRY_WINDOW_MINUTES=360 \
+    /opt/optionsbot-mcp/.venv/bin/optionsbot-mcp

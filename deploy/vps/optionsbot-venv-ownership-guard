@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+venv=/home/optionsbot/optionsbot/.venv
+if [ ! -d "$venv" ]; then
+    echo "OptionsBot virtualenv is missing: $venv" >&2
+    exit 1
+fi
+
+/usr/bin/find "$venv" \( ! -user optionsbot -o ! -group optionsbot \) \
+    -exec /usr/bin/chown optionsbot:optionsbot '{}' +
+
+if ! /usr/sbin/runuser -u optionsbot -- /usr/bin/test -r "$venv/bin/optionsbot-daemon"; then
+    echo "OptionsBot virtualenv remains unreadable after ownership repair" >&2
+    exit 1
+fi

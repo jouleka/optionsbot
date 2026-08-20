@@ -1,0 +1,13 @@
+[Unit]
+Description=OptionsBot RTH paper-data acceptance check
+After=optionsbot-daemon.service optionsbot-gateway.service
+Wants=optionsbot-daemon.service optionsbot-gateway.service
+
+[Service]
+Type=oneshot
+User=optionsbot
+Group=optionsbot
+Environment=HOME=/home/optionsbot
+WorkingDirectory=/home/optionsbot/optionsbot
+ExecStartPre=+/usr/local/libexec/optionsbot-venv-ownership-guard
+ExecStart=/home/optionsbot/optionsbot/.venv/bin/optionsbot-rth-acceptance

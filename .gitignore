@@ -17,6 +17,10 @@ __pycache__/
 .env.*
 !.env.example
 config.local.toml
+deploy/gateway/config.ini
+deploy/vps/config.paper.toml
+deploy/vps/reporter.env
+deploy/vps/market-context.env
 auth.json
 .op.env
 *.pem

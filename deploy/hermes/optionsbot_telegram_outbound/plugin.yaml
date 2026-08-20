@@ -1,0 +1,10 @@
+name: optionsbot-telegram-outbound
+label: OptionsBot Telegram Outbound
+kind: platform
+version: 1.0.0
+description: Outbound-only Telegram adapter for signed OptionsBot operational events.
+author: OptionsBot
+requires_env:
+  - name: OPTIONSBOT_TELEGRAM_BOT_TOKEN
+    description: Existing OptionsBot Telegram token (send-only; never polls updates).
+    password: true
