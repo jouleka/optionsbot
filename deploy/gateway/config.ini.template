@@ -1,0 +1,24 @@
+# IBC config for a headless PAPER IB Gateway. Copy it outside the checkout,
+# replace both placeholders, and set mode 0600.
+IbLoginId=CHANGEME
+IbPassword=CHANGEME
+TradingMode=paper
+
+# --- API / dialogs: fully unattended ---
+AcceptNonBrokerageAccountWarning=yes
+AcceptIncomingConnectionAction=accept
+ReadOnlyApi=no
+OverrideTwsApiPort=4002
+AcceptBidAskLastSizeDisplayUpdateNotification=accept
+
+# If the same paper user logs in elsewhere, THIS session stays primary
+# (the bot's Gateway must not be silently bumped).
+ExistingSessionDetectedAction=primary
+
+# Daily Gateway auto-restart OUTSIDE US market hours. IBC interprets this in
+# the host's local time zone; calculate the correct local value before use.
+AutoRestartTime=02:35 AM
+
+# Keep resilient 2FA timeout behavior for paper accounts that require it.
+ReloginAfterSecondFactorAuthenticationTimeout=yes
+TwofaTimeoutAction=restart

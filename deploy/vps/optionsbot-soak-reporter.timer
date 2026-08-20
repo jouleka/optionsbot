@@ -1,0 +1,11 @@
+[Unit]
+Description=Report OptionsBot soak evidence after RTH acceptance retries
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 10:25:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 11:00:00 America/New_York
+Persistent=true
+Unit=optionsbot-soak-reporter.service
+
+[Install]
+WantedBy=timers.target

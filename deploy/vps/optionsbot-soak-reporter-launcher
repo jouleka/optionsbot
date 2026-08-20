@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+env_file=${OPTIONSBOT_REPORTER_ENV_FILE:-/etc/optionsbot/reporter.env}
+if [ ! -r "$env_file" ]; then
+    echo "OptionsBot reporter environment is not readable" >&2
+    exit 2
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
+if [ -z "${YOUTRACK_API_TOKEN:-}" ]; then
+    echo "YouTrack token is not configured" >&2
+    exit 2
+fi
+if [ -z "${YOUTRACK_BASE_URL:-}" ] || [ -z "${OPTIONSBOT_YOUTRACK_ISSUES:-}" ]; then
+    echo "YouTrack URL or issue list is not configured" >&2
+    exit 2
+fi
+
+exec env -i \
+    HOME=/home/optionsbot \
+    PATH=/usr/bin:/bin \
+    YOUTRACK_API_TOKEN="$YOUTRACK_API_TOKEN" \
+    YOUTRACK_BASE_URL="$YOUTRACK_BASE_URL" \
+    OPTIONSBOT_YOUTRACK_ISSUES="$OPTIONSBOT_YOUTRACK_ISSUES" \
+    /home/optionsbot/optionsbot/.venv/bin/python -m optionsbot.daemon.soak_reporter

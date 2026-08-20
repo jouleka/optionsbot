@@ -1,0 +1,22 @@
+[Unit]
+Description=OptionsBot paper scheduler and alert daemon
+After=network-online.target optionsbot-gateway.service
+Wants=network-online.target optionsbot-gateway.service
+OnFailure=optionsbot-daemon-failure.service
+
+[Service]
+Type=simple
+User=optionsbot
+Group=optionsbot
+Environment=HOME=/home/optionsbot
+WorkingDirectory=/home/optionsbot/optionsbot
+ExecStartPre=+/usr/local/libexec/optionsbot-venv-ownership-guard
+ExecStart=/home/optionsbot/optionsbot/.venv/bin/optionsbot-daemon
+Restart=on-failure
+RestartSec=10
+MemoryMax=256M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Headless paper IB Gateway via IBC
+After=ibc-xvfb.service
+Requires=ibc-xvfb.service
+
+[Service]
+Environment=DISPLAY=:1
+ExecStart=/home/optionsbot/.local/bin/optionsbot-gateway-start.sh
+Restart=always
+RestartSec=30
+User=optionsbot
+
+[Install]
+WantedBy=multi-user.target

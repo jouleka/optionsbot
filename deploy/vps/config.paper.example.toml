@@ -1,0 +1,96 @@
+# Aggressive paper-learning example. This file is secret-free, but it enables
+# automatic PAPER orders and is not a recommendation or profitability claim.
+# Copy it to ~/.config/optionsbot/config.toml, review every value, and add any
+# Telegram values only to that private runtime copy. Omitted settings use the
+# defaults in src/optionsbot/config.py.
+
+[ibkr]
+market_data_type = 1   # live real-time data shared into paper when entitled
+port = 4002            # IB Gateway paper
+paper = true
+
+[scan]
+# Paper-discovery cadence: let a previously refused setup be reconsidered when
+# quotes/liquidity improve instead of suppressing it for most of the session.
+interval_minutes = 2  # keeps one-minute-bar polling inside IBKR pacing limits
+opening_range_fvg_enabled = true
+opening_range_timeframe_minutes = 1
+opening_range_minutes = 10
+opening_range_entry_window_minutes = 360  # setup confirmations through 15:30 New York
+opening_range_signal_max_age_minutes = 10  # allows the bounded Hermes review handoff
+score_threshold = 50
+alert_top_n = 9
+alert_cooldown_hours = 0
+# Exact same-session expiry paper-learning profile.
+dte_target = 0
+dte_window_min = 0
+dte_window_max = 0
+# Same-day chains need only the near-money ladder. This keeps SPY/QQQ/IWM
+# under the per-symbol scan budget while retaining the strikes strategies use.
+strike_band_pct = 0.08
+max_strikes_per_side = 20
+scan_symbol_timeout_s = 45.0
+
+[screener]
+# The daemon filters this liquid candidate set by the exchange's expiration
+# calendar before ranking it: SPY/QQQ/IWM daily; additional stock, crypto,
+# metal, bond, sector, oil and gas opportunities on their eligible 0DTE days.
+universe = [
+  "SPY", "QQQ", "IWM",
+  "AAPL", "AMZN", "AVGO", "GOOGL", "META", "MSFT", "NVDA", "TSLA",
+  "AMD", "MU",
+  "GLD", "IBIT", "SLV", "SMH", "TLT", "XLF", "UNG", "USO",
+  "COIN", "MSTR", "PLTR", "NFLX", "SMCI", "GME",
+]
+scan_top_n = 8
+
+[validation]
+# The first post-close hourly tick settles today's 0DTE counterfactuals and
+# makes them available to Hermes on its next analyst pass.
+outcomes_eval_hours = 1
+
+[execution]
+enabled = true         # arm the execution engine (manage/exit open positions)
+mode = "auto"          # full-auto paper entries from alert candidates; exits autonomous
+paper_only = true      # hard interlock: refuse to arm on a non-paper account/port
+zero_dte_only = true   # execution rejects every non-same-day expiry structure
+zero_dte_entry_cutoff_minutes = 30
+zero_dte_force_exit_minutes = 30
+opening_range_max_entries_per_day = 3
+opening_range_stop_pct = 0.15
+opening_range_target_r_min = 1.5
+# The example keeps a single 1.5R target. Change it only after independent
+# paper evidence and a fresh risk review.
+opening_range_target_r_max = 1.5
+exit_check_interval_seconds = 15
+# These remain dormant while max target is 1.5R. If a future evidence-gated
+# 2R target is re-enabled, +1R protects estimated round-trip costs and +1.5R
+# locks a +1R floor while the final +2R objective remains live.
+opening_range_extended_break_even_activation_r = 1.0
+opening_range_extended_profit_lock_activation_r = 1.5
+opening_range_extended_profit_lock_floor_r = 1.0
+# Admission reserves round-trip option commissions plus one current combo
+# spread (half-spread on entry and exit). This rejects paper-thin theoretical
+# EV before it can consume an entry slot.
+opening_range_commission_per_contract = 0.70
+opening_range_round_trip_slippage_spread_frac = 1.0
+# +50% on debit now arms a durable winner trail. Defined-risk debit spreads
+# harvest at 50% of maximum profit; the trail tightens from 35% to 10%
+# permitted peak giveback as the mandatory pre-close flatten approaches.
+zero_dte_debit_max_profit_take_pct = 0.50
+zero_dte_debit_trail_early_giveback_pct = 0.35
+zero_dte_debit_trail_late_giveback_pct = 0.10
+exit_stop_enabled = true  # credit soft stops remain; exact-0DTE debit stops stay disabled
+# Multiple independent 0DTE positions may coexist; retain one-per-symbol to
+# avoid stacking correlated exposure in the same underlying.
+max_open_positions = 6
+max_per_symbol = 1
+require_hermes_entry_review = false  # trusted daemon enters paper trades; Hermes audits in parallel
+auto_skip_earnings = false           # paper discovery includes defined-risk event trades
+allow_structural_margin_fallback = true  # reserve full max loss if paper what-if omits it
+max_slippage_spread_frac = 0.50  # paper walk may reach the displayed marketable side
+max_slippage_abs = 0.15          # never concede more than $15 per one-lot structure
+# Dynamic account-relative caps: all open defined-risk max loss may total at
+# most 50% of current USD net liquidation; any one trade remains capped at 10%.
+max_portfolio_heat_pct = 0.50
+max_single_trade_risk_pct = 0.10
