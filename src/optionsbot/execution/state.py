@@ -21,6 +21,10 @@ _SESSION_LOSS_KILL_PREFIXES = (
     "daily realized loss ",
     "daily cumulative Hermes realized-loss cap breached ",
 )
+_CLEAN_RECONCILE_KILL_PREFIXES = (
+    "price-walk modify outcome unknown for order #",
+    "cancel request outcome unknown for order #",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +72,16 @@ def is_session_loss_kill(reason: str | None) -> bool:
     return reason.startswith(_SESSION_LOSS_KILL_PREFIXES) or reason.endswith(
         " consecutive losing trades this session"
     )
+
+
+def is_clean_reconcile_recoverable_kill(reason: str | None) -> bool:
+    """Whether exact clean broker proof may recover a mutation uncertainty.
+
+    This is deliberately narrow. Manual halts, risk breakers, position
+    mismatches, callback failures, and arbitrary reconciliation errors remain
+    latched for explicit review.
+    """
+    return reason is not None and reason.startswith(_CLEAN_RECONCILE_KILL_PREFIXES)
 
 
 def _write(

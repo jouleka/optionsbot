@@ -1211,6 +1211,7 @@ async def _manage_entry(
                 budget=budget,
                 increment=increment,
                 ibkr_lock=context.ibkr_lock,
+                protective_close=True,
             )
         )
         context.walk_tasks.add(task)

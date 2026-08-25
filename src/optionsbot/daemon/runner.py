@@ -365,6 +365,15 @@ class Daemon:
             msg = format_heartbeat(None, None, None)
         else:
             msg = format_heartbeat(last.tickers_scanned, last.alerts_fired, last.finished)
+        from optionsbot.execution.state import load_state
+
+        execution_state = load_state(self._context.engine)
+        if execution_state.killed:
+            msg += f"\n🛑 execution HALTED — {execution_state.reason or 'no reason recorded'}"
+        elif self._context.settings.execution.enabled:
+            msg += "\n✅ execution armed"
+        else:
+            msg += "\n⚪ execution disabled by config"
         try:
             await self._context.telegram.send_message(msg, parse_mode=None)
         except Exception:  # noqa: BLE001 -- heartbeat failure must not crash the daemon

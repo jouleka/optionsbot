@@ -614,13 +614,27 @@ class OrderClient:
         # limits; a single-leg option's premium is always positive (a signed
         # walk target sent raw produced lmtPrice=-6.14 → IBKR Error 201).
         order.lmtPrice = new_limit_price if contract.secType == "BAG" else abs(new_limit_price)
-        self._client.ib.placeOrder(contract, order)
         changed = _snapshot_bot_order(contract, order, status="Registered")
+        # Mutating the existing Order object is IBKR's modify mechanism.  Make
+        # that deliberate local mutation authoritative *before* placeOrder:
+        # placeOrder can raise after the request crossed the socket, and an
+        # emergency cancel must still be allowed to use the exact same order.
+        # Previously the registry retained the pre-modify price on that path,
+        # so cancel() rejected our own authorized change as "authority drift".
         self._registry[ib_order_id] = _RegisteredOrder(
             contract,
             order,
             _mutation_authority(changed),
         )
+        self._client.ib.placeOrder(contract, order)
+        # Fail closed if the synchronous broker call changed any protected
+        # identity/contract/order term behind our back.  Normal IBKR updates
+        # (permId/status) are intentionally outside the authority tuple.
+        confirmed = _snapshot_bot_order(contract, order, status="Registered")
+        if _mutation_authority(confirmed) != self._registry[ib_order_id].authority:
+            raise RuntimeError(
+                f"order id {ib_order_id} broker acknowledgement altered mutation authority"
+            )
         log.info("order modified: id=%s new_limit=%s", ib_order_id, new_limit_price)
 
     async def cancel(self, ib_order_id: int) -> None:

@@ -8,6 +8,7 @@ from sqlalchemy import Engine
 
 from optionsbot.execution.state import (
     clear_kill,
+    is_clean_reconcile_recoverable_kill,
     is_session_loss_kill,
     load_state,
     trip_kill,
@@ -71,3 +72,14 @@ def test_only_session_loss_reasons_are_session_scoped() -> None:
     assert not is_session_loss_kill("manual /kill via Telegram")
     assert not is_session_loss_kill("reconcile exact position mismatch")
     assert not is_session_loss_kill("broker side effects are uncertain")
+
+
+def test_only_order_mutation_uncertainty_is_clean_reconcile_recoverable() -> None:
+    assert is_clean_reconcile_recoverable_kill(
+        "price-walk modify outcome unknown for order #7: timeout"
+    )
+    assert is_clean_reconcile_recoverable_kill(
+        "cancel request outcome unknown for order #7: authority drifted"
+    )
+    assert not is_clean_reconcile_recoverable_kill("manual emergency halt")
+    assert not is_clean_reconcile_recoverable_kill("reconcile exact position mismatch")

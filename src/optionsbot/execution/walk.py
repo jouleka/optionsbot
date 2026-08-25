@@ -219,6 +219,7 @@ async def run_price_walk(
     ibkr_lock: asyncio.Lock | None = None,
     start_step: int = 0,
     prev_target_override: float | None = None,
+    protective_close: bool = False,
 ) -> None:
     """Walk one working order from mid toward marketable, then give up.
 
@@ -234,10 +235,17 @@ async def run_price_walk(
     prev_target = prev_target_override if prev_target_override is not None else decision_mid
     option_legs = [leg for leg in legs if leg.get("sec_type", "OPT") == "OPT"]
     broker_mutated = False
+    # Entry walks optimize price inside a bounded slippage budget. Protective
+    # close walks have a different job: flatten an already-triggered stop/TP
+    # before 0DTE gamma moves again. They therefore chase the current
+    # marketable package boundary and never use the long final-rest period.
     try:
         for step in range(start_step + 1, cfg.walk_max_steps + 1):
             if cfg.walk_step_seconds:
-                await asyncio.sleep(cfg.walk_step_seconds)
+                await asyncio.sleep(
+                    min(cfg.walk_step_seconds, 2) if protective_close
+                    else cfg.walk_step_seconds
+                )
             record = get_order(engine, order_id)
             if record is None or record.status not in WORKING_STATUSES:
                 return  # filled/cancelled/rejected while we slept — done
@@ -324,15 +332,21 @@ async def run_price_walk(
                 )
                 return
 
-            target = next_walk_target(
-                decision_mid=decision_mid,
-                current_mid=current_mid,
-                prev_target=prev_target,
-                step=step,
-                max_steps=cfg.walk_max_steps,
-                budget=budget,
-                increment=increment,
-            )
+            if protective_close:
+                # combo_bid is the immediately marketable boundary in signed
+                # credit-positive space for both credit and debit packages.
+                # Never walk backward if a quote improves between snapshots.
+                target = round_to_increment(min(prev_target, nbbo[0]), increment)
+            else:
+                target = next_walk_target(
+                    decision_mid=decision_mid,
+                    current_mid=current_mid,
+                    prev_target=prev_target,
+                    step=step,
+                    max_steps=cfg.walk_max_steps,
+                    budget=budget,
+                    increment=increment,
+                )
             if abs(target - prev_target) < increment / 2:
                 continue  # no-op step (favorable market or floor reached)
             try:
@@ -439,7 +453,7 @@ async def run_price_walk(
         # let the TRACKER confirm it. Marking the row terminal ourselves while
         # the broker could still (partially) fill is exactly how a real
         # position once hid behind a "trade skipped" message.
-        if cfg.walk_final_rest_seconds:
+        if cfg.walk_final_rest_seconds and not protective_close:
             await asyncio.sleep(cfg.walk_final_rest_seconds)
         record = get_order(engine, order_id)
         if record is None:
@@ -631,6 +645,7 @@ async def resume_walks(
                 budget=ws.budget, increment=ws.increment,
                 ibkr_lock=ibkr_lock,
                 start_step=ws.step, prev_target_override=ws.prev_target,
+                protective_close=record.intent == "close",
             )
         )
         walk_tasks.add(task)

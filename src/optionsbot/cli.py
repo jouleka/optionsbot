@@ -327,6 +327,7 @@ async def _run_status(*, json_output: bool, no_telegram: bool) -> int:
     settings = load_settings()
 
     db_check = _check_db(settings)
+    execution_check = _check_execution_state(settings)
     ibkr_check = _check_ibkr_socket(settings)
     last_scan = _check_last_scan(settings)
     last_alert = _check_last_alert(settings)
@@ -341,7 +342,7 @@ async def _run_status(*, json_output: bool, no_telegram: bool) -> int:
     last_scan.is_critical = False
     last_alert.is_critical = False
 
-    results = [db_check, ibkr_check, last_scan, last_alert, tg_check]
+    results = [db_check, execution_check, ibkr_check, last_scan, last_alert, tg_check]
 
     if json_output:
         typer.echo(json.dumps([asdict(r) for r in results], indent=2))
@@ -382,6 +383,34 @@ def _check_db(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
         return _CheckResult("db", "ok", f"{db_path} ({count} watchlist entries)")
     except Exception as e:  # noqa: BLE001
         return _CheckResult("db", "fail", f"{db_path}: {type(e).__name__}: {e}")
+
+
+def _check_execution_state(settings) -> _CheckResult:  # type: ignore[no-untyped-def]
+    from optionsbot.execution.state import load_state
+    from optionsbot.storage.db import create_engine_for_path
+
+    if not settings.storage.db_path.exists():
+        return _CheckResult("execution", "fail", "db missing; state unknown")
+    try:
+        state = load_state(create_engine_for_path(settings.storage.db_path))
+    except Exception as e:  # noqa: BLE001
+        return _CheckResult(
+            "execution", "fail", f"state query failed: {type(e).__name__}: {e}"
+        )
+    if state.killed:
+        ts = f" since {state.ts.isoformat()}" if state.ts is not None else ""
+        critical = bool(settings.execution.enabled)
+        return _CheckResult(
+            "execution",
+            "fail" if critical else "warn",
+            f"HALTED{ts}: {state.reason or 'no reason recorded'}",
+            is_critical=critical,
+        )
+    if settings.execution.enabled:
+        return _CheckResult("execution", "ok", "armed (kill switch clear)")
+    return _CheckResult(
+        "execution", "warn", "disabled by config (kill switch clear)", is_critical=False
+    )
 
 
 def _check_ibkr_socket(settings) -> _CheckResult:  # type: ignore[no-untyped-def]

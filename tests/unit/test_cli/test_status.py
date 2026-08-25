@@ -104,6 +104,22 @@ def test_status_ibkr_unreachable_exits_one(
     assert "✗ ibkr" in result.output
 
 
+def test_status_tripped_execution_is_visible_and_fails_when_enabled(
+    runner: CliRunner,
+    configured_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from optionsbot.execution.state import trip_kill
+
+    monkeypatch.setenv("OPTIONSBOT_EXECUTION__ENABLED", "true")
+    trip_kill(create_engine_for_path(configured_env), "order mutation uncertain")
+    with patch("socket.create_connection", side_effect=_fake_socket_ok):
+        result = runner.invoke(app, ["status", "--no-telegram"])
+    assert result.exit_code == 1
+    assert "✗ execution" in result.output
+    assert "order mutation uncertain" in result.output
+
+
 def test_status_no_telegram_flag_skips_check(
     runner: CliRunner, configured_env: Path
 ) -> None:

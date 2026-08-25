@@ -33,7 +33,12 @@ from optionsbot.execution.orders import (
     set_fill_commission,
     transition,
 )
-from optionsbot.execution.state import clear_kill, load_state, trip_kill
+from optionsbot.execution.state import (
+    clear_kill,
+    is_clean_reconcile_recoverable_kill,
+    load_state,
+    trip_kill,
+)
 from optionsbot.execution.tracker import map_ib_status, row_id_from_ref
 from optionsbot.execution.walk import resume_walks
 from optionsbot.ibkr.types import OpenOrderSnapshot, ledger_row_id_from_ref
@@ -797,23 +802,38 @@ async def _reconcile_once(
                     "inspect /positions and ledger, reconcile manually, then /arm.",
                 )
 
-    # A scheduled Gateway recycle can interrupt the opening snapshot and trip
-    # the persistent switch. Re-arm only this exact transient reason, and only
-    # after a later pass has proved all broker orders, executions, and positions
-    # agree. Every other kill reason remains manual.
+    # A scheduled Gateway recycle or an uncertain price mutation can trip the
+    # persistent switch. Re-arm only narrowly classified transient reasons,
+    # and only after a later pass proves all broker orders, executions, and
+    # positions agree. Mutation uncertainty additionally requires zero working
+    # bot orders, so reconciliation can never re-arm while an ambiguous order
+    # may still be live. Every other kill reason remains manual.
     state = load_state(engine)
+    with engine.connect() as conn:
+        working_row_remains = conn.execute(
+            select(orders.c.id)
+            .where(orders.c.status.in_(("staged", "submitting", "submitted", "partial")))
+            .limit(1)
+        ).first() is not None
+    transient_disconnect = state.reason == _TRANSIENT_GATEWAY_DISCONNECT_KILL
+    mutation_recovered = (
+        is_clean_reconcile_recoverable_kill(state.reason)
+        and not authorization_candidates
+        and not working_row_remains
+    )
     if (
         mismatches == 0
         and positions_snapshot is not None
         and state.killed
-        and state.reason == _TRANSIENT_GATEWAY_DISCONNECT_KILL
+        and (transient_disconnect or mutation_recovered)
     ):
+        prior_reason = state.reason
         state = clear_kill(engine, now=ts_now)
-        log.info("reconcile: auto-rearmed after clean post-disconnect snapshot")
+        log.info("reconcile: auto-rearmed after exact clean broker proof: %s", prior_reason)
         await _send(
             notify,
-            "✅ execution re-armed after a complete clean broker reconciliation "
-            "following the transient Gateway disconnect",
+            "✅ execution re-armed after a complete clean broker reconciliation; "
+            f"resolved prior halt: {prior_reason}",
         )
 
     # Mutation authority and walk resumption are the final commit point: no

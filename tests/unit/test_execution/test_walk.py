@@ -257,10 +257,12 @@ def test_record_order_quotes_round_trips(tmp_db: Engine) -> None:
 # --- walk runner ------------------------------------------------------------------------
 
 
-def _walk_order(engine: Engine, status: str = "submitted") -> int:
+def _walk_order(
+    engine: Engine, status: str = "submitted", *, intent: str = "open"
+) -> int:
     with engine.begin() as conn:
         pk = conn.execute(insert(orders).values(
-            intent="open", symbol="SPY", strategy="bull_put_spread",
+            intent=intent, symbol="SPY", strategy="bull_put_spread",
             legs_json=LEGS, quantity=1, status=status, staged_ts=NOW,
             submitted_ts=NOW, ib_order_id=11, limit_price=-1.20, reprice_count=0,
         )).inserted_primary_key
@@ -382,6 +384,33 @@ async def test_walk_exhaustion_requests_cancel_tracker_confirms(tmp_db: Engine) 
         journal = conn.execute(select(order_quotes)).fetchall()
     assert len(journal) == 3  # one row per executed step
     assert {r.kind for r in journal} == {"step"}
+
+
+async def test_protective_close_chases_live_bid_without_two_minute_rest(
+    tmp_db: Engine,
+) -> None:
+    order_id = _walk_order(tmp_db, intent="close")
+    order_client = MagicMock()
+    order_client.modify_price = AsyncMock()
+    order_client.cancel = _tracker_confirms_cancel(tmp_db, order_id)
+    md = _md({(580.0, "P"): (1.55, 1.65), (575.0, "P"): (0.35, 0.45)})
+    settings = _walk_settings()
+    settings.execution.walk_step_seconds = 10
+    settings.execution.walk_final_rest_seconds = 120
+
+    with patch("optionsbot.execution.walk.asyncio.sleep", new=AsyncMock()) as sleep:
+        await run_price_walk(
+            engine=tmp_db, settings=settings, order_client=order_client,
+            md=md, symbol="SPY", legs=LEGS, order_id=order_id, ib_order_id=11,
+            decision_mid=1.20, budget=0.01, increment=0.01,
+            protective_close=True,
+        )
+
+    limits = [c.kwargs["new_limit_price"] for c in order_client.modify_price.call_args_list]
+    assert limits == [pytest.approx(-1.10)]  # live marketable combo bid
+    assert [call.args[0] for call in sleep.await_args_list] == [2, 2, 2]
+    assert 120 not in [call.args[0] for call in sleep.await_args_list]
+    order_client.cancel.assert_awaited_once_with(11)
 
 
 async def test_walk_does_not_modify_from_delayed_quotes(tmp_db: Engine) -> None:

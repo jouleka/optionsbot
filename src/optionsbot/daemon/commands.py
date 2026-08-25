@@ -92,11 +92,20 @@ async def _cmd_status(context: DaemonContext, args: list[str]) -> list[CommandRe
     with context.engine.connect() as conn:
         last = conn.execute(select(scan_runs).order_by(scan_runs.c.id.desc()).limit(1)).first()
         wl = conn.execute(select(func.count()).select_from(watchlist)).scalar() or 0
+    execution_state = load_state(context.engine)
+    execution_verdict = can_execute(context.settings, execution_state)
+    if execution_state.killed:
+        execution_line = f"🛑 HALTED — {execution_state.reason or 'no reason recorded'}"
+    elif execution_verdict.allowed:
+        execution_line = "✅ armed"
+    else:
+        execution_line = f"off — {execution_verdict.reason}"
     lines = [
         f"daemon up {_fmt_duration(now - context.started_at)}",
         f"IBKR: {'connected' if context.ibkr.is_connected else 'disconnected'}",
         f"market: {'open' if is_market_open(now) else 'closed'}",
         f"alerting: {'PAUSED' if context.alerting_paused else 'on'}",
+        f"execution: {execution_line}",
         f"watchlist: {wl} symbol{'s' if wl != 1 else ''}",
     ]
     if last is not None:

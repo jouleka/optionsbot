@@ -789,6 +789,60 @@ async def test_transient_disconnect_kill_needs_full_position_proof(
     client.authorize_adoptions.assert_not_called()
 
 
+async def test_clean_full_reconcile_rearms_resolved_mutation_uncertainty(
+    tmp_db: Engine,
+) -> None:
+    trip_kill(
+        tmp_db,
+        "cancel request outcome unknown for order #383: broker mutation authority drifted",
+        now=NOW,
+    )
+    client = _client(open_orders=[], executions=[])
+    notify, sent = _notify()
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return []
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        notify=notify,
+        now=NOW + timedelta(minutes=1),
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 0
+    assert not load_state(tmp_db).killed
+    client.authorize_adoptions.assert_called_once_with(())
+    assert any("re-armed" in message for message in sent)
+
+
+async def test_mutation_uncertainty_never_rearms_with_working_order(
+    tmp_db: Engine,
+) -> None:
+    order_id = _insert_order(tmp_db, "submitted")
+    trip_kill(
+        tmp_db,
+        f"cancel request outcome unknown for order #{order_id}: timeout",
+        now=NOW,
+    )
+    client = _client(open_orders=[_broker_order(order_id)], executions=[])
+
+    async def positions_snapshot() -> list[PortfolioPosition]:
+        return []
+
+    summary = await reconcile(
+        tmp_db,
+        client,
+        now=NOW + timedelta(minutes=1),
+        positions_snapshot=positions_snapshot,
+    )
+
+    assert summary.mismatches == 0
+    assert load_state(tmp_db).killed
+    client.authorize_adoptions.assert_not_called()
+
+
 async def test_clean_reconcile_never_clears_an_unrelated_kill_reason(
     tmp_db: Engine,
 ) -> None:

@@ -300,6 +300,25 @@ async def test_modify_price_reuses_same_order_id(
     assert second_order.lmtPrice == -1.45
 
 
+async def test_modify_transport_failure_keeps_emergency_cancel_authorized(
+    order_client: OrderClient, order_ib: MagicMock
+) -> None:
+    placed = await order_client.place_combo_limit(
+        "SPY", CONDOR_LEGS, quantity=1, limit_price=-1.55, order_ref="obot-18",
+    )
+    order_ib.placeOrder.side_effect = TimeoutError("acknowledgement lost")
+
+    with pytest.raises(TimeoutError, match="acknowledgement lost"):
+        await order_client.modify_price(placed.ib_order_id, new_limit_price=-1.45)
+
+    # The authorized local price mutation must not make the mandatory cancel
+    # reject its own order as broker-mutation authority drift.
+    await order_client.cancel(placed.ib_order_id)
+    (cancelled_order,) = order_ib.cancelOrder.call_args.args
+    assert cancelled_order.orderId == placed.ib_order_id
+    assert cancelled_order.lmtPrice == pytest.approx(-1.45)
+
+
 async def test_modify_single_leg_normalizes_to_positive_premium(
     order_client: OrderClient, order_ib: MagicMock
 ) -> None:

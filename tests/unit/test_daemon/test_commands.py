@@ -67,6 +67,7 @@ async def test_status_reports_state(daemon_context: DaemonContext) -> None:
             tickers_scanned=7, alerts_fired=3,
         ))
     [reply] = await dispatch(daemon_context, "/status")
+    assert "execution:" in reply.text
     assert "scanned 7" in reply.text and "alerts 3" in reply.text
     assert "1 symbol" in reply.text
     assert "alerting: on" in reply.text
