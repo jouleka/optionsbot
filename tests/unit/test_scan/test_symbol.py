@@ -531,21 +531,23 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
         opening_range_signal=signal,
     )
 
-    # Gross managed EV is $7.50.  One $0.10-wide quote plus two $0.70
-    # commissions reserves $11.40, so admission EV is -$3.90.
-    assert result.scored[0].suggestion.expected_value == pytest.approx(-3.9)
+    # Terminal PoP is not a target-before-stop probability. Until a calibrated
+    # managed-path model is promoted, the exact 0DTE candidate is shadow-only.
+    assert result.scored[0].suggestion.expected_value is None
     with scan_engine.connect() as conn:
         stored = conn.execute(
             select(strategy_scores).where(
                 strategy_scores.c.snapshot_id == result.snapshot_id
             )
         ).one()
-    assert stored.suggestion_json["expected_value"] == pytest.approx(-3.9)
-    assert stored.suggestion_json["gross_managed_expected_value"] == pytest.approx(7.5)
+    assert stored.suggestion_json["expected_value"] is None
+    assert stored.suggestion_json["gross_managed_expected_value"] is None
+    assert stored.suggestion_json["managed_target_hit_probability_lcb"] is None
+    assert stored.suggestion_json["managed_break_even_probability"] is not None
     assert stored.suggestion_json["estimated_round_trip_cost"] == pytest.approx(11.4)
     assert stored.suggestion_json["terminal_expected_value"] == terminal_ev
     assert stored.suggestion_json["expected_value_model"] == (
-        "opening_range_stop_target_after_costs_v2"
+        "managed_outcome_calibration_required_v3"
     )
 
 

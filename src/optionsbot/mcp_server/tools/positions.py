@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from optionsbot.mcp_server.context import ServerContext
 from optionsbot.mcp_server.serialization import iso_utc
-from optionsbot.storage.schema import orders
+from optionsbot.storage.schema import orders, position_settlements
 
 log = logging.getLogger(__name__)
 
@@ -88,8 +88,13 @@ def _persisted_open_book(lifespan: ServerContext) -> dict[str, Any]:
             .where(orders.c.status == "filled")
             .where(orders.c.closes_order_id.is_not(None))
         ).fetchall()
+        settlements = conn.execute(
+            select(position_settlements.c.entry_order_id)
+        ).fetchall()
     closed_ids = {int(row.closes_order_id) for row in closes}
-    open_rows = [row for row in entries if int(row.id) not in closed_ids]
+    settled_ids = {int(row.entry_order_id) for row in settlements}
+    terminal_ids = closed_ids | settled_ids
+    open_rows = [row for row in entries if int(row.id) not in terminal_ids]
     return {
         "ok": True,
         "as_of": datetime.now(UTC).isoformat(),

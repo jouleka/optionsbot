@@ -957,7 +957,7 @@ async def test_entry_proposal_uses_fresh_economics_after_preliminary_rejection(
     assert review.status == "held"
 
 
-def test_halt_is_queued_then_monotonically_consumed_by_daemon(
+def test_restricted_halt_is_advisory_and_cannot_trip_global_kill(
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
     intent_path = tmp_path / "intents.db"
@@ -970,17 +970,35 @@ def test_halt_is_queued_then_monotonically_consumed_by_daemon(
     halt = get_tools(nightwatch.register)["halt"]
     result = halt("boundary drill", "HALT_OPTIONSBOT", FakeCtx(context))
     assert result["ok"] is True
-    assert result["killed"] == "pending_daemon_consumption"
+    assert result["killed"] is False
+    assert result["status"] == "advisory_queued"
     assert load_state(mcp_engine).killed is False
 
     daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
     assert consume_control_intents(daemon_context, intent_path) == 1
-    assert load_state(mcp_engine).killed is True
-    assert load_state(mcp_engine).reason == "boundary drill"
+    assert load_state(mcp_engine).killed is False
     with intent_engine.connect() as conn:
         row = conn.execute(select(control_intents)).one()
     assert row.status == "processed"
+    assert row.kind == "halt_advisory"
+    assert row.result_text == "advisory recorded; global kill state unchanged"
 
-    # Consumption is idempotent; a second pass cannot clear or duplicate it.
+    # Consumption is idempotent; a second pass cannot change execution state.
     assert consume_control_intents(daemon_context, intent_path) == 0
-    assert load_state(mcp_engine).killed is True
+    assert load_state(mcp_engine).killed is False
+
+
+def test_legacy_restricted_halt_intent_is_rejected(
+    mcp_engine: Engine, tmp_path: Path
+) -> None:
+    intent_path = tmp_path / "legacy-halt-intents.db"
+    intent_engine = create_intent_engine(intent_path)
+    enqueue_intent(intent_engine, "halt", {"reason": "legacy row"})  # type: ignore[arg-type]
+
+    daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
+    assert consume_control_intents(daemon_context, intent_path) == 0
+    assert load_state(mcp_engine).killed is False
+    with intent_engine.connect() as conn:
+        row = conn.execute(select(control_intents)).one()
+    assert row.status == "rejected"
+    assert "global halt authority was removed" in row.result_text

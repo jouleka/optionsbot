@@ -15,7 +15,6 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
-from optionsbot.execution.state import trip_kill
 from optionsbot.hermes_overlay import load_overlay_state
 from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
 from optionsbot.review_checks import all_entry_checks_pass, normalize_entry_checks
@@ -441,10 +440,16 @@ def _consume_one(context: DaemonContext, kind: str, payload: object) -> str:
         return _consume_entry_review(context, payload)
     if kind == "request_exit":
         return _consume_exit_request(context, payload)
+    if kind == "halt_advisory":
+        reason = str(payload.get("reason") or "Hermes anomaly advisory").strip()
+        if not reason:
+            raise ValueError("halt advisory reason is required")
+        log.warning("Hermes halt advisory (no kill authority): %s", reason)
+        return "advisory recorded; global kill state unchanged"
     if kind == "halt":
-        reason = str(payload.get("reason") or "Hermes restricted MCP halt")
-        state = trip_kill(context.engine, reason)
-        return f"kill switch set: {state.reason}"
+        # Reject legacy rows created before the least-privilege boundary was
+        # tightened.  Free-form LLM prose is not a deterministic kill signal.
+        raise ValueError("restricted Hermes global halt authority was removed")
     raise ValueError(f"unknown intent kind: {kind}")
 
 

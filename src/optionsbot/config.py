@@ -280,8 +280,9 @@ class ExecutionSettings(BaseModel):
     # IBK-126 semi-auto execution. A pick older than max_pick_age is the wrong
     # trade (strikes/credit moved) — rescan instead. v1 pricing places at the
     # fresh mid and rests until the TTL, then auto-cancels (= trade skipped);
-    # the reprice ladder arrives in IBK-127. credit_drift_warn_pct flags when
-    # the fresh mid drifted from the alerted credit.
+    # the reprice ladder arrives in IBK-127. ``credit_drift_warn_pct`` is kept
+    # for environment compatibility, but is now a hard stale-model boundary:
+    # beyond it, exact strikes/features/probability must be rebuilt by a rescan.
     max_pick_age_minutes: int = Field(default=20, ge=1, le=60)
     # Every option leg used to price an entry must carry a recent provider
     # timestamp. Unknown or stale quote times fail closed before staging.

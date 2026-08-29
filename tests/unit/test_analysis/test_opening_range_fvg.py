@@ -154,3 +154,24 @@ def test_later_valid_reversal_is_not_suppressed_by_first_breakout() -> None:
     assert signal is not None
     assert signal.direction == "bear"
     assert signal.setup_type == "fvg_retest"
+
+
+def test_hour_late_gap_cannot_be_claimed_by_old_breakout() -> None:
+    bars = _frame(
+        [
+            (99.80, 100.70, 99.70, 100.50),  # breakout
+            *[(100.40, 100.60, 100.20, 100.45) for _ in range(45)],
+            (100.50, 101.00, 100.45, 100.90),
+            (100.90, 101.10, 100.80, 101.00),  # unrelated late FVG
+            (100.70, 100.95, 100.70, 100.90),
+        ]
+    )
+
+    signal = detect_opening_range_fvg(
+        bars,
+        symbol="SPY",
+        now=datetime(2026, 7, 31, 10, 45, tzinfo=NY),
+        entry_window_minutes=360,
+    )
+
+    assert signal is None

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from sqlalchemy import Engine, insert
+
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.tools.positions import register
+from optionsbot.mcp_server.tools.positions import _persisted_open_book, register
+from optionsbot.storage.schema import orders, position_settlements
 from tests.unit.test_mcp.conftest import FakeCtx, get_tools
 
 
@@ -62,3 +67,40 @@ async def test_positions_tool_passes_history_client_and_returns_beta(
     # history_client threaded through (portfolio.enabled defaults True)
     assert mock.await_args.kwargs["history_client"] is not None
     assert mock.await_args.kwargs["benchmark_symbol"] == "SPY"
+
+
+def test_persisted_open_book_excludes_expiration_settlements(
+    mcp_engine: Engine,
+) -> None:
+    now = datetime.now(UTC)
+    with mcp_engine.begin() as conn:
+        entry_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="long_call",
+                    legs_json=[],
+                    quantity=1,
+                    status="filled",
+                    staged_ts=now,
+                    terminal_ts=now,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(position_settlements).values(
+                entry_order_id=entry_id,
+                kind="expired_worthless",
+                expiry="20260828",
+                terminal_spot=500.0,
+                pnl=-25.0,
+                commissions=0.70,
+                settled_at=now,
+            )
+        )
+
+    result = _persisted_open_book(SimpleNamespace(engine=mcp_engine))  # type: ignore[arg-type]
+
+    assert result["position_count"] == 0
+    assert result["positions"] == []

@@ -79,6 +79,7 @@ def test_orb_reconciliation_uses_stop_target_ev_when_terminal_ev_turns_negative(
             "expected_value": 17.25052816113675,
             "terminal_expected_value": 83.03360198143658,
             "prob_profit": 0.564424975189262,
+            "managed_target_hit_probability_lcb": 0.564424975189262,
             "opening_range_fvg": {
                 "status": "entry_confirmed",
                 "source": "trusted_daemon",
@@ -121,6 +122,7 @@ def test_orb_reconciliation_uses_stop_target_ev_when_terminal_ev_turns_negative(
             "expected_value": economics.expected_value,
             "terminal_expected_value": economics.terminal_expected_value,
             "prob_profit": 0.564424975189262,
+            "managed_target_hit_probability_lcb": 0.564424975189262,
             "opening_range_fvg": {
                 "status": "entry_confirmed",
                 "source": "trusted_daemon",
@@ -144,6 +146,7 @@ def test_orb_reconciliation_still_rejects_negative_managed_edge() -> None:
             "expected_value": -1.0,
             "terminal_expected_value": 5.0,
             "prob_profit": 0.35,
+            "managed_target_hit_probability_lcb": 0.35,
             "opening_range_fvg": {
                 "status": "entry_confirmed",
                 "source": "trusted_daemon",
@@ -176,6 +179,7 @@ def test_googl_fresh_economics_deducts_round_trip_costs() -> None:
             "credit_or_debit": -69.5,
             "terminal_expected_value": 15.524697215831935,
             "prob_profit": 0.34827346286975674,
+            "managed_target_hit_probability_lcb": 0.34827346286975674,
             "opening_range_fvg": {
                 "status": "entry_confirmed", "source": "trusted_daemon",
                 "stop_pct": 0.15, "target_r": 2.0, "target_pct": 0.30,
@@ -190,3 +194,49 @@ def test_googl_fresh_economics_deducts_round_trip_costs() -> None:
     assert economics.estimated_round_trip_cost == pytest.approx(11.80)
     assert economics.managed_expected_value == pytest.approx(-11.332747448748358)
     assert economics.expected_value == pytest.approx(-11.332747448748358)
+
+
+def test_terminal_probability_cannot_authorize_managed_trade() -> None:
+    economics = reconcile_entry_economics(
+        [_leg("sell", 689.0), _leg("buy", 692.0)],  # type: ignore[list-item]
+        {
+            "credit_or_debit": -100.0,
+            "terminal_expected_value": 50.0,
+            "prob_profit": 0.99,
+            "opening_range_fvg": {
+                "status": "entry_confirmed", "source": "trusted_daemon",
+                "stop_pct": 0.15, "target_r": 1.5, "target_pct": 0.225,
+            },
+        },
+        fresh_net_per_share=-1.00,
+    )
+
+    assert economics is not None
+    assert economics.managed_expected_value is None
+    assert economics.expected_value is None
+
+
+def test_impossible_finite_spread_target_is_unavailable() -> None:
+    economics = reconcile_entry_economics(
+        [
+            _leg("sell", 690.0),
+            _leg("buy", 691.0),
+        ],  # type: ignore[list-item]
+        {
+            "credit_or_debit": -82.0,
+            "terminal_expected_value": 10.0,
+            "prob_profit": 0.70,
+            "managed_target_hit_probability_lcb": 0.70,
+            "opening_range_fvg": {
+                "status": "entry_confirmed", "source": "trusted_daemon",
+                "stop_pct": 0.15, "target_r": 1.5, "target_pct": 0.225,
+            },
+        },
+        fresh_net_per_share=-0.82,
+        estimated_round_trip_cost=6.80,
+    )
+
+    assert economics is not None
+    assert economics.max_profit == pytest.approx(18.0)
+    assert economics.managed_expected_value is None
+    assert economics.expected_value is None

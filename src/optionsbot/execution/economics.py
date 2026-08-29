@@ -86,14 +86,16 @@ def reconcile_entry_economics(
     )
     gross_managed_ev = managed_expected_value(
         credit_or_debit=fresh_cashflow,
-        prob_profit=suggestion.get("prob_profit"),
+        target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
         plan=opening_range_plan,
+        maximum_profit=max_profit,
     )
     managed_ev = managed_expected_value(
         credit_or_debit=fresh_cashflow,
-        prob_profit=suggestion.get("prob_profit"),
+        target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
         plan=opening_range_plan,
         estimated_round_trip_cost=estimated_round_trip_cost,
+        maximum_profit=max_profit,
     )
     round_trip_cost = _finite_number(estimated_round_trip_cost)
     expected_value = managed_ev if opening_range_candidate else terminal_expected_value

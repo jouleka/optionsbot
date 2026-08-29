@@ -61,6 +61,7 @@ def _insert_pick(
     expected_value: float = 11.0,
     legs: list[dict[str, Any]] | None = None,
     raw_json: Any = None,
+    suggestion_extra: dict[str, Any] | None = None,
 ) -> int:
     with engine.begin() as conn:
         snapshot_id = conn.execute(
@@ -79,6 +80,7 @@ def _insert_pick(
                     "suggested_quantity": suggested_quantity,
                     "reward_risk": 0.32, "expected_value": expected_value,
                     "risk_tier": "balanced",
+                    **(suggestion_extra or {}),
                 },
             )
         ).inserted_primary_key[0]
@@ -488,8 +490,55 @@ async def test_rejects_when_fresh_debit_turns_positive_scan_ev_negative(
         outcome = await execute_pick(deps, score_id, now=NOW)
 
     assert not outcome.ok
+    assert "price drift exceeded" in outcome.message.lower()
+    assert "rescan and rebuild" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_final_reprice_rejects_gross_edge_erased_by_round_trip_costs(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "QQQ", "side": "sell", "sec_type": "OPT",
+            "expiry": "20260717", "strike": 689.0, "right": "P", "quantity": 1,
+        },
+        {
+            "symbol": "QQQ", "side": "buy", "sec_type": "OPT",
+            "expiry": "20260717", "strike": 692.0, "right": "P", "quantity": 1,
+        },
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        symbol="QQQ",
+        legs=legs,
+        credit_or_debit=-69.5,
+        max_loss=69.5,
+        max_profit=230.5,
+        expected_value=0.47,
+        suggestion_extra={
+            "terminal_expected_value": 15.52,
+            "managed_target_hit_probability_lcb": 0.34827346286975674,
+            "opening_range_fvg": {
+                "status": "entry_confirmed",
+                "source": "trusted_daemon",
+                "stop_pct": 0.15,
+                "target_r": 2.0,
+                "target_pct": 0.30,
+            },
+        },
+    )
+    deps = _deps(
+        tmp_db,
+        md_mids={(689.0, "P"): 0.50, (692.0, "P"): 1.195},
+    )
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
     assert "expected value" in outcome.message.lower()
-    assert "-26.17" in outcome.message
     deps.order_client.whatif_combo.assert_not_awaited()
     deps.order_client.place_combo_limit.assert_not_awaited()
 
@@ -618,7 +667,7 @@ async def test_happy_path_debit_places_positive_limit(tmp_db: Engine) -> None:
     assert "debit" in outcome.message
 
 
-async def test_drift_warning_included(tmp_db: Engine) -> None:
+async def test_material_price_drift_requires_fresh_rebuild(tmp_db: Engine) -> None:
     # Scan credit $1.80/unit, fresh mid $1.20 -> 33% drift > 25% default band.
     # Keep enough model edge that the $60 adverse repricing remains positive.
     score_id = _insert_pick(
@@ -629,8 +678,9 @@ async def test_drift_warning_included(tmp_db: Engine) -> None:
     deps = _deps(tmp_db)
     with patch("optionsbot.execution.engine.is_market_open", return_value=True):
         outcome = await execute_pick(deps, score_id, now=NOW)
-    assert outcome.ok
-    assert "drift" in outcome.message.lower()
+    assert not outcome.ok
+    assert "price drift exceeded" in outcome.message.lower()
+    assert "rescan and rebuild" in outcome.message.lower()
 
 
 async def test_rejects_illiquid_wide_spread(tmp_db: Engine) -> None:

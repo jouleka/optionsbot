@@ -4,6 +4,7 @@ import pytest
 
 from optionsbot.opening_range_economics import (
     estimated_round_trip_cost,
+    managed_break_even_probability,
     managed_expected_value,
 )
 
@@ -21,7 +22,7 @@ def _plan(*, target_r: float = 1.5) -> dict[str, object]:
 def test_managed_ev_uses_the_actual_stop_and_target() -> None:
     value = managed_expected_value(
         credit_or_debit=-270.0,
-        prob_profit=0.564424975189262,
+        target_hit_probability=0.564424975189262,
         plan=_plan(),
     )
 
@@ -32,14 +33,14 @@ def test_managed_ev_requires_probability_above_plan_break_even() -> None:
     assert (
         managed_expected_value(
             credit_or_debit=-270.0,
-            prob_profit=0.39,
+            target_hit_probability=0.39,
             plan=_plan(),
         )
         is not None
     )
     assert managed_expected_value(
         credit_or_debit=-270.0,
-        prob_profit=0.39,
+        target_hit_probability=0.39,
         plan=_plan(),
     ) < 0
 
@@ -48,7 +49,7 @@ def test_managed_ev_does_not_apply_to_credit_or_untrusted_plans() -> None:
     assert (
         managed_expected_value(
             credit_or_debit=100.0,
-            prob_profit=0.70,
+            target_hit_probability=0.70,
             plan=_plan(),
         )
         is None
@@ -67,12 +68,12 @@ def test_cost_adjusted_ev_rejects_august_10_googl_marginal_edge() -> None:
 
     gross = managed_expected_value(
         credit_or_debit=-69.5,
-        prob_profit=0.34827346286975674,
+        target_hit_probability=0.34827346286975674,
         plan=_plan(target_r=2.0),
     )
     after_costs = managed_expected_value(
         credit_or_debit=-69.5,
-        prob_profit=0.34827346286975674,
+        target_hit_probability=0.34827346286975674,
         plan=_plan(target_r=2.0),
         estimated_round_trip_cost=cost,
     )
@@ -83,8 +84,36 @@ def test_cost_adjusted_ev_rejects_august_10_googl_marginal_edge() -> None:
     assert (
         managed_expected_value(
             credit_or_debit=-100.0,
-            prob_profit=0.70,
+            target_hit_probability=0.70,
             plan=untrusted,
         )
         is None
     )
+
+
+def test_break_even_probability_includes_costs() -> None:
+    assert managed_break_even_probability(
+        credit_or_debit=-100.0,
+        plan=_plan(),
+    ) == pytest.approx(0.4)
+    assert managed_break_even_probability(
+        credit_or_debit=-100.0,
+        plan=_plan(),
+        estimated_round_trip_cost=10.0,
+    ) == pytest.approx(25.0 / 37.5)
+
+
+def test_finite_spread_with_unreachable_net_target_fails_closed() -> None:
+    assert managed_expected_value(
+        credit_or_debit=-82.0,
+        target_hit_probability=0.70,
+        plan=_plan(),
+        estimated_round_trip_cost=6.80,
+        maximum_profit=18.0,
+    ) is None
+    assert managed_break_even_probability(
+        credit_or_debit=-82.0,
+        plan=_plan(),
+        estimated_round_trip_cost=6.80,
+        maximum_profit=18.0,
+    ) is None

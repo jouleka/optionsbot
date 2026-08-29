@@ -15,6 +15,7 @@ from optionsbot.storage.schema import (
     entry_reviews,
     exit_requests,
     orders,
+    position_settlements,
     snapshots,
     strategy_scores,
 )
@@ -1005,6 +1006,47 @@ def test_request_exit_refuses_unknown_position(server_context: ServerContext) ->
 
     assert result["ok"] is False
     assert result["error"] == "position_not_open"
+
+
+def test_request_exit_refuses_settled_position(server_context: ServerContext) -> None:
+    with server_context.engine.begin() as conn:
+        position_id = int(
+            conn.execute(
+                insert(orders).values(
+                    intent="open",
+                    symbol="SPY",
+                    strategy="long_call",
+                    legs_json=LEGS,
+                    quantity=1,
+                    status="filled",
+                    staged_ts=NOW,
+                    terminal_ts=NOW,
+                    reprice_count=0,
+                )
+            ).inserted_primary_key[0]
+        )
+        conn.execute(
+            insert(position_settlements).values(
+                entry_order_id=position_id,
+                kind="expired_worthless",
+                expiry="20260717",
+                terminal_spot=550.0,
+                pnl=-25.0,
+                commissions=0.70,
+                settled_at=NOW,
+            )
+        )
+
+    result = get_tools(register)["request_exit"](
+        position_id=position_id,
+        catalyst_type="risk_management",
+        confidence=0.9,
+        sources=["settlement ledger", "exchange calendar"],
+        reason="must not queue a close for a terminal position",
+        ctx=FakeCtx(server_context),
+    )
+
+    assert result == {"ok": False, "error": "position_not_open"}
 
 
 def test_halt_requires_exact_confirmation(server_context: ServerContext) -> None:

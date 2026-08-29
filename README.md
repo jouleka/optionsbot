@@ -109,7 +109,7 @@ credentials outside the checkout.
 
 ### MCP configuration
 
-Copy [`.mcp.json.example`](.mcp.json.example), replace `/path/to/optionsbot` with the absolute checkout path, and keep the resulting `.mcp.json` local. The server exposes watchlist, analysis, snapshot, position, track-record, daily-briefing, candidate-review, close-request, and monotonic-halt tools.
+Copy [`.mcp.json.example`](.mcp.json.example), replace `/path/to/optionsbot` with the absolute checkout path, and keep the resulting `.mcp.json` local. The trusted server exposes watchlist, analysis, snapshot, position, track-record, daily-briefing, candidate-review, close-request, and monotonic-halt tools. The restricted Hermes boundary records halt advisories but cannot trip the global kill switch.
 
 ## Configuration
 
@@ -148,6 +148,10 @@ The default test command excludes tests marked `live`. `uv run pytest -m live` r
 ## Status and scope
 
 The project is designed for one operator, one IBKR paper account, and one Telegram chat. Paper execution, order tracking, reconciliation, risk gates, deterministic exits, and optional external-review hooks are implemented. Execution remains off by default. Multi-account and live trading are out of scope.
+
+The current 0DTE research architecture, managed-payoff formula, Hermes boundary,
+and validation/promotion plan are documented in
+[the strategy redesign](docs/strategy-redesign.md).
 
 ## Security
 

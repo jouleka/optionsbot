@@ -39,6 +39,7 @@ from optionsbot.ibkr.types import OptionChainLeg
 from optionsbot.market_hours import minutes_to_nyse_close
 from optionsbot.opening_range_economics import (
     estimated_round_trip_cost,
+    managed_break_even_probability,
     managed_expected_value,
     with_managed_expected_value,
 )
@@ -350,6 +351,7 @@ async def scan_symbol(
     )
     opening_range_round_trip_costs: dict[str, float | None] = {}
     gross_managed_expected_values: dict[str, float | None] = {}
+    managed_break_even_probabilities: dict[str, float | None] = {}
     if opening_range_plan is not None:
         for item in scored:
             opening_range_round_trip_costs[item.strategy_name] = (
@@ -357,8 +359,21 @@ async def scan_symbol(
             )
             gross_managed_expected_values[item.strategy_name] = managed_expected_value(
                 credit_or_debit=item.suggestion.credit_or_debit,
-                prob_profit=item.suggestion.prob_profit,
+                # No target-before-stop model is currently promoted.  Terminal
+                # expiry PoP must never silently stand in for this value.
+                target_hit_probability=None,
                 plan=opening_range_plan,
+                maximum_profit=item.suggestion.max_profit,
+            )
+            managed_break_even_probabilities[item.strategy_name] = (
+                managed_break_even_probability(
+                    credit_or_debit=item.suggestion.credit_or_debit,
+                    plan=opening_range_plan,
+                    estimated_round_trip_cost=opening_range_round_trip_costs.get(
+                        item.strategy_name
+                    ),
+                    maximum_profit=item.suggestion.max_profit,
+                )
             )
         scored = tuple(
             replace(
@@ -366,6 +381,7 @@ async def scan_symbol(
                 suggestion=with_managed_expected_value(
                     item.suggestion,
                     opening_range_plan,
+                    target_hit_probability=None,
                     estimated_round_trip_cost=opening_range_round_trip_costs.get(
                         item.strategy_name
                     ),
@@ -479,7 +495,7 @@ async def scan_symbol(
                             "reward_risk": s.suggestion.reward_risk,
                             "expected_value": s.suggestion.expected_value,
                             "expected_value_model": (
-                                "opening_range_stop_target_after_costs_v2"
+                                "managed_outcome_calibration_required_v3"
                                 if opening_range_plan is not None
                                 else "terminal_expiry_v1"
                             ),
@@ -488,6 +504,12 @@ async def scan_symbol(
                             ),
                             "gross_managed_expected_value": (
                                 gross_managed_expected_values.get(s.strategy_name)
+                            ),
+                            "managed_target_hit_probability": None,
+                            "managed_target_hit_probability_lcb": None,
+                            "managed_probability_model": None,
+                            "managed_break_even_probability": (
+                                managed_break_even_probabilities.get(s.strategy_name)
                             ),
                             "estimated_round_trip_cost": (
                                 opening_range_round_trip_costs.get(s.strategy_name)

@@ -64,6 +64,8 @@ def detect_opening_range_fvg(
     stop_pct: float = 0.15,
     target_r_min: float = 1.5,
     target_r_max: float = 2.0,
+    max_fvg_formation_bars: int = 5,
+    max_retest_bars: int = 10,
 ) -> OpeningRangeFVGSignal | None:
     """Return the newest confirmed same-session opening-range retest, if any.
 
@@ -75,8 +77,12 @@ def detect_opening_range_fvg(
     near edge. A range-level retest must pull back to the broken opening-range
     boundary, avoid a material re-entry into the range, and close back outside.
     Every fresh bull or bear breakout is evaluated, so an early false break no
-    longer suppresses a valid reversal later in the session.
+    longer suppresses a valid reversal later in the session. A breakout thesis
+    expires after a bounded number of bars: it cannot claim an unrelated gap or
+    retest formed nearly an hour later.
     """
+    if max_fvg_formation_bars < 2 or max_retest_bars < 1:
+        return None
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     now_ny = now.astimezone(_NEW_YORK)
@@ -144,7 +150,11 @@ def detect_opening_range_fvg(
         # A 10%-of-range penetration allowance tolerates a tick through the
         # level without accepting a material move back inside the range.
         boundary = range_high if direction == "bull" else range_low
-        for retest in range(breakout_position + 1, segment_end):
+        range_retest_end = min(
+            segment_end,
+            breakout_position + max_retest_bars + 1,
+        )
+        for retest in range(breakout_position + 1, range_retest_end):
             retest_key, bar = records[retest]
             retest_ts = cast(pd.Timestamp, retest_key)
             low = float(bar["low"])
@@ -206,7 +216,14 @@ def detect_opening_range_fvg(
             break
 
         # Setup 2: post-breakout three-candle FVG pullback and respect.
-        for formed in range(max(2, breakout_position + 1), segment_end):
+        # The breakout candle must participate in, or precede by at most a few
+        # bars, the displacement imbalance.  Starting at breakout+2 ensures all
+        # three FVG candles belong to the post-break thesis.
+        formation_end = min(
+            segment_end,
+            breakout_position + max_fvg_formation_bars + 1,
+        )
+        for formed in range(max(2, breakout_position + 2), formation_end):
             _, first = records[formed - 2]
             formed_key, third = records[formed]
             formed_ts = cast(pd.Timestamp, formed_key)
@@ -221,7 +238,8 @@ def detect_opening_range_fvg(
                 if gap_high <= gap_low:
                     continue
 
-            for retest in range(formed + 1, segment_end):
+            fvg_retest_end = min(segment_end, formed + max_retest_bars + 1)
+            for retest in range(formed + 1, fvg_retest_end):
                 retest_key, bar = records[retest]
                 retest_ts = cast(pd.Timestamp, retest_key)
                 low = float(bar["low"])

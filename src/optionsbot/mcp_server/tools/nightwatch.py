@@ -3,8 +3,9 @@
 These tools deliberately split read-only analyst packets from write-gated actions:
 ``pending_picks`` is a compact read-only queue, ``pick_review_packet`` returns
 one complete candidate without transport truncation, ``request_exit`` only
-queues an audited request for the daemon to evaluate, and ``halt`` trips the
-existing persisted kill switch with an exact confirmation token.
+queues an audited request for the daemon to evaluate, and restricted ``halt``
+creates only an advisory.  A trusted operator or deterministic daemon fault
+owns the global kill switch.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from optionsbot.storage.schema import (
     entry_reviews,
     exit_requests,
     orders,
+    position_settlements,
     snapshots,
     strategy_scores,
 )
@@ -145,8 +147,13 @@ def _open_position_ids(lifespan: ServerContext) -> set[int]:
             .where(orders.c.status == "filled")
             .where(orders.c.closes_order_id.is_not(None))
         ).fetchall()
+        settlements = conn.execute(
+            select(position_settlements.c.entry_order_id)
+        ).fetchall()
     closed_ids = {int(row.closes_order_id) for row in closed}
-    return {int(row.id) for row in entries if int(row.id) not in closed_ids}
+    settled_ids = {int(row.entry_order_id) for row in settlements}
+    terminal_ids = closed_ids | settled_ids
+    return {int(row.id) for row in entries if int(row.id) not in terminal_ids}
 
 
 def _pending_open_close(lifespan: ServerContext, position_id: int) -> bool:
@@ -927,10 +934,11 @@ def register(server: FastMCP) -> None:
         confirm: str,
         ctx: Context[ServerSession, ServerContext],
     ) -> dict[str, Any]:
-        """Trip the persisted execution kill switch.
+        """Request a halt with exact confirmation.
 
-        Requires exact confirmation ``HALT_OPTIONSBOT``. This is intentionally
-        one-way from MCP: re-arming remains the existing human Telegram/CLI path.
+        In a trusted operator context this trips the persisted switch.  In the
+        restricted Hermes context it records an advisory only; free-form model
+        output cannot become a global trading halt.
         """
         if confirm != "HALT_OPTIONSBOT":
             return {
@@ -944,15 +952,20 @@ def register(server: FastMCP) -> None:
         if intent_engine is not None:
             intent_id, intent_uid = enqueue_intent(
                 intent_engine,
-                "halt",
+                "halt_advisory",
                 {"reason": msg},
             )
             return {
                 "ok": True,
-                "killed": "pending_daemon_consumption",
+                "killed": False,
+                "status": "advisory_queued",
                 "intent_id": intent_id,
                 "intent_uid": intent_uid,
                 "reason": msg,
+                "note": (
+                    "Hermes has no global halt authority; the trusted daemon or "
+                    "an operator must verify a deterministic fault"
+                ),
             }
         from optionsbot.execution.state import trip_kill
 

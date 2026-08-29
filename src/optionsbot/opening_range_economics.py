@@ -19,28 +19,35 @@ def _number(value: object) -> float | None:
 def managed_expected_value(
     *,
     credit_or_debit: object,
-    prob_profit: object,
+    target_hit_probability: object,
     plan: object,
     estimated_round_trip_cost: object = 0.0,
+    maximum_profit: object = None,
 ) -> float | None:
     """Return expectancy at the configured premium stop/target boundaries.
 
-    The generic strategy model estimates terminal-expiry value. Exact ORB/FVG
-    entries are instead closed at a premium-percent stop or R target, so their
-    admission metric must use those same outcomes. ``prob_profit`` remains the
-    bot's bounded probability estimate and is treated as the target-hit proxy;
-    both terminal EV and this managed EV are retained downstream for learning.
+    ``target_hit_probability`` must come from a versioned, out-of-sample model
+    of the *managed option path*: target reached before stop/timeout.  A generic
+    probability of terminal profit is deliberately not accepted here; expiry
+    profitability and first passage through intraday premium boundaries are
+    different events.
+
+    This is the conservative binary target/stop form.  Timeout observations
+    must be incorporated by the calibrated model before it supplies the target
+    probability.  Finite-payoff structures also fail closed when the desired
+    net target cannot fit below their maximum profit.
     """
     if not isinstance(plan, Mapping):
         return None
     if plan.get("status") != "entry_confirmed" or plan.get("source") != "trusted_daemon":
         return None
     cashflow = _number(credit_or_debit)
-    win_probability = _number(prob_profit)
+    win_probability = _number(target_hit_probability)
     stop_pct = _number(plan.get("stop_pct"))
     target_r = _number(plan.get("target_r"))
     target_pct = _number(plan.get("target_pct"))
     round_trip_cost = _number(estimated_round_trip_cost)
+    finite_maximum_profit = _number(maximum_profit)
     if None in (
         cashflow,
         win_probability,
@@ -69,10 +76,55 @@ def managed_expected_value(
     debit = abs(cashflow)
     target_dollars = debit * target_pct
     stop_dollars = debit * stop_pct
+    if finite_maximum_profit is not None and (
+        finite_maximum_profit <= 0
+        or target_dollars + round_trip_cost > finite_maximum_profit
+    ):
+        return None
     gross_expectancy = (
         win_probability * target_dollars - (1 - win_probability) * stop_dollars
     )
     return gross_expectancy - round_trip_cost
+
+
+def managed_break_even_probability(
+    *,
+    credit_or_debit: object,
+    plan: object,
+    estimated_round_trip_cost: object = 0.0,
+    maximum_profit: object = None,
+) -> float | None:
+    """Return the target-first probability required to break even after costs."""
+    if not isinstance(plan, Mapping):
+        return None
+    if plan.get("status") != "entry_confirmed" or plan.get("source") != "trusted_daemon":
+        return None
+    cashflow = _number(credit_or_debit)
+    stop_pct = _number(plan.get("stop_pct"))
+    target_r = _number(plan.get("target_r"))
+    target_pct = _number(plan.get("target_pct"))
+    round_trip_cost = _number(estimated_round_trip_cost)
+    finite_maximum_profit = _number(maximum_profit)
+    if None in (cashflow, stop_pct, target_r, target_pct, round_trip_cost):
+        return None
+    assert cashflow is not None
+    assert stop_pct is not None
+    assert target_r is not None
+    assert target_pct is not None
+    assert round_trip_cost is not None
+    if cashflow >= 0 or not 0 < stop_pct < 1 or round_trip_cost < 0:
+        return None
+    if target_r < 1 or not math.isclose(target_pct, stop_pct * target_r, rel_tol=1e-9):
+        return None
+    debit = abs(cashflow)
+    target_dollars = debit * target_pct
+    stop_dollars = debit * stop_pct
+    if finite_maximum_profit is not None and (
+        finite_maximum_profit <= 0
+        or target_dollars + round_trip_cost > finite_maximum_profit
+    ):
+        return None
+    return (stop_dollars + round_trip_cost) / (target_dollars + stop_dollars)
 
 
 def estimated_round_trip_cost(
@@ -110,14 +162,16 @@ def with_managed_expected_value(
     suggestion: StrategySuggestion,
     plan: object,
     *,
+    target_hit_probability: object = None,
     estimated_round_trip_cost: object = 0.0,
 ) -> StrategySuggestion:
     """Apply managed ORB expectancy to an immutable strategy suggestion."""
     expected_value = managed_expected_value(
         credit_or_debit=suggestion.credit_or_debit,
-        prob_profit=suggestion.prob_profit,
+        target_hit_probability=target_hit_probability,
         plan=plan,
         estimated_round_trip_cost=estimated_round_trip_cost,
+        maximum_profit=suggestion.max_profit,
     )
     if not isinstance(plan, Mapping) or plan.get("status") != "entry_confirmed":
         return suggestion

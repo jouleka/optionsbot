@@ -54,6 +54,7 @@ from optionsbot.ibkr.market_data import MarketDataClient
 from optionsbot.ibkr.orders import OrderClient
 from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.ibkr.types import OptionQuote
+from optionsbot.opening_range_economics import estimated_round_trip_cost
 from optionsbot.review_evidence import snapshot_ready_for_auto
 from optionsbot.storage.schema import (
     orders,
@@ -505,10 +506,49 @@ async def execute_pick(
     # The raw mid is often a half-cent (bid 9.30/ask 9.33 → 9.315); IBKR
     # rejects sub-increment limits with Error 110. Round to the symbol's tick.
     fresh_net = round_to_increment(fresh_net, price_increment_for(symbol))
+    scan_net = float(suggestion.get("credit_or_debit") or 0.0) / 100.0  # per unit
+    if scan_net != 0 and (fresh_net == 0 or (fresh_net > 0) != (scan_net > 0)):
+        return _reject(
+            f"edge gone — scan priced {scan_net:+.2f}/unit but fresh mid is "
+            f"{fresh_net:+.2f}/unit"
+        )
+    drift_note = ""
+    if scan_net != 0:
+        drift = abs(fresh_net - scan_net) / abs(scan_net)
+        if drift > settings.execution.credit_drift_warn_pct:
+            return _reject(
+                "candidate price drift exceeded the stale-model boundary "
+                f"({drift * 100:.0f}% > "
+                f"{settings.execution.credit_drift_warn_pct * 100:.0f}%; "
+                f"{scan_net:+.2f} → {fresh_net:+.2f}); rescan and rebuild"
+            )
+
+    # Recompute the same conservative round-trip reserve at the final quote.
+    # The earlier evidence packet is not authority after prices have moved.
+    fresh_combo = combo_bid_ask(legs, quotes)
+    if fresh_combo is None:
+        return _reject("fresh combo bid/ask unavailable — refusing cost-blind entry")
+    option_contracts_per_unit = sum(
+        int(leg.get("quantity", 1))
+        for leg in option_legs
+    )
+    round_trip_cost = estimated_round_trip_cost(
+        option_contracts_per_unit=option_contracts_per_unit,
+        combo_spread_per_share=fresh_combo[1] - fresh_combo[0],
+        commission_per_contract=(
+            settings.execution.opening_range_commission_per_contract
+        ),
+        slippage_spread_fraction=(
+            settings.execution.opening_range_round_trip_slippage_spread_frac
+        ),
+    )
+    if round_trip_cost is None:
+        return _reject("fresh round-trip cost reserve unavailable")
     fresh_economics = reconcile_entry_economics(
         legs,
         suggestion,
         fresh_net_per_share=fresh_net,
+        estimated_round_trip_cost=round_trip_cost,
     )
     if fresh_economics is None:
         return _reject("fresh option economics do not prove a finite structural loss")
@@ -530,21 +570,6 @@ async def execute_pick(
     )
     if combo_issue is not None:
         return _reject("liquidity: " + combo_issue)
-
-    scan_net = float(suggestion.get("credit_or_debit") or 0.0) / 100.0  # per unit
-    if scan_net != 0 and (fresh_net == 0 or (fresh_net > 0) != (scan_net > 0)):
-        return _reject(
-            f"edge gone — scan priced {scan_net:+.2f}/unit but fresh mid is "
-            f"{fresh_net:+.2f}/unit"
-        )
-    drift_note = ""
-    if scan_net != 0:
-        drift = abs(fresh_net - scan_net) / abs(scan_net)
-        if drift > settings.execution.credit_drift_warn_pct:
-            drift_note = (
-                f"\n⚠ drift {drift * 100:.0f}% vs scan "
-                f"({scan_net:+.2f} → {fresh_net:+.2f})"
-            )
 
     limit_price = -fresh_net  # BUY-bag convention: credit = negative limit
 
@@ -585,7 +610,13 @@ async def execute_pick(
         max_loss_unit=max_loss_unit,
         max_profit_unit=max_profit_unit,
         prob_profit=(
-            float(suggestion["prob_profit"]) if suggestion.get("prob_profit") else None
+            float(suggestion["managed_target_hit_probability_lcb"])
+            if suggestion.get("opening_range_fvg") is not None
+            and suggestion.get("managed_target_hit_probability_lcb") is not None
+            else float(suggestion["prob_profit"])
+            if suggestion.get("opening_range_fvg") is None
+            and suggestion.get("prob_profit") is not None
+            else None
         ),
         open_heat=open_heat,
         recent_pnls=recent_pnls,

@@ -29,7 +29,12 @@ from sqlalchemy import (
     select,
 )
 
-IntentKind = Literal["entry_review", "entry_proposal", "request_exit", "halt"]
+IntentKind = Literal[
+    "entry_review",
+    "entry_proposal",
+    "request_exit",
+    "halt_advisory",
+]
 
 metadata = MetaData()
 
