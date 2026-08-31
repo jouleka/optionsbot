@@ -29,12 +29,9 @@ from sqlalchemy import (
     select,
 )
 
-IntentKind = Literal[
-    "entry_review",
-    "entry_proposal",
-    "request_exit",
-    "halt_advisory",
-]
+IntentKind = Literal["context_review"]
+
+_ALLOWED_INTENT_KIND = "context_review"
 
 metadata = MetaData()
 
@@ -87,6 +84,13 @@ def enqueue_intent(
     now: datetime | None = None,
 ) -> tuple[int, str]:
     """Append one typed intent and return its local id and opaque uid."""
+    # Keep this as a runtime check as well as a type boundary.  The restricted
+    # process is an untrusted writer, and callers written before the shadow-only
+    # context boundary may still exist in an old deployment.
+    if kind != _ALLOWED_INTENT_KIND:
+        raise ValueError(
+            "restricted action intent is disabled; only context_review is accepted"
+        )
     created_at = now if now is not None else datetime.now(UTC)
     intent_uid = uuid.uuid4().hex
     with engine.begin() as conn:

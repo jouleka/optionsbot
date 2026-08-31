@@ -29,6 +29,11 @@ from optionsbot.storage.schema import scan_runs
 log = logging.getLogger(__name__)
 
 
+def managed_capture_cron_seconds(interval: int, offset: int) -> str:
+    """Cron second field for a research pass offset from protective exits."""
+    return ",".join(str(second) for second in range(offset, 60, interval))
+
+
 def format_heartbeat(scanned: int | None, alerts: int | None, finished: datetime | None) -> str:
     if finished is None:
         return "✅ optionsbot alive — no scan ticks yet"
@@ -255,6 +260,8 @@ class Daemon:
         self._scheduler.reschedule_job(
             "scan", trigger=IntervalTrigger(minutes=new.scan.interval_minutes)
         )
+        self._sync_managed_capture_job()
+        self._sync_managed_learning_job()
         log.info("config reloaded: %s", _config_summary(new))
 
     def _build_context(self) -> DaemonContext:
@@ -354,6 +361,52 @@ class Daemon:
             await run_exits_tick(self._context)
         except Exception:
             log.exception("exits tick failed catastrophically")
+
+    async def _managed_capture_tick(self) -> None:
+        """Run bounded shadow quote capture; never place or manage an order."""
+        assert self._context is not None
+        try:
+            from optionsbot.daemon.managed_capture import run_managed_capture_tick
+
+            summary = await run_managed_capture_tick(self._context)
+            if summary.opportunities_seen or summary.skipped_for_trading:
+                log.info(
+                    "managed capture tick: opportunities=%d usable=%d unusable=%d "
+                    "resolved=%d censored=%d trading_priority_skip=%s quote_errors=%d",
+                    summary.opportunities_seen,
+                    summary.usable_marks,
+                    summary.unusable_marks,
+                    summary.resolved,
+                    summary.censored,
+                    summary.skipped_for_trading,
+                    summary.quote_errors,
+                )
+        except Exception:
+            # Shadow research must not poison exits, scanning, or daemon life.
+            log.exception("managed capture tick failed")
+
+    async def _managed_learning_tick(self) -> None:
+        """Train/evaluate immutable challengers off-loop after market hours."""
+        assert self._context is not None
+        try:
+            from optionsbot.daemon.managed_learning import run_managed_learning_tick
+
+            summary = await run_managed_learning_tick(self._context)
+            if summary.status not in {"market_open", "already_registered"}:
+                log.info(
+                    "managed learning: status=%s samples=%d sessions=%d "
+                    "base_eligible=%s context_eligible=%s incremental=%s promoted=%s",
+                    summary.status,
+                    summary.samples,
+                    summary.sessions,
+                    summary.base_eligible,
+                    summary.context_eligible,
+                    summary.context_incremental_eligible,
+                    summary.promoted_model_version,
+                )
+        except Exception:
+            # Learning is never allowed to impair scanning, orders, or exits.
+            log.exception("managed learning tick failed")
 
     async def _heartbeat_tick(self) -> None:
         assert self._context is not None
@@ -539,6 +592,8 @@ class Daemon:
             coalesce=True,
             replace_existing=True,
         )
+        self._sync_managed_capture_job()
+        self._sync_managed_learning_job()
         # The MCP process cannot touch the trading DB. It appends only typed
         # intents to a separate queue; this trusted daemon translates them and
         # all downstream entry/exit gates independently revalidate the request.
@@ -551,3 +606,46 @@ class Daemon:
                 coalesce=True,
                 replace_existing=True,
             )
+
+    def _sync_managed_capture_job(self) -> None:
+        """Add/reschedule/remove the observational capture job after reloads."""
+        assert self._scheduler is not None
+        job_id = "managed_capture"
+        validation = self._settings.validation
+        existing = self._scheduler.get_job(job_id)
+        if not validation.managed_capture_enabled:
+            if existing is not None:
+                self._scheduler.remove_job(job_id)
+            return
+        seconds = managed_capture_cron_seconds(
+            validation.managed_capture_interval_seconds,
+            validation.managed_capture_offset_seconds,
+        )
+        self._scheduler.add_job(
+            self._managed_capture_tick,
+            trigger=CronTrigger(second=seconds, timezone=UTC),
+            id=job_id,
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+
+    def _sync_managed_learning_job(self) -> None:
+        """Add/reschedule/remove the CPU-bound post-session learner."""
+        assert self._scheduler is not None
+        job_id = "managed_learning"
+        config = self._settings.managed_learning
+        existing = self._scheduler.get_job(job_id)
+        if not config.enabled:
+            if existing is not None:
+                self._scheduler.remove_job(job_id)
+            return
+        self._scheduler.add_job(
+            self._managed_learning_tick,
+            trigger=IntervalTrigger(hours=config.training_interval_hours),
+            id=job_id,
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            next_run_time=datetime.now(UTC) + timedelta(minutes=3),
+        )

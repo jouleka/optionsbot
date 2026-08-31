@@ -21,6 +21,14 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from optionsbot.managed_contract import (
+    DEFAULT_MANAGED_OUTCOME_POLICY_VERSION,
+    MANAGED_FEATURE_SCHEMA_VERSION,
+    ManagedOutcomePolicySpec,
+    derive_managed_outcome_policy_version,
+    validate_managed_contract,
+)
+
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "optionsbot" / "config.toml"
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "optionsbot" / "optionsbot.db"
 
@@ -139,18 +147,14 @@ class ScanSettings(BaseModel):
     def _validate_dte_window(self) -> ScanSettings:
         if not self.dte_window_min <= self.dte_target <= self.dte_window_max:
             raise ValueError(
-                "scan DTE settings must satisfy "
-                "dte_window_min <= dte_target <= dte_window_max"
+                "scan DTE settings must satisfy dte_window_min <= dte_target <= dte_window_max"
             )
         if self.opening_range_minutes % self.opening_range_timeframe_minutes:
             raise ValueError(
-                "scan.opening_range_minutes must be divisible by "
-                "opening_range_timeframe_minutes"
+                "scan.opening_range_minutes must be divisible by opening_range_timeframe_minutes"
             )
         if self.opening_range_entry_window_minutes <= self.opening_range_minutes:
-            raise ValueError(
-                "scan.opening_range_entry_window_minutes must end after the range"
-            )
+            raise ValueError("scan.opening_range_entry_window_minutes must end after the range")
         return self
 
 
@@ -182,6 +186,105 @@ class ManageSettings(BaseModel):
 class ValidationSettings(BaseModel):
     # IBK-117: how often the daemon evaluates newly-expired picks into the outcomes ledger.
     outcomes_eval_hours: int = Field(default=24, ge=0)  # 0 disables the daily accrual job
+    # Prospective managed-outcome capture is shadow-only.  It records the
+    # executable option path for confirmed structures even when admission
+    # rejects them; it never supplies a probability or authorizes an order.
+    managed_capture_enabled: bool = True
+    managed_capture_interval_seconds: int = Field(default=15, ge=5, le=60)
+    # Offset the capture pass from protective exits (which run on second 0 of
+    # each interval).  A strict lock wait/deadline means research I/O yields to
+    # a real position every time.
+    managed_capture_offset_seconds: int = Field(default=5, ge=1, le=59)
+    managed_capture_lock_timeout_seconds: float = Field(default=1.0, gt=0.0, le=5.0)
+    managed_capture_tick_timeout_seconds: float = Field(default=5.0, gt=0.0, le=10.0)
+    managed_capture_max_active: int = Field(default=16, ge=1, le=50)
+    managed_capture_max_unique_legs: int = Field(default=32, ge=1, le=50)
+    managed_capture_quote_max_age_seconds: int = Field(default=45, ge=1, le=120)
+    managed_capture_quote_span_seconds: int = Field(default=10, ge=0, le=60)
+    managed_capture_max_mark_gap_seconds: int = Field(default=45, ge=5, le=300)
+
+    @model_validator(mode="after")
+    def _validate_managed_capture_cadence(self) -> ValidationSettings:
+        interval = self.managed_capture_interval_seconds
+        offset = self.managed_capture_offset_seconds
+        if 60 % interval != 0:
+            raise ValueError("validation.managed_capture_interval_seconds must divide 60")
+        if offset >= interval:
+            raise ValueError("validation.managed_capture_offset_seconds must be below the interval")
+        if (
+            offset
+            + self.managed_capture_lock_timeout_seconds
+            + self.managed_capture_tick_timeout_seconds
+            >= interval
+        ):
+            raise ValueError(
+                "managed capture offset + lock wait + tick timeout must leave time "
+                "for the next exit tick"
+            )
+        if self.managed_capture_max_mark_gap_seconds < interval:
+            raise ValueError(
+                "validation.managed_capture_max_mark_gap_seconds must be at least one interval"
+            )
+        return self
+
+
+class ManagedLearningSettings(BaseModel):
+    """Challenger training, chronological validation, and paper promotion."""
+
+    enabled: bool = True
+    artifact_dir: Path | None = None
+    feature_schema_version: str = MANAGED_FEATURE_SCHEMA_VERSION
+    outcome_policy_version: str = DEFAULT_MANAGED_OUTCOME_POLICY_VERSION
+    training_interval_hours: int = Field(default=6, ge=1, le=24)
+    min_train_sessions: int = Field(default=15, ge=3)
+    embargo_sessions: int = Field(default=1, ge=0, le=5)
+    bootstrap_iterations: int = Field(default=2_000, ge=200, le=20_000)
+    min_sessions: int = Field(default=30, ge=1)
+    min_samples: int = Field(default=100, ge=1)
+    min_independent_signals: int = Field(default=100, ge=1)
+    min_oof_samples: int = Field(default=50, ge=1)
+    min_folds: int = Field(default=10, ge=2)
+    min_admitted: int = Field(default=20, ge=1)
+    min_admitted_sessions: int = Field(default=10, ge=1)
+    min_profit_factor: float = Field(default=1.05, ge=1.0)
+    # OOF evidence freezes a challenger; it is never promoted on the same
+    # history. One challenger at a time must next survive this deterministic
+    # prefix of strictly future, resolved sessions. This serial protocol also
+    # prevents repeated-candidate shopping on the same future cohort.
+    prospective_min_sessions: int = Field(default=10, ge=2)
+    prospective_min_independent_signals: int = Field(default=20, ge=3)
+    prospective_min_admitted: int = Field(default=5, ge=1)
+    prospective_min_admitted_sessions: int = Field(default=3, ge=1)
+    prospective_min_incumbent_disagreements: int = Field(default=5, ge=1)
+    train_hermes_context_challenger: bool = True
+    # Release invariant: asynchronous context may be evaluated prospectively,
+    # but can neither auto-promote nor become a live admission artifact.
+    hermes_context_shadow_only: Literal[True] = True
+    min_context_disagreements: int = Field(default=20, ge=1)
+    min_context_disagreement_sessions: int = Field(default=10, ge=1)
+    auto_promote: bool = False
+
+    @model_validator(mode="after")
+    def _validate_learning_windows(self) -> ManagedLearningSettings:
+        if self.feature_schema_version != MANAGED_FEATURE_SCHEMA_VERSION:
+            raise ValueError(
+                "managed_learning.feature_schema_version is unsupported by the "
+                f"installed encoder; expected {MANAGED_FEATURE_SCHEMA_VERSION!r}"
+            )
+        if self.min_train_sessions + self.embargo_sessions >= self.min_sessions:
+            raise ValueError(
+                "managed learning needs promotion sessions beyond the training+embargo window"
+            )
+        if self.min_admitted_sessions > self.min_sessions:
+            raise ValueError("managed_learning.min_admitted_sessions cannot exceed min_sessions")
+        if self.min_context_disagreement_sessions > self.min_sessions:
+            raise ValueError("managed context session minimum cannot exceed min_sessions")
+        if self.prospective_min_admitted_sessions > self.prospective_min_sessions:
+            raise ValueError(
+                "managed_learning.prospective_min_admitted_sessions cannot exceed "
+                "prospective_min_sessions"
+            )
+        return self
 
 
 class PortfolioSettings(BaseModel):
@@ -225,32 +328,20 @@ class ExecutionSettings(BaseModel):
     # A target above this activation is an extended (normally 2R) attempt. It
     # keeps the original -1R stop, but protects a winner after reaching +1R
     # and locks +1R after reaching +1.5R instead of allowing a full reversal.
-    opening_range_extended_break_even_activation_r: float = Field(
-        default=1.0, ge=0.5, le=2.0
-    )
-    opening_range_extended_profit_lock_activation_r: float = Field(
-        default=1.5, ge=1.0, le=2.5
-    )
-    opening_range_extended_profit_lock_floor_r: float = Field(
-        default=1.0, ge=0.0, le=2.0
-    )
+    opening_range_extended_break_even_activation_r: float = Field(default=1.0, ge=0.5, le=2.0)
+    opening_range_extended_profit_lock_activation_r: float = Field(default=1.5, ge=1.0, le=2.5)
+    opening_range_extended_profit_lock_floor_r: float = Field(default=1.0, ge=0.0, le=2.0)
     # Entry expectancy must survive realistic round-trip trading costs.  The
     # commission estimate is per option contract, per side; one full current
     # combo spread reserves half-spread slippage on both entry and exit.
     opening_range_commission_per_contract: float = Field(default=0.70, ge=0.0)
-    opening_range_round_trip_slippage_spread_frac: float = Field(
-        default=1.0, ge=0.0, le=2.0
-    )
+    opening_range_round_trip_slippage_spread_frac: float = Field(default=1.0, ge=0.0, le=2.0)
     # Crossing the generic debit target arms a durable winner trail rather
     # than immediately dumping an exact-0DTE debit structure. A bounded spread
     # is harvested once it captures the configured share of maximum profit.
     zero_dte_debit_max_profit_take_pct: float = Field(default=0.50, gt=0.0, le=1.0)
-    zero_dte_debit_trail_early_giveback_pct: float = Field(
-        default=0.35, gt=0.0, lt=1.0
-    )
-    zero_dte_debit_trail_late_giveback_pct: float = Field(
-        default=0.10, gt=0.0, lt=1.0
-    )
+    zero_dte_debit_trail_early_giveback_pct: float = Field(default=0.35, gt=0.0, lt=1.0)
+    zero_dte_debit_trail_late_giveback_pct: float = Field(default=0.10, gt=0.0, lt=1.0)
     # Optional analyst overlay for entries. Production paper discovery may
     # execute a trusted ready evidence packet directly; disabling the review
     # is forbidden unless the paper-only interlock remains enabled.
@@ -267,9 +358,7 @@ class ExecutionSettings(BaseModel):
     # option loss. This is a broker-feasibility cap, not a risk-budget change:
     # it prevents a cheap multi-lot spread from creating an expiry assignment
     # notional that IBKR will reject despite its small defined option loss.
-    physical_settlement_notional_cap_multiple: float = Field(
-        default=10.0, ge=1.0, le=100.0
-    )
+    physical_settlement_notional_cap_multiple: float = Field(default=10.0, ge=1.0, le=100.0)
     # Portfolio caps consumed by the entry gates (IBK-126/130).
     max_open_positions: int = Field(default=6, ge=1)
     max_per_symbol: int = Field(default=1, ge=1)
@@ -370,16 +459,13 @@ class ExecutionSettings(BaseModel):
             >= self.opening_range_extended_profit_lock_activation_r
         ):
             raise ValueError(
-                "opening-range break-even activation must be below profit-lock "
-                "activation"
+                "opening-range break-even activation must be below profit-lock activation"
             )
         if (
             self.opening_range_extended_profit_lock_floor_r
             > self.opening_range_extended_profit_lock_activation_r
         ):
-            raise ValueError(
-                "opening-range profit-lock floor must not exceed its activation"
-            )
+            raise ValueError("opening-range profit-lock floor must not exceed its activation")
         if (
             self.zero_dte_debit_trail_late_giveback_pct
             > self.zero_dte_debit_trail_early_giveback_pct
@@ -400,8 +486,7 @@ class ExecutionSettings(BaseModel):
             )
         if self.allow_structural_margin_fallback and not self.paper_only:
             raise ValueError(
-                "execution.allow_structural_margin_fallback requires "
-                "execution.paper_only=true"
+                "execution.allow_structural_margin_fallback requires execution.paper_only=true"
             )
         # Phase 0 hard ceilings: reject a config that lifts the risk caps
         # past what is safe to run unattended 24/7. These are absolute
@@ -426,8 +511,7 @@ class ExecutionSettings(BaseModel):
             value = getattr(self, name)
             if value > ceiling:
                 raise ValueError(
-                    f"execution.{name}={value} exceeds the Phase 0 safety "
-                    f"ceiling of {ceiling}"
+                    f"execution.{name}={value} exceeds the Phase 0 safety ceiling of {ceiling}"
                 )
         return self
 
@@ -477,6 +561,7 @@ class Settings(BaseSettings):
     storage: StorageSettings = StorageSettings()
     manage: ManageSettings = ManageSettings()
     validation: ValidationSettings = ValidationSettings()
+    managed_learning: ManagedLearningSettings = ManagedLearningSettings()
     portfolio: PortfolioSettings = PortfolioSettings()
     execution: ExecutionSettings = ExecutionSettings()
     monitor: MonitorSettings = MonitorSettings()
@@ -485,10 +570,62 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_strategy_modes(self) -> Settings:
-        if self.scan.opening_range_fvg_enabled and not self.execution.zero_dte_only:
-            raise ValueError(
-                "scan.opening_range_fvg_enabled requires execution.zero_dte_only=true"
+        if self.managed_learning.artifact_dir is None:
+            self.managed_learning.artifact_dir = self.storage.db_path.parent / "managed_models"
+        if self.validation.managed_capture_enabled:
+            capture_seconds = range(
+                self.validation.managed_capture_offset_seconds,
+                60,
+                self.validation.managed_capture_interval_seconds,
             )
+            exit_seconds = range(
+                0,
+                60,
+                self.execution.exit_check_interval_seconds,
+            )
+            # Both jobs use wall-clock CronTriggers.  Validate every phase in
+            # the minute because two independently valid divisors of 60 do not
+            # necessarily retain the same relative offset on later ticks.
+            clearance_to_exit = min(
+                min((exit_second - capture_second) % 60 for exit_second in exit_seconds)
+                for capture_second in capture_seconds
+            )
+            capture_lock_budget = (
+                self.validation.managed_capture_lock_timeout_seconds
+                + self.validation.managed_capture_tick_timeout_seconds
+            )
+            if clearance_to_exit == 0 or capture_lock_budget >= clearance_to_exit:
+                raise ValueError(
+                    "managed capture schedule must leave its full lock+tick budget "
+                    "before every protective exit tick"
+                )
+        if self.scan.opening_range_fvg_enabled and not self.execution.zero_dte_only:
+            raise ValueError("scan.opening_range_fvg_enabled requires execution.zero_dte_only=true")
+        if self.managed_learning.auto_promote and not self.execution.paper_only:
+            raise ValueError("managed_learning.auto_promote requires execution.paper_only=true")
+        outcome_policy_spec = ManagedOutcomePolicySpec(
+            capture_interval_seconds=self.validation.managed_capture_interval_seconds,
+            capture_offset_seconds=self.validation.managed_capture_offset_seconds,
+            quote_max_age_seconds=self.validation.managed_capture_quote_max_age_seconds,
+            quote_span_seconds=self.validation.managed_capture_quote_span_seconds,
+            max_mark_gap_seconds=self.validation.managed_capture_max_mark_gap_seconds,
+        )
+        expected_policy = derive_managed_outcome_policy_version(outcome_policy_spec)
+        configured_policy_is_explicit = (
+            "outcome_policy_version" in self.managed_learning.model_fields_set
+        )
+        if (
+            self.managed_learning.outcome_policy_version != expected_policy
+            and not configured_policy_is_explicit
+        ):
+            # When the operator changes capture semantics but leaves the policy
+            # identity unspecified, derive it rather than mislabel the rows.
+            self.managed_learning.outcome_policy_version = expected_policy
+        validate_managed_contract(
+            feature_schema_version=self.managed_learning.feature_schema_version,
+            outcome_policy_version=self.managed_learning.outcome_policy_version,
+            outcome_policy_spec=outcome_policy_spec,
+        )
         return self
 
     model_config = SettingsConfigDict(

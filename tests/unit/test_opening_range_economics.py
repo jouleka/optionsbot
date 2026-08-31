@@ -6,6 +6,7 @@ from optionsbot.opening_range_economics import (
     estimated_round_trip_cost,
     managed_break_even_probability,
     managed_expected_value,
+    managed_path_expected_values,
 )
 
 
@@ -117,3 +118,25 @@ def test_finite_spread_with_unreachable_net_target_fails_closed() -> None:
         estimated_round_trip_cost=6.80,
         maximum_profit=18.0,
     ) is None
+
+
+def test_three_event_expected_value_includes_timeout_costs_and_scaled_lcb() -> None:
+    values = managed_path_expected_values(
+        credit_or_debit=-100.0,
+        target_probability=0.50,
+        stop_probability=0.30,
+        timeout_probability=0.20,
+        timeout_expected_return=-0.02,
+        ev_residual_return_q05=-0.03,
+        plan={
+            "status": "entry_confirmed",
+            "source": "trusted_daemon",
+            "stop_pct": 0.15,
+            "target_pct": 0.30,
+        },
+        estimated_round_trip_cost=1.40,
+    )
+    assert values is not None
+    point, lower = values
+    assert point == pytest.approx(8.7)
+    assert lower == pytest.approx(5.7)

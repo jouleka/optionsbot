@@ -7,11 +7,18 @@ import pytest
 
 from optionsbot.config import (
     IBKRSettings,
+    ManagedLearningSettings,
     ScanSettings,
     Settings,
     StorageSettings,
     TelegramSettings,
+    ValidationSettings,
     load_settings,
+)
+from optionsbot.managed_contract import (
+    DEFAULT_MANAGED_OUTCOME_POLICY_VERSION,
+    ManagedOutcomePolicySpec,
+    derive_managed_outcome_policy_version,
 )
 
 
@@ -47,7 +54,122 @@ def test_manage_settings_defaults() -> None:
 
 
 def test_validation_settings_default() -> None:
-    assert Settings().validation.outcomes_eval_hours == 24
+    validation = Settings().validation
+    assert validation.outcomes_eval_hours == 24
+    assert validation.managed_capture_enabled is True
+    assert validation.managed_capture_interval_seconds == 15
+    assert validation.managed_capture_offset_seconds == 5
+
+
+def test_managed_capture_cadence_leaves_room_for_protective_exits() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ValidationSettings
+
+    with pytest.raises(ValidationError, match="must divide 60"):
+        ValidationSettings(managed_capture_interval_seconds=14)
+    with pytest.raises(ValidationError, match="leave time for the next exit tick"):
+        ValidationSettings(
+            managed_capture_interval_seconds=15,
+            managed_capture_offset_seconds=10,
+            managed_capture_tick_timeout_seconds=5,
+        )
+
+
+def test_managed_capture_checks_every_phase_against_exit_cadence() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ExecutionSettings
+
+    # Capture seconds 5/20/35/50 eventually collide with 10-second exit
+    # boundaries even though the first capture tick itself is offset.
+    with pytest.raises(ValidationError, match="before every protective exit tick"):
+        Settings(execution=ExecutionSettings(exit_check_interval_seconds=10))
+
+
+def test_managed_learning_defaults_artifacts_beside_database(tmp_path: Path) -> None:
+    settings = Settings(storage=StorageSettings(db_path=tmp_path / "ledger.db"))
+
+    assert settings.managed_learning.enabled is True
+    assert settings.managed_learning.artifact_dir == tmp_path / "managed_models"
+    assert settings.managed_learning.feature_schema_version == "managed_capture_features_v1"
+    assert settings.managed_learning.outcome_policy_version == "marketable_nbbo_15s_v1"
+    assert settings.managed_learning.min_sessions == 30
+    assert settings.managed_learning.min_samples == 100
+    assert settings.managed_learning.min_independent_signals == 100
+    assert settings.managed_learning.min_oof_samples == 50
+    assert settings.managed_learning.min_folds == 10
+    assert settings.managed_learning.min_admitted == 20
+    assert settings.managed_learning.min_admitted_sessions == 10
+    assert settings.managed_learning.min_profit_factor == 1.05
+    assert settings.managed_learning.hermes_context_shadow_only is True
+    assert settings.managed_learning.auto_promote is False
+
+
+def test_managed_learning_context_promotion_cannot_be_enabled() -> None:
+    from pydantic import ValidationError
+
+    from optionsbot.config import ManagedLearningSettings
+
+    with pytest.raises(ValidationError, match="hermes_context_shadow_only"):
+        ManagedLearningSettings(hermes_context_shadow_only=False)  # type: ignore[arg-type]
+
+
+def test_managed_feature_schema_rejects_an_identity_the_encoder_does_not_implement() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="unsupported by the installed encoder"):
+        ManagedLearningSettings(feature_schema_version="managed_capture_features_v2")
+
+
+def test_managed_outcome_policy_is_derived_from_label_affecting_capture_settings() -> None:
+    validation = ValidationSettings(managed_capture_quote_max_age_seconds=60)
+    settings = Settings(validation=validation)
+    expected = derive_managed_outcome_policy_version(
+        ManagedOutcomePolicySpec(
+            capture_interval_seconds=15,
+            capture_offset_seconds=5,
+            quote_max_age_seconds=60,
+            quote_span_seconds=10,
+            max_mark_gap_seconds=45,
+        )
+    )
+
+    assert expected != DEFAULT_MANAGED_OUTCOME_POLICY_VERSION
+    assert settings.managed_learning.outcome_policy_version == expected
+
+
+def test_managed_outcome_policy_changes_with_polling_phase() -> None:
+    settings = Settings(
+        validation=ValidationSettings(managed_capture_offset_seconds=6),
+    )
+    expected = derive_managed_outcome_policy_version(
+        ManagedOutcomePolicySpec(
+            capture_interval_seconds=15,
+            capture_offset_seconds=6,
+            quote_max_age_seconds=45,
+            quote_span_seconds=10,
+            max_mark_gap_seconds=45,
+        )
+    )
+
+    assert expected != DEFAULT_MANAGED_OUTCOME_POLICY_VERSION
+    assert settings.managed_learning.outcome_policy_version == expected
+
+
+def test_explicit_stale_managed_outcome_policy_fails_closed() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(
+        ValidationError,
+        match="does not identify the configured managed-capture semantics",
+    ):
+        Settings(
+            validation=ValidationSettings(managed_capture_quote_max_age_seconds=60),
+            managed_learning=ManagedLearningSettings(
+                outcome_policy_version=DEFAULT_MANAGED_OUTCOME_POLICY_VERSION
+            ),
+        )
 
 
 def test_manage_long_leg_expiry_alerts_default_on() -> None:
@@ -211,12 +333,7 @@ def test_storage_db_path_is_under_user_home() -> None:
 
 def test_load_settings_respects_explicit_config_file(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
-    cfg.write_text(
-        "[ibkr]\n"
-        "host = \"10.0.0.5\"\n"
-        "port = 7496\n"
-        "paper = false\n"
-    )
+    cfg.write_text('[ibkr]\nhost = "10.0.0.5"\nport = 7496\npaper = false\n')
     s = load_settings(config_file=cfg)
     assert s.ibkr.host == "10.0.0.5"
     assert s.ibkr.port == 7496
@@ -272,13 +389,10 @@ def test_load_settings_raises_helpful_error_for_malformed_toml(tmp_path: Path) -
         load_settings(config_file=cfg)
 
 
-def test_env_var_beats_toml_overlay(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_env_var_beats_toml_overlay(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        "[ibkr]\n"
-        "port = 7496\n"  # TOML says 7496
+        "[ibkr]\nport = 7496\n"  # TOML says 7496
     )
     monkeypatch.setenv("OPTIONSBOT_IBKR__PORT", "4001")  # env says 4001
     s = load_settings(config_file=cfg)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -14,9 +15,12 @@ from sqlalchemy import Engine, insert, select
 
 from optionsbot.config import Settings
 from optionsbot.execution.engine import ExecutionDeps, combo_mid, execute_pick
+from optionsbot.execution.managed_boundary import ManagedExecutionError
 from optionsbot.execution.orders import get_order, stage_order, transition
+from optionsbot.execution.sizing import dynamic_quantity
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import AccountSummary, MarginPreview, OptionQuote, PlacedOrder
+from optionsbot.learning.managed_model import ManagedPrediction
 from optionsbot.storage.schema import execution_state, snapshots, strategy_scores
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
@@ -29,6 +33,18 @@ CONDOR_LEGS: list[dict[str, Any]] = [
 ]
 
 QUOTE_MIDS = {(580.0, "P"): 1.60, (575.0, "P"): 0.40}  # fresh net credit 1.20
+
+MANAGED_PACKET = {
+    "expected_value_model": "managed-test",
+    "managed_probability_model": "managed-test",
+    "managed_model_artifact_hash": "a" * 64,
+    "managed_feature_schema_version": "managed_capture_features_v1",
+    "managed_outcome_policy_version": "marketable_nbbo_15s_v1",
+    "managed_model_trained_through": "2026-06-09",
+    "managed_target_hit_probability": 0.7,
+    "managed_stop_probability": 0.2,
+    "managed_timeout_probability": 0.1,
+}
 
 
 def _quote(
@@ -100,6 +116,7 @@ def _deps(
     walk: bool = False,
     delayed: bool = False,
     quote_ts: datetime | None = NOW,
+    clock: Callable[[], datetime] | None = None,
 ) -> ExecutionDeps:
     settings = Settings()
     settings.execution.enabled = enabled
@@ -154,6 +171,20 @@ def _deps(
         md=md, positions=positions, ibkr_lock=asyncio.Lock(),
         walk_md=md if walk else None,
         walk_tasks=set() if walk else None,
+        clock=clock or (lambda: NOW),
+    )
+
+
+def _managed_prediction() -> ManagedPrediction:
+    return ManagedPrediction(
+        target_probability=0.70,
+        stop_probability=0.20,
+        timeout_probability=0.10,
+        target_probability_lcb=0.60,
+        expected_value=12.0,
+        expected_value_lcb=8.0,
+        model_version="managed-test",
+        artifact_hash="a" * 64,
     )
 
 
@@ -283,6 +314,273 @@ async def test_auto_entry_accepts_exact_false_ready_flags(tmp_db: Engine) -> Non
 
     assert outcome.ok, outcome.message
     deps.order_client.place_combo_limit.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "suggestion_extra",
+    [
+        {"shadow_only": True},
+        {"admission_enabled": False},
+    ],
+)
+async def test_research_only_candidate_cannot_be_executed_by_id(
+    tmp_db: Engine, suggestion_extra: dict[str, object]
+) -> None:
+    score_id = _insert_pick(tmp_db, suggestion_extra=suggestion_extra)
+    deps = _deps(tmp_db)
+
+    outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "research-only" in outcome.message.lower()
+    deps.md.get_option_snapshot.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_auto_rejects_without_promoted_managed_packet(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": "20260610",
+            "strike": 580.0,
+            "right": "C",
+            "quantity": 1,
+        }
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        credit_or_debit=-120.0,
+        max_loss=120.0,
+        max_profit=None,
+        raw_json={"delayed": False, "warming_up": False},
+    )
+    deps = _deps(tmp_db, md_mids={(580.0, "C"): 1.20})
+    deps.settings.execution.mode = "auto"
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "managed model authorization" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_auto_rechecks_managed_artifact_before_placement(
+    tmp_db: Engine,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        raw_json={"delayed": False, "warming_up": False},
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "auto"
+    prediction = _managed_prediction()
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            return_value=prediction,
+        ) as refresh,
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    assert refresh.call_count == 2
+    deps.order_client.place_combo_limit.assert_awaited_once()
+
+
+async def test_exact_zero_dte_confirm_rejects_without_promoted_managed_packet(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": "20260610",
+            "strike": 580.0,
+            "right": "C",
+            "quantity": 1,
+        }
+    ]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        credit_or_debit=-120.0,
+        max_loss=120.0,
+        max_profit=None,
+    )
+    deps = _deps(tmp_db, md_mids={(580.0, "C"): 1.20})
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = True
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "managed model authorization" in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_confirm_rechecks_managed_artifact_before_placement(
+    tmp_db: Engine,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(tmp_db, legs=legs)
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = True
+    prediction = _managed_prediction()
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            return_value=prediction,
+        ) as refresh,
+        patch(
+            "optionsbot.execution.sizing.dynamic_quantity",
+            wraps=dynamic_quantity,
+        ) as size,
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    assert refresh.call_count == 2
+    assert size.call_args.kwargs["prob_profit"] == prediction.target_probability_lcb
+    deps.order_client.place_combo_limit.assert_awaited_once()
+
+
+async def test_persisted_managed_packet_rechecks_artifact_after_mode_reload(
+    tmp_db: Engine,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        suggestion_extra=MANAGED_PACKET,
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = False
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            return_value=_managed_prediction(),
+        ) as refresh,
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
+        ),
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    assert refresh.call_count == 2
+    assert [call.kwargs["now"] for call in refresh.call_args_list] == [NOW, NOW]
+    deps.order_client.place_combo_limit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("paper_only", "ibkr_paper", "port"),
+    [
+        (False, True, 4002),
+        (True, False, 4002),
+        (True, True, 4001),
+    ],
+    ids=["interlock-off", "account-not-paper", "live-port"],
+)
+async def test_persisted_managed_packet_rejects_nonpaper_runtime_after_reload(
+    tmp_db: Engine,
+    paper_only: bool,
+    ibkr_paper: bool,
+    port: int,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        suggestion_extra=MANAGED_PACKET,
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = False
+    deps.settings.execution.paper_only = paper_only
+    deps.settings.ibkr.paper = ibkr_paper
+    deps.settings.ibkr.port = port
+
+    with patch(
+        "optionsbot.execution.engine.refresh_managed_prediction"
+    ) as refresh:
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "paper" in outcome.message.lower()
+    refresh.assert_not_called()
+    deps.md.get_option_snapshot.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_confirm_rejects_changed_artifact_before_placement(
+    tmp_db: Engine,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(tmp_db, legs=legs)
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = True
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            side_effect=[
+                _managed_prediction(),
+                ManagedExecutionError("promotion changed"),
+            ],
+        ) as refresh,
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "authorization changed before placement" in outcome.message.lower()
+    assert refresh.call_count == 2
+    assert outcome.order_id is not None
+    record = get_order(tmp_db, outcome.order_id)
+    assert record is not None and record.status == "skipped"
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_confirm_legacy_mode_does_not_require_managed_packet(
+    tmp_db: Engine,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(tmp_db, legs=legs)
+    deps = _deps(tmp_db)
+    deps.settings.execution.mode = "confirm"
+    deps.settings.execution.zero_dte_only = False
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch("optionsbot.execution.engine.refresh_managed_prediction") as refresh,
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    refresh.assert_not_called()
+    deps.order_client.place_combo_limit.assert_awaited_once()
 
 
 async def test_rejects_undefined_risk(tmp_db: Engine) -> None:
@@ -799,6 +1097,90 @@ async def test_kill_tripped_during_whatif_blocks_entry_placement(tmp_db: Engine)
 
     assert not outcome.ok
     assert "kill" in outcome.message.lower() or "halt" in outcome.message.lower()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_market_close_after_whatif_skips_staged_order(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db)
+
+    with patch(
+        "optionsbot.execution.engine.is_market_open", side_effect=[True, False]
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "market closed" in outcome.message.lower()
+    assert outcome.order_id is not None
+    record = get_order(tmp_db, outcome.order_id)
+    assert record is not None and record.status == "skipped"
+    deps.order_client.whatif_combo.assert_awaited_once()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_pick_aging_out_after_whatif_skips_staged_order(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db, ts=NOW - timedelta(minutes=19))
+    deps = _deps(tmp_db, clock=lambda: NOW + timedelta(minutes=2))
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "exceeded max age" in outcome.message.lower()
+    assert outcome.order_id is not None
+    record = get_order(tmp_db, outcome.order_id)
+    assert record is not None and record.status == "skipped"
+    deps.order_client.whatif_combo.assert_awaited_once()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_quote_aging_out_after_whatif_skips_staged_order(tmp_db: Engine) -> None:
+    score_id = _insert_pick(tmp_db)
+    deps = _deps(tmp_db, clock=lambda: NOW + timedelta(seconds=46))
+
+    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "quote aged" in outcome.message.lower()
+    assert outcome.order_id is not None
+    record = get_order(tmp_db, outcome.order_id)
+    assert record is not None and record.status == "skipped"
+    deps.order_client.whatif_combo.assert_awaited_once()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_zero_dte_cutoff_crossed_after_whatif_skips_staged_order(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {**leg, "expiry": "20260610"}
+        for leg in CONDOR_LEGS
+    ]
+    score_id = _insert_pick(tmp_db, legs=legs)
+    deps = _deps(tmp_db)
+    deps.settings.execution.zero_dte_only = True
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            return_value=_managed_prediction(),
+        ) as refresh,
+        patch(
+            "optionsbot.execution.engine.minutes_to_nyse_close",
+            side_effect=[91.0, 90.0],
+        ),
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert "cutoff reached before placement" in outcome.message.lower()
+    assert outcome.order_id is not None
+    record = get_order(tmp_db, outcome.order_id)
+    assert record is not None and record.status == "skipped"
+    refresh.assert_called_once()
+    deps.order_client.whatif_combo.assert_awaited_once()
     deps.order_client.place_combo_limit.assert_not_awaited()
 
 

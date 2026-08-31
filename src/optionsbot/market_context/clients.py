@@ -7,6 +7,7 @@ keys, or untrusted response bodies.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import unicodedata
@@ -19,6 +20,7 @@ import httpx
 
 _FRED_BASE_URL = "https://api.stlouisfed.org"
 _FINNHUB_BASE_URL = "https://finnhub.io"
+_FRED_MACRO_SNAPSHOT_TIMEOUT_SECONDS = 20.0
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -190,7 +192,22 @@ class FredClient:
 
     async def macro_snapshot(self) -> dict[str, object]:
         snapshot_ids = ("DGS10", "DGS2", "T10Y2Y", "VIXCLS", "CPIAUCSL", "UNRATE")
-        series = [await self.series(series_id, limit=1) for series_id in snapshot_ids]
+        try:
+            async with asyncio.timeout(_FRED_MACRO_SNAPSHOT_TIMEOUT_SECONDS):
+                results = await asyncio.gather(
+                    *(self.series(series_id, limit=1) for series_id in snapshot_ids),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            raise MarketDataError("FRED macro snapshot request timed out") from None
+
+        # Fail the entire snapshot if any constituent failed. Iterating in the
+        # fixed request order also makes simultaneous failures deterministic;
+        # no incomplete macro view is ever returned as if it were authoritative.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        series = list(results)
         return {
             "source": "FRED",
             "trust": "high_primary_numeric",

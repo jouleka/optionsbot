@@ -1,11 +1,8 @@
 """IBK-138 MCP tools for Hermes nightwatch supervision.
 
-These tools deliberately split read-only analyst packets from write-gated actions:
-``pending_picks`` is a compact read-only queue, ``pick_review_packet`` returns
-one complete candidate without transport truncation, ``request_exit`` only
-queues an audited request for the daemon to evaluate, and restricted ``halt``
-creates only an advisory.  A trusted operator or deterministic daemon fault
-owns the global kill switch.
+These tools deliberately split read-only analyst packets from trusted writes.
+Legacy action tools write the main database only in a trusted server context;
+the restricted queue accepts shadow context reviews and no action intents.
 """
 
 from __future__ import annotations
@@ -22,11 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.hermes_overlay import learning_feedback
 from optionsbot.mcp_server.context import ServerContext
-from optionsbot.mcp_server.intent_queue import (
-    control_intents,
-    enqueue_intent,
-    recent_proposal_decisions,
-)
+from optionsbot.mcp_server.intent_queue import recent_proposal_decisions
 from optionsbot.mcp_server.serialization import iso_utc
 from optionsbot.review_checks import (
     all_entry_checks_pass,
@@ -534,17 +527,10 @@ def register(server: FastMCP) -> None:
         checks: dict[str, bool],
         ctx: Context[ServerSession, ServerContext],
     ) -> dict[str, Any]:
-        """Ask OptionsBot to independently scan and gate a Hermes trade idea.
-
-        This never creates an order. It appends a bounded proposal to the
-        unprivileged intent queue; the trusted daemon must reconstruct an exact
-        current candidate and pass every normal paper-execution gate.
-        """
-        lifespan = ctx.request_context.lifespan_context
+        """Validate a legacy Hermes trade idea without granting queue authority."""
         clean_symbol = symbol.strip().upper()
         clean_direction = direction.strip().lower()
         clean_iv = iv_regime.strip().lower()
-        clean_strategy = strategy.strip().lower().replace(" ", "_") or "auto"
         clean_thesis = thesis.strip()
         if not clean_symbol or not clean_thesis:
             return {"ok": False, "error": "symbol_and_thesis_required"}
@@ -576,59 +562,11 @@ def register(server: FastMCP) -> None:
                 clean_sources.append(source)
         if len(clean_sources) < 2:
             return {"ok": False, "error": "two_distinct_sources_required"}
-        intent_engine = getattr(lifespan, "intent_engine", None)
-        if intent_engine is None:
-            return {"ok": False, "error": "proposal_queue_unavailable"}
-
-        # Keep one thesis from being resubmitted every analyst interval. The
-        # daemon may still decline it; Hermes can propose a materially different
-        # direction/strategy immediately or retry this one after 30 minutes.
-        cutoff = datetime.now(UTC) - timedelta(minutes=30)
-        with intent_engine.connect() as conn:
-            recent = conn.execute(
-                select(control_intents.c.id, control_intents.c.payload_json)
-                .where(control_intents.c.kind == "entry_proposal")
-                .where(control_intents.c.created_at >= cutoff)
-                .order_by(control_intents.c.id.desc())
-                .limit(50)
-            ).fetchall()
-        for row in recent:
-            payload = row.payload_json if isinstance(row.payload_json, dict) else {}
-            if (
-                payload.get("symbol") == clean_symbol
-                and payload.get("direction") == clean_direction
-                and payload.get("strategy") == clean_strategy
-            ):
-                return {
-                    "ok": True,
-                    "already_proposed": True,
-                    "intent_id": int(row.id),
-                    "note": "same symbol/direction/strategy is inside the 30-minute window",
-                }
-        now = datetime.now(UTC)
-        intent_id, intent_uid = enqueue_intent(
-            intent_engine,
-            "entry_proposal",
-            {
-                "proposed_at": now.isoformat(),
-                "symbol": clean_symbol,
-                "direction": clean_direction,
-                "iv_regime": clean_iv,
-                "strategy": clean_strategy,
-                "confidence": normalized_confidence,
-                "sources": clean_sources,
-                "thesis": clean_thesis,
-                "checks": dict(checks),
-            },
-            now=now,
-        )
         return {
-            "ok": True,
-            "status": "queued_for_optionsbot_validation",
-            "intent_id": intent_id,
-            "intent_uid": intent_uid,
+            "ok": False,
+            "error": "restricted_action_boundary_removed",
             "symbol": clean_symbol,
-            "note": "OptionsBot will rescan and may decline; Hermes cannot place orders",
+            "note": "independent proposals are disabled; only shadow context reviews may queue",
         }
 
     @server.tool()
@@ -758,30 +696,10 @@ def register(server: FastMCP) -> None:
             return {"ok": False, "error": "candidate_evidence_unready"}
         intent_engine = getattr(lifespan, "intent_engine", None)
         if intent_engine is not None:
-            intent_id, intent_uid = enqueue_intent(
-                intent_engine,
-                "entry_review",
-                {
-                    "pick_id": int(pick_id),
-                    "alert_id": int(alert_id),
-                    "reviewed_at": now.isoformat(),
-                    "verdict": normalized,
-                    "confidence": normalized_confidence,
-                    "sources": clean_sources,
-                    "reason": clean_reason,
-                    "checks": persisted_checks,
-                    "status": status,
-                },
-                now=now,
-            )
             return {
-                "ok": True,
-                "status": "queued_for_daemon_validation",
-                "intent_id": intent_id,
-                "intent_uid": intent_uid,
-                "pick_id": int(pick_id),
-                "alert_id": int(alert_id),
-                "note": "restricted MCP cannot write the trading ledger",
+                "ok": False,
+                "error": "restricted_action_boundary_removed",
+                "note": "only shadow context reviews may use the restricted queue",
             }
         try:
             with lifespan.engine.begin() as conn:
@@ -871,33 +789,10 @@ def register(server: FastMCP) -> None:
         clean_sources = [str(s).strip() for s in sources if str(s).strip()]
         intent_engine = getattr(lifespan, "intent_engine", None)
         if intent_engine is not None:
-            intent_id, intent_uid = enqueue_intent(
-                intent_engine,
-                "request_exit",
-                {
-                    "position_id": int(position_id),
-                    "requested_at": now.isoformat(),
-                    "catalyst_type": catalyst,
-                    "confidence": float(confidence),
-                    "sources": clean_sources,
-                    "reason": reason.strip(),
-                },
-                now=now,
-            )
             return {
-                "ok": True,
-                "status": "queued_for_daemon_validation",
-                "intent_id": intent_id,
-                "intent_uid": intent_uid,
-                "position": None
-                if position is None
-                else {
-                    "id": int(position.id),
-                    "symbol": position.symbol,
-                    "strategy": position.strategy,
-                    "quantity": position.quantity,
-                },
-                "note": "restricted MCP cannot write the trading ledger or submit orders",
+                "ok": False,
+                "error": "restricted_action_boundary_removed",
+                "note": "only shadow context reviews may use the restricted queue",
             }
         with lifespan.engine.begin() as conn:
             pk = conn.execute(
@@ -936,9 +831,8 @@ def register(server: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Request a halt with exact confirmation.
 
-        In a trusted operator context this trips the persisted switch.  In the
-        restricted Hermes context it records an advisory only; free-form model
-        output cannot become a global trading halt.
+        In a trusted operator context this trips the persisted switch.  The
+        restricted identity has no action queue or global-halt authority.
         """
         if confirm != "HALT_OPTIONSBOT":
             return {
@@ -950,22 +844,12 @@ def register(server: FastMCP) -> None:
         msg = reason.strip() or "Hermes MCP halt"
         intent_engine = getattr(lifespan, "intent_engine", None)
         if intent_engine is not None:
-            intent_id, intent_uid = enqueue_intent(
-                intent_engine,
-                "halt_advisory",
-                {"reason": msg},
-            )
             return {
-                "ok": True,
+                "ok": False,
                 "killed": False,
-                "status": "advisory_queued",
-                "intent_id": intent_id,
-                "intent_uid": intent_uid,
+                "error": "restricted_action_boundary_removed",
                 "reason": msg,
-                "note": (
-                    "Hermes has no global halt authority; the trusted daemon or "
-                    "an operator must verify a deterministic fault"
-                ),
+                "note": "only shadow context reviews may use the restricted queue",
             }
         from optionsbot.execution.state import trip_kill
 

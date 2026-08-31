@@ -10,7 +10,10 @@ from optionsbot.execution.risk_structure import (
     structural_max_loss_dollars,
     structural_max_profit_dollars,
 )
-from optionsbot.opening_range_economics import managed_expected_value
+from optionsbot.opening_range_economics import (
+    managed_expected_value,
+    managed_path_expected_values,
+)
 
 
 def _finite_number(value: object) -> float | None:
@@ -32,6 +35,7 @@ class ReconciledEntryEconomics:
     terminal_expected_value: float | None
     gross_managed_expected_value: float | None
     managed_expected_value: float | None
+    managed_expected_value_lcb: float | None
     estimated_round_trip_cost: float | None
     scan_credit_or_debit: float | None
     scan_expected_value: float | None
@@ -84,21 +88,55 @@ def reconcile_entry_economics(
         isinstance(opening_range_plan, dict)
         and opening_range_plan.get("status") == "entry_confirmed"
     )
-    gross_managed_ev = managed_expected_value(
+    path_values = managed_path_expected_values(
         credit_or_debit=fresh_cashflow,
-        target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
-        plan=opening_range_plan,
-        maximum_profit=max_profit,
-    )
-    managed_ev = managed_expected_value(
-        credit_or_debit=fresh_cashflow,
-        target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
+        target_probability=suggestion.get("managed_target_hit_probability"),
+        stop_probability=suggestion.get("managed_stop_probability"),
+        timeout_probability=suggestion.get("managed_timeout_probability"),
+        timeout_expected_return=suggestion.get("managed_timeout_expected_return"),
+        ev_residual_return_q05=suggestion.get("managed_ev_residual_return_q05"),
         plan=opening_range_plan,
         estimated_round_trip_cost=estimated_round_trip_cost,
         maximum_profit=max_profit,
     )
+    managed_ev: float | None
+    managed_ev_lcb: float | None
+    gross_managed_ev: float | None
+    if path_values is not None:
+        managed_ev, managed_ev_lcb = path_values
+        gross_values = managed_path_expected_values(
+            credit_or_debit=fresh_cashflow,
+            target_probability=suggestion.get("managed_target_hit_probability"),
+            stop_probability=suggestion.get("managed_stop_probability"),
+            timeout_probability=suggestion.get("managed_timeout_probability"),
+            timeout_expected_return=suggestion.get("managed_timeout_expected_return"),
+            ev_residual_return_q05=0.0,
+            plan=opening_range_plan,
+            maximum_profit=max_profit,
+        )
+        gross_managed_ev = gross_values[0] if gross_values is not None else None
+    else:
+        # Backward-compatible binary calculation for historical persisted test
+        # packets. New production candidates always carry the three-event
+        # artifact fields above.
+        gross_managed_ev = managed_expected_value(
+            credit_or_debit=fresh_cashflow,
+            target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
+            plan=opening_range_plan,
+            maximum_profit=max_profit,
+        )
+        managed_ev = managed_expected_value(
+            credit_or_debit=fresh_cashflow,
+            target_hit_probability=suggestion.get("managed_target_hit_probability_lcb"),
+            plan=opening_range_plan,
+            estimated_round_trip_cost=estimated_round_trip_cost,
+            maximum_profit=max_profit,
+        )
+        managed_ev_lcb = managed_ev
     round_trip_cost = _finite_number(estimated_round_trip_cost)
-    expected_value = managed_ev if opening_range_candidate else terminal_expected_value
+    expected_value = (
+        managed_ev_lcb if opening_range_candidate else terminal_expected_value
+    )
     reward_risk = (
         max_profit / max_loss
         if max_profit is not None and math.isfinite(max_profit) and max_profit > 0
@@ -113,6 +151,7 @@ def reconcile_entry_economics(
         terminal_expected_value=terminal_expected_value,
         gross_managed_expected_value=gross_managed_ev,
         managed_expected_value=managed_ev,
+        managed_expected_value_lcb=managed_ev_lcb,
         estimated_round_trip_cost=round_trip_cost,
         scan_credit_or_debit=scan_cashflow,
         scan_expected_value=scan_ev,

@@ -60,23 +60,29 @@ async def test_restricted_server_exposes_only_bounded_surface() -> None:
     names = {tool.name for tool in await server.list_tools()}
     assert names == {
         "analyze",
+        "context_critic_metrics",
+        "context_opportunity_packet",
         "control_intent_status",
         "daily_brief",
-        "halt",
         "health",
         "hermes_metrics",
         "latest_snapshot",
         "list_watchlist",
-        "pick_review_packet",
-        "pending_picks",
+        "pending_context_opportunities",
         "positions",
-        "propose_entry",
-        "request_exit",
         "score_breakdown",
-        "submit_entry_review",
+        "submit_context_review",
         "track_record",
     }
-    assert {"add_to_watchlist", "remove_from_watchlist", "set_view_override"}.isdisjoint(names)
+    assert {
+        "add_to_watchlist",
+        "halt",
+        "propose_entry",
+        "remove_from_watchlist",
+        "request_exit",
+        "set_view_override",
+        "submit_entry_review",
+    }.isdisjoint(names)
 
 
 def test_restricted_health_attests_zero_dte_entry_window(
@@ -567,7 +573,7 @@ def test_restricted_context_contains_no_broker_or_messaging_secrets(
     assert not hasattr(context.settings, "ibkr")
 
 
-def test_hermes_entry_proposal_only_enters_isolated_queue(
+def test_legacy_entry_proposal_tool_cannot_write_restricted_queue(
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
     intent_engine = create_intent_engine(tmp_path / "proposal-intents.db")
@@ -593,14 +599,14 @@ def test_hermes_entry_proposal_only_enters_isolated_queue(
         FakeCtx(context),
     )
 
-    assert result["ok"] is True
-    assert result["status"] == "queued_for_optionsbot_validation"
+    assert result == {
+        "ok": False,
+        "error": "restricted_action_boundary_removed",
+        "symbol": "SPY",
+        "note": "independent proposals are disabled; only shadow context reviews may queue",
+    }
     with intent_engine.connect() as conn:
-        row = conn.execute(select(control_intents)).one()
-    assert row.kind == "entry_proposal"
-    assert row.status == "pending"
-    assert row.payload_json["symbol"] == "SPY"
-    assert row.payload_json["direction"] == "bull"
+        assert conn.execute(select(control_intents.c.id)).fetchall() == []
     with mcp_engine.connect() as conn:
         assert conn.execute(select(orders.c.id)).fetchall() == []
 
@@ -610,30 +616,28 @@ def test_terminal_proposal_decision_is_available_to_next_learning_pass(
 ) -> None:
     intent_engine = create_intent_engine(tmp_path / "proposal-feedback.db")
     proposed_at = datetime.now(UTC)
-    intent_id, _ = enqueue_intent(
-        intent_engine,
-        "entry_proposal",
-        {
-            "symbol": "QQQ",
-            "direction": "bear",
-            "iv_regime": "neutral",
-            "strategy": "bear_put_spread",
-            "confidence": 0.78,
-        },
-        now=proposed_at,
-    )
     with intent_engine.begin() as conn:
-        conn.execute(
-            update(control_intents)
-            .where(control_intents.c.id == intent_id)
-            .values(
-                status="processed",
-                processed_at=proposed_at,
-                result_text=(
-                    "Hermes proposal declined as score #42: "
-                    "non_positive_edge(expected_value=-12.50)"
-                ),
-            )
+        intent_id = int(
+            conn.execute(
+                insert(control_intents).values(
+                    intent_uid="legacy-proposal-audit",
+                    kind="entry_proposal",
+                    created_at=proposed_at,
+                    payload_json={
+                        "symbol": "QQQ",
+                        "direction": "bear",
+                        "iv_regime": "neutral",
+                        "strategy": "bear_put_spread",
+                        "confidence": 0.78,
+                    },
+                    status="processed",
+                    processed_at=proposed_at,
+                    result_text=(
+                        "Hermes proposal declined as score #42: "
+                        "non_positive_edge(expected_value=-12.50)"
+                    ),
+                )
+            ).inserted_primary_key[0]
         )
 
     assert recent_proposal_decisions(intent_engine) == [
@@ -654,16 +658,25 @@ def test_terminal_proposal_decision_is_available_to_next_learning_pass(
     ]
 
 
-async def test_async_consumer_routes_entry_proposal_to_live_rebuilder(
-    mcp_engine: Engine, tmp_path: Path
+@pytest.mark.parametrize(
+    "kind",
+    ["entry_review", "entry_proposal", "request_exit", "halt_advisory", "halt"],
+)
+async def test_async_consumer_rejects_legacy_actions_without_rebuilding(
+    kind: str, mcp_engine: Engine, tmp_path: Path
 ) -> None:
-    intent_path = tmp_path / "proposal-consumer.db"
+    intent_path = tmp_path / f"legacy-{kind}-async-consumer.db"
     intent_engine = create_intent_engine(intent_path)
-    enqueue_intent(
-        intent_engine,
-        "entry_proposal",
-        {"symbol": "SPY"},
-    )
+    with intent_engine.begin() as conn:
+        conn.execute(
+            insert(control_intents).values(
+                intent_uid=f"legacy-{kind}-async",
+                kind=kind,
+                created_at=datetime.now(UTC),
+                payload_json={"symbol": "SPY"},
+                status="pending",
+            )
+        )
     daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
     with patch(
         "optionsbot.daemon.control_intents._consume_entry_proposal",
@@ -671,12 +684,12 @@ async def test_async_consumer_routes_entry_proposal_to_live_rebuilder(
     ) as rebuild:
         consumed = await consume_control_intents_async(daemon_context, intent_path)
 
-    assert consumed == 1
-    rebuild.assert_awaited_once()
+    assert consumed == 0
+    rebuild.assert_not_awaited()
     with intent_engine.connect() as conn:
         row = conn.execute(select(control_intents)).one()
-    assert row.status == "processed"
-    assert row.result_text == "proposal independently rebuilt"
+    assert row.status == "rejected"
+    assert "only context_review is accepted" in row.result_text
 
 
 @pytest.mark.asyncio
@@ -957,7 +970,7 @@ async def test_entry_proposal_uses_fresh_economics_after_preliminary_rejection(
     assert review.status == "held"
 
 
-def test_restricted_halt_is_advisory_and_cannot_trip_global_kill(
+def test_restricted_halt_tool_cannot_queue_or_trip_global_kill(
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
     intent_path = tmp_path / "intents.db"
@@ -969,31 +982,34 @@ def test_restricted_halt_is_advisory_and_cannot_trip_global_kill(
     )
     halt = get_tools(nightwatch.register)["halt"]
     result = halt("boundary drill", "HALT_OPTIONSBOT", FakeCtx(context))
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["killed"] is False
-    assert result["status"] == "advisory_queued"
-    assert load_state(mcp_engine).killed is False
-
-    daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
-    assert consume_control_intents(daemon_context, intent_path) == 1
+    assert result["error"] == "restricted_action_boundary_removed"
     assert load_state(mcp_engine).killed is False
     with intent_engine.connect() as conn:
-        row = conn.execute(select(control_intents)).one()
-    assert row.status == "processed"
-    assert row.kind == "halt_advisory"
-    assert row.result_text == "advisory recorded; global kill state unchanged"
-
-    # Consumption is idempotent; a second pass cannot change execution state.
-    assert consume_control_intents(daemon_context, intent_path) == 0
-    assert load_state(mcp_engine).killed is False
+        assert conn.execute(select(control_intents.c.id)).fetchall() == []
 
 
-def test_legacy_restricted_halt_intent_is_rejected(
+@pytest.mark.parametrize(
+    "kind",
+    ["entry_review", "entry_proposal", "request_exit", "halt_advisory", "halt"],
+)
+def test_legacy_restricted_action_intents_are_rejected(
+    kind: str,
     mcp_engine: Engine, tmp_path: Path
 ) -> None:
-    intent_path = tmp_path / "legacy-halt-intents.db"
+    intent_path = tmp_path / f"legacy-{kind}-intents.db"
     intent_engine = create_intent_engine(intent_path)
-    enqueue_intent(intent_engine, "halt", {"reason": "legacy row"})  # type: ignore[arg-type]
+    with intent_engine.begin() as conn:
+        conn.execute(
+            insert(control_intents).values(
+                intent_uid=f"legacy-{kind}",
+                kind=kind,
+                created_at=datetime.now(UTC),
+                payload_json={"reason": "legacy row"},
+                status="pending",
+            )
+        )
 
     daemon_context = cast("DaemonContext", SimpleNamespace(engine=mcp_engine))
     assert consume_control_intents(daemon_context, intent_path) == 0
@@ -1001,4 +1017,24 @@ def test_legacy_restricted_halt_intent_is_rejected(
     with intent_engine.connect() as conn:
         row = conn.execute(select(control_intents)).one()
     assert row.status == "rejected"
-    assert "global halt authority was removed" in row.result_text
+    assert "only context_review is accepted" in row.result_text
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["entry_review", "entry_proposal", "request_exit", "halt_advisory", "halt"],
+)
+def test_queue_writer_runtime_rejects_legacy_action_kinds(
+    kind: str, tmp_path: Path
+) -> None:
+    intent_engine = create_intent_engine(tmp_path / f"writer-{kind}.db")
+
+    with pytest.raises(ValueError, match="only context_review is accepted"):
+        enqueue_intent(
+            intent_engine,
+            kind,  # type: ignore[arg-type]
+            {"reason": "legacy caller"},
+        )
+
+    with intent_engine.connect() as conn:
+        assert conn.execute(select(control_intents.c.id)).fetchall() == []

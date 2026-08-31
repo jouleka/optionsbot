@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 import sys
@@ -49,6 +50,87 @@ async def test_fred_errors_do_not_leak_secret() -> None:
 
     with pytest.raises(MarketDataError) as error:
         await client.series("DGS2")
+    assert secret not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_fred_macro_snapshot_is_concurrent_and_keeps_fixed_series_order() -> None:
+    expected = ["DGS10", "DGS2", "T10Y2Y", "VIXCLS", "CPIAUCSL", "UNRATE"]
+    started: set[str] = set()
+    all_started = asyncio.Event()
+    delays = {
+        series_id: (len(expected) - index) / 1_000
+        for index, series_id in enumerate(expected)
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        series_id = parse_qs(request.url.query.decode())["series_id"][0]
+        started.add(series_id)
+        if len(started) == len(expected):
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=0.5)
+        await asyncio.sleep(delays[series_id])
+        return httpx.Response(
+            200,
+            json={"observations": [{"date": "2026-08-28", "value": "1.0"}]},
+        )
+
+    result = await asyncio.wait_for(
+        FredClient("secret", transport=httpx.MockTransport(handler)).macro_snapshot(),
+        timeout=1.0,
+    )
+
+    assert started == set(expected)
+    assert [item["series_id"] for item in result["series"]] == expected  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_fred_macro_snapshot_fails_closed_with_sanitized_ordered_error() -> None:
+    secret = "fred-secret-must-not-leak"
+    expected = ["DGS10", "DGS2", "T10Y2Y", "VIXCLS", "CPIAUCSL", "UNRATE"]
+    all_started = asyncio.Event()
+    started: set[str] = set()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        series_id = parse_qs(request.url.query.decode())["series_id"][0]
+        started.add(series_id)
+        if len(started) == len(expected):
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=0.5)
+        if series_id in {"DGS10", "DGS2"}:
+            status = 502 if series_id == "DGS10" else 503
+            return httpx.Response(status, text=secret)
+        return httpx.Response(
+            200,
+            json={"observations": [{"date": "2026-08-28", "value": "1.0"}]},
+        )
+
+    client = FredClient(secret, transport=httpx.MockTransport(handler))
+    with pytest.raises(MarketDataError, match="FRED returned HTTP 502") as error:
+        await client.macro_snapshot()
+
+    assert started == set(expected)
+    assert secret not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_fred_macro_snapshot_has_one_sanitized_batch_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "fred-secret-must-not-leak"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1.0)
+        return httpx.Response(200, json={"observations": []})
+
+    monkeypatch.setattr(
+        "optionsbot.market_context.clients._FRED_MACRO_SNAPSHOT_TIMEOUT_SECONDS",
+        0.01,
+    )
+    client = FredClient(secret, transport=httpx.MockTransport(handler))
+    with pytest.raises(MarketDataError, match="FRED macro snapshot request timed out") as error:
+        await client.macro_snapshot()
+
     assert secret not in str(error.value)
 
 

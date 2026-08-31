@@ -43,7 +43,7 @@ def _register_tools(server: FastMCP) -> None:
 
 def _register_restricted_tools(server: FastMCP) -> None:
     from optionsbot.mcp_server.tools import (
-        nightwatch,
+        context_critic,
         positions,
         snapshots,
     )
@@ -51,5 +51,5 @@ def _register_restricted_tools(server: FastMCP) -> None:
 
     snapshots.register(server)
     positions.register(server)
-    nightwatch.register(server)
+    context_critic.register(server)
     register_restricted(server)

@@ -53,6 +53,13 @@ def load_unevaluated_expired(engine: Engine, today: date) -> list[UnevaluatedPic
             sug = row.suggestion_json or {}
             if isinstance(sug, str):
                 sug = json.loads(sug)
+            if (
+                sug.get("shadow_only") is True
+                or sug.get("admission_enabled") is False
+            ):
+                # Managed-path capture owns labels for research alternatives;
+                # they are not production picks and must not enter track record.
+                continue
             if sug.get("credit_or_debit") is None or row.spot is None:
                 continue
             legs_data = row.legs_json or []

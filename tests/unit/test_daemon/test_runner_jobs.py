@@ -5,7 +5,7 @@ from __future__ import annotations
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from optionsbot.config import Settings
-from optionsbot.daemon.runner import Daemon
+from optionsbot.daemon.runner import Daemon, managed_capture_cron_seconds
 
 
 def _daemon(outcomes_eval_hours: int, *, zero_dte_only: bool = False) -> Daemon:
@@ -53,3 +53,21 @@ def test_register_periodic_jobs_adds_entry_review_consumer() -> None:
     job = d._scheduler.get_job("entry_reviews")
     assert job is not None
     assert job.trigger.interval.total_seconds() == 60
+
+
+def test_register_periodic_jobs_offsets_managed_capture_from_exits() -> None:
+    d = _daemon(0)
+    d._register_periodic_jobs()
+
+    job = d._scheduler.get_job("managed_capture")
+    assert job is not None
+    assert "second='5,20,35,50'" in str(job.trigger)
+    assert managed_capture_cron_seconds(15, 5) == "5,20,35,50"
+
+
+def test_register_periodic_jobs_can_disable_managed_capture() -> None:
+    d = _daemon(0)
+    d._settings.validation.managed_capture_enabled = False
+    d._register_periodic_jobs()
+
+    assert d._scheduler.get_job("managed_capture") is None

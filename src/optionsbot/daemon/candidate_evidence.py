@@ -779,6 +779,9 @@ async def capture_candidate_evidence(
                     economics.gross_managed_expected_value
                 ),
                 managed_expected_value=economics.managed_expected_value,
+                managed_expected_value_lcb=(
+                    economics.managed_expected_value_lcb
+                ),
                 estimated_round_trip_cost=economics.estimated_round_trip_cost,
             )
         updated["review_evidence"] = evidence

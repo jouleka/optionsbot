@@ -48,7 +48,7 @@ def test_evaluate_pnl_long_call_itm() -> None:
     assert win2 is False
 
 
-def _seed_expired_pick(engine) -> None:
+def _seed_expired_pick(engine, *, shadow_only: bool = False) -> None:
     with engine.begin() as conn:
         sid = conn.execute(insert(snapshots).values(
             symbol="SPY", ts=datetime(2026, 1, 1, tzinfo=UTC), spot=100.0
@@ -60,7 +60,9 @@ def _seed_expired_pick(engine) -> None:
                         "quantity": 1}],
             suggestion_json={"prob_profit": 0.4, "credit_or_debit": -500.0,
                              "max_profit": None, "max_loss": 500.0,
-                             "risk_tier": "aggressive"}))
+                             "risk_tier": "aggressive",
+                             "shadow_only": shadow_only,
+                             "admission_enabled": not shadow_only}))
 
 
 async def test_evaluate_pending_persists_and_dedups(tmp_path) -> None:
@@ -93,6 +95,20 @@ async def test_evaluate_pending_skips_unexpired(tmp_path) -> None:
 
     # today BEFORE expiry -> nothing evaluated.
     assert await evaluate_pending(engine, fake_close, date(2026, 1, 15)) == 0
+
+
+async def test_evaluate_pending_excludes_shadow_research_from_track_record(
+    tmp_path,
+) -> None:
+    engine = _migrated_engine(tmp_path)
+    _seed_expired_pick(engine, shadow_only=True)
+
+    async def fake_close(symbol: str, expiry: str) -> float:
+        raise AssertionError("shadow-only row must not request a terminal close")
+
+    assert await evaluate_pending(engine, fake_close, date(2026, 3, 1)) == 0
+    with engine.connect() as conn:
+        assert conn.execute(select(pick_outcomes)).fetchall() == []
 
 
 async def test_outcomes_report_aggregates(tmp_path) -> None:

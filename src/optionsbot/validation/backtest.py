@@ -155,6 +155,11 @@ def load_pick_records(engine: Engine) -> list[PickRecord]:
             sug = row.suggestion_json or {}
             if isinstance(sug, str):
                 sug = json.loads(sug)
+            if (
+                sug.get("shadow_only") is True
+                or sug.get("admission_enabled") is False
+            ):
+                continue
             pop = sug.get("prob_profit")
             spot = row.spot
             if pop is None or spot is None:

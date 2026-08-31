@@ -13,6 +13,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    text,
 )
 
 metadata = MetaData()
@@ -172,6 +173,373 @@ pick_outcomes = Table(
     Column("realized_pnl", Float, nullable=False),
     Column("win", Integer, nullable=False),
     Column("evaluated_at", DateTime(timezone=True), nullable=False),
+)
+
+
+# Prospective managed-outcome journal.  A row is one immutable structure for
+# one deterministic signal.  It is created before alert, EV, affordability, or
+# Hermes admission so rejected ideas remain available to an unbiased shadow
+# evaluation.  Repeated scans of the same signal/strategy resolve to the same
+# ``opportunity_key`` and may never retarget the frozen legs.
+managed_opportunities = Table(
+    "managed_opportunities",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("opportunity_key", Text, nullable=False, unique=True),
+    Column("signal_id", Text, nullable=False, index=True),
+    Column("session", Text, nullable=False, index=True),
+    Column("symbol", Text, nullable=False, index=True),
+    Column("direction", Text, nullable=False),
+    Column("setup_type", Text, nullable=False),
+    Column("strategy", Text, nullable=False),
+    Column(
+        "strategy_score_id",
+        Integer,
+        ForeignKey("strategy_scores.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        unique=True,
+    ),
+    Column("structure_hash", Text, nullable=False),
+    Column("legs_json", JSON, nullable=False),
+    Column("features_json", JSON, nullable=False),
+    Column("policy_version", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("detected_at", DateTime(timezone=True), nullable=False),
+    # Immutable inputs needed to replay the production scan selector. Equity is
+    # frozen later, in the same first-writer-wins transition as bot_action,
+    # because the daemon fetches one account summary only after the scan batch.
+    Column("decision_batch_id", Text, nullable=False),
+    Column("decision_score", Float, nullable=False),
+    Column("decision_defined_risk", Integer, nullable=False),
+    Column("decision_max_loss", Float),
+    Column("decision_account_value_available", Integer),
+    Column("decision_account_value_usd", Float),
+    Column("baseline_action", Text, nullable=False),
+    Column("baseline_reason", Text, nullable=False),
+    Column("admission_eligible", Integer, nullable=False, server_default="0"),
+    Column("shadow_only", Integer, nullable=False, server_default="0"),
+    Column("bot_action", Text),
+    Column("bot_reason", Text),
+    Column("bot_decided_at", DateTime(timezone=True)),
+    Column("session_close_at", DateTime(timezone=True), nullable=False),
+    Column("entry_cutoff_at", DateTime(timezone=True), nullable=False),
+    Column("timeout_at", DateTime(timezone=True), nullable=False),
+    Column("entry_ts", DateTime(timezone=True)),
+    Column("entry_combo_bid", Float),
+    Column("entry_combo_ask", Float),
+    Column("entry_net", Float),
+    Column("basis_dollars", Float),
+    Column("stop_pct", Float, nullable=False),
+    Column("target_pct", Float, nullable=False),
+    Column("commission_estimate", Float, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("outcome", Text),
+    Column("resolved_at", DateTime(timezone=True)),
+    Column("exit_net", Float),
+    Column("gross_pnl", Float),
+    Column("net_pnl", Float),
+    Column("mfe_dollars", Float),
+    Column("mae_dollars", Float),
+    Column("last_valid_mark_at", DateTime(timezone=True)),
+    Column("valid_marks", Integer, nullable=False, server_default="0"),
+    Column("max_mark_gap_seconds", Float),
+    Column("training_eligible", Integer, nullable=False, server_default="0"),
+    Column("resolution_reason", Text),
+    CheckConstraint(
+        "direction IN ('bull','bear')",
+        name="ck_managed_opportunities_direction",
+    ),
+    CheckConstraint(
+        "status IN ('pending_entry','active','resolved','censored','unobservable')",
+        name="ck_managed_opportunities_status",
+    ),
+    CheckConstraint(
+        "outcome IN ('target','stop','timeout','censored') OR outcome IS NULL",
+        name="ck_managed_opportunities_outcome",
+    ),
+    CheckConstraint(
+        "stop_pct > 0.0 AND stop_pct < 1.0",
+        name="ck_managed_opportunities_stop_pct",
+    ),
+    CheckConstraint(
+        "target_pct > 0.0",
+        name="ck_managed_opportunities_target_pct",
+    ),
+    CheckConstraint(
+        "commission_estimate >= 0.0",
+        name="ck_managed_opportunities_commission",
+    ),
+    CheckConstraint(
+        "length(decision_batch_id) > 0",
+        name="ck_managed_opportunities_decision_batch",
+    ),
+    CheckConstraint(
+        "decision_score >= 0.0 AND decision_score <= 100.0",
+        name="ck_managed_opportunities_decision_score",
+    ),
+    CheckConstraint(
+        "decision_defined_risk IN (0, 1)",
+        name="ck_managed_opportunities_decision_defined_risk",
+    ),
+    CheckConstraint(
+        "decision_max_loss IS NULL OR decision_max_loss > 0.0",
+        name="ck_managed_opportunities_decision_max_loss",
+    ),
+    CheckConstraint(
+        "(bot_decided_at IS NULL AND decision_account_value_available IS NULL "
+        "AND decision_account_value_usd IS NULL) OR "
+        "(bot_decided_at IS NOT NULL AND "
+        "((decision_account_value_available = 0 AND decision_account_value_usd IS NULL) OR "
+        "(decision_account_value_available = 1 AND decision_account_value_usd IS NOT NULL)))",
+        name="ck_managed_opportunities_decision_account",
+    ),
+    CheckConstraint(
+        "training_eligible IN (0, 1)",
+        name="ck_managed_opportunities_training_eligible",
+    ),
+    CheckConstraint(
+        "baseline_action IN ('candidate','hold')",
+        name="ck_managed_opportunities_baseline_action",
+    ),
+    CheckConstraint(
+        "admission_eligible IN (0, 1)",
+        name="ck_managed_opportunities_admission_eligible",
+    ),
+    CheckConstraint(
+        "shadow_only IN (0, 1)",
+        name="ck_managed_opportunities_shadow_only",
+    ),
+    CheckConstraint(
+        "shadow_only = 0 OR admission_eligible = 0",
+        name="ck_managed_opportunities_shadow_not_admission_eligible",
+    ),
+    CheckConstraint(
+        "bot_action != 'candidate' OR (admission_eligible = 1 AND shadow_only = 0)",
+        name="ck_managed_opportunities_candidate_is_executable",
+    ),
+    CheckConstraint(
+        "bot_action != 'candidate' OR "
+        "(decision_defined_risk = 1 AND decision_max_loss IS NOT NULL "
+        "AND decision_account_value_available = 1)",
+        name="ck_managed_opportunities_candidate_has_risk_evidence",
+    ),
+    CheckConstraint(
+        "bot_action != 'candidate' OR "
+        "(bot_decided_at >= detected_at AND bot_decided_at < entry_cutoff_at)",
+        name="ck_managed_opportunities_candidate_timing",
+    ),
+    CheckConstraint(
+        "bot_action IN ('candidate','hold') OR bot_action IS NULL",
+        name="ck_managed_opportunities_bot_action",
+    ),
+    CheckConstraint(
+        "(bot_action IS NULL AND bot_reason IS NULL AND bot_decided_at IS NULL) OR "
+        "(bot_action IS NOT NULL AND bot_reason IS NOT NULL AND bot_decided_at IS NOT NULL)",
+        name="ck_managed_opportunities_bot_disposition_complete",
+    ),
+    CheckConstraint(
+        "status != 'resolved' OR "
+        "(outcome IN ('target','stop','timeout') AND resolved_at IS NOT NULL "
+        "AND entry_ts IS NOT NULL AND basis_dollars IS NOT NULL "
+        "AND gross_pnl IS NOT NULL AND net_pnl IS NOT NULL)",
+        name="ck_managed_opportunities_resolved_complete",
+    ),
+    CheckConstraint(
+        "training_eligible = 0 OR "
+        "(status = 'resolved' AND outcome IN ('target','stop','timeout') "
+        "AND bot_decided_at IS NOT NULL AND entry_ts IS NOT NULL "
+        "AND bot_decided_at <= entry_ts AND entry_ts < entry_cutoff_at "
+        "AND basis_dollars IS NOT NULL AND gross_pnl IS NOT NULL "
+        "AND net_pnl IS NOT NULL AND resolved_at IS NOT NULL)",
+        name="ck_managed_opportunities_training_complete",
+    ),
+)
+
+Index(
+    "ix_managed_opportunities_signal_strategy",
+    managed_opportunities.c.signal_id,
+    managed_opportunities.c.strategy,
+)
+Index(
+    "ix_managed_opportunities_status_timeout",
+    managed_opportunities.c.status,
+    managed_opportunities.c.timeout_at,
+)
+
+
+# One executable synthetic-combo observation per opportunity and scheduler
+# bucket.  Bad/missing quotes are records too: silently omitting them would
+# make a later target/stop ordering look more certain than it was.
+managed_opportunity_marks = Table(
+    "managed_opportunity_marks",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "opportunity_id",
+        Integer,
+        ForeignKey("managed_opportunities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("poll_bucket", Integer, nullable=False),
+    Column("observed_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("leg_quote_min_ts", DateTime(timezone=True)),
+    Column("leg_quote_max_ts", DateTime(timezone=True)),
+    Column("combo_bid", Float),
+    Column("combo_ask", Float),
+    Column("combo_mid", Float),
+    Column("liquidation_net", Float),
+    Column("gross_pnl", Float),
+    Column("net_pnl", Float),
+    Column("usable", Integer, nullable=False),
+    Column("issue", Text),
+    Column("legs_json", JSON, nullable=False),
+    CheckConstraint(
+        "usable IN (0, 1)",
+        name="ck_managed_opportunity_marks_usable",
+    ),
+)
+
+Index(
+    "uq_managed_opportunity_marks_bucket",
+    managed_opportunity_marks.c.opportunity_id,
+    managed_opportunity_marks.c.poll_bucket,
+    unique=True,
+)
+
+
+# First-class structured Hermes context record.  It is advisory evidence only;
+# no field here is execution authority or a production probability.
+managed_context_reviews = Table(
+    "managed_context_reviews",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "opportunity_id",
+        Integer,
+        ForeignKey("managed_opportunities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("received_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("timing", Text, nullable=False),
+    Column("response_json", JSON, nullable=False),
+    Column("response_hash", Text, nullable=False),
+    Column("context_probability", Float),
+    Column("event_conflict", Integer),
+    Column("anomaly_json", JSON, nullable=False),
+    Column("evidence_json", JSON, nullable=False),
+    Column("model_version", Text, nullable=False),
+    Column("prompt_version", Text, nullable=False),
+    CheckConstraint(
+        "timing IN ('pretrade','post_entry','post_cutoff','post_outcome')",
+        name="ck_managed_context_reviews_timing",
+    ),
+    CheckConstraint(
+        "context_probability IS NULL OR "
+        "(context_probability >= 0.0 AND context_probability <= 1.0)",
+        name="ck_managed_context_reviews_probability",
+    ),
+    CheckConstraint(
+        "event_conflict IN (0, 1) OR event_conflict IS NULL",
+        name="ck_managed_context_reviews_event_conflict",
+    ),
+)
+
+Index(
+    "uq_managed_context_reviews_response",
+    managed_context_reviews.c.opportunity_id,
+    managed_context_reviews.c.response_hash,
+    unique=True,
+)
+Index(
+    "uq_managed_context_reviews_critic",
+    managed_context_reviews.c.opportunity_id,
+    managed_context_reviews.c.model_version,
+    managed_context_reviews.c.prompt_version,
+    unique=True,
+)
+
+
+# Immutable model artifacts and their fold/holdout evidence.  Capture never
+# reads these tables for trade admission; a later controlled promotion layer
+# may do so only after explicit validation.
+managed_models = Table(
+    "managed_models",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("model_version", Text, nullable=False, unique=True),
+    Column("artifact_hash", Text, nullable=False),
+    Column("feature_schema_version", Text, nullable=False),
+    Column("outcome_policy_version", Text, nullable=False),
+    Column("trained_from_session", Text, nullable=False),
+    Column("trained_through_session", Text, nullable=False),
+    Column("metrics_json", JSON, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("promoted_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "status IN ('challenger','promoted','rejected','retired')",
+        name="ck_managed_models_status",
+    ),
+)
+
+Index(
+    "uq_managed_models_one_promoted",
+    managed_models.c.status,
+    unique=True,
+    sqlite_where=managed_models.c.status == "promoted",
+    postgresql_where=managed_models.c.status == "promoted",
+)
+Index(
+    "uq_managed_models_one_base_challenger",
+    managed_models.c.status,
+    unique=True,
+    sqlite_where=text(
+        "status = 'challenger' AND json_extract(metrics_json, '$.model_role') = 'causal_base'"
+    ),
+    postgresql_where=text(
+        "status = 'challenger' AND (metrics_json ->> 'model_role') = 'causal_base'"
+    ),
+)
+
+
+managed_model_evaluations = Table(
+    "managed_model_evaluations",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "model_id",
+        Integer,
+        ForeignKey("managed_models.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("evaluation_kind", Text, nullable=False),
+    Column("fold_index", Integer, nullable=False),
+    Column("train_from_session", Text),
+    Column("train_through_session", Text),
+    Column("test_from_session", Text, nullable=False),
+    Column("test_through_session", Text, nullable=False),
+    Column("metrics_json", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "evaluation_kind IN ('walk_forward','holdout','paper_shadow')",
+        name="ck_managed_model_evaluations_kind",
+    ),
+    CheckConstraint(
+        "fold_index >= 0",
+        name="ck_managed_model_evaluations_fold",
+    ),
+)
+
+Index(
+    "uq_managed_model_evaluations_fold",
+    managed_model_evaluations.c.model_id,
+    managed_model_evaluations.c.evaluation_kind,
+    managed_model_evaluations.c.fold_index,
+    unique=True,
 )
 
 

@@ -9,6 +9,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from optionsbot.analysis.opening_range_quality import (
+    OpeningRangeQualityFeatures,
+    build_opening_range_quality_features,
+)
+
 _NEW_YORK = ZoneInfo("America/New_York")
 Direction = Literal["bull", "bear"]
 SetupType = Literal["fvg_retest", "range_level_retest"]
@@ -32,11 +37,15 @@ class OpeningRangeFVGSignal:
     target_r: float
     target_pct: float
     setup_type: SetupType = "fvg_retest"
+    quality: OpeningRangeQualityFeatures | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         for key in ("breakout_ts", "fvg_formed_ts", "respected_ts"):
             result[key] = result[key].astimezone(UTC).isoformat()
+        if result["quality"] is None:
+            # Preserve compatibility for manually reconstructed legacy plans.
+            result.pop("quality")
         result["status"] = "entry_confirmed"
         result["source"] = "trusted_daemon"
         return result
@@ -46,7 +55,10 @@ def _bars_in_new_york(bars: pd.DataFrame) -> pd.DataFrame:
     required = {"open", "high", "low", "close"}
     if bars.empty or not required.issubset(bars.columns):
         return pd.DataFrame(columns=sorted(required))
-    result = bars.loc[:, ["open", "high", "low", "close"]].copy()
+    columns = ["open", "high", "low", "close"]
+    if "volume" in bars.columns:
+        columns.append("volume")
+    result = bars.loc[:, columns].copy()
     result.index = pd.DatetimeIndex(pd.to_datetime(result.index, utc=True))
     result = result.sort_index()
     result = result[~result.index.duplicated(keep="last")]
@@ -122,6 +134,34 @@ def detect_opening_range_fvg(
     records = list(eligible.iterrows())
     signals: list[OpeningRangeFVGSignal] = []
     range_size = range_high - range_low
+
+    def quality_for(
+        *,
+        direction: Direction,
+        setup_type: SetupType,
+        breakout_ts: pd.Timestamp,
+        formed_ts: pd.Timestamp,
+        respected_ts: pd.Timestamp,
+        gap_low: float,
+        gap_high: float,
+    ) -> OpeningRangeQualityFeatures:
+        return build_opening_range_quality_features(
+            frame,
+            direction=direction,
+            setup_type=setup_type,
+            market_open=market_open,
+            entry_window_minutes=entry_window_minutes,
+            timeframe_minutes=timeframe_minutes,
+            now=now_ny,
+            opening_range_high=range_high,
+            opening_range_low=range_low,
+            breakout_ts=breakout_ts.to_pydatetime(),
+            formed_ts=formed_ts.to_pydatetime(),
+            respected_ts=respected_ts.to_pydatetime(),
+            gap_low=gap_low,
+            gap_high=gap_high,
+        )
+
     breakouts: list[tuple[int, Direction]] = []
     previous_close: float | None = None
     for position, (_, bar) in enumerate(records):
@@ -148,10 +188,29 @@ def detect_opening_range_fvg(
 
         # Setup 1: pull back to the broken opening-range boundary and reject it.
         # A 10%-of-range penetration allowance tolerates a tick through the
-        # level without accepting a material move back inside the range.
+        # level without accepting a material move back inside the range. The
+        # first material re-entry ends this breakout thesis for both setup
+        # branches. Check every later completed eligible bar, including a bar
+        # that starts a fresh opposite breakout: a signal confirmed one bar
+        # earlier must not remain executable after its thesis is invalidated.
         boundary = range_high if direction == "bull" else range_low
+        reentry_tolerance = 0.10 * range_size
+        invalidated = False
+        for position in range(breakout_position + 1, len(records)):
+            _, bar = records[position]
+            material_reentry = (
+                float(bar["low"]) < boundary - reentry_tolerance
+                if direction == "bull"
+                else float(bar["high"]) > boundary + reentry_tolerance
+            )
+            if material_reentry:
+                invalidated = True
+                break
+        if invalidated:
+            continue
+        thesis_end = segment_end
         range_retest_end = min(
-            segment_end,
+            thesis_end,
             breakout_position + max_retest_bars + 1,
         )
         for retest in range(breakout_position + 1, range_retest_end):
@@ -166,20 +225,16 @@ def detect_opening_range_fvg(
                 abs(close - open_) / retest_range if retest_range > 0 else 0.0
             )
             if direction == "bull":
-                if close < range_low:
-                    break
                 respected = (
                     low <= boundary
-                    and low >= boundary - 0.10 * range_size
+                    and low >= boundary - reentry_tolerance
                     and close > boundary
                     and close > open_
                 )
             else:
-                if close > range_high:
-                    break
                 respected = (
                     high >= boundary
-                    and high <= boundary + 0.10 * range_size
+                    and high <= boundary + reentry_tolerance
                     and close < boundary
                     and close < open_
                 )
@@ -211,6 +266,15 @@ def detect_opening_range_fvg(
                     target_r=target_r,
                     target_pct=stop_pct * target_r,
                     setup_type="range_level_retest",
+                    quality=quality_for(
+                        direction=direction,
+                        setup_type="range_level_retest",
+                        breakout_ts=breakout_ts,
+                        formed_ts=breakout_ts,
+                        respected_ts=retest_ts,
+                        gap_low=boundary,
+                        gap_high=boundary,
+                    ),
                 )
             )
             break
@@ -220,7 +284,7 @@ def detect_opening_range_fvg(
         # bars, the displacement imbalance.  Starting at breakout+2 ensures all
         # three FVG candles belong to the post-break thesis.
         formation_end = min(
-            segment_end,
+            thesis_end,
             breakout_position + max_fvg_formation_bars + 1,
         )
         for formed in range(max(2, breakout_position + 2), formation_end):
@@ -238,7 +302,7 @@ def detect_opening_range_fvg(
                 if gap_high <= gap_low:
                     continue
 
-            fvg_retest_end = min(segment_end, formed + max_retest_bars + 1)
+            fvg_retest_end = min(thesis_end, formed + max_retest_bars + 1)
             for retest in range(formed + 1, fvg_retest_end):
                 retest_key, bar = records[retest]
                 retest_ts = cast(pd.Timestamp, retest_key)
@@ -288,6 +352,15 @@ def detect_opening_range_fvg(
                         target_r=target_r,
                         target_pct=stop_pct * target_r,
                         setup_type="fvg_retest",
+                        quality=quality_for(
+                            direction=direction,
+                            setup_type="fvg_retest",
+                            breakout_ts=breakout_ts,
+                            formed_ts=formed_ts,
+                            respected_ts=retest_ts,
+                            gap_low=gap_low,
+                            gap_high=gap_high,
+                        ),
                     )
                 )
                 break

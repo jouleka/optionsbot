@@ -44,16 +44,31 @@ boundary. Bullish and bearish breaks are evaluated independently so an early
 false break does not suppress a later reversal.
 
 Confirmed setups use defined-risk long options or debit spreads. Entry
-admission applies the configured premium stop and R-multiple target to the
-probability estimate, then subtracts estimated round-trip commissions and
-spread slippage. A candidate must retain positive managed expectancy after
-those costs and pass the existing freshness, liquidity, sizing, buying-power,
-portfolio-heat, position, daily-entry, market-hours, and kill-switch gates.
+admission requires a versioned, out-of-sample probability that the premium
+target is observed before the stop or timeout, then subtracts estimated
+round-trip costs. No such model is currently promoted, so managed expectancy is
+unavailable and automatic entry fails closed. The daemon instead records every
+confirmed candidate before alert or admission filtering and prospectively shadows
+its executable bid/ask path. This produces target/stop/timeout/censored labels
+without treating terminal expiry probability as intraday trade authority.
 
-Hermes can review or originate hypotheses, but it cannot place broker orders.
-The daemon reconstructs and validates every evidence packet and remains the
-only component authorized to submit an order. Disabling synchronous Hermes
-entry review is permitted only while the paper-account interlock remains on.
+The restricted Hermes integration is an asynchronous, research-only context
+critic. It can attach structured macro, news, event-conflict, or operational
+observations to daemon-generated opportunities. It cannot originate a candidate,
+review or authorize an entry, change strategy or risk settings, halt the bot, or
+place an order. Its output is excluded from production admission artifacts.
+The daemon remains the only component authorized to submit an order.
+
+Model promotion is deliberately slower than model fitting: one eligible causal
+base challenger is frozen at a time, then must pass a checksummed block of
+strictly later sessions before it can authorize paper entries. A replacement
+must also outperform the frozen incumbent on that same future block. Shadow
+structure variants and Hermes context remain research-only and cannot be used
+as order authority.
+
+The generators, label reducer, and promotion gates have software tests; they do
+not demonstrate a profitable strategy. No base model may trade until enough
+prospective data exists and an out-of-sample artifact is explicitly promoted.
 
 ## Architecture
 
@@ -109,7 +124,7 @@ credentials outside the checkout.
 
 ### MCP configuration
 
-Copy [`.mcp.json.example`](.mcp.json.example), replace `/path/to/optionsbot` with the absolute checkout path, and keep the resulting `.mcp.json` local. The trusted server exposes watchlist, analysis, snapshot, position, track-record, daily-briefing, candidate-review, close-request, and monotonic-halt tools. The restricted Hermes boundary records halt advisories but cannot trip the global kill switch.
+Copy [`.mcp.json.example`](.mcp.json.example), replace `/path/to/optionsbot` with the absolute checkout path, and keep the resulting `.mcp.json` local. The trusted operator server exposes watchlist, analysis, snapshot, position, track-record, daily-briefing, candidate-review, close-request, and monotonic-halt tools. Do not give that endpoint to Hermes. The restricted Hermes endpoint exposes bounded ledger reads and the shadow context-critic contract; it has no proposal, entry-review, order, exit, halt, or rearm tool.
 
 ## Configuration
 
@@ -120,13 +135,21 @@ Settings live in `~/.config/optionsbot/config.toml`. Environment overrides use t
 | IBKR host | `OPTIONSBOT_IBKR__HOST` | `127.0.0.1` |
 | IBKR port | `OPTIONSBOT_IBKR__PORT` | `4002` |
 | Scan interval | `OPTIONSBOT_SCAN__INTERVAL_MINUTES` | `15` |
-| Score threshold | `OPTIONSBOT_SCAN__SCORE_THRESHOLD` | `70` |
+| Score threshold | `OPTIONSBOT_SCAN__SCORE_THRESHOLD` | `55` |
 | Telegram token | `OPTIONSBOT_TELEGRAM__BOT_TOKEN` | unset |
 | Telegram chat | `OPTIONSBOT_TELEGRAM__CHAT_ID` | unset |
 | Database path | `OPTIONSBOT_STORAGE__DB_PATH` | `~/.local/share/optionsbot/optionsbot.db` |
 | Execution switch | `OPTIONSBOT_EXECUTION__ENABLED` | `false` |
 | Execution mode | `OPTIONSBOT_EXECUTION__MODE` | `confirm` |
 | Paper-only interlock | `OPTIONSBOT_EXECUTION__PAPER_ONLY` | `true` |
+| Managed shadow capture | `OPTIONSBOT_VALIDATION__MANAGED_CAPTURE_ENABLED` | `true` |
+| Managed capture cadence | `OPTIONSBOT_VALIDATION__MANAGED_CAPTURE_INTERVAL_SECONDS` | `15` |
+| Managed-model auto-promotion | `OPTIONSBOT_MANAGED_LEARNING__AUTO_PROMOTE` | `false` |
+
+The managed outcome-policy identity is derived from label-affecting capture
+settings, including polling cadence and phase. If an explicit policy identity
+no longer matches those settings, configuration fails instead of pooling
+incompatible labels.
 
 Recognized default ports are 4002/7497 for paper and 4001/7496 for live. The MCP server and daemon use distinct client IDs (1 and 2 by default).
 

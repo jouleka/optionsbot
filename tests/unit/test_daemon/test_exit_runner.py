@@ -1838,7 +1838,7 @@ async def test_close_command_replay_is_idempotent_end_to_end(
     # seam: dispatch -> _cmd_close -> force_close_entry -> open_close_for guard.
     from optionsbot.daemon.commands import dispatch
 
-    daemon_context.settings.telegram.chat_id = "5356256463"
+    daemon_context.settings.telegram.chat_id = "9999999999"
     entry_id = _filled_entry(daemon_context)
     order_client = _wire(daemon_context, {(580.0, "P"): 0.80, (575.0, "P"): 0.30})
     with patch("optionsbot.daemon.exit_runner._exec_md", return_value=daemon_context._test_md):  # type: ignore[attr-defined]

@@ -27,6 +27,7 @@ from sqlalchemy import Engine, Row, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from optionsbot.execution.close_safety import NonAtomicCloseError, assert_atomic_close_legs
+from optionsbot.execution.managed_boundary import validate_managed_stage_authorization
 from optionsbot.storage.schema import (
     entry_intent_consumptions,
     fills,
@@ -191,6 +192,18 @@ def stage_order(
         if row is None:
             raise ValueError(f"no strategy_scores row with id {strategy_score_id}")
         suggestion: dict[str, Any] = row.suggestion_json or {}
+        if intent == "open":
+            if (
+                suggestion.get("shadow_only") is True
+                or suggestion.get("admission_enabled") is False
+            ):
+                raise ValueError("shadow-only research candidate cannot be staged")
+            validate_managed_stage_authorization(
+                conn,
+                int(row.id),
+                suggestion,
+                now=ts,
+            )
         qty = quantity if quantity is not None else int(suggestion.get("suggested_quantity") or 0)
         if qty < 1:
             raise ValueError(f"order quantity must be >= 1, got {qty}")

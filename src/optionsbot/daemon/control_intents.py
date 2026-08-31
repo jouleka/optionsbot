@@ -15,10 +15,26 @@ from sqlalchemy.exc import IntegrityError
 
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.execution.exit_requests import ALLOWED_CATALYST_TYPES
+from optionsbot.hermes_context import (
+    HermesContextSubmissionV1,
+    bind_context_response,
+    classify_context_timing,
+    context_response_hash,
+    context_response_payload,
+    earliest_context_entry,
+)
 from optionsbot.hermes_overlay import load_overlay_state
 from optionsbot.mcp_server.intent_queue import control_intents, create_intent_engine
 from optionsbot.review_checks import all_entry_checks_pass, normalize_entry_checks
-from optionsbot.storage.schema import alerts, entry_reviews, exit_requests, orders, strategy_scores
+from optionsbot.storage.schema import (
+    alerts,
+    entry_reviews,
+    exit_requests,
+    managed_context_reviews,
+    managed_opportunities,
+    orders,
+    strategy_scores,
+)
 
 _REQUIRED_PROPOSAL_CHECKS = {
     "bot_health",
@@ -36,6 +52,13 @@ def _timestamp(value: object, field: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _db_utc(value: datetime | None) -> datetime | None:
+    """Restore UTC tzinfo stripped by SQLite's datetime adapter."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _clean_sources(value: object) -> list[str]:
@@ -151,6 +174,132 @@ def _consume_exit_request(context: DaemonContext, payload: dict[str, Any]) -> st
     return f"exit request imported as #{int(pk[0])} for daemon-side gating"
 
 
+def _consume_context_review(
+    context: DaemonContext,
+    payload: dict[str, Any],
+    *,
+    intent_created_at: datetime,
+) -> str:
+    """Persist one identity-bound shadow observation with no action authority."""
+    # The restricted MCP process owns the queue file and is therefore an
+    # untrusted writer.  Its payload/row timestamps are useful only for wrapper
+    # consistency; jointly backdating both values must never manufacture a
+    # causal pretrade observation.  The trusted daemon ingestion clock is the
+    # sole authority for persisted receipt time and timing classification.
+    trusted_received_at = datetime.now(UTC)
+    supplied_received_at = _timestamp(payload.get("received_at"), "received_at")
+    queued_at = (
+        intent_created_at.replace(tzinfo=UTC)
+        if intent_created_at.tzinfo is None
+        else intent_created_at.astimezone(UTC)
+    )
+    if abs((supplied_received_at - queued_at).total_seconds()) > 1.0:
+        raise ValueError("context received_at must match the local intent receipt time")
+    if supplied_received_at > trusted_received_at + timedelta(minutes=1):
+        raise ValueError("context received_at is future-dated")
+    raw_submission = payload.get("submission")
+    if not isinstance(raw_submission, dict):
+        raise ValueError("context submission must be an object")
+    submission = HermesContextSubmissionV1.model_validate(raw_submission)
+    with context.engine.connect() as conn:
+        opportunity = conn.execute(
+            select(managed_opportunities).where(
+                managed_opportunities.c.id == submission.opportunity_id
+            )
+        ).one_or_none()
+        if opportunity is None:
+            raise ValueError("unknown managed opportunity")
+        opportunity_created_at = _db_utc(opportunity.created_at)
+        opportunity_detected_at = _db_utc(opportunity.detected_at)
+        bot_decided_at = _db_utc(opportunity.bot_decided_at)
+        if (
+            opportunity_created_at is None
+            or opportunity_detected_at is None
+            or trusted_received_at < opportunity_created_at
+            or trusted_received_at < opportunity_detected_at
+        ):
+            raise ValueError("trusted context receipt predates managed opportunity evidence")
+        if bot_decided_at is None or trusted_received_at < bot_decided_at:
+            raise ValueError("trusted context receipt predates frozen scan admission")
+        first_entry_at = (
+            conn.execute(
+                select(orders.c.staged_ts)
+                .where(orders.c.intent == "open")
+                .where(orders.c.strategy_score_id == opportunity.strategy_score_id)
+                .order_by(orders.c.staged_ts, orders.c.id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if opportunity.strategy_score_id is not None
+            else None
+        )
+        existing = conn.execute(
+            select(
+                managed_context_reviews.c.id,
+                managed_context_reviews.c.response_hash,
+            )
+            .where(managed_context_reviews.c.opportunity_id == submission.opportunity_id)
+            .where(managed_context_reviews.c.model_version == submission.model_version)
+            .where(managed_context_reviews.c.prompt_version == submission.prompt_version)
+            .order_by(managed_context_reviews.c.id)
+            .limit(1)
+        ).first()
+    timing = classify_context_timing(
+        received_at=trusted_received_at,
+        cutoff_at=_db_utc(opportunity.entry_cutoff_at),
+        first_entry_at=earliest_context_entry(
+            _db_utc(opportunity.entry_ts),
+            _db_utc(first_entry_at),
+        ),
+        outcome_available_at=_db_utc(opportunity.resolved_at),
+    )
+    response = bind_context_response(
+        submission,
+        trusted_opportunity_id=int(opportunity.id),
+        trusted_signal_id=str(opportunity.signal_id),
+        received_at=trusted_received_at,
+        timing=timing,
+    )
+    response_hash = context_response_hash(response)
+    if existing is not None:
+        if existing.response_hash == response_hash:
+            return f"context review already existed as #{int(existing.id)}"
+        raise ValueError("critic version already reviewed this managed opportunity")
+    try:
+        with context.engine.begin() as conn:
+            pk = conn.execute(
+                insert(managed_context_reviews).values(
+                    opportunity_id=int(opportunity.id),
+                    received_at=trusted_received_at,
+                    timing=timing.value,
+                    response_json=context_response_payload(response),
+                    response_hash=response_hash,
+                    context_probability=response.context_probability,
+                    event_conflict=int(response.event_conflict),
+                    anomaly_json=[item.value for item in response.anomaly_codes],
+                    evidence_json=list(response.evidence_ids),
+                    model_version=response.model_version,
+                    prompt_version=response.prompt_version,
+                )
+            ).inserted_primary_key
+    except IntegrityError:
+        with context.engine.connect() as conn:
+            raced = conn.execute(
+                select(managed_context_reviews.c.id)
+                .where(managed_context_reviews.c.opportunity_id == submission.opportunity_id)
+                .where(managed_context_reviews.c.model_version == submission.model_version)
+                .where(managed_context_reviews.c.prompt_version == submission.prompt_version)
+                .limit(1)
+            ).scalar_one_or_none()
+        if raced is None:
+            raise
+        return f"context review already existed as #{int(raced)}"
+    assert pk is not None
+    return (
+        f"context review imported as #{int(pk[0])}; timing={timing.value}; "
+        "shadow only, execution state unchanged"
+    )
+
+
 async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any]) -> str:
     """Rebuild a Hermes idea from live data; OptionsBot remains authoritative."""
     from optionsbot.analysis.opening_range_fvg import detect_opening_range_fvg
@@ -223,17 +372,13 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
     ):
         raise ValueError("proposal arrived after the 0DTE entry cutoff")
 
-    opening_range_enabled = bool(
-        getattr(context.settings.scan, "opening_range_fvg_enabled", False)
-    )
+    opening_range_enabled = bool(getattr(context.settings.scan, "opening_range_fvg_enabled", False))
     opening_signal = None
     if opening_range_enabled:
         if direction not in {"bull", "bear"}:
             return "proposal declined: opening-range/FVG mode requires bull or bear direction"
         market_open_at = nyse_session_start_utc(now) + timedelta(hours=9, minutes=30)
-        range_end = market_open_at + timedelta(
-            minutes=context.settings.scan.opening_range_minutes
-        )
+        range_end = market_open_at + timedelta(minutes=context.settings.scan.opening_range_minutes)
         entry_end = market_open_at + timedelta(
             minutes=context.settings.scan.opening_range_entry_window_minutes
         )
@@ -245,9 +390,7 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
             intraday = await asyncio.wait_for(
                 HistoryClient(context.ibkr, context.resolver).get_intraday_history(
                     symbol,
-                    timeframe_minutes=(
-                        context.settings.scan.opening_range_timeframe_minutes
-                    ),
+                    timeframe_minutes=(context.settings.scan.opening_range_timeframe_minutes),
                 ),
                 timeout=context.settings.scan.scan_symbol_timeout_s,
             )
@@ -257,9 +400,7 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
                 now=now,
                 timeframe_minutes=context.settings.scan.opening_range_timeframe_minutes,
                 opening_range_minutes=context.settings.scan.opening_range_minutes,
-                entry_window_minutes=(
-                    context.settings.scan.opening_range_entry_window_minutes
-                ),
+                entry_window_minutes=(context.settings.scan.opening_range_entry_window_minutes),
                 stop_pct=context.settings.execution.opening_range_stop_pct,
                 target_r_min=context.settings.execution.opening_range_target_r_min,
                 target_r_max=context.settings.execution.opening_range_target_r_max,
@@ -433,24 +574,24 @@ async def _consume_entry_proposal(context: DaemonContext, payload: dict[str, Any
     )
 
 
-def _consume_one(context: DaemonContext, kind: str, payload: object) -> str:
+def _consume_one(
+    context: DaemonContext,
+    kind: str,
+    payload: object,
+    *,
+    intent_created_at: datetime,
+) -> str:
+    if kind != "context_review":
+        # Rows written by older restricted MCP releases remain visible for
+        # audit, but can no longer cross into any action-capable daemon path.
+        raise ValueError("restricted action intent is disabled; only context_review is accepted")
     if not isinstance(payload, dict):
         raise ValueError("intent payload must be an object")
-    if kind == "entry_review":
-        return _consume_entry_review(context, payload)
-    if kind == "request_exit":
-        return _consume_exit_request(context, payload)
-    if kind == "halt_advisory":
-        reason = str(payload.get("reason") or "Hermes anomaly advisory").strip()
-        if not reason:
-            raise ValueError("halt advisory reason is required")
-        log.warning("Hermes halt advisory (no kill authority): %s", reason)
-        return "advisory recorded; global kill state unchanged"
-    if kind == "halt":
-        # Reject legacy rows created before the least-privilege boundary was
-        # tightened.  Free-form LLM prose is not a deterministic kill signal.
-        raise ValueError("restricted Hermes global halt authority was removed")
-    raise ValueError(f"unknown intent kind: {kind}")
+    return _consume_context_review(
+        context,
+        payload,
+        intent_created_at=intent_created_at,
+    )
 
 
 def consume_control_intents(
@@ -473,7 +614,12 @@ def consume_control_intents(
         for row in rows:
             now = datetime.now(UTC)
             try:
-                result = _consume_one(context, str(row.kind), row.payload_json)
+                result = _consume_one(
+                    context,
+                    str(row.kind),
+                    row.payload_json,
+                    intent_created_at=row.created_at,
+                )
                 status = "processed"
                 consumed += 1
             except Exception as exc:  # noqa: BLE001 -- reject malformed/untrusted intent
@@ -511,7 +657,7 @@ async def consume_control_intents_async(
     *,
     limit: int = 50,
 ) -> int:
-    """Async consumer variant that can rebuild Hermes entry proposals live."""
+    """Async consumer variant for shadow-only context observations."""
     intent_engine = create_intent_engine(intent_db_path)
     consumed = 0
     try:
@@ -522,28 +668,18 @@ async def consume_control_intents_async(
                 .order_by(control_intents.c.id)
                 .limit(max(1, min(int(limit), 100)))
             ).fetchall()
-        # Never let a live proposal scan delay a halt or close request queued
-        # behind it. Process control actions first and at most one expensive
-        # proposal per scheduler pass; remaining proposals stay pending.
-        ordered = sorted(rows, key=lambda row: str(row.kind) == "entry_proposal")
-        proposal_started = False
-        for row in ordered:
-            if str(row.kind) == "entry_proposal":
-                if proposal_started:
-                    continue
-                proposal_started = True
+        for row in rows:
             now = datetime.now(UTC)
             try:
-                payload = row.payload_json
-                if not isinstance(payload, dict):
-                    raise ValueError("intent payload must be an object")
-                if str(row.kind) == "entry_proposal":
-                    result = await _consume_entry_proposal(context, payload)
-                else:
-                    result = _consume_one(context, str(row.kind), payload)
+                result = _consume_one(
+                    context,
+                    str(row.kind),
+                    row.payload_json,
+                    intent_created_at=row.created_at,
+                )
                 status = "processed"
                 consumed += 1
-            except Exception as exc:  # noqa: BLE001 -- untrusted proposal fails closed
+            except Exception as exc:  # noqa: BLE001 -- untrusted intent fails closed
                 result = f"rejected: {type(exc).__name__}: {exc}"
                 status = "rejected"
             with intent_engine.begin() as conn:

@@ -87,6 +87,82 @@ def managed_expected_value(
     return gross_expectancy - round_trip_cost
 
 
+def managed_path_expected_values(
+    *,
+    credit_or_debit: object,
+    target_probability: object,
+    stop_probability: object,
+    timeout_probability: object,
+    timeout_expected_return: object,
+    ev_residual_return_q05: object,
+    plan: object,
+    estimated_round_trip_cost: object = 0.0,
+    maximum_profit: object = None,
+) -> tuple[float, float] | None:
+    """Return point and conservative EV for target/stop/timeout paths.
+
+    All returns use one fresh entry basis. The residual is a dimensionless
+    out-of-fold error quantile and therefore scales with the candidate's
+    current debit rather than leaking the dollar size of historical samples.
+    """
+    if not isinstance(plan, Mapping):
+        return None
+    if plan.get("status") != "entry_confirmed" or plan.get("source") != "trusted_daemon":
+        return None
+    cashflow = _number(credit_or_debit)
+    target = _number(target_probability)
+    stop = _number(stop_probability)
+    timeout = _number(timeout_probability)
+    timeout_return = _number(timeout_expected_return)
+    residual_return = _number(ev_residual_return_q05)
+    stop_pct = _number(plan.get("stop_pct"))
+    target_pct = _number(plan.get("target_pct"))
+    round_trip_cost = _number(estimated_round_trip_cost)
+    finite_maximum_profit = _number(maximum_profit)
+    if None in (
+        cashflow,
+        target,
+        stop,
+        timeout,
+        timeout_return,
+        residual_return,
+        stop_pct,
+        target_pct,
+        round_trip_cost,
+    ):
+        return None
+    assert cashflow is not None
+    assert target is not None and stop is not None and timeout is not None
+    assert timeout_return is not None and residual_return is not None
+    assert stop_pct is not None and target_pct is not None
+    assert round_trip_cost is not None
+    probabilities = (target, stop, timeout)
+    if (
+        cashflow >= 0.0
+        or any(probability < 0.0 or probability > 1.0 for probability in probabilities)
+        or not math.isclose(sum(probabilities), 1.0, rel_tol=1e-6, abs_tol=1e-6)
+        or not 0.0 < stop_pct < 1.0
+        or target_pct <= 0.0
+        or round_trip_cost < 0.0
+    ):
+        return None
+    basis = abs(cashflow)
+    target_gain = basis * target_pct
+    stop_loss = basis * stop_pct
+    if finite_maximum_profit is not None and (
+        finite_maximum_profit <= 0.0
+        or target_gain + round_trip_cost > finite_maximum_profit
+    ):
+        return None
+    point = (
+        target * target_gain
+        - stop * stop_loss
+        + timeout * timeout_return * basis
+        - round_trip_cost
+    )
+    return point, point + residual_return * basis
+
+
 def managed_break_even_probability(
     *,
     credit_or_debit: object,

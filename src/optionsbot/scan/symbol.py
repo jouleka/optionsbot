@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 from collections.abc import Callable
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pandas as pd
@@ -15,13 +16,21 @@ from sqlalchemy import Engine, insert
 
 from optionsbot.analysis.beta_weighting import beta
 from optionsbot.analysis.events import next_earnings
+from optionsbot.analysis.intraday_hypotheses import ShadowIntradayHypothesis
 from optionsbot.analysis.news import (
     news_cache_is_stale,
     refresh_news_if_stale,
     replace_news,
 )
 from optionsbot.analysis.opening_range_fvg import OpeningRangeFVGSignal
+from optionsbot.analysis.opening_range_quality import quality_payload_with_regime
 from optionsbot.analysis.relative_strength import relative_strength
+from optionsbot.analysis.structure_optimizer import (
+    ShadowStructureCandidate,
+    UnderlyingThesis,
+    build_shadow_grid_for_thesis,
+    build_shadow_structure_grid,
+)
 from optionsbot.analysis.types import Direction, EarningsInfo, IVRegime, MarketView
 from optionsbot.analysis.view import infer_view
 from optionsbot.analysis.volatility import historical_volatility, iv_hv_ratio
@@ -36,7 +45,7 @@ from optionsbot.ibkr import (
 )
 from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg
-from optionsbot.market_hours import minutes_to_nyse_close
+from optionsbot.market_hours import minutes_to_nyse_close, nyse_session_close_utc
 from optionsbot.opening_range_economics import (
     estimated_round_trip_cost,
     managed_break_even_probability,
@@ -52,6 +61,12 @@ from optionsbot.strategies import Leg, StrategySnapshot, StrategySuggestion, get
 from optionsbot.strategies.strikes import closest_expiry_to_dte
 
 log = logging.getLogger(__name__)
+
+_SHADOW_GRID_PREFIX = "shadow_grid_v1"
+_SHADOW_GRID_HOLD_REASON = "shadow_structure_pending_promoted_base_model"
+_MAX_SHADOW_HYPOTHESES_PER_SNAPSHOT = 3
+_MAX_GRID_STRUCTURES_PER_PLAN = 2
+_MAX_SHADOW_ROWS_PER_SNAPSHOT = 8
 
 
 async def _bounded_to_thread[T](
@@ -111,6 +126,249 @@ def _serialize_legs(legs: tuple[Leg, ...]) -> list[dict[str, object]]:
     return [asdict(leg) for leg in legs]
 
 
+def _shadow_strategy_identity(
+    candidate: ShadowStructureCandidate,
+    managed_plan: dict[str, object],
+) -> str:
+    """Ledger-unique identity; model features strip the immutable hash suffix."""
+    generator = managed_plan.get("generator")
+    if generator == "opening_range_fvg":
+        # Preserve the original OR/FVG identity so an upgrade cannot duplicate
+        # an already-captured alternative for the same frozen legs.
+        suffix = candidate.candidate_id
+    else:
+        signal_id = str(managed_plan.get("signal_id", ""))
+        signal_hash = hashlib.sha256(signal_id.encode("utf-8")).hexdigest()[:12]
+        suffix = f"{signal_hash}:{candidate.candidate_id}"
+    return f"{_SHADOW_GRID_PREFIX}:{candidate.strategy}:{suffix}"
+
+
+def _shadow_structure_score_row(
+    candidate: ShadowStructureCandidate,
+    managed_plan: dict[str, object],
+    settings: Settings,
+    *,
+    opening_range_plan: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Serialize one optimizer alternative without creating an alert candidate."""
+    leg_count = len(candidate.legs)
+    commissions = (
+        leg_count
+        * 2.0
+        * settings.execution.opening_range_commission_per_contract
+    )
+    strikes = [float(leg.strike) for leg in candidate.legs if leg.strike is not None]
+    width = max(strikes) - min(strikes) if len(strikes) > 1 else None
+    reward_risk = (
+        candidate.maximum_profit_dollars / candidate.maximum_loss_dollars
+        if candidate.maximum_profit_dollars is not None
+        and candidate.maximum_loss_dollars > 0.0
+        else None
+    )
+    features = candidate.features
+    suggestion: dict[str, object] = {
+        "defined_risk": True,
+        # StrategySuggestion and the managed ledger use credit-positive signed
+        # dollars; the optimizer exposes a positive marketable debit.
+        "credit_or_debit": -candidate.entry_debit_dollars,
+        "max_loss": candidate.maximum_loss_dollars,
+        "max_profit": candidate.maximum_profit_dollars,
+        "prob_profit": None,
+        "suggested_quantity": 0,
+        "reward_risk": reward_risk,
+        "expected_value": None,
+        "expected_value_model": "shadow_structure_requires_promoted_base_model",
+        "managed_target_hit_probability": None,
+        "managed_target_hit_probability_lcb": None,
+        "managed_probability_model": None,
+        "risk_tier": "research_only",
+        "managed_signal_plan": managed_plan,
+        "shadow_only": True,
+        "shadow_reason": _SHADOW_GRID_HOLD_REASON,
+        "shadow_schema_version": candidate.schema_version,
+        "shadow_candidate_id": candidate.candidate_id,
+        "shadow_strategy": candidate.strategy,
+        "admission_enabled": False,
+        "managed_marketable_entry_net": -candidate.entry_debit_dollars / 100.0,
+        "managed_marketable_basis_dollars": candidate.entry_debit_dollars,
+        "managed_commission_estimate": commissions,
+        "estimated_round_trip_cost": candidate.round_trip_friction_dollars,
+        "structure_kind": features.get("structure_kind"),
+        "structure_leg_count": leg_count,
+        "structure_width": width,
+        "structure_net_delta": features.get("net_delta"),
+        "structure_net_gamma": features.get("net_gamma"),
+        "structure_net_theta": features.get("net_theta"),
+        "structure_net_vega": features.get("net_vega"),
+        "structure_friction_fraction": features.get("friction_fraction"),
+        "structure_desired_premium_target_dollars": (
+            candidate.desired_premium_target_dollars
+        ),
+        "structure_target_scenario_pnl_dollars": (
+            candidate.target_scenario_pnl_dollars
+        ),
+        "structure_invalidation_scenario_pnl_dollars": (
+            candidate.invalidation_scenario_pnl_dollars
+        ),
+        "structure_timeout_scenario_pnl_dollars": (
+            candidate.timeout_scenario_pnl_dollars
+        ),
+        "thesis_entry_spot": features.get("thesis_entry_spot"),
+        "thesis_invalidation_spot": features.get("thesis_invalidation_spot"),
+        "thesis_target_spot": features.get("thesis_target_spot"),
+        "thesis_underlying_risk_fraction": features.get(
+            "underlying_risk_fraction"
+        ),
+        "thesis_underlying_reward_risk": features.get(
+            "underlying_reward_risk"
+        ),
+        "thesis_timeout_minutes": features.get("timeout_minutes"),
+        "premium_target_feasible": candidate.premium_target_feasible,
+    }
+    if opening_range_plan is not None:
+        # Legacy OR consumers continue to receive the exact plan shape while
+        # managed capture uses the row-local, provenance-rich plan above.
+        suggestion["opening_range_fvg"] = opening_range_plan
+    return {
+        "strategy": _shadow_strategy_identity(candidate, managed_plan),
+        # A shadow row has no admission score. The non-null legacy column uses
+        # zero while `shadow_only` remains the authoritative hold invariant.
+        "score": 0.0,
+        "rationale": (
+            f"shadow-only optimizer alternative ({candidate.strategy}); "
+            "requires a promoted causal base model"
+        ),
+        "legs_json": _serialize_legs(candidate.legs),
+        "suggestion_json": suggestion,
+    }
+
+
+def _utc_iso(value: datetime) -> str:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat()
+
+
+def _force_exit_at(signal_at: datetime, settings: Settings) -> datetime | None:
+    close = nyse_session_close_utc(signal_at)
+    if close is None:
+        return None
+    return close - timedelta(minutes=settings.execution.zero_dte_force_exit_minutes)
+
+
+def _opening_range_managed_plan(
+    signal: OpeningRangeFVGSignal,
+    *,
+    observed_at: datetime,
+    settings: Settings,
+) -> dict[str, object] | None:
+    """Trusted row-local identity for the existing production OR plan."""
+    signal_at = signal.respected_ts + timedelta(minutes=signal.timeframe_minutes)
+    force_exit_at = _force_exit_at(signal_at, settings)
+    if force_exit_at is None:
+        return None
+    return {
+        "schema_version": "managed_signal_plan_v1",
+        "status": "entry_confirmed",
+        "source": "trusted_daemon",
+        "authority": "existing_opening_range_policy",
+        "admission_enabled": True,
+        "signal_id": signal.signal_id,
+        "session": signal.session,
+        "direction": signal.direction,
+        "generator": "opening_range_fvg",
+        "setup_type": signal.setup_type,
+        "option_expiry": signal.session.replace("-", ""),
+        "signal_at": _utc_iso(signal_at),
+        "observed_at": _utc_iso(observed_at),
+        "causal_cutoff_at": _utc_iso(signal_at),
+        "thesis_expires_at": _utc_iso(force_exit_at),
+        "stop_pct": signal.stop_pct,
+        "target_r": signal.target_r,
+        "target_pct": signal.target_pct,
+        "label_policy": "premium_stop_target_before_force_exit_v1",
+    }
+
+
+def _hypothesis_managed_plan(
+    hypothesis: ShadowIntradayHypothesis,
+    *,
+    observed_at: datetime,
+    entry_spot: float,
+    settings: Settings,
+) -> tuple[dict[str, object], UnderlyingThesis] | None:
+    """Freeze a causal shadow thesis without granting admission authority."""
+    force_exit_at = _force_exit_at(hypothesis.signal_at, settings)
+    if force_exit_at is None:
+        return None
+    hypothesis_expiry = (
+        hypothesis.thesis_expires_at
+        if hypothesis.thesis_expires_at.tzinfo is not None
+        else hypothesis.thesis_expires_at.replace(tzinfo=UTC)
+    ).astimezone(UTC)
+    expires_at = min(hypothesis_expiry, force_exit_at.astimezone(UTC))
+    observed_utc = (
+        observed_at
+        if observed_at.tzinfo is not None
+        else observed_at.replace(tzinfo=UTC)
+    ).astimezone(UTC)
+    if expires_at <= observed_utc or not math.isfinite(entry_spot) or entry_spot <= 0.0:
+        return None
+    invalidation = float(hypothesis.invalidation_level)
+    risk_distance = (
+        entry_spot - invalidation
+        if hypothesis.direction == "bull"
+        else invalidation - entry_spot
+    )
+    if not math.isfinite(risk_distance) or risk_distance <= 0.0:
+        return None
+    target_r = settings.execution.opening_range_target_r_min
+    target_spot = (
+        entry_spot + risk_distance * target_r
+        if hypothesis.direction == "bull"
+        else entry_spot - risk_distance * target_r
+    )
+    if not math.isfinite(target_spot) or target_spot <= 0.0:
+        return None
+    timeout_minutes = (expires_at - observed_utc).total_seconds() / 60.0
+    stop_pct = settings.execution.opening_range_stop_pct
+    plan: dict[str, object] = {
+        "schema_version": "managed_signal_plan_v1",
+        "status": "shadow_confirmed",
+        "source": "trusted_daemon",
+        "authority": hypothesis.authority,
+        "admission_enabled": False,
+        "calibration_status": hypothesis.calibration_status,
+        "signal_id": hypothesis.hypothesis_id,
+        "session": hypothesis.session,
+        "direction": hypothesis.direction,
+        "generator": hypothesis.generator,
+        "setup_type": hypothesis.generator,
+        "option_expiry": hypothesis.option_expiry,
+        "signal_at": _utc_iso(hypothesis.signal_at),
+        "observed_at": _utc_iso(observed_at),
+        "causal_cutoff_at": _utc_iso(hypothesis.causal_cutoff_at),
+        "thesis_expires_at": _utc_iso(expires_at),
+        "stop_pct": stop_pct,
+        "target_r": target_r,
+        "target_pct": stop_pct * target_r,
+        "thesis_entry_spot": entry_spot,
+        "thesis_invalidation_spot": invalidation,
+        "thesis_target_spot": target_spot,
+        "label_policy": "premium_stop_target_before_force_exit_v1",
+        "hypothesis": hypothesis.to_dict(),
+    }
+    return (
+        plan,
+        UnderlyingThesis(
+            direction=hypothesis.direction,
+            entry_spot=entry_spot,
+            invalidation_spot=invalidation,
+            target_spot=target_spot,
+            timeout_minutes=timeout_minutes,
+        ),
+    )
+
+
 def _opening_range_round_trip_cost(
     suggestion: StrategySuggestion,
     chain: list[OptionChainLeg],
@@ -149,6 +407,56 @@ def _opening_range_round_trip_cost(
     )
 
 
+def _opening_range_marketable_entry(
+    suggestion: StrategySuggestion,
+    chain: list[OptionChainLeg],
+    settings: Settings,
+) -> tuple[float, float, float] | None:
+    """Signed marketable entry net, debit basis, and round-trip commission."""
+    quotes = {(q.expiry, q.strike, q.right): q for q in chain}
+    entry_net = 0.0
+    contracts = 0
+    for leg in suggestion.legs:
+        if leg.sec_type != "OPT":
+            continue
+        if leg.expiry is None or leg.strike is None or leg.right is None:
+            return None
+        quote = quotes.get((leg.expiry, leg.strike, leg.right))
+        if quote is None or quote.bid is None or quote.ask is None:
+            return None
+        if (
+            not math.isfinite(float(quote.bid))
+            or not math.isfinite(float(quote.ask))
+            or quote.bid < 0.0
+            or quote.ask < quote.bid
+        ):
+            return None
+        quantity = int(leg.quantity)
+        contracts += quantity
+        entry_net += (
+            quote.bid * quantity
+            if leg.side == "sell"
+            else -quote.ask * quantity
+        )
+    basis = abs(entry_net) * 100.0
+    if contracts <= 0 or entry_net >= 0.0 or basis <= 0.0:
+        return None
+    commissions = (
+        contracts
+        * 2.0
+        * settings.execution.opening_range_commission_per_contract
+    )
+    return entry_net, basis, commissions
+
+
+def _marketable_entry_component(
+    entry: tuple[float, float, float] | None,
+    index: int,
+) -> float | None:
+    """Mypy-friendly projection from an optional frozen entry tuple."""
+    return entry[index] if entry is not None else None
+
+
 async def scan_symbol(
     symbol: str,
     ibkr: IBKRClient,
@@ -157,6 +465,7 @@ async def scan_symbol(
     resolver: ContractResolver | None = None,
     view_override: tuple[Direction | None, IVRegime | None] | None = None,
     opening_range_signal: OpeningRangeFVGSignal | None = None,
+    managed_hypotheses: tuple[ShadowIntradayHypothesis, ...] = (),
 ) -> ScanResult:
     """Scan one symbol end-to-end and persist snapshot + strategy_scores.
 
@@ -265,10 +574,11 @@ async def scan_symbol(
         default=EarningsInfo(next_date=None, source="unknown"),
         label=f"next_earnings({symbol})",
     )
-    view = infer_view(
+    inferred_view = infer_view(
         bars, current_atm_iv=atm_iv or 0.0, atm_iv_history=iv_history, earnings=earnings
     )
-    view = _override_view(view, view_override)
+    configured_view = _override_view(inferred_view, view_override)
+    view = configured_view
     if settings.scan.opening_range_fvg_enabled and opening_range_signal is not None:
         # The price-action setup supplies the directional thesis. A debit
         # vertical still limits IV exposure when the broad IV regime is high,
@@ -346,14 +656,136 @@ async def scan_symbol(
     terminal_expected_values = {
         item.strategy_name: item.suggestion.expected_value for item in scored
     }
-    opening_range_plan = (
-        opening_range_signal.to_dict() if opening_range_signal is not None else None
+    opening_range_plan: dict[str, object] | None = None
+    opening_range_managed_plan: dict[str, object] | None = None
+    if opening_range_signal is not None:
+        opening_range_plan = opening_range_signal.to_dict()
+        if opening_range_signal.quality is not None:
+            # Keep the dedicated setup features shadow-only.  Persist the raw
+            # inferred regime beside them instead of letting the OR direction
+            # overwrite the historical context needed for later calibration.
+            opening_range_plan["quality"] = quality_payload_with_regime(
+                opening_range_signal.quality,
+                inferred_view,
+            )
+        opening_range_managed_plan = _opening_range_managed_plan(
+            opening_range_signal,
+            observed_at=now,
+            settings=settings,
+        )
+    managed_signal_plans: list[dict[str, object]] = []
+    if opening_range_managed_plan is not None:
+        managed_signal_plans.append(opening_range_managed_plan)
+    shadow_structure_rows: list[dict[str, object]] = []
+    shadow_row_budget = min(
+        _MAX_SHADOW_ROWS_PER_SNAPSHOT,
+        settings.validation.managed_capture_max_active,
     )
+    if (
+        opening_range_plan is not None
+        and opening_range_managed_plan is not None
+        and opening_range_signal is not None
+        and minutes_left is not None
+        and minutes_left > settings.execution.zero_dte_force_exit_minutes
+        and shadow_row_budget > 0
+    ):
+        shadow_timeout_minutes = (
+            minutes_left - settings.execution.zero_dte_force_exit_minutes
+        )
+        try:
+            shadow_structure_rows = [
+                _shadow_structure_score_row(
+                    candidate,
+                    opening_range_managed_plan,
+                    settings,
+                    opening_range_plan=opening_range_plan,
+                )
+                for candidate in build_shadow_structure_grid(
+                    chain,
+                    opening_range_signal,
+                    timeout_minutes=shadow_timeout_minutes,
+                    commission_per_contract=(
+                        settings.execution.opening_range_commission_per_contract
+                    ),
+                    max_candidates=min(
+                        _MAX_GRID_STRUCTURES_PER_PLAN,
+                        shadow_row_budget,
+                    ),
+                )
+            ]
+        except ValueError:
+            # A malformed thesis should not poison the ordinary scanner. The
+            # base score remains available and no alternative is invented.
+            log.exception("shadow structure grid rejected %s thesis", symbol)
+    shadow_row_budget -= len(shadow_structure_rows)
+
+    # Independent generators remain a separate, shadow-only research path.
+    # Newest causal hypotheses get the bounded quote budget first; their rows
+    # never enter ``scored`` and therefore cannot reach alerts or execution.
+    selected_hypotheses = sorted(
+        (
+            item
+            for item in managed_hypotheses
+            if item.symbol == symbol
+            and item.option_expiry == item.session.replace("-", "")
+        ),
+        key=lambda item: (item.signal_at, item.generator, item.hypothesis_id),
+        reverse=True,
+    )[:_MAX_SHADOW_HYPOTHESES_PER_SNAPSHOT]
+    for hypothesis in selected_hypotheses:
+        frozen = _hypothesis_managed_plan(
+            hypothesis,
+            observed_at=now,
+            entry_spot=spot,
+            settings=settings,
+        )
+        if frozen is None:
+            continue
+        managed_plan, thesis = frozen
+        managed_signal_plans.append(managed_plan)
+        if shadow_row_budget <= 0:
+            continue
+        try:
+            candidates = build_shadow_grid_for_thesis(
+                chain,
+                thesis,
+                expiry=hypothesis.option_expiry,
+                target_pct=(
+                    settings.execution.opening_range_stop_pct
+                    * settings.execution.opening_range_target_r_min
+                ),
+                commission_per_contract=(
+                    settings.execution.opening_range_commission_per_contract
+                ),
+                max_candidates=min(
+                    _MAX_GRID_STRUCTURES_PER_PLAN,
+                    shadow_row_budget,
+                ),
+            )
+        except ValueError:
+            log.exception(
+                "shadow hypothesis structure grid rejected %s/%s thesis",
+                symbol,
+                hypothesis.hypothesis_id,
+            )
+            continue
+        rows = [
+            _shadow_structure_score_row(candidate, managed_plan, settings)
+            for candidate in candidates
+        ]
+        shadow_structure_rows.extend(rows)
+        shadow_row_budget -= len(rows)
     opening_range_round_trip_costs: dict[str, float | None] = {}
+    opening_range_marketable_entries: dict[
+        str, tuple[float, float, float] | None
+    ] = {}
     gross_managed_expected_values: dict[str, float | None] = {}
     managed_break_even_probabilities: dict[str, float | None] = {}
     if opening_range_plan is not None:
         for item in scored:
+            opening_range_marketable_entries[item.strategy_name] = (
+                _opening_range_marketable_entry(item.suggestion, chain, settings)
+            )
             opening_range_round_trip_costs[item.strategy_name] = (
                 _opening_range_round_trip_cost(item.suggestion, chain, settings)
             )
@@ -442,6 +874,9 @@ async def scan_symbol(
         "front_expiry": front_expiry,
         "front_dte": front_dte,
         "expected_move": expected_move,
+        "inferred_market_view": asdict(inferred_view),
+        "configured_market_view": asdict(configured_view),
+        "effective_scoring_view": asdict(view),
         "opening_range_fvg": (
             opening_range_plan
             if opening_range_plan is not None
@@ -452,6 +887,10 @@ async def scan_symbol(
             if settings.scan.opening_range_fvg_enabled
             else None
         ),
+        "managed_signal_plans": managed_signal_plans,
+        "shadow_intraday_hypotheses": [
+            item.to_dict() for item in selected_hypotheses
+        ],
     }
     with engine.begin() as conn:
         result = conn.execute(
@@ -471,57 +910,81 @@ async def scan_symbol(
         # inserted_primary_key is a named-tuple; index-subscript is the supported API,
         # but SQLAlchemy's stubs type it as Any so mypy reports a spurious index error.
         snapshot_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
-        if scored:
+        persisted_scores: list[dict[str, object]] = [
+            {
+                "snapshot_id": snapshot_id,
+                "strategy": s.strategy_name,
+                "score": s.score,
+                "rationale": s.rationale,
+                "legs_json": _serialize_legs(s.suggestion.legs),
+                # Persist the StrategySuggestion fields the retry path
+                # needs to render an identical alert. Without these the
+                # retry alert silently drops the UNDEFINED RISK header
+                # and all financial figures.
+                "suggestion_json": {
+                    "defined_risk": s.suggestion.defined_risk,
+                    "credit_or_debit": s.suggestion.credit_or_debit,
+                    "max_loss": s.suggestion.max_loss,
+                    "max_profit": s.suggestion.max_profit,
+                    "prob_profit": s.suggestion.prob_profit,
+                    "suggested_quantity": s.suggestion.suggested_quantity,
+                    "reward_risk": s.suggestion.reward_risk,
+                    "expected_value": s.suggestion.expected_value,
+                    "expected_value_model": (
+                        "managed_outcome_calibration_required_v3"
+                        if opening_range_plan is not None
+                        else "terminal_expiry_v1"
+                    ),
+                    "terminal_expected_value": terminal_expected_values.get(
+                        s.strategy_name
+                    ),
+                    "gross_managed_expected_value": (
+                        gross_managed_expected_values.get(s.strategy_name)
+                    ),
+                    "managed_target_hit_probability": None,
+                    "managed_target_hit_probability_lcb": None,
+                    "managed_probability_model": None,
+                    "managed_break_even_probability": (
+                        managed_break_even_probabilities.get(s.strategy_name)
+                    ),
+                    "estimated_round_trip_cost": (
+                        opening_range_round_trip_costs.get(s.strategy_name)
+                    ),
+                    "managed_marketable_entry_net": (
+                        _marketable_entry_component(
+                            opening_range_marketable_entries.get(s.strategy_name),
+                            0,
+                        )
+                    ),
+                    "managed_marketable_basis_dollars": (
+                        _marketable_entry_component(
+                            opening_range_marketable_entries.get(s.strategy_name),
+                            1,
+                        )
+                    ),
+                    "managed_commission_estimate": (
+                        _marketable_entry_component(
+                            opening_range_marketable_entries.get(s.strategy_name),
+                            2,
+                        )
+                    ),
+                    "risk_tier": s.suggestion.risk_tier,
+                    "opening_range_fvg": (
+                        opening_range_plan
+                    ),
+                    "managed_signal_plan": opening_range_managed_plan,
+                },
+            }
+            for s in scored
+        ]
+        persisted_scores.extend(
+            {"snapshot_id": snapshot_id, **row}
+            for row in shadow_structure_rows
+        )
+        if persisted_scores:
             conn.execute(
                 insert(scores_t),
-                [
-                    {
-                        "snapshot_id": snapshot_id,
-                        "strategy": s.strategy_name,
-                        "score": s.score,
-                        "rationale": s.rationale,
-                        "legs_json": _serialize_legs(s.suggestion.legs),
-                        # Persist the StrategySuggestion fields the retry path
-                        # needs to render an identical alert. Without these the
-                        # retry alert silently drops the UNDEFINED RISK header
-                        # and all financial figures.
-                        "suggestion_json": {
-                            "defined_risk": s.suggestion.defined_risk,
-                            "credit_or_debit": s.suggestion.credit_or_debit,
-                            "max_loss": s.suggestion.max_loss,
-                            "max_profit": s.suggestion.max_profit,
-                            "prob_profit": s.suggestion.prob_profit,
-                            "suggested_quantity": s.suggestion.suggested_quantity,
-                            "reward_risk": s.suggestion.reward_risk,
-                            "expected_value": s.suggestion.expected_value,
-                            "expected_value_model": (
-                                "managed_outcome_calibration_required_v3"
-                                if opening_range_plan is not None
-                                else "terminal_expiry_v1"
-                            ),
-                            "terminal_expected_value": terminal_expected_values.get(
-                                s.strategy_name
-                            ),
-                            "gross_managed_expected_value": (
-                                gross_managed_expected_values.get(s.strategy_name)
-                            ),
-                            "managed_target_hit_probability": None,
-                            "managed_target_hit_probability_lcb": None,
-                            "managed_probability_model": None,
-                            "managed_break_even_probability": (
-                                managed_break_even_probabilities.get(s.strategy_name)
-                            ),
-                            "estimated_round_trip_cost": (
-                                opening_range_round_trip_costs.get(s.strategy_name)
-                            ),
-                            "risk_tier": s.suggestion.risk_tier,
-                            "opening_range_fvg": (
-                                opening_range_plan
-                            ),
-                        },
-                    }
-                    for s in scored
-                ],
+                persisted_scores,
             )
 
     # Prefer the Gateway's entitled API news: it is timely, source-attributed,

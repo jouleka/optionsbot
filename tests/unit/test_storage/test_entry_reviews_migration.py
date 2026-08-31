@@ -334,7 +334,7 @@ def test_upgrade_resumes_after_correct_unique_score_index_prefix(
     with upgraded.connect() as conn:
         assert conn.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0022"
+        ).scalar_one() == "0023"
         assert conn.exec_driver_sql("PRAGMA integrity_check").scalar_one() == "ok"
     upgraded.dispose()
 

@@ -163,6 +163,15 @@ def test_load_pick_records_filters_non_modelable(tmp_path) -> None:
             snapshot_id=sid, strategy="long_call", score=50.0,
             legs_json=[_leg("buy", 100.0, "20260201")],
             suggestion_json={"prob_profit": None, "credit_or_debit": -300.0}))
+        conn.execute(insert(scores).values(  # research row -> never production backtest
+            snapshot_id=sid, strategy="shadow_grid_v1:long_call_d50:x", score=0.0,
+            legs_json=[_leg("buy", 100.0, "20260201")],
+            suggestion_json={
+                "prob_profit": 0.99,
+                "credit_or_debit": -300.0,
+                "shadow_only": True,
+                "admission_enabled": False,
+            }))
 
     picks = load_pick_records(engine)
     assert len(picks) == 1

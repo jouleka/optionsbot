@@ -48,6 +48,50 @@ scan_top_n = 8
 # The first post-close hourly tick settles today's 0DTE counterfactuals and
 # makes them available to Hermes on its next analyst pass.
 outcomes_eval_hours = 1
+managed_capture_enabled = true
+managed_capture_interval_seconds = 15
+managed_capture_offset_seconds = 5
+managed_capture_lock_timeout_seconds = 1.0
+managed_capture_tick_timeout_seconds = 5.0
+managed_capture_max_active = 16
+managed_capture_max_unique_legs = 32
+managed_capture_quote_max_age_seconds = 45
+managed_capture_quote_span_seconds = 10
+managed_capture_max_mark_gap_seconds = 45
+
+[managed_learning]
+enabled = true
+# These identities describe the installed feature encoder and the capture
+# semantics above. A stale explicit value fails configuration validation; omit
+# outcome_policy_version to derive a new fingerprint after changing cadence,
+# polling phase, quote-age, quote-span, or maximum-gap settings.
+feature_schema_version = "managed_capture_features_v1"
+outcome_policy_version = "marketable_nbbo_15s_v1"
+training_interval_hours = 6
+min_train_sessions = 15
+embargo_sessions = 1
+bootstrap_iterations = 2000
+min_sessions = 30
+min_samples = 100
+min_independent_signals = 100
+min_oof_samples = 50
+min_folds = 10
+min_admitted = 20
+min_admitted_sessions = 10
+min_profit_factor = 1.05
+prospective_min_sessions = 10
+prospective_min_independent_signals = 20
+prospective_min_admitted = 5
+prospective_min_admitted_sessions = 3
+prospective_min_incumbent_disagreements = 5
+train_hermes_context_challenger = true
+min_context_disagreements = 20
+min_context_disagreement_sessions = 10
+# Even when enabled, promotion is paper-only and cannot happen on the model's
+# training/OOF history. One frozen challenger at a time must first pass the
+# configured strictly-future cohort; replacements must add value over the
+# frozen incumbent on that same cohort.
+auto_promote = false
 
 [execution]
 enabled = true         # arm the execution engine (manage/exit open positions)

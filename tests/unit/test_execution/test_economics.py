@@ -163,6 +163,35 @@ def test_orb_reconciliation_still_rejects_negative_managed_edge() -> None:
     assert economics.expected_value == pytest.approx(-1.875)
 
 
+def test_reconciliation_uses_three_event_lcb_at_fresh_price() -> None:
+    economics = reconcile_entry_economics(
+        [_leg("buy", 689.0)],  # type: ignore[list-item]
+        {
+            "credit_or_debit": -100.0,
+            "prob_profit": 0.50,
+            "managed_target_hit_probability": 0.50,
+            "managed_target_hit_probability_lcb": 0.30,
+            "managed_stop_probability": 0.30,
+            "managed_timeout_probability": 0.20,
+            "managed_timeout_expected_return": -0.02,
+            "managed_ev_residual_return_q05": -0.03,
+            "opening_range_fvg": {
+                "status": "entry_confirmed",
+                "source": "trusted_daemon",
+                "stop_pct": 0.15,
+                "target_r": 2.0,
+                "target_pct": 0.30,
+            },
+        },
+        fresh_net_per_share=-1.00,
+        estimated_round_trip_cost=1.40,
+    )
+    assert economics is not None
+    assert economics.managed_expected_value == pytest.approx(8.7)
+    assert economics.managed_expected_value_lcb == pytest.approx(5.7)
+    assert economics.expected_value == pytest.approx(5.7)
+
+
 def test_googl_fresh_economics_deducts_round_trip_costs() -> None:
     economics = reconcile_entry_economics(
         [

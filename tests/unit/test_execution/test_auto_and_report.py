@@ -33,6 +33,7 @@ from tests.unit.test_execution.test_engine import (
     CONDOR_LEGS,
     _deps,
     _insert_pick,
+    _managed_prediction,
 )
 from tests.unit.test_execution.test_engine import (
     NOW as ENGINE_NOW,
@@ -174,7 +175,13 @@ async def test_zero_dte_physical_settlement_caps_quantity_before_margin_fallback
         warning="paper BAG omitted margin",
     )
 
-    with patch("optionsbot.execution.engine.is_market_open", return_value=True):
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch(
+            "optionsbot.execution.engine.refresh_managed_prediction",
+            return_value=_managed_prediction(),
+        ) as refresh,
+    ):
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
 
     assert outcome.ok, outcome.message
@@ -182,6 +189,7 @@ async def test_zero_dte_physical_settlement_caps_quantity_before_margin_fallback
     assert placed.kwargs["quantity"] == 1
     assert "physical-settlement fallback capped" in outcome.message
     assert deps.order_client.whatif_combo.await_count == 2
+    assert refresh.call_count == 2
 
 
 @pytest.mark.parametrize("quality_flag", ["delayed", "warming_up"])

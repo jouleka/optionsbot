@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -23,7 +23,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
 from optionsbot.analysis.events import earnings_before_option_expiry
-from optionsbot.config import Settings
+from optionsbot.config import PAPER_PORTS, Settings
 from optionsbot.daemon.market_hours import (
     is_market_open,
     minutes_to_nyse_close,
@@ -32,6 +32,11 @@ from optionsbot.daemon.market_hours import (
 )
 from optionsbot.execution.economics import reconcile_entry_economics
 from optionsbot.execution.gate import can_execute
+from optionsbot.execution.managed_boundary import (
+    ManagedExecutionError,
+    carries_managed_model_packet,
+    refresh_managed_prediction,
+)
 from optionsbot.execution.orders import (
     record_order_quotes,
     set_order_leg_contracts,
@@ -72,6 +77,10 @@ _ACTIVE_STATUSES = ("staged", "submitting", "submitted", "partial", "filled")
 LegSpec = tuple[str, float, str]
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionDeps:
     """Everything execute_pick needs; daemon/commands assembles it from context.
@@ -90,6 +99,7 @@ class ExecutionDeps:
     ibkr_lock: asyncio.Lock
     walk_md: MarketDataClient | None = None
     walk_tasks: set[asyncio.Task[None]] | None = None
+    clock: Callable[[], datetime] = _utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +143,70 @@ def _reject(message: str) -> ExecuteOutcome:
     # "why didn't it trade?" undiagnosable from the logs.
     log.info("execute_pick reject: %s", message)
     return ExecuteOutcome(ok=False, message=f"❌ {message}")
+
+
+def _placement_readiness_error(
+    settings: Settings,
+    *,
+    pick_ts: datetime,
+    expiry_strings: set[str],
+    quotes: Mapping[LegSpec, OptionQuote],
+    now: datetime,
+) -> str | None:
+    """Recheck all time-sensitive entry gates immediately before placement."""
+    if now.tzinfo is None:
+        return "final placement clock lacks a timezone"
+    current = now.astimezone(UTC)
+    if not is_market_open(current):
+        return "market closed while preparing the order"
+
+    normalized_pick_ts = (
+        pick_ts if pick_ts.tzinfo is not None else pick_ts.replace(tzinfo=UTC)
+    ).astimezone(UTC)
+    age = current - normalized_pick_ts
+    max_age = timedelta(minutes=settings.execution.max_pick_age_minutes)
+    if age < timedelta(0):
+        return "pick became future-dated before placement"
+    if age > max_age:
+        return (
+            "pick exceeded max age before placement "
+            f"({age.total_seconds() / 60.0:.1f}m > "
+            f"{settings.execution.max_pick_age_minutes}m)"
+        )
+
+    session_expiry = nyse_session_date(current).strftime("%Y%m%d")
+    if expiry_strings == {session_expiry}:
+        minutes_left = minutes_to_nyse_close(current)
+        if (
+            minutes_left is None
+            or minutes_left <= settings.execution.zero_dte_entry_cutoff_minutes
+        ):
+            remaining = "unknown" if minutes_left is None else f"{minutes_left:.0f}m"
+            return (
+                "0DTE entry cutoff reached before placement: "
+                f"{remaining} to close (requires more than "
+                f"{settings.execution.zero_dte_entry_cutoff_minutes}m)"
+            )
+
+    quote_max_age = timedelta(
+        seconds=settings.execution.entry_quote_max_age_seconds
+    )
+    for quote in quotes.values():
+        if not isinstance(quote.ts, datetime):
+            return "option quote timestamp unknown before placement"
+        quote_ts = (
+            quote.ts
+            if quote.ts.tzinfo is not None
+            else quote.ts.replace(tzinfo=UTC)
+        ).astimezone(UTC)
+        quote_age = current - quote_ts
+        if quote_age < timedelta(0) or quote_age > quote_max_age:
+            return (
+                "option quote aged outside the execution window before placement "
+                f"({quote_age.total_seconds():.0f}s; max "
+                f"{settings.execution.entry_quote_max_age_seconds}s)"
+            )
+    return None
 
 
 def _opening_range_entry_error(
@@ -247,7 +321,7 @@ def _opening_range_entry_error(
 async def execute_pick(
     deps: ExecutionDeps, score_id: int, *, now: datetime | None = None
 ) -> ExecuteOutcome:
-    ts_now = now if now is not None else datetime.now(UTC)
+    ts_now = now if now is not None else deps.clock()
     engine = deps.engine
     settings = deps.settings
 
@@ -297,6 +371,23 @@ async def execute_pick(
     legs: list[dict[str, Any]] = list(pick.legs_json or [])
     symbol: str = pick.symbol
     snapshot_raw = pick.raw_json
+    managed_packet = carries_managed_model_packet(suggestion)
+    if (
+        suggestion.get("shadow_only") is True
+        or suggestion.get("admission_enabled") is False
+    ):
+        return _reject(
+            "research-only candidate is not authorized for order execution"
+        )
+    if managed_packet and not (
+        settings.execution.paper_only
+        and settings.ibkr.paper
+        and settings.ibkr.port in PAPER_PORTS
+    ):
+        return _reject(
+            "managed model admission is restricted to the current recognized "
+            "paper account and paper-only execution interlock"
+        )
 
     # 3. Freshness — stale strikes are the wrong trade.
     pick_ts: datetime = pick.ts
@@ -369,13 +460,24 @@ async def execute_pick(
 
     # Exact-0DTE mode is an execution invariant, not just a scanner preference:
     # stale database picks and future-expiry legs cannot slip through it.
+    expiry_strings = {
+        str(leg.get("expiry"))
+        for leg in legs
+        if leg.get("sec_type", "OPT") == "OPT"
+    }
+    session_expiry = nyse_session_date(ts_now).strftime("%Y%m%d")
+    exact_zero_dte = bool(expiry_strings) and expiry_strings == {session_expiry}
+    if managed_packet and not exact_zero_dte:
+        return _reject("managed model packet is bound to an exact-0DTE structure")
+    # Automatic exact-0DTE entries have always required the promoted managed
+    # model.  The configured 0DTE-only invariant must impose the same boundary
+    # on explicitly confirmed entries; otherwise /execute could bypass a
+    # promotion that changed between the scan and broker placement.
+    managed_exact_zero_dte = managed_packet or (
+        exact_zero_dte
+        and (settings.execution.mode == "auto" or settings.execution.zero_dte_only)
+    )
     if settings.execution.zero_dte_only:
-        expiry_strings = {
-            str(leg.get("expiry"))
-            for leg in legs
-            if leg.get("sec_type", "OPT") == "OPT"
-        }
-        session_expiry = nyse_session_date(ts_now).strftime("%Y%m%d")
         if not expiry_strings or expiry_strings != {session_expiry}:
             return _reject(
                 "0DTE-only mode: every option leg must expire in today's NYSE session"
@@ -554,7 +656,26 @@ async def execute_pick(
         return _reject("fresh option economics do not prove a finite structural loss")
     max_loss_unit = fresh_economics.max_loss
     max_profit_unit = fresh_economics.max_profit
-    fresh_expected_value = fresh_economics.expected_value
+    fresh_managed_prediction = None
+    if managed_exact_zero_dte:
+        try:
+            fresh_managed_prediction = refresh_managed_prediction(
+                engine,
+                settings,
+                score_id,
+                suggestion,
+                fresh_basis_dollars=abs(fresh_net) * 100.0,
+                fresh_costs=round_trip_cost,
+                maximum_profit=max_profit_unit,
+                now=ts_now,
+            )
+        except ManagedExecutionError as exc:
+            return _reject(f"managed model authorization failed: {exc}")
+    fresh_expected_value = (
+        fresh_managed_prediction.expected_value_lcb
+        if fresh_managed_prediction is not None
+        else fresh_economics.expected_value
+    )
     if fresh_expected_value is None and settings.execution.mode == "auto":
         return _reject(
             "fresh executable expected value unavailable — refusing automatic entry"
@@ -610,7 +731,9 @@ async def execute_pick(
         max_loss_unit=max_loss_unit,
         max_profit_unit=max_profit_unit,
         prob_profit=(
-            float(suggestion["managed_target_hit_probability_lcb"])
+            fresh_managed_prediction.target_probability_lcb
+            if fresh_managed_prediction is not None
+            else float(suggestion["managed_target_hit_probability_lcb"])
             if suggestion.get("opening_range_fvg") is not None
             and suggestion.get("managed_target_hit_probability_lcb") is not None
             else float(suggestion["prob_profit"])
@@ -762,6 +885,8 @@ async def execute_pick(
         return _reject(
             f"pick {score_id} already has an order intent; its authorization is consumed"
         )
+    except ValueError as exc:
+        return _reject(f"order staging rejected: {exc}")
     record_order_quotes(
         engine, record.id, kind="decision", step=0, ts=ts_now,
         combo_bid=nbbo[0] if nbbo else None,
@@ -791,7 +916,56 @@ async def execute_pick(
             message=f"❌ execution interlock closed before placement: {execution_verdict.reason}",
             order_id=record.id,
         )
-    transition(engine, record.id, "submitting", now=ts_now)
+    placement_now = deps.clock()
+    placement_error = _placement_readiness_error(
+        settings,
+        pick_ts=pick_ts,
+        expiry_strings=expiry_strings,
+        quotes=quotes,
+        now=placement_now,
+    )
+    if placement_error is not None:
+        transition(
+            engine,
+            record.id,
+            "skipped",
+            error=placement_error,
+            now=placement_now,
+        )
+        return ExecuteOutcome(
+            ok=False,
+            message=f"❌ {placement_error}",
+            order_id=record.id,
+        )
+    if managed_exact_zero_dte:
+        # Promotion may change while account summary or broker what-if awaits.
+        # Rebind immediately before placement; no await follows this check.
+        try:
+            refresh_managed_prediction(
+                engine,
+                settings,
+                score_id,
+                suggestion,
+                fresh_basis_dollars=abs(fresh_net) * 100.0,
+                fresh_costs=round_trip_cost,
+                maximum_profit=max_profit_unit,
+                now=placement_now,
+            )
+        except ManagedExecutionError as exc:
+            error = f"managed model authorization changed before placement: {exc}"
+            transition(
+                engine,
+                record.id,
+                "skipped",
+                error=error,
+                now=placement_now,
+            )
+            return ExecuteOutcome(
+                ok=False,
+                message=f"❌ {error}",
+                order_id=record.id,
+            )
+    transition(engine, record.id, "submitting", now=placement_now)
     try:
         placed = await deps.order_client.place_combo_limit(
             symbol,

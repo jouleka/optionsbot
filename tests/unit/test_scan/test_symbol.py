@@ -468,7 +468,8 @@ async def test_scan_symbol_no_iv_history_when_no_option_data(
 async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
     monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
 ) -> None:
-    from optionsbot.analysis.opening_range_fvg import OpeningRangeFVGSignal
+    from optionsbot.analysis.opening_range_fvg import detect_opening_range_fvg
+    from optionsbot.analysis.types import MarketView
     from optionsbot.scan import symbol as symbol_mod
     from optionsbot.scoring import ScoredStrategy
     from optionsbot.scoring.types import FactorBreakdown
@@ -504,24 +505,36 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
         rationale="test",
     )
     monkeypatch.setattr(symbol_mod, "score_all", MagicMock(return_value=(scored,)))
-    now = datetime.now(UTC)
-    signal = OpeningRangeFVGSignal(
-        signal_id="2026-08-06:SPY:bull:test",
-        session="2026-08-06",
-        timeframe_minutes=1,
-        direction="bull",
-        opening_range_high=401.0,
-        opening_range_low=399.0,
-        breakout_ts=now,
-        fvg_formed_ts=now,
-        fvg_low=401.1,
-        fvg_high=401.2,
-        respected_ts=now,
-        entry_underlying_price=401.3,
-        stop_pct=0.15,
-        target_r=1.5,
-        target_pct=0.225,
+    raw_view = MarketView(
+        direction="bear",
+        direction_strength="weak",
+        iv_regime="high",
+        iv_rank_value=0.8,
+        earnings_in_window=False,
+        warming_up=False,
     )
+    monkeypatch.setattr(symbol_mod, "infer_view", MagicMock(return_value=raw_view))
+    start = datetime(2026, 8, 6, 13, 30, tzinfo=UTC)
+    rows = [(99.5, 100.0, 99.0, 99.6, 100.0) for _ in range(10)]
+    rows.extend(
+        [
+            (99.8, 100.7, 99.7, 100.5, 200.0),
+            (100.5, 101.0, 100.45, 100.9, 150.0),
+            (100.9, 101.1, 100.8, 101.0, 180.0),
+            (100.7, 100.95, 100.7, 100.9, 250.0),
+        ]
+    )
+    intraday = pd.DataFrame(
+        rows,
+        columns=["open", "high", "low", "close", "volume"],
+        index=[start + timedelta(minutes=i) for i in range(len(rows))],
+    )
+    signal = detect_opening_range_fvg(
+        intraday,
+        symbol="SPY",
+        now=start + timedelta(minutes=15),
+    )
+    assert signal is not None and signal.quality is not None
 
     result = await scan_symbol(
         "SPY",
@@ -540,6 +553,9 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
                 strategy_scores.c.snapshot_id == result.snapshot_id
             )
         ).one()
+        snapshot = conn.execute(
+            select(snapshots).where(snapshots.c.id == result.snapshot_id)
+        ).one()
     assert stored.suggestion_json["expected_value"] is None
     assert stored.suggestion_json["gross_managed_expected_value"] is None
     assert stored.suggestion_json["managed_target_hit_probability_lcb"] is None
@@ -549,6 +565,278 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
     assert stored.suggestion_json["expected_value_model"] == (
         "managed_outcome_calibration_required_v3"
     )
+    quality = stored.suggestion_json["opening_range_fvg"]["quality"]
+    assert quality["schema_version"] == "opening_range_quality_v1"
+    assert quality["calibration_status"] == "shadow_unvalidated"
+    assert quality["admission_enabled"] is False
+    assert quality["regime"]["raw_direction"] == "bear"
+    assert quality["regime"]["raw_iv_regime"] == "high"
+    assert quality["regime"]["direction_opposed"] is True
+    assert snapshot.raw_json["inferred_market_view"]["direction"] == "bear"
+    assert snapshot.raw_json["configured_market_view"]["direction"] == "bear"
+    assert snapshot.raw_json["effective_scoring_view"]["direction"] == "bull"
+    assert snapshot.raw_json["effective_scoring_view"]["direction_strength"] == "strong"
+    assert snapshot.regime_dir == "bull"
+    assert snapshot.regime_iv == "neutral"
+
+
+async def test_orb_scan_persists_optimizer_grid_only_as_shadow_scores(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    from optionsbot.analysis.opening_range_fvg import OpeningRangeFVGSignal
+    from optionsbot.analysis.structure_optimizer import ShadowStructureCandidate
+    from optionsbot.scan import symbol as symbol_mod
+    from optionsbot.strategies import Leg
+
+    scan_settings.scan.opening_range_fvg_enabled = True
+    signal = OpeningRangeFVGSignal(
+        signal_id="2026-08-28:SPY:bull:fvg-shadow-grid",
+        session="2026-08-28",
+        timeframe_minutes=1,
+        direction="bull",
+        opening_range_high=100.5,
+        opening_range_low=99.5,
+        breakout_ts=datetime(2026, 8, 28, 13, 41, tzinfo=UTC),
+        fvg_formed_ts=datetime(2026, 8, 28, 13, 43, tzinfo=UTC),
+        fvg_low=100.4,
+        fvg_high=100.6,
+        respected_ts=datetime(2026, 8, 28, 13, 45, tzinfo=UTC),
+        entry_underlying_price=101.0,
+        stop_pct=0.15,
+        target_r=1.5,
+        target_pct=0.225,
+    )
+    candidate = ShadowStructureCandidate(
+        candidate_id="a" * 64,
+        strategy="long_call_d50",
+        legs=(
+            Leg(
+                symbol="SPY",
+                side="buy",
+                expiry="20260828",
+                strike=101.0,
+                right="C",
+            ),
+        ),
+        entry_debit_dollars=100.0,
+        maximum_loss_dollars=100.0,
+        maximum_profit_dollars=20.0,
+        round_trip_friction_dollars=11.4,
+        desired_premium_target_dollars=22.5,
+        premium_target_feasible=False,
+        target_scenario_pnl_dollars=15.0,
+        invalidation_scenario_pnl_dollars=-20.0,
+        timeout_scenario_pnl_dollars=-8.0,
+        features={
+            "structure_kind": "long_option",
+            "leg_count": 1,
+            "friction_fraction": 0.114,
+            "net_delta": 0.5,
+            "net_gamma": 0.03,
+            "net_theta": -0.12,
+            "net_vega": 0.04,
+            "thesis_entry_spot": 101.0,
+            "thesis_invalidation_spot": 100.4,
+            "thesis_target_spot": 101.9,
+            "underlying_risk_fraction": 0.006,
+            "underlying_reward_risk": 1.5,
+            "timeout_minutes": 90.0,
+            "premium_target_feasible": False,
+        },
+    )
+    grid = MagicMock(return_value=(candidate,))
+    monkeypatch.setattr(symbol_mod, "build_shadow_structure_grid", grid)
+    monkeypatch.setattr(symbol_mod, "minutes_to_nyse_close", MagicMock(return_value=120.0))
+    monkeypatch.setattr(symbol_mod, "score_all", MagicMock(return_value=()))
+
+    result = await scan_symbol(
+        "SPY",
+        mock_ibkr_for_scan,
+        scan_engine,
+        scan_settings,
+        opening_range_signal=signal,
+    )
+
+    # The alternative is persisted for managed capture but never enters the
+    # ScanResult collection consumed by ranking, alerts, and execution.
+    assert result.scored == ()
+    with scan_engine.connect() as conn:
+        rows = conn.execute(
+            select(strategy_scores).where(
+                strategy_scores.c.snapshot_id == result.snapshot_id
+            )
+        ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.strategy == f"shadow_grid_v1:long_call_d50:{'a' * 64}"
+    assert row.score == 0.0
+    assert row.suggestion_json["shadow_only"] is True
+    assert row.suggestion_json["admission_enabled"] is False
+    assert row.suggestion_json["premium_target_feasible"] is False
+    assert row.suggestion_json["managed_marketable_entry_net"] == -1.0
+    assert row.suggestion_json["managed_marketable_basis_dollars"] == 100.0
+    assert row.suggestion_json["managed_commission_estimate"] == pytest.approx(1.4)
+    assert row.suggestion_json["structure_target_scenario_pnl_dollars"] == 15.0
+    assert grid.call_args.kwargs["timeout_minutes"] == pytest.approx(90.0)
+
+
+async def test_independent_hypothesis_persists_only_row_local_shadow_plan(
+    monkeypatch, mock_ibkr_for_scan, scan_engine, scan_settings  # type: ignore[no-untyped-def]
+) -> None:
+    import hashlib
+
+    from optionsbot.analysis.intraday_hypotheses import (
+        CausalWindow,
+        MomentumMeasurements,
+        OpeningMomentumFeatures,
+        ShadowIntradayHypothesis,
+    )
+    from optionsbot.analysis.structure_optimizer import ShadowStructureCandidate
+    from optionsbot.scan import symbol as symbol_mod
+    from optionsbot.strategies import Leg
+
+    scan_settings.scan.opening_range_fvg_enabled = True
+    observed = datetime.now(UTC)
+    signal_at = observed - timedelta(minutes=5)
+    # The generator's thesis outlives the session safety boundary; persistence
+    # must cap it at force-exit rather than keep the research lifetime.
+    expires_at = observed + timedelta(minutes=120)
+    features = OpeningMomentumFeatures(
+        causal_window=CausalWindow(
+            start_at=signal_at - timedelta(minutes=30),
+            end_at=signal_at,
+            last_bar_started_at=signal_at - timedelta(minutes=1),
+            last_bar_completed_at=signal_at,
+            bar_count=30,
+        ),
+        momentum=MomentumMeasurements(
+            open_price=399.0,
+            close_price=400.0,
+            high_price=400.2,
+            low_price=398.8,
+            return_pct=1.0 / 399.0,
+            directional_return_pct=1.0 / 399.0,
+            range_pct=1.4 / 399.0,
+            atr_14=0.8,
+            directional_return_atr_ratio=1.25,
+            directional_return_atr_normalized=1.25 / 2.25,
+            directional_efficiency=0.7,
+            directional_close_location=0.85,
+            vwap=399.5,
+            directional_vwap_distance_pct=0.5 / 399.5,
+            vwap_direction_aligned=True,
+            total_volume=3_000_000.0,
+            mean_volume=100_000.0,
+            relative_volume=1.4,
+            relative_volume_normalized=1.4 / 2.4,
+        ),
+        opening_window_minutes=30,
+        thesis_lifetime_minutes=90,
+        second_half_volume_ratio=1.2,
+        second_half_volume_normalized=1.2 / 2.2,
+        parameter_version="intraday_shadow_windows_v1",
+    )
+    session = observed.date().isoformat()
+    hypothesis = ShadowIntradayHypothesis(
+        hypothesis_id="opening-momentum-causal-id",
+        generator="opening_momentum_continuation",
+        symbol="SPY",
+        direction="bull",
+        session=session,
+        option_expiry=session.replace("-", ""),
+        signal_at=signal_at,
+        observed_at=observed,
+        causal_cutoff_at=signal_at,
+        thesis_expires_at=expires_at,
+        reference_price=400.0,
+        invalidation_level=399.0,
+        features=features,
+    )
+    candidate = ShadowStructureCandidate(
+        candidate_id="b" * 64,
+        strategy="long_call_d50",
+        legs=(
+            Leg(
+                symbol="SPY",
+                side="buy",
+                expiry=hypothesis.option_expiry,
+                strike=400.0,
+                right="C",
+            ),
+        ),
+        entry_debit_dollars=100.0,
+        maximum_loss_dollars=100.0,
+        maximum_profit_dollars=None,
+        round_trip_friction_dollars=11.4,
+        desired_premium_target_dollars=22.5,
+        premium_target_feasible=True,
+        target_scenario_pnl_dollars=30.0,
+        invalidation_scenario_pnl_dollars=-25.0,
+        timeout_scenario_pnl_dollars=-8.0,
+        features={
+            "structure_kind": "long_option",
+            "leg_count": 1,
+            "friction_fraction": 0.114,
+            "net_delta": 0.5,
+            "net_gamma": 0.03,
+            "net_theta": -0.12,
+            "net_vega": 0.04,
+            "thesis_entry_spot": 400.0,
+            "thesis_invalidation_spot": 399.0,
+            "thesis_target_spot": 401.5,
+            "underlying_risk_fraction": 0.0025,
+            "underlying_reward_risk": 1.5,
+            "timeout_minutes": 60.0,
+            "premium_target_feasible": True,
+        },
+    )
+    grid = MagicMock(return_value=(candidate,))
+    monkeypatch.setattr(symbol_mod, "build_shadow_grid_for_thesis", grid)
+    monkeypatch.setattr(
+        symbol_mod,
+        "nyse_session_close_utc",
+        MagicMock(return_value=observed + timedelta(minutes=90)),
+    )
+    monkeypatch.setattr(symbol_mod, "score_all", MagicMock(return_value=()))
+
+    result = await scan_symbol(
+        "SPY",
+        mock_ibkr_for_scan,
+        scan_engine,
+        scan_settings,
+        managed_hypotheses=(hypothesis,),
+    )
+
+    assert result.scored == ()
+    with scan_engine.connect() as conn:
+        snapshot = conn.execute(
+            select(snapshots).where(snapshots.c.id == result.snapshot_id)
+        ).one()
+        row = conn.execute(
+            select(strategy_scores).where(
+                strategy_scores.c.snapshot_id == result.snapshot_id
+            )
+        ).one()
+    plan = row.suggestion_json["managed_signal_plan"]
+    assert plan["signal_id"] == hypothesis.hypothesis_id
+    assert plan["generator"] == "opening_momentum_continuation"
+    assert plan["admission_enabled"] is False
+    assert plan["stop_pct"] == scan_settings.execution.opening_range_stop_pct
+    assert plan["target_r"] == scan_settings.execution.opening_range_target_r_min
+    persisted_expiry = datetime.fromisoformat(plan["thesis_expires_at"])
+    assert abs(
+        (persisted_expiry - (observed + timedelta(minutes=60))).total_seconds()
+    ) < 2.0
+    assert "opening_range_fvg" not in row.suggestion_json
+    signal_hash = hashlib.sha256(hypothesis.hypothesis_id.encode()).hexdigest()[:12]
+    assert row.strategy == (
+        f"shadow_grid_v1:long_call_d50:{signal_hash}:{'b' * 64}"
+    )
+    assert snapshot.raw_json["managed_signal_plans"] == [plan]
+    assert snapshot.raw_json["shadow_intraday_hypotheses"][0][
+        "hypothesis_id"
+    ] == hypothesis.hypothesis_id
+    assert grid.call_args.kwargs["max_candidates"] <= 2
 
 
 async def test_scan_symbol_passes_back_dte_gap_to_get_chain(

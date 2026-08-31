@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import UTC, date, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, date, datetime, timedelta
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from sqlalchemy import insert, select
 
@@ -71,6 +71,92 @@ async def test_run_scan_tick_scans_each_watchlist_symbol(
         assert call.kwargs["resolver"] is daemon_context.resolver
 
 
+async def test_or_scan_reuses_intraday_bars_for_active_shadow_hypothesis(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.scan.auto_screen = False
+    daemon_context.settings.scan.opening_range_fvg_enabled = True
+    daemon_context.settings.execution.zero_dte_only = True
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC))
+        )
+    now = datetime.now(UTC)
+    hypothesis = MagicMock()
+    hypothesis.session = now.date().isoformat()
+    hypothesis.option_expiry = now.strftime("%Y%m%d")
+    hypothesis.signal_at = now.replace(microsecond=0)
+    hypothesis.thesis_expires_at = now.replace(microsecond=0) + timedelta(hours=1)
+    hypothesis.generator = "failed_breakout_reversal"
+    hypothesis.hypothesis_id = "shadow-failed-breakout"
+    history = MagicMock()
+    intraday = MagicMock(name="completed_intraday_bars")
+    history.get_intraday_history = AsyncMock(return_value=intraday)
+
+    with patch(
+        "optionsbot.daemon.scan_runner.is_market_open", return_value=True
+    ), patch(
+        "optionsbot.daemon.scan_runner.HistoryClient", return_value=history
+    ), patch(
+        "optionsbot.daemon.scan_runner.detect_opening_range_fvg",
+        return_value=None,
+    ), patch(
+        "optionsbot.daemon.scan_runner.generate_shadow_hypotheses",
+        return_value=(hypothesis,),
+    ) as generate, patch(
+        "optionsbot.daemon.scan_runner.nyse_session_close_utc",
+        return_value=now + timedelta(hours=2),
+    ), patch(
+        "optionsbot.daemon.scan_runner.nyse_session_date",
+        return_value=now.date(),
+    ), patch(
+        "optionsbot.daemon.scan_runner.scan_symbol",
+        new=AsyncMock(return_value=_fake_scan_result("SPY")),
+    ) as scan:
+        summary = await run_scan_tick(daemon_context)
+
+    assert summary.tickers_scanned == 1
+    history.get_intraday_history.assert_awaited_once()
+    assert generate.call_args.args[0] is intraday
+    scan.assert_awaited_once()
+    assert scan.await_args.kwargs["opening_range_signal"] is None
+    assert scan.await_args.kwargs["managed_hypotheses"] == (hypothesis,)
+
+
+async def test_or_scan_avoids_chain_when_no_or_or_active_shadow_hypothesis(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.scan.auto_screen = False
+    daemon_context.settings.scan.opening_range_fvg_enabled = True
+    daemon_context.settings.execution.zero_dte_only = True
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC))
+        )
+    history = MagicMock()
+    history.get_intraday_history = AsyncMock(return_value=MagicMock())
+
+    with patch(
+        "optionsbot.daemon.scan_runner.is_market_open", return_value=True
+    ), patch(
+        "optionsbot.daemon.scan_runner.HistoryClient", return_value=history
+    ), patch(
+        "optionsbot.daemon.scan_runner.detect_opening_range_fvg",
+        return_value=None,
+    ), patch(
+        "optionsbot.daemon.scan_runner.generate_shadow_hypotheses",
+        return_value=(),
+    ), patch(
+        "optionsbot.daemon.scan_runner.scan_symbol",
+        new=AsyncMock(),
+    ) as scan:
+        summary = await run_scan_tick(daemon_context)
+
+    assert summary.tickers_scanned == 1
+    history.get_intraday_history.assert_awaited_once()
+    scan.assert_not_awaited()
+
+
 async def test_run_scan_tick_passes_view_override_from_watchlist(
     daemon_context: DaemonContext,
 ) -> None:
@@ -111,6 +197,40 @@ async def test_run_scan_tick_persists_scan_runs_row(
     assert rows[0].finished is not None
 
 
+async def test_managed_capture_registration_runs_before_any_alert_candidate(
+    daemon_context: DaemonContext,
+) -> None:
+    """A no-edge/no-alert tick still hands its persisted snapshot to shadow capture."""
+    with daemon_context.engine.begin() as conn:
+        conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
+
+    with (
+        patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True),
+        patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(return_value=_fake_scan_result("SPY")),
+        ),
+        patch(
+            "optionsbot.daemon.managed_capture.register_snapshot_opportunities",
+            return_value=1,
+        ) as register,
+        patch(
+            "optionsbot.daemon.scan_runner.enqueue_alert",
+            new=AsyncMock(),
+        ) as enqueue,
+    ):
+        summary = await run_scan_tick(daemon_context)
+
+    register.assert_called_once_with(
+        daemon_context.engine,
+        daemon_context.settings,
+        42,
+        decision_batch_id=ANY,
+    )
+    enqueue.assert_not_awaited()
+    assert summary.alerts_enqueued == 0
+
+
 async def test_run_scan_tick_records_per_symbol_errors_without_aborting_tick(
     daemon_context: DaemonContext,
 ) -> None:
@@ -146,7 +266,7 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
         sug = MagicMock()
         sug.legs = ()
         sug.credit_or_debit = 0.0
-        sug.max_loss = 0.0
+        sug.max_loss = 100.0
         sug.max_profit = 0.0
         sug.prob_profit = 0.5
         sug.suggested_quantity = 1
@@ -175,7 +295,7 @@ async def test_run_scan_tick_enqueues_top_n_above_floor(
         conn.execute(insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC)))
 
     # Task 6: PositionsClient must return a large USD equity so all picks pass
-    # the single-trade-cap affordability gate (max_loss=0.0 always fits).
+    # the single-trade-cap affordability gate (a $100 structure fits).
     from decimal import Decimal
 
     from optionsbot.ibkr.types import AccountSummary
@@ -331,7 +451,7 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
         sug.expected_value = score        # positive -> has_positive_edge True
         # Task 6: new gate requires defined_risk=True and numeric max_loss within cap.
         sug.defined_risk = True
-        sug.max_loss = 0.0               # 0.0 always fits any single-trade cap
+        sug.max_loss = 100.0             # a $100 defined-risk structure fits
         return ScoredStrategy(
             strategy_name=name, score=score,
             factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
@@ -351,7 +471,7 @@ async def test_run_scan_tick_alerts_top_n_across_all_symbols(
         return spy if symbol == "SPY" else aapl
 
     # Task 6: patch PositionsClient so the affordability gate sees a large USD
-    # equity (all picks have max_loss=0.0 and always pass the cap).
+    # equity (all picks have $100 max loss and pass the cap).
     _fake_summary = AccountSummary(
         net_liquidation=Decimal("50000"), buying_power=None,
         available_funds=Decimal("50000"), currency="USD",

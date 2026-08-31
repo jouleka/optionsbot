@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import insert, select
 
+from optionsbot.admission_policy import (
+    AdmissionCandidate,
+    AdmissionSelectionPolicy,
+    admission_blockers,
+    rank_admission_candidates,
+)
+from optionsbot.analysis.intraday_hypotheses import (
+    HypothesisResearchConfig,
+    ShadowIntradayHypothesis,
+    generate_shadow_hypotheses,
+)
 from optionsbot.analysis.opening_range_fvg import (
     OpeningRangeFVGSignal,
     detect_opening_range_fvg,
@@ -23,6 +34,7 @@ from optionsbot.daemon.gateway_health import BUDGET_TIMEOUT_SUFFIX
 from optionsbot.daemon.market_hours import (
     is_last_nyse_session_of_week,
     is_market_open,
+    nyse_session_close_utc,
     nyse_session_date,
 )
 from optionsbot.ibkr.history import HistoryClient
@@ -30,16 +42,47 @@ from optionsbot.ibkr.positions import PositionsClient
 from optionsbot.observability import bind_log_context
 from optionsbot.scan import scan_symbol
 from optionsbot.scoring import ScoredStrategy
-from optionsbot.scoring.composite import edge_sort_key, has_positive_edge
 from optionsbot.screener.screen import screen_universe
 from optionsbot.screener.universe import (
     DEFAULT_UNIVERSE,
     zero_dte_universe_for_session,
 )
-from optionsbot.storage.schema import scan_runs, watchlist
+from optionsbot.storage.schema import managed_opportunities, scan_runs, strategy_scores, watchlist
 from optionsbot.strategies.base import StrategySuggestion
 
 log = logging.getLogger(__name__)
+
+_MAX_ACTIVE_SHADOW_HYPOTHESES_PER_SYMBOL = 3
+
+
+def _active_shadow_hypotheses(
+    hypotheses: tuple[ShadowIntradayHypothesis, ...],
+    *,
+    now: datetime,
+    force_exit_minutes: int,
+) -> tuple[ShadowIntradayHypothesis, ...]:
+    """Keep same-session causal theses that can still receive path labels."""
+    now_utc = now.astimezone(UTC)
+    close = nyse_session_close_utc(now_utc)
+    if close is None:
+        return ()
+    force_exit_at = close - timedelta(minutes=force_exit_minutes)
+    session = nyse_session_date(now_utc).isoformat()
+    active = [
+        item
+        for item in hypotheses
+        if item.session == session
+        and item.option_expiry == session.replace("-", "")
+        and item.signal_at.astimezone(UTC) <= now_utc
+        and now_utc < min(item.thesis_expires_at.astimezone(UTC), force_exit_at)
+    ]
+    return tuple(
+        sorted(
+            active,
+            key=lambda item: (item.signal_at, item.generator, item.hypothesis_id),
+            reverse=True,
+        )[:_MAX_ACTIVE_SHADOW_HYPOTHESES_PER_SYMBOL]
+    )
 
 
 def is_proposable(
@@ -70,34 +113,26 @@ def candidate_admission_blockers(
     predicate prevents the learning loop from seeing a vague "one of several
     gates failed" result that it cannot adapt to on its next pass.
     """
-    blockers: list[str] = []
     suggestion = scored.suggestion
-    if scored.score < score_floor:
-        blockers.append(
-            f"score_below_floor(score={scored.score:.2f},floor={score_floor:.2f})"
-        )
-    if not has_positive_edge(suggestion):
-        expected_value = suggestion.expected_value
-        ev_text = (
-            f"{float(expected_value):.2f}"
-            if isinstance(expected_value, int | float) and math.isfinite(expected_value)
-            else "unavailable"
-        )
-        blockers.append(f"non_positive_edge(expected_value={ev_text})")
-    if not suggestion.defined_risk or suggestion.max_loss is None:
-        blockers.append("undefined_or_missing_max_loss")
-    elif account_value_usd is None:
-        blockers.append("live_equity_unavailable")
-    else:
-        max_loss = float(suggestion.max_loss)
-        risk_cap = float(account_value_usd) * float(single_trade_cap_pct)
-        if max_loss > risk_cap:
-            blockers.append(
-                "single_contract_risk_over_cap("
-                f"max_loss={max_loss:.2f},cap={risk_cap:.2f},"
-                f"cap_pct={single_trade_cap_pct:.4f})"
-            )
-    return blockers
+    policy = AdmissionSelectionPolicy(
+        score_floor=float(score_floor),
+        single_trade_cap_pct=float(single_trade_cap_pct),
+        max_candidates_per_batch=1,
+        max_admitted_per_session=1,
+    )
+    return admission_blockers(
+        AdmissionCandidate(
+            payload=scored,
+            signal_id=f"candidate:{scored.strategy_name}",
+            score=float(scored.score),
+            expected_value=suggestion.expected_value,
+            defined_risk=suggestion.defined_risk,
+            max_loss=suggestion.max_loss,
+            account_value_available=account_value_usd is not None,
+            account_value_usd=account_value_usd,
+        ),
+        policy,
+    )
 
 
 def rank_alert_candidates(
@@ -105,6 +140,8 @@ def rank_alert_candidates(
     score_floor: float,
     account_value_usd: float | None = None,
     single_trade_cap_pct: float = 0.10,
+    *,
+    signal_ids: Mapping[tuple[int, str], str] | None = None,
 ) -> list[tuple[str, ScoredStrategy, int]]:
     """Alert-worthy picks: ``score >= score_floor``, positive edge (EV>0), AND
     proposable at the current bankroll; sorted by sign-aware edge descending.
@@ -122,18 +159,61 @@ def rank_alert_candidates(
     AccountSummary.net_liquidation_usd). The precise execution money-gates
     (whatIf margin vs available-funds) remain downstream in execute_pick.
     """
-    above = [
-        p
-        for p in picks
-        if not candidate_admission_blockers(
-            p[1],
-            score_floor,
-            account_value_usd,
-            single_trade_cap_pct,
+    policy = AdmissionSelectionPolicy(
+        score_floor=float(score_floor),
+        single_trade_cap_pct=float(single_trade_cap_pct),
+        max_candidates_per_batch=max(1, len(picks)),
+        max_admitted_per_session=max(1, len(picks)),
+    )
+    candidates = [
+        AdmissionCandidate(
+            payload=pick,
+            signal_id=(
+                signal_ids.get((pick[2], pick[1].strategy_name))
+                if signal_ids is not None
+                else None
+            )
+            or f"candidate:{pick[2]}:{pick[1].strategy_name}",
+            score=float(pick[1].score),
+            expected_value=pick[1].suggestion.expected_value,
+            defined_risk=pick[1].suggestion.defined_risk,
+            max_loss=pick[1].suggestion.max_loss,
+            account_value_available=account_value_usd is not None,
+            account_value_usd=account_value_usd,
         )
+        for pick in picks
     ]
-    above.sort(key=lambda p: edge_sort_key(p[1].suggestion), reverse=True)
-    return above
+    return [candidate.payload for candidate in rank_admission_candidates(candidates, policy)]
+
+
+def _managed_signal_ids(
+    context: DaemonContext,
+    picks: list[tuple[str, ScoredStrategy, int]],
+) -> dict[tuple[int, str], str]:
+    """Bind persisted managed rows to their immutable thesis identity."""
+
+    snapshot_ids = {snapshot_id for _, _, snapshot_id in picks}
+    if not snapshot_ids:
+        return {}
+    with context.engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                strategy_scores.c.snapshot_id,
+                strategy_scores.c.strategy,
+                managed_opportunities.c.signal_id,
+            )
+            .join(
+                managed_opportunities,
+                managed_opportunities.c.strategy_score_id == strategy_scores.c.id,
+            )
+            .where(strategy_scores.c.snapshot_id.in_(snapshot_ids))
+            .where(managed_opportunities.c.admission_eligible == 1)
+            .where(managed_opportunities.c.shadow_only == 0)
+        ).all()
+    return {
+        (int(row.snapshot_id), str(row.strategy)): str(row.signal_id)
+        for row in rows
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,13 +273,17 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         for sym, override in symbols:
             with bind_log_context(symbol=sym):
                 opening_signal: OpeningRangeFVGSignal | None = None
+                managed_hypotheses: tuple[ShadowIntradayHypothesis, ...] = ()
+                intraday_checked = False
                 try:
-                    if context.settings.scan.opening_range_fvg_enabled:
+                    shadow_research_enabled = (
+                        context.settings.validation.managed_capture_enabled
+                        and context.settings.execution.zero_dte_only
+                    )
+                    if context.settings.scan.opening_range_fvg_enabled or shadow_research_enabled:
                         async with context.ibkr_lock:
                             intraday = await asyncio.wait_for(
-                                HistoryClient(
-                                    context.ibkr, context.resolver
-                                ).get_intraday_history(
+                                HistoryClient(context.ibkr, context.resolver).get_intraday_history(
                                     sym,
                                     timeframe_minutes=(
                                         context.settings.scan.opening_range_timeframe_minutes
@@ -207,67 +291,108 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                                 ),
                                 timeout=context.settings.scan.scan_symbol_timeout_s,
                             )
+                        intraday_checked = True
                         tickers_scanned += 1
                         signal_checked_at = datetime.now(UTC)
-                        opening_signal = detect_opening_range_fvg(
-                            intraday,
-                            symbol=sym,
-                            now=signal_checked_at,
-                            timeframe_minutes=(
-                                context.settings.scan.opening_range_timeframe_minutes
-                            ),
-                            opening_range_minutes=(
-                                context.settings.scan.opening_range_minutes
-                            ),
-                            entry_window_minutes=(
-                                context.settings.scan.opening_range_entry_window_minutes
-                            ),
-                            stop_pct=context.settings.execution.opening_range_stop_pct,
-                            target_r_min=(
-                                context.settings.execution.opening_range_target_r_min
-                            ),
-                            target_r_max=(
-                                context.settings.execution.opening_range_target_r_max
-                            ),
-                        )
-                        if opening_signal is None:
-                            continue
-                        signal_completed = opening_signal.respected_ts + timedelta(
-                            minutes=opening_signal.timeframe_minutes
-                        )
-                        signal_age = signal_checked_at - signal_completed.astimezone(UTC)
-                        if signal_age < timedelta(0) or signal_age > timedelta(
-                            minutes=(
-                                context.settings.scan.opening_range_signal_max_age_minutes
+                        if context.settings.scan.opening_range_fvg_enabled:
+                            opening_signal = detect_opening_range_fvg(
+                                intraday,
+                                symbol=sym,
+                                now=signal_checked_at,
+                                timeframe_minutes=(
+                                    context.settings.scan.opening_range_timeframe_minutes
+                                ),
+                                opening_range_minutes=(context.settings.scan.opening_range_minutes),
+                                entry_window_minutes=(
+                                    context.settings.scan.opening_range_entry_window_minutes
+                                ),
+                                stop_pct=(context.settings.execution.opening_range_stop_pct),
+                                target_r_min=(
+                                    context.settings.execution.opening_range_target_r_min
+                                ),
+                                target_r_max=(
+                                    context.settings.execution.opening_range_target_r_max
+                                ),
                             )
+                            if opening_signal is not None:
+                                signal_completed = opening_signal.respected_ts + timedelta(
+                                    minutes=opening_signal.timeframe_minutes
+                                )
+                                signal_age = signal_checked_at - signal_completed.astimezone(UTC)
+                                if signal_age < timedelta(0) or signal_age > timedelta(
+                                    minutes=(
+                                        context.settings.scan.opening_range_signal_max_age_minutes
+                                    )
+                                ):
+                                    log.info(
+                                        "opening-range signal stale: id=%s age=%.1fm",
+                                        opening_signal.signal_id,
+                                        signal_age.total_seconds() / 60.0,
+                                    )
+                                    opening_signal = None
+                                else:
+                                    log.info(
+                                        "opening-range FVG entry confirmed: direction=%s "
+                                        "range=%.4f/%.4f gap=%.4f/%.4f target=%.1fR id=%s",
+                                        opening_signal.direction,
+                                        opening_signal.opening_range_low,
+                                        opening_signal.opening_range_high,
+                                        opening_signal.fvg_low,
+                                        opening_signal.fvg_high,
+                                        opening_signal.target_r,
+                                        opening_signal.signal_id,
+                                    )
+                        if shadow_research_enabled:
+                            try:
+                                generated = generate_shadow_hypotheses(
+                                    intraday,
+                                    symbol=sym,
+                                    observed_at=signal_checked_at,
+                                    config=HypothesisResearchConfig(
+                                        timeframe_minutes=(
+                                            context.settings.scan.opening_range_timeframe_minutes
+                                        ),
+                                        opening_range_minutes=(
+                                            context.settings.scan.opening_range_minutes
+                                        ),
+                                    ),
+                                )
+                                managed_hypotheses = _active_shadow_hypotheses(
+                                    generated,
+                                    now=signal_checked_at,
+                                    force_exit_minutes=(
+                                        context.settings.execution.zero_dte_force_exit_minutes
+                                    ),
+                                )
+                            except Exception:  # noqa: BLE001 -- shadow research degrades closed
+                                log.exception(
+                                    "independent shadow hypothesis generation failed for %s",
+                                    sym,
+                                )
+                                managed_hypotheses = ()
+                        # Preserve the existing OR-gated scanner economics: an
+                        # independent hypothesis may justify a bounded chain
+                        # capture, but it never becomes a production signal.
+                        if (
+                            context.settings.scan.opening_range_fvg_enabled
+                            and opening_signal is None
+                            and not managed_hypotheses
                         ):
-                            log.info(
-                                "opening-range signal stale: id=%s age=%.1fm",
-                                opening_signal.signal_id,
-                                signal_age.total_seconds() / 60.0,
-                            )
                             continue
-                        log.info(
-                            "opening-range FVG entry confirmed: direction=%s "
-                            "range=%.4f/%.4f gap=%.4f/%.4f target=%.1fR id=%s",
-                            opening_signal.direction,
-                            opening_signal.opening_range_low,
-                            opening_signal.opening_range_high,
-                            opening_signal.fvg_low,
-                            opening_signal.fvg_high,
-                            opening_signal.target_r,
-                            opening_signal.signal_id,
-                        )
                     # Serialize one complete symbol quote set, then release the
                     # session so a queued exit check takes priority before the
                     # next symbol.  asyncio.Lock wakes waiters FIFO.
                     async with context.ibkr_lock:
                         result = await asyncio.wait_for(
                             scan_symbol(
-                                sym, context.ibkr, context.engine, context.settings,
+                                sym,
+                                context.ibkr,
+                                context.engine,
+                                context.settings,
                                 resolver=context.resolver,
                                 view_override=override,
                                 opening_range_signal=opening_signal,
+                                managed_hypotheses=managed_hypotheses,
                             ),
                             timeout=context.settings.scan.scan_symbol_timeout_s,
                         )
@@ -285,8 +410,54 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                     log.exception("scan_symbol failed for %s", sym)
                     errors.append(f"{sym}: {type(e).__name__}: {e}")
                     continue
-                if not context.settings.scan.opening_range_fvg_enabled:
+                if not intraday_checked:
                     tickers_scanned += 1
+                # Prospective path capture is deliberately upstream of every
+                # admission decision.  Register the persisted candidate even
+                # when EV is unavailable, alerting is paused, affordability
+                # fails, or Hermes later says no.  This call is DB-only; broker
+                # marks are collected by the separately bounded shadow job.
+                try:
+                    from optionsbot.daemon.managed_capture import (
+                        register_snapshot_opportunities,
+                    )
+
+                    registered = register_snapshot_opportunities(
+                        context.engine,
+                        context.settings,
+                        result.snapshot_id,
+                        decision_batch_id=scan_run_id,
+                    )
+                    if registered:
+                        log.info(
+                            "managed shadow opportunities registered: symbol=%s count=%d",
+                            sym,
+                            registered,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- research capture never blocks scans
+                    log.exception("managed shadow registration failed for %s", sym)
+                    errors.append(f"{sym}/managed_capture: {type(exc).__name__}: {exc}")
+                # A checksum-verified, prospectively promoted *base* model is
+                # the sole source of managed-path EV. Applying it only after
+                # capture freezes the raw candidate prevents model output from
+                # leaking back into its own training features.
+                try:
+                    from optionsbot.daemon.managed_admission import (
+                        apply_promoted_managed_model,
+                    )
+
+                    result = replace(
+                        result,
+                        scored=apply_promoted_managed_model(
+                            context.engine,
+                            context.settings,
+                            result.snapshot_id,
+                            result.scored,
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 -- fail closed on no managed EV
+                    log.exception("managed admission model failed for %s", sym)
+                    errors.append(f"{sym}/managed_admission: {type(exc).__name__}: {exc}")
                 for scored in result.scored:
                     all_picks.append((sym, scored, result.snapshot_id))
 
@@ -311,6 +482,40 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             except Exception:  # noqa: BLE001 -- net-liq is advisory (incl. timeout); never abort a tick
                 log.exception("net-liq fetch failed/timed out; affordability filter off this tick")
 
+        # Freeze OptionsBot's own deterministic scan-admission disposition
+        # before an alert can expose the opportunity to Hermes.  This records
+        # association with the scan policy, not a claim that downstream order
+        # liquidity/margin/fill gates passed.
+        dispositions_by_snapshot: dict[int, dict[str, tuple[str, str]]] = {}
+        for _symbol, scored, snapshot_id in all_picks:
+            blockers = candidate_admission_blockers(
+                scored,
+                context.settings.scan.score_threshold,
+                account_value_usd,
+                context.settings.execution.max_single_trade_risk_pct,
+            )
+            dispositions_by_snapshot.setdefault(snapshot_id, {})[scored.strategy_name] = (
+                "hold" if blockers else "candidate",
+                ";".join(blockers) if blockers else "scan_admission_passed",
+            )
+        if dispositions_by_snapshot:
+            try:
+                from optionsbot.daemon.managed_capture import (
+                    record_snapshot_bot_dispositions,
+                )
+
+                for snapshot_id, dispositions in dispositions_by_snapshot.items():
+                    record_snapshot_bot_dispositions(
+                        context.engine,
+                        snapshot_id,
+                        dispositions,
+                        policy_version=(context.settings.managed_learning.outcome_policy_version),
+                        account_value_usd=account_value_usd,
+                    )
+            except Exception as exc:  # noqa: BLE001 -- shadow attribution cannot block alerts
+                log.exception("managed baseline disposition persistence failed")
+                errors.append(f"managed_capture/disposition: {type(exc).__name__}: {exc}")
+
         # Alert the day's best: floor by score, rank desc, enqueue the top N that
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
         # cooldown'd pick doesn't waste a slot. Across the whole tick, not per symbol.
@@ -322,10 +527,10 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                 context.settings.scan.score_threshold,
                 account_value_usd,
                 context.settings.execution.max_single_trade_risk_pct,
+                signal_ids=_managed_signal_ids(context, all_picks),
             )
             if not candidates and any(
-                scored.score >= context.settings.scan.score_threshold
-                for _, scored, _ in all_picks
+                scored.score >= context.settings.scan.score_threshold for _, scored, _ in all_picks
             ):
                 log.info(
                     "no-edge tick: pick(s) passed the score floor but none had "
@@ -434,9 +639,7 @@ async def _resolve_scan_symbols(
         # screening (it runs BEFORE the symbol loop) can't hang the whole tick.
         # A timeout is caught below -> fall back to watchlist-only.
         candidates = await asyncio.wait_for(
-            screen_universe(
-                history, universe, context.settings.screener.min_dollar_volume
-            ),
+            screen_universe(history, universe, context.settings.screener.min_dollar_volume),
             timeout=context.settings.scan.screen_timeout_s,
         )
     except Exception:  # noqa: BLE001 -- screening (incl. timeout) must never abort the tick

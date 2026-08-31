@@ -31,6 +31,11 @@ EXPECTED_TABLES = {
     "entry_intent_consumptions",
     "position_exit_state",
     "position_settlements",
+    "managed_opportunities",
+    "managed_opportunity_marks",
+    "managed_context_reviews",
+    "managed_models",
+    "managed_model_evaluations",
 }
 
 
@@ -237,7 +242,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
     assert "migration 0016" in closes[0].last_error
     assert state.killed == 1
     assert "duplicate active closes" in state.reason
-    assert revision == "0022"
+    assert revision == "0023"
     assert "uq_orders_active_close_per_entry" in indexes
     assert "uq_orders_ib_order_id" in indexes
 
@@ -257,7 +262,7 @@ def test_active_close_migration_quarantines_legacy_duplicate_claims(
         ).scalar_one()
     assert statuses == ["abandoned", "submitted"]
     assert state_after_roundtrip.killed == 1
-    assert revision_after_roundtrip == "0022"
+    assert revision_after_roundtrip == "0023"
 
 
 def test_order_quotes_migration_round_trips(tmp_path: Path) -> None:
@@ -301,6 +306,57 @@ def test_migration_applies_cleanly_and_creates_tables(tmp_path: Path) -> None:
     with engine.connect() as conn:
         present = set(inspect(conn).get_table_names())
     assert EXPECTED_TABLES <= present
+
+
+def test_managed_capture_migration_upgrades_a_populated_0022_database(
+    tmp_path: Path,
+) -> None:
+    from alembic.config import Config
+
+    from alembic import command
+
+    project_root = Path(__file__).resolve().parents[2]
+    db_path = tmp_path / "populated-0022.db"
+    cfg = Config(str(project_root / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, "0022")
+    engine = create_engine_for_path(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            schema.watchlist.insert().values(
+                symbol="SPY",
+                added_at=datetime(2026, 8, 28, tzinfo=UTC),
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "0023")
+
+    upgraded = create_engine_for_path(db_path)
+    inspector = inspect(upgraded)
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("managed_opportunities")
+    }
+    with upgraded.connect() as conn:
+        symbols = conn.execute(select(schema.watchlist.c.symbol)).scalars().all()
+        revision = conn.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one()
+        integrity = conn.exec_driver_sql("PRAGMA integrity_check").scalar_one()
+    upgraded.dispose()
+
+    assert symbols == ["SPY"]
+    assert {
+        "decision_batch_id",
+        "decision_score",
+        "decision_defined_risk",
+        "decision_max_loss",
+        "decision_account_value_available",
+        "decision_account_value_usd",
+    } <= columns
+    assert revision == "0023"
+    assert integrity == "ok"
 
 
 def test_wal_mode_is_set_on_connect(tmp_path: Path) -> None:
