@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import Engine, insert, select
@@ -49,6 +50,7 @@ def _seed_opportunity(
     resolved_at: datetime | None = None,
     training_eligible: int = 0,
     entry_ts: datetime | None = None,
+    entry_cutoff_at: datetime | None = None,
 ) -> int:
     now = detected_at or datetime.now(UTC)
     with engine.begin() as conn:
@@ -115,7 +117,7 @@ def _seed_opportunity(
                 decision_account_value_available=(1 if bot_action else None),
                 decision_account_value_usd=(50_000.0 if bot_action else None),
                 session_close_at=now + timedelta(hours=5),
-                entry_cutoff_at=now + timedelta(hours=4),
+                entry_cutoff_at=entry_cutoff_at or now + timedelta(hours=4),
                 timeout_at=now + timedelta(hours=4, minutes=15),
                 entry_ts=entry_ts,
                 entry_net=(-1.0 if status == "resolved" else None),
@@ -227,6 +229,185 @@ def test_context_tools_queue_and_import_only_shadow_evidence(
     duplicate = _submit(tools, context, opportunity_id)
     assert duplicate["already_recorded"] is True
     assert duplicate["review_id"] == review.id
+
+
+def test_pending_context_queue_deduplicates_signals_and_prioritizes_pretrade(
+    mcp_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    trusted_now = datetime(2026, 8, 31, 15, 0, tzinfo=UTC)
+    post_outcome = _seed_opportunity(
+        mcp_engine,
+        key="post-outcome",
+        signal_id="signal-post-outcome",
+        detected_at=trusted_now - timedelta(minutes=15),
+        entry_ts=trusted_now - timedelta(minutes=10),
+        status="resolved",
+        outcome="target",
+        net_pnl=20.0,
+        resolved_at=trusted_now,
+    )
+    post_entry = _seed_opportunity(
+        mcp_engine,
+        key="post-entry",
+        signal_id="signal-post-entry",
+        detected_at=trusted_now - timedelta(minutes=14),
+        entry_ts=trusted_now,
+    )
+    post_cutoff = _seed_opportunity(
+        mcp_engine,
+        key="post-cutoff",
+        signal_id="signal-post-cutoff",
+        detected_at=trusted_now - timedelta(minutes=13),
+        entry_cutoff_at=trusted_now,
+    )
+    _seed_opportunity(
+        mcp_engine,
+        key="shared-post-entry",
+        signal_id="signal-shared",
+        detected_at=trusted_now - timedelta(minutes=6),
+        entry_ts=trusted_now - timedelta(minutes=1),
+    )
+    shared_pretrade = _seed_opportunity(
+        mcp_engine,
+        key="shared-pretrade-first",
+        signal_id="signal-shared",
+        detected_at=trusted_now - timedelta(minutes=5),
+    )
+    _seed_opportunity(
+        mcp_engine,
+        key="shared-pretrade-second",
+        signal_id="signal-shared",
+        detected_at=trusted_now - timedelta(minutes=4),
+    )
+    other_pretrade = _seed_opportunity(
+        mcp_engine,
+        key="other-pretrade",
+        signal_id="signal-other-pretrade",
+        detected_at=trusted_now - timedelta(minutes=3),
+    )
+    future = _seed_opportunity(
+        mcp_engine,
+        key="future",
+        signal_id="signal-future",
+        detected_at=trusted_now + timedelta(minutes=1),
+    )
+    context = _context(mcp_engine, tmp_path / "ranked-context-intents.db")
+    pending = get_tools(context_critic.register)["pending_context_opportunities"]
+
+    with patch(
+        "optionsbot.mcp_server.tools.context_critic._utc_now",
+        return_value=trusted_now,
+    ):
+        limited = pending(2, 30, "critic-v1", "prompt-v1", FakeCtx(context))
+        complete = pending(25, 30, "critic-v1", "prompt-v1", FakeCtx(context))
+
+    assert [item["opportunity_id"] for item in limited["opportunities"]] == [
+        shared_pretrade,
+        other_pretrade,
+    ]
+    assert [item["timing_now"] for item in limited["opportunities"]] == [
+        "pretrade",
+        "pretrade",
+    ]
+    assert [item["opportunity_id"] for item in complete["opportunities"]] == [
+        shared_pretrade,
+        other_pretrade,
+        post_cutoff,
+        post_entry,
+        post_outcome,
+    ]
+    assert [item["timing_now"] for item in complete["opportunities"]] == [
+        "pretrade",
+        "pretrade",
+        "post_cutoff",
+        "post_entry",
+        "post_outcome",
+    ]
+    returned_ids = {item["opportunity_id"] for item in complete["opportunities"]}
+    assert future not in returned_ids
+    assert complete["count"] == 5
+
+
+def test_pending_context_queue_excludes_reviewed_or_pending_signal_siblings(
+    mcp_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    trusted_now = datetime(2026, 8, 31, 15, 0, tzinfo=UTC)
+    first = _seed_opportunity(
+        mcp_engine,
+        key="shared-first",
+        signal_id="shared-reviewed-signal",
+        detected_at=trusted_now - timedelta(minutes=2),
+    )
+    second = _seed_opportunity(
+        mcp_engine,
+        key="shared-second",
+        signal_id="shared-reviewed-signal",
+        detected_at=trusted_now - timedelta(minutes=1),
+    )
+    _seed_review(
+        mcp_engine,
+        first,
+        suffix="shared-reviewed",
+        timing="pretrade",
+        event_conflict=False,
+        received_at=trusted_now,
+    )
+    context = _context(mcp_engine, tmp_path / "group-exclusion-intents.db")
+    pending = get_tools(context_critic.register)["pending_context_opportunities"]
+
+    with patch(
+        "optionsbot.mcp_server.tools.context_critic._utc_now",
+        return_value=trusted_now,
+    ):
+        reviewed = pending(10, 20, "critic-v1", "prompt-v1", FakeCtx(context))
+        unreviewed_version = pending(
+            10,
+            20,
+            "critic-v2",
+            "prompt-v1",
+            FakeCtx(context),
+        )
+
+    assert reviewed["opportunities"] == []
+    assert [item["opportunity_id"] for item in unreviewed_version["opportunities"]] == [first]
+
+    enqueue_intent(
+        context.intent_engine,
+        "context_review",
+        {
+            "received_at": trusted_now.isoformat(),
+            "submission": {
+                "opportunity_id": second,
+                "signal_id": "shared-reviewed-signal",
+                "model_version": "critic-v2",
+                "prompt_version": "prompt-v1",
+            },
+        },
+        now=trusted_now,
+    )
+    with patch(
+        "optionsbot.mcp_server.tools.context_critic._utc_now",
+        return_value=trusted_now,
+    ):
+        pending_sibling = pending(
+            10,
+            20,
+            "critic-v2",
+            "prompt-v1",
+            FakeCtx(context),
+        )
+        different_version = pending(
+            10,
+            20,
+            "critic-v3",
+            "prompt-v1",
+            FakeCtx(context),
+        )
+
+    assert pending_sibling["opportunities"] == []
+    assert [item["opportunity_id"] for item in different_version["opportunities"]] == [first]
 
 
 def test_context_timing_uses_managed_entry_without_a_broker_order(

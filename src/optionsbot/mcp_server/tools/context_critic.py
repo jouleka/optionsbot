@@ -8,7 +8,7 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from pydantic import ValidationError
-from sqlalchemy import exists, func, select
+from sqlalchemy import func, select
 
 from optionsbot.hermes_context import (
     CONTEXT_CONTRACT_VERSION,
@@ -30,6 +30,17 @@ CONTEXT_PROBABILITY_MEANING = (
     "Probability that independent external context supports the signal's stated "
     "direction; never probability of profit, target-first, or order authority."
 )
+
+_TIMING_PRIORITY = {
+    "pretrade": 0,
+    "post_cutoff": 1,
+    "post_entry": 2,
+    "post_outcome": 3,
+}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _first_order_at_subquery() -> Any:
@@ -56,7 +67,13 @@ def _opportunity_projection() -> Any:
     )
 
 
-def _pending_context_intent_ids(lifespan: Any) -> set[int]:
+def _pending_context_intent_ids(
+    lifespan: Any,
+    *,
+    model_version: str,
+    prompt_version: str,
+) -> set[int]:
+    """Return pending opportunity IDs for exactly one critic version."""
     with lifespan.intent_engine.connect() as conn:
         rows = conn.execute(
             select(control_intents.c.payload_json)
@@ -68,6 +85,11 @@ def _pending_context_intent_ids(lifespan: Any) -> set[int]:
         payload = row.payload_json if isinstance(row.payload_json, dict) else {}
         submission = payload.get("submission")
         if not isinstance(submission, dict):
+            continue
+        if (
+            submission.get("model_version") != model_version
+            or submission.get("prompt_version") != prompt_version
+        ):
             continue
         opportunity_id = submission.get("opportunity_id")
         if type(opportunity_id) is int and opportunity_id > 0:
@@ -91,6 +113,17 @@ def _timing_for_row(row: Any, received_at: datetime) -> str:
         ),
         outcome_available_at=_db_utc(row.resolved_at),
     ).value
+
+
+def _group_key(row: Any) -> tuple[str, str]:
+    return str(row.session), str(row.signal_id)
+
+
+def _row_rank(row: Any, timing: str) -> tuple[int, datetime, int]:
+    detected_at = _db_utc(row.detected_at)
+    if detected_at is None:
+        raise ValueError("managed opportunity detected_at is missing")
+    return _TIMING_PRIORITY[timing], detected_at, int(row.id)
 
 
 def register(server: FastMCP) -> None:
@@ -119,28 +152,74 @@ def register(server: FastMCP) -> None:
         lifespan = ctx.request_context.lifespan_context
         lim = max(1, min(int(limit or 10), 25))
         age_minutes = max(1, min(int(max_age_minutes or 20), 390))
-        cutoff = datetime.now(UTC) - timedelta(minutes=age_minutes)
-        already_reviewed = exists(
-            select(managed_context_reviews.c.id)
-            .where(managed_context_reviews.c.opportunity_id == managed_opportunities.c.id)
-            .where(managed_context_reviews.c.model_version == model_version)
-            .where(managed_context_reviews.c.prompt_version == prompt_version)
+        now = _utc_now()
+        cutoff = now - timedelta(minutes=age_minutes)
+        pending_ids = _pending_context_intent_ids(
+            lifespan,
+            model_version=model_version,
+            prompt_version=prompt_version,
         )
         with lifespan.engine.connect() as conn:
             rows = conn.execute(
                 _opportunity_projection()
                 .where(managed_opportunities.c.detected_at >= cutoff)
+                .where(managed_opportunities.c.detected_at <= now)
+                .where(managed_opportunities.c.created_at <= now)
                 .where(managed_opportunities.c.bot_decided_at.is_not(None))
-                .where(~already_reviewed)
+                .where(managed_opportunities.c.bot_decided_at <= now)
                 .order_by(managed_opportunities.c.detected_at, managed_opportunities.c.id)
-                .limit(lim * 2)
             ).fetchall()
-        pending_ids = _pending_context_intent_ids(lifespan)
-        now = datetime.now(UTC)
-        items: list[dict[str, Any]] = []
+            reviewed_groups = {
+                (str(row.session), str(row.signal_id))
+                for row in conn.execute(
+                    select(
+                        managed_opportunities.c.session,
+                        managed_opportunities.c.signal_id,
+                    )
+                    .join(
+                        managed_context_reviews,
+                        managed_context_reviews.c.opportunity_id == managed_opportunities.c.id,
+                    )
+                    .where(managed_context_reviews.c.model_version == model_version)
+                    .where(managed_context_reviews.c.prompt_version == prompt_version)
+                    .distinct()
+                )
+            }
+            pending_groups: set[tuple[str, str]] = set()
+            pending_list = sorted(pending_ids)
+            for start in range(0, len(pending_list), 500):
+                chunk = pending_list[start : start + 500]
+                pending_groups.update(
+                    (str(row.session), str(row.signal_id))
+                    for row in conn.execute(
+                        select(
+                            managed_opportunities.c.session,
+                            managed_opportunities.c.signal_id,
+                        ).where(managed_opportunities.c.id.in_(chunk))
+                    )
+                )
+
+        # A context response describes the shared signal, not the option
+        # structure used to transport its packet. Pick one deterministic row
+        # per immutable signal identity, preferring a still-causal structure
+        # when sibling structures have already crossed an entry/outcome bound.
+        representatives: dict[tuple[str, str], tuple[Any, str]] = {}
+        excluded_groups = reviewed_groups | pending_groups
         for row in rows:
-            if int(row.id) in pending_ids:
+            key = _group_key(row)
+            if key in excluded_groups:
                 continue
+            timing = _timing_for_row(row, now)
+            incumbent = representatives.get(key)
+            if incumbent is None or _row_rank(row, timing) < _row_rank(incumbent[0], incumbent[1]):
+                representatives[key] = (row, timing)
+
+        ranked = sorted(
+            representatives.values(),
+            key=lambda item: _row_rank(item[0], item[1]),
+        )
+        items: list[dict[str, Any]] = []
+        for row, timing in ranked[:lim]:
             items.append(
                 {
                     "opportunity_id": int(row.id),
@@ -163,11 +242,9 @@ def register(server: FastMCP) -> None:
                     "admission_eligible": bool(row.admission_eligible),
                     "shadow_only": bool(row.shadow_only),
                     "managed_status": row.status,
-                    "timing_now": _timing_for_row(row, now),
+                    "timing_now": timing,
                 }
             )
-            if len(items) >= lim:
-                break
         return {
             "ok": True,
             "count": len(items),

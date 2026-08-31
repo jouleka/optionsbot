@@ -962,7 +962,10 @@ class OrderClient:
         # TODAY only, which would hide weekend-outage fills from
         # reconciliation's mismatch detection (Opus I1). Timezone slop of a
         # few hours is irrelevant at this window size.
-        since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y%m%d %H:%M:%S")
+        # A dash between the date and time is IBKR's explicit UTC form.  The
+        # legacy space-separated form relies on the TWS login timezone and is
+        # being removed by the API (warning 2174).
+        since = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y%m%d-%H:%M:%S")
         fills_ = await self._client.ib.reqExecutionsAsync(ExecutionFilter(time=since))
         return [
             self._to_execution_fill(fill)

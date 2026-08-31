@@ -1352,6 +1352,9 @@ async def test_recent_executions_translates_with_commission(
     # only and would hide weekend-outage fills from reconciliation.
     (exec_filter,) = order_ib.reqExecutionsAsync.call_args.args
     assert exec_filter.time  # non-empty lookback
+    date, time = exec_filter.time.split("-")
+    assert len(date) == 8 and date.isdigit()
+    assert len(time) == 8 and time[2] == ":" and time[5] == ":"
     assert record.exec_id == "0009.aa.01"
     assert record.side == "SELL"
     assert record.order_ref == "obot-12"
