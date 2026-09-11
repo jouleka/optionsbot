@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from optionsbot.execution.economics import reconcile_entry_economics
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
 
 
 def _leg(side: str, strike: float) -> dict[str, object]:
@@ -243,6 +244,28 @@ def test_terminal_probability_cannot_authorize_managed_trade() -> None:
     assert economics is not None
     assert economics.managed_expected_value is None
     assert economics.expected_value is None
+
+
+def test_explicit_paper_rule_uses_terminal_ev_after_costs() -> None:
+    economics = reconcile_entry_economics(
+        [_leg("sell", 689.0), _leg("buy", 692.0)],  # type: ignore[list-item]
+        {
+            "credit_or_debit": -100.0,
+            "expected_value_model": PAPER_RULE_EXPECTED_VALUE_MODEL,
+            "terminal_expected_value": 50.0,
+            "prob_profit": 0.60,
+            "opening_range_fvg": {
+                "status": "entry_confirmed", "source": "trusted_daemon",
+                "stop_pct": 0.15, "target_r": 1.5, "target_pct": 0.225,
+            },
+        },
+        fresh_net_per_share=-1.00,
+        estimated_round_trip_cost=7.50,
+    )
+
+    assert economics is not None
+    assert economics.managed_expected_value is None
+    assert economics.expected_value == pytest.approx(42.50)
 
 
 def test_impossible_finite_spread_target_is_unavailable() -> None:

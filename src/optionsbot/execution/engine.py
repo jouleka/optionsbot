@@ -35,6 +35,7 @@ from optionsbot.execution.gate import can_execute
 from optionsbot.execution.managed_boundary import (
     ManagedExecutionError,
     carries_managed_model_packet,
+    carries_paper_rule_packet,
     refresh_managed_prediction,
 )
 from optionsbot.execution.orders import (
@@ -372,6 +373,12 @@ async def execute_pick(
     symbol: str = pick.symbol
     snapshot_raw = pick.raw_json
     managed_packet = carries_managed_model_packet(suggestion)
+    paper_rule_packet = carries_paper_rule_packet(suggestion)
+    paper_runtime = (
+        settings.execution.paper_only
+        and settings.ibkr.paper
+        and settings.ibkr.port in PAPER_PORTS
+    )
     if (
         suggestion.get("shadow_only") is True
         or suggestion.get("admission_enabled") is False
@@ -379,13 +386,9 @@ async def execute_pick(
         return _reject(
             "research-only candidate is not authorized for order execution"
         )
-    if managed_packet and not (
-        settings.execution.paper_only
-        and settings.ibkr.paper
-        and settings.ibkr.port in PAPER_PORTS
-    ):
+    if (managed_packet or paper_rule_packet) and not paper_runtime:
         return _reject(
-            "managed model admission is restricted to the current recognized "
+            "managed and deterministic rule admission is restricted to the recognized "
             "paper account and paper-only execution interlock"
         )
 
@@ -467,16 +470,17 @@ async def execute_pick(
     }
     session_expiry = nyse_session_date(ts_now).strftime("%Y%m%d")
     exact_zero_dte = bool(expiry_strings) and expiry_strings == {session_expiry}
-    if managed_packet and not exact_zero_dte:
-        return _reject("managed model packet is bound to an exact-0DTE structure")
-    # Automatic exact-0DTE entries have always required the promoted managed
-    # model.  The configured 0DTE-only invariant must impose the same boundary
-    # on explicitly confirmed entries; otherwise /execute could bypass a
-    # promotion that changed between the scan and broker placement.
-    managed_exact_zero_dte = managed_packet or (
+    if (managed_packet or paper_rule_packet) and not exact_zero_dte:
+        return _reject("managed admission packet is bound to an exact-0DTE structure")
+    managed_model_entry = managed_packet
+    if (
         exact_zero_dte
         and (settings.execution.mode == "auto" or settings.execution.zero_dte_only)
-    )
+        and not (managed_packet or paper_rule_packet)
+    ):
+        return _reject(
+            "exact-0DTE candidate lacks a managed model or deterministic paper-rule packet"
+        )
     if settings.execution.zero_dte_only:
         if not expiry_strings or expiry_strings != {session_expiry}:
             return _reject(
@@ -657,7 +661,7 @@ async def execute_pick(
     max_loss_unit = fresh_economics.max_loss
     max_profit_unit = fresh_economics.max_profit
     fresh_managed_prediction = None
-    if managed_exact_zero_dte:
+    if managed_model_entry:
         try:
             fresh_managed_prediction = refresh_managed_prediction(
                 engine,
@@ -733,6 +737,8 @@ async def execute_pick(
         prob_profit=(
             fresh_managed_prediction.target_probability_lcb
             if fresh_managed_prediction is not None
+            else None
+            if paper_rule_packet
             else float(suggestion["managed_target_hit_probability_lcb"])
             if suggestion.get("opening_range_fvg") is not None
             and suggestion.get("managed_target_hit_probability_lcb") is not None
@@ -746,6 +752,7 @@ async def execute_pick(
         base_risk_pct=settings.execution.base_risk_pct,
         heat_cap_pct=settings.execution.max_portfolio_heat_pct,
         single_trade_cap_pct=settings.execution.max_single_trade_risk_pct,
+        neutral_edge_tilt=paper_rule_packet,
     )
     if decision.quantity < 1:
         return _reject(decision.note)
@@ -880,7 +887,13 @@ async def execute_pick(
         else increment
     )
     try:
-        record = stage_order(engine, score_id, quantity=quantity, now=ts_now)
+        record = stage_order(
+            engine,
+            score_id,
+            quantity=quantity,
+            now=ts_now,
+            allow_paper_rule=paper_runtime and paper_rule_packet,
+        )
     except IntegrityError:
         return _reject(
             f"pick {score_id} already has an order intent; its authorization is consumed"
@@ -937,7 +950,7 @@ async def execute_pick(
             message=f"❌ {placement_error}",
             order_id=record.id,
         )
-    if managed_exact_zero_dte:
+    if managed_model_entry:
         # Promotion may change while account summary or broker what-if awaits.
         # Rebind immediately before placement; no await follows this check.
         try:

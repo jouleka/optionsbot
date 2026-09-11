@@ -44,13 +44,12 @@ boundary. Bullish and bearish breaks are evaluated independently so an early
 false break does not suppress a later reversal.
 
 Confirmed setups use defined-risk long options or debit spreads. Entry
-admission requires a versioned, out-of-sample probability that the premium
-target is observed before the stop or timeout, then subtracts estimated
-round-trip costs. No such model is currently promoted, so managed expectancy is
-unavailable and automatic entry fails closed. The daemon instead records every
-confirmed candidate before alert or admission filtering and prospectively shadows
-its executable bid/ask path. This produces target/stop/timeout/censored labels
-without treating terminal expiry probability as intraday trade authority.
+selection on the recognized paper runtime uses the strategy engine's positive
+terminal expectancy after estimated round-trip costs. That heuristic is named
+separately and is never presented as a target-before-stop probability. The
+daemon rechecks live quotes, cost, target reachability, liquidity, risk, margin,
+and the configured stop/target plan before an order. It also follows each
+confirmed candidate's executable bid/ask path to produce managed labels.
 
 The restricted Hermes integration is an asynchronous, research-only context
 critic. It can attach structured macro, news, event-conflict, or operational
@@ -61,10 +60,10 @@ The daemon remains the only component authorized to submit an order.
 
 Model promotion is deliberately slower than model fitting: one eligible causal
 base challenger is frozen at a time, then must pass a checksummed block of
-strictly later sessions before it can authorize paper entries. A replacement
-must also outperform the frozen incumbent on that same future block. Shadow
-structure variants and Hermes context remain research-only and cannot be used
-as order authority.
+strictly later sessions. A replacement must also outperform the frozen
+incumbent on that same future block. Managed models, shadow structure variants,
+and Hermes context remain observational on the current paper runtime and cannot
+veto or authorize orders.
 
 The generators, label reducer, and promotion gates have software tests; they do
 not demonstrate a profitable strategy. No base model may trade until enough

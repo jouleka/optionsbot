@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -21,7 +23,13 @@ from optionsbot.execution.sizing import dynamic_quantity
 from optionsbot.execution.state import load_state, trip_kill
 from optionsbot.ibkr.types import AccountSummary, MarginPreview, OptionQuote, PlacedOrder
 from optionsbot.learning.managed_model import ManagedPrediction
-from optionsbot.storage.schema import execution_state, snapshots, strategy_scores
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
+from optionsbot.storage.schema import (
+    execution_state,
+    managed_opportunities,
+    snapshots,
+    strategy_scores,
+)
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 
@@ -78,6 +86,7 @@ def _insert_pick(
     legs: list[dict[str, Any]] | None = None,
     raw_json: Any = None,
     suggestion_extra: dict[str, Any] | None = None,
+    strategy: str = "bull_put_spread",
 ) -> int:
     with engine.begin() as conn:
         snapshot_id = conn.execute(
@@ -87,7 +96,7 @@ def _insert_pick(
         ).inserted_primary_key[0]
         score_id = conn.execute(
             insert(strategy_scores).values(
-                snapshot_id=snapshot_id, strategy="bull_put_spread", score=78.0,
+                snapshot_id=snapshot_id, strategy=strategy, score=78.0,
                 rationale="t", legs_json=legs if legs is not None else CONDOR_LEGS,
                 suggestion_json={
                     "defined_risk": defined_risk,
@@ -366,7 +375,10 @@ async def test_exact_zero_dte_auto_rejects_without_promoted_managed_packet(
         outcome = await execute_pick(deps, score_id, now=NOW)
 
     assert not outcome.ok
-    assert "managed model authorization" in outcome.message.lower()
+    assert (
+        "lacks a managed model or deterministic paper-rule packet"
+        in outcome.message.lower()
+    )
     deps.order_client.whatif_combo.assert_not_awaited()
     deps.order_client.place_combo_limit.assert_not_awaited()
 
@@ -379,6 +391,7 @@ async def test_exact_zero_dte_auto_rechecks_managed_artifact_before_placement(
         tmp_db,
         legs=legs,
         raw_json={"delayed": False, "warming_up": False},
+        suggestion_extra=MANAGED_PACKET,
     )
     deps = _deps(tmp_db)
     deps.settings.execution.mode = "auto"
@@ -390,6 +403,10 @@ async def test_exact_zero_dte_auto_rechecks_managed_artifact_before_placement(
             "optionsbot.execution.engine.refresh_managed_prediction",
             return_value=prediction,
         ) as refresh,
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
+        ),
     ):
         outcome = await execute_pick(deps, score_id, now=NOW)
 
@@ -427,16 +444,193 @@ async def test_exact_zero_dte_confirm_rejects_without_promoted_managed_packet(
         outcome = await execute_pick(deps, score_id, now=NOW)
 
     assert not outcome.ok
-    assert "managed model authorization" in outcome.message.lower()
+    assert (
+        "lacks a managed model or deterministic paper-rule packet"
+        in outcome.message.lower()
+    )
     deps.order_client.whatif_combo.assert_not_awaited()
     deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("paper_only", "paper_account", "port", "expected_reason"),
+    [
+        (False, True, 4002, "restricted to the recognized paper account"),
+        (True, False, 4002, "paper-only interlock: ibkr.paper is false"),
+        (True, True, 4001, "paper-only interlock: port 4001"),
+    ],
+)
+async def test_paper_rule_never_routes_outside_recognized_paper_runtime(
+    tmp_db: Engine,
+    paper_only: bool,
+    paper_account: bool,
+    port: int,
+    expected_reason: str,
+) -> None:
+    legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
+    score_id = _insert_pick(
+        tmp_db,
+        legs=legs,
+        suggestion_extra={
+            "expected_value_model": PAPER_RULE_EXPECTED_VALUE_MODEL,
+        },
+    )
+    deps = _deps(tmp_db)
+    deps.settings.execution.paper_only = paper_only
+    deps.settings.ibkr.paper = paper_account
+    deps.settings.ibkr.port = port
+
+    outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert not outcome.ok
+    assert expected_reason in outcome.message.lower()
+    deps.order_client.whatif_combo.assert_not_awaited()
+    deps.order_client.place_combo_limit.assert_not_awaited()
+
+
+async def test_exact_zero_dte_paper_rule_executes_without_managed_model(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "sec_type": "OPT",
+            "expiry": "20260610",
+            "strike": 580.0,
+            "right": "C",
+            "quantity": 1,
+        }
+    ]
+    signal_id = "2026-06-10:SPY:bull:fvg-retest"
+    opening_plan = {
+        "status": "entry_confirmed",
+        "source": "trusted_daemon",
+        "signal_id": signal_id,
+        "session": "2026-06-10",
+        "direction": "bull",
+        "setup_type": "fvg_retest",
+        "respected_ts": (NOW - timedelta(minutes=1)).isoformat(),
+        "stop_pct": 0.15,
+        "target_r": 1.5,
+        "target_pct": 0.225,
+    }
+    managed_plan = {
+        **opening_plan,
+        "schema_version": "managed_signal_plan_v1",
+        "generator": "opening_range_fvg",
+        "admission_enabled": True,
+        "option_expiry": "20260610",
+    }
+    score_id = _insert_pick(
+        tmp_db,
+        strategy="long_call",
+        legs=legs,
+        credit_or_debit=-120.0,
+        max_loss=120.0,
+        max_profit=None,
+        expected_value=48.0,
+        raw_json={
+            "delayed": False,
+            "warming_up": False,
+            "opening_range_fvg": opening_plan,
+        },
+        suggestion_extra={
+            "expected_value_model": PAPER_RULE_EXPECTED_VALUE_MODEL,
+            "terminal_expected_value": 50.0,
+            "estimated_round_trip_cost": 2.0,
+            "opening_range_fvg": opening_plan,
+            "managed_signal_plan": managed_plan,
+        },
+    )
+    with tmp_db.begin() as conn:
+        snapshot_id = conn.execute(
+            select(strategy_scores.c.snapshot_id).where(
+                strategy_scores.c.id == score_id
+            )
+        ).scalar_one()
+        structure_hash = hashlib.sha256(
+            json.dumps(legs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            insert(managed_opportunities).values(
+                opportunity_key="paper-rule-engine-candidate",
+                signal_id=signal_id,
+                session="2026-06-10",
+                symbol="SPY",
+                direction="bull",
+                setup_type="fvg_retest",
+                strategy="long_call",
+                strategy_score_id=score_id,
+                structure_hash=structure_hash,
+                legs_json=legs,
+                features_json={
+                    "feature_schema_version": "managed_capture_features_v1",
+                    "snapshot_id": snapshot_id,
+                },
+                policy_version="marketable_nbbo_15s_v1",
+                decision_batch_id="paper-rule-engine-batch",
+                decision_score=78.0,
+                decision_defined_risk=1,
+                decision_max_loss=120.0,
+                created_at=NOW - timedelta(minutes=1),
+                detected_at=NOW - timedelta(minutes=1),
+                baseline_action="hold",
+                baseline_reason="capture",
+                admission_eligible=1,
+                shadow_only=0,
+                bot_action="candidate",
+                bot_reason="scan_admission_passed",
+                bot_decided_at=NOW,
+                decision_account_value_available=1,
+                decision_account_value_usd=50_000.0,
+                session_close_at=NOW + timedelta(hours=4),
+                entry_cutoff_at=NOW + timedelta(minutes=10),
+                timeout_at=NOW + timedelta(hours=1),
+                stop_pct=0.15,
+                target_pct=0.225,
+                commission_estimate=2.0,
+                status="pending_entry",
+                training_eligible=0,
+            )
+        )
+    deps = _deps(tmp_db, md_mids={(580.0, "C"): 1.20})
+    deps.settings.execution.mode = "auto"
+    deps.settings.execution.zero_dte_only = True
+    deps.settings.scan.opening_range_fvg_enabled = True
+    deps.settings.scan.opening_range_entry_window_minutes = 180
+    deps.order_client.place_combo_limit.side_effect = None
+    deps.order_client.place_combo_limit.return_value = PlacedOrder(
+        ib_order_id=11,
+        order_ref="obot-paper-rule",
+        action="BUY",
+        limit_price=1.20,
+        quantity=1,
+        leg_contracts=((580001, 100, "USD"),),
+    )
+
+    with (
+        patch("optionsbot.execution.engine.is_market_open", return_value=True),
+        patch("optionsbot.execution.engine.refresh_managed_prediction") as refresh,
+        patch(
+            "optionsbot.execution.sizing.dynamic_quantity",
+            wraps=dynamic_quantity,
+        ) as size,
+    ):
+        outcome = await execute_pick(deps, score_id, now=NOW)
+
+    assert outcome.ok, outcome.message
+    refresh.assert_not_called()
+    assert size.call_args.kwargs["prob_profit"] is None
+    assert size.call_args.kwargs["neutral_edge_tilt"] is True
+    deps.order_client.place_combo_limit.assert_awaited_once()
 
 
 async def test_exact_zero_dte_confirm_rechecks_managed_artifact_before_placement(
     tmp_db: Engine,
 ) -> None:
     legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
-    score_id = _insert_pick(tmp_db, legs=legs)
+    score_id = _insert_pick(tmp_db, legs=legs, suggestion_extra=MANAGED_PACKET)
     deps = _deps(tmp_db)
     deps.settings.execution.mode = "confirm"
     deps.settings.execution.zero_dte_only = True
@@ -452,12 +646,17 @@ async def test_exact_zero_dte_confirm_rechecks_managed_artifact_before_placement
             "optionsbot.execution.sizing.dynamic_quantity",
             wraps=dynamic_quantity,
         ) as size,
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
+        ),
     ):
         outcome = await execute_pick(deps, score_id, now=NOW)
 
     assert outcome.ok, outcome.message
     assert refresh.call_count == 2
     assert size.call_args.kwargs["prob_profit"] == prediction.target_probability_lcb
+    assert size.call_args.kwargs["neutral_edge_tilt"] is False
     deps.order_client.place_combo_limit.assert_awaited_once()
 
 
@@ -537,7 +736,7 @@ async def test_exact_zero_dte_confirm_rejects_changed_artifact_before_placement(
     tmp_db: Engine,
 ) -> None:
     legs = [{**leg, "expiry": "20260610"} for leg in CONDOR_LEGS]
-    score_id = _insert_pick(tmp_db, legs=legs)
+    score_id = _insert_pick(tmp_db, legs=legs, suggestion_extra=MANAGED_PACKET)
     deps = _deps(tmp_db)
     deps.settings.execution.mode = "confirm"
     deps.settings.execution.zero_dte_only = True
@@ -551,6 +750,10 @@ async def test_exact_zero_dte_confirm_rejects_changed_artifact_before_placement(
                 ManagedExecutionError("promotion changed"),
             ],
         ) as refresh,
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
+        ),
     ):
         outcome = await execute_pick(deps, score_id, now=NOW)
 
@@ -1157,7 +1360,7 @@ async def test_zero_dte_cutoff_crossed_after_whatif_skips_staged_order(
         {**leg, "expiry": "20260610"}
         for leg in CONDOR_LEGS
     ]
-    score_id = _insert_pick(tmp_db, legs=legs)
+    score_id = _insert_pick(tmp_db, legs=legs, suggestion_extra=MANAGED_PACKET)
     deps = _deps(tmp_db)
     deps.settings.execution.zero_dte_only = True
 
@@ -1170,6 +1373,10 @@ async def test_zero_dte_cutoff_crossed_after_whatif_skips_staged_order(
         patch(
             "optionsbot.execution.engine.minutes_to_nyse_close",
             side_effect=[91.0, 90.0],
+        ),
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
         ),
     ):
         outcome = await execute_pick(deps, score_id, now=NOW)

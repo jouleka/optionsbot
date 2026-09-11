@@ -1,15 +1,16 @@
 # 0DTE strategy and Hermes redesign
 
-Status: shadow-data implementation baseline, 2026-08-29. This document does
-not claim deployment, a promoted model, or a demonstrated trading edge.
+Status: paper-execution and shadow-learning baseline, 2026-09-02. This document
+does not claim a promoted model or a demonstrated trading edge.
 
 ## Decision
 
 The current opening-range/FVG rule is an experimental candidate generator, not
-a demonstrated trading edge. Automatic admission must not use terminal-expiry
-probability as a proxy for an intraday target-before-stop probability. Until a
-managed option-path model is trained, calibrated, and promoted, exact-0DTE
-candidates remain shadow observations with `expected_value=null`.
+a demonstrated trading edge. On the recognized paper runtime, its automatic
+selection signal is positive terminal expectancy after estimated round-trip
+costs. That heuristic is explicitly named and must never be represented as an
+intraday target-before-stop probability. Managed path models and Hermes remain
+observational and cannot veto or authorize the deterministic paper rule.
 
 This does not alter the configured per-trade risk percentages. It fixes which
 opportunities are allowed to consume that risk.
@@ -78,11 +79,12 @@ treating FVG as a universal premise:
 Each generator must expire its thesis after bounded time, invalidation, or a
 material return through the relevant level.
 
-The current checkout implements the first three as deterministic shadow-only
-generators. Explicit macro-event generators are not implemented. Their rows do
-not enter `ScanResult`, alerts, execution, or base-model training; a separate
-audited promotion bridge would be required before any could become an entry
-candidate.
+The current checkout implements the opening-range/FVG rule as the production
+paper candidate generator and the other implemented hypotheses as deterministic
+shadow-only generators. Explicit macro-event generators are not implemented.
+Shadow rows do not enter `ScanResult`, alerts, execution, or base-model
+training; a separate audited promotion bridge would be required before any
+could become an entry candidate.
 
 ## Decision-time features
 
@@ -231,12 +233,12 @@ records:
   fold/holdout registries. Their presence does not load or promote a model.
 
 Capture runs before score/EV, affordability, alert, and Hermes context
-collection, so held candidates do not disappear from the learning population. Repeated scans
-cannot change the first legs. Capacity admits one representative per independent
-signal before alternative structures. Quote bundles rotate by signal and use
-bounded concurrency and per-request deadlines under the daemon's short shared
-lock budget, preventing one slow contract or early universe symbol from
-starving later signals. Protective exits retain scheduling priority.
+collection, so held candidates do not disappear from the learning population.
+Repeated scans cannot change the first legs. Production rows have strict
+capacity priority: production may reclaim shadow capacity, while shadow work
+can never evict production. Within each tier, quote bundles rotate by signal
+under the daemon's bounded lock budget. Protective exits retain scheduling
+priority.
 
 Three independent, deterministic generators now emit volatility-normalized
 opening momentum, failed-breakout reversal, and late-session momentum theses

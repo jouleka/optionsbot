@@ -47,10 +47,11 @@ from optionsbot.ibkr.contracts import ContractResolver
 from optionsbot.ibkr.types import OptionChainLeg
 from optionsbot.market_hours import minutes_to_nyse_close, nyse_session_close_utc
 from optionsbot.opening_range_economics import (
+    PAPER_RULE_EXPECTED_VALUE_MODEL,
     estimated_round_trip_cost,
     managed_break_even_probability,
     managed_expected_value,
-    with_managed_expected_value,
+    paper_rule_expected_value,
 )
 from optionsbot.scan.types import ScanResult
 from optionsbot.scoring import score_all
@@ -810,12 +811,18 @@ async def scan_symbol(
         scored = tuple(
             replace(
                 item,
-                suggestion=with_managed_expected_value(
+                suggestion=replace(
                     item.suggestion,
-                    opening_range_plan,
-                    target_hit_probability=None,
-                    estimated_round_trip_cost=opening_range_round_trip_costs.get(
-                        item.strategy_name
+                    expected_value=paper_rule_expected_value(
+                        terminal_expected_value=terminal_expected_values.get(
+                            item.strategy_name
+                        ),
+                        credit_or_debit=item.suggestion.credit_or_debit,
+                        plan=opening_range_plan,
+                        estimated_round_trip_cost=(
+                            opening_range_round_trip_costs.get(item.strategy_name)
+                        ),
+                        maximum_profit=item.suggestion.max_profit,
                     ),
                 ),
             )
@@ -931,7 +938,7 @@ async def scan_symbol(
                     "reward_risk": s.suggestion.reward_risk,
                     "expected_value": s.suggestion.expected_value,
                     "expected_value_model": (
-                        "managed_outcome_calibration_required_v3"
+                        PAPER_RULE_EXPECTED_VALUE_MODEL
                         if opening_range_plan is not None
                         else "terminal_expiry_v1"
                     ),

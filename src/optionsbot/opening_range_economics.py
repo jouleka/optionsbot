@@ -8,6 +8,12 @@ from dataclasses import replace
 
 from optionsbot.strategies import StrategySuggestion
 
+# The paper account may exercise the existing deterministic scanner before a
+# managed-path calibration artifact exists. This names the source of that
+# admission evidence honestly: it is the terminal expectancy after costs, not
+# a target-before-stop probability model.
+PAPER_RULE_EXPECTED_VALUE_MODEL = "paper_rule_terminal_ev_after_cost_v1"
+
 
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -201,6 +207,37 @@ def managed_break_even_probability(
     ):
         return None
     return (stop_dollars + round_trip_cost) / (target_dollars + stop_dollars)
+
+
+def paper_rule_expected_value(
+    *,
+    terminal_expected_value: object,
+    credit_or_debit: object,
+    plan: object,
+    estimated_round_trip_cost: object = 0.0,
+    maximum_profit: object = None,
+) -> float | None:
+    """Return deterministic paper-selection EV after current trading costs.
+
+    This deliberately does not reinterpret terminal profit probability as a
+    target-before-stop probability. It keeps the strategy engine's terminal
+    expectancy as a paper-only selection heuristic, subtracts the executable
+    round-trip reserve, and uses the managed-plan break-even calculation only
+    to prove that the configured premium target fits the structure.
+    """
+    terminal_ev = _number(terminal_expected_value)
+    round_trip_cost = _number(estimated_round_trip_cost)
+    if terminal_ev is None or round_trip_cost is None or round_trip_cost < 0.0:
+        return None
+    break_even_probability = managed_break_even_probability(
+        credit_or_debit=credit_or_debit,
+        plan=plan,
+        estimated_round_trip_cost=round_trip_cost,
+        maximum_profit=maximum_profit,
+    )
+    if break_even_probability is None or not 0.0 < break_even_probability < 1.0:
+        return None
+    return terminal_ev - round_trip_cost
 
 
 def estimated_round_trip_cost(

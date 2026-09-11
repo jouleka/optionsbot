@@ -7,6 +7,7 @@ from optionsbot.opening_range_economics import (
     managed_break_even_probability,
     managed_expected_value,
     managed_path_expected_values,
+    paper_rule_expected_value,
 )
 
 
@@ -118,6 +119,19 @@ def test_finite_spread_with_unreachable_net_target_fails_closed() -> None:
         estimated_round_trip_cost=6.80,
         maximum_profit=18.0,
     ) is None
+
+
+@pytest.mark.parametrize("cost", [2.25, 2.50])
+def test_paper_rule_rejects_cost_at_or_above_cheap_debit_target(cost: float) -> None:
+    assert (
+        paper_rule_expected_value(
+            terminal_expected_value=10.0,
+            credit_or_debit=-10.0,
+            plan=_plan(),
+            estimated_round_trip_cost=cost,
+        )
+        is None
+    )
 
 
 def test_three_event_expected_value_includes_timeout_costs_and_scaled_lcb() -> None:

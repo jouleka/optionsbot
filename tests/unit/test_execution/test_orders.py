@@ -26,6 +26,7 @@ from optionsbot.execution.orders import (
     transition,
     working_orders,
 )
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
 from optionsbot.storage.schema import (
     entry_intent_consumptions,
     fills,
@@ -67,6 +68,8 @@ def _insert_score(
     suggested_quantity: int = 2,
     symbol: str = "SPY",
     suggestion_extra: dict[str, object] | None = None,
+    strategy: str = "iron_condor",
+    legs: list[dict[str, object]] | None = None,
 ) -> int:
     """Persist a realistic snapshot + strategy_scores row, return the score id."""
     with engine.begin() as conn:
@@ -76,10 +79,10 @@ def _insert_score(
         score_id = conn.execute(
             insert(strategy_scores).values(
                 snapshot_id=snapshot_id,
-                strategy="iron_condor",
+                strategy=strategy,
                 score=78.0,
                 rationale="test",
-                legs_json=CONDOR_LEGS,
+                legs_json=legs if legs is not None else CONDOR_LEGS,
                 suggestion_json={
                     "defined_risk": True,
                     "credit_or_debit": 155.0,
@@ -141,6 +144,8 @@ def _insert_managed_binding(
     decided_at: datetime | None = NOW,
     captured_legs: list[dict[str, object]] | None = None,
     structure_hash: str | None = None,
+    signal_id: str | None = None,
+    status: str = "pending_entry",
 ) -> None:
     legs = captured_legs if captured_legs is not None else CONDOR_LEGS
     with engine.begin() as conn:
@@ -153,10 +158,20 @@ def _insert_managed_binding(
             .join(snapshots, strategy_scores.c.snapshot_id == snapshots.c.id)
             .where(strategy_scores.c.id == score_id)
         ).one()
+        terminal_values: dict[str, object] = {}
+        if status == "resolved":
+            terminal_values = {
+                "outcome": "target",
+                "resolved_at": NOW + timedelta(minutes=1),
+                "entry_ts": NOW,
+                "basis_dollars": 100.0,
+                "gross_pnl": 22.5,
+                "net_pnl": 21.1,
+            }
         conn.execute(
             insert(managed_opportunities).values(
                 opportunity_key=f"managed-stage-{score_id}",
-                signal_id=f"managed-signal-{score_id}",
+                signal_id=signal_id or f"managed-signal-{score_id}",
                 session="2026-06-10",
                 symbol=row.symbol,
                 direction="bull",
@@ -191,10 +206,41 @@ def _insert_managed_binding(
                 stop_pct=0.15,
                 target_pct=0.225,
                 commission_estimate=1.4,
-                status="pending_entry",
+                status=status,
                 training_eligible=0,
+                **terminal_values,
             )
         )
+
+
+def _paper_rule_packet(signal_id: str = "paper-rule-signal") -> dict[str, object]:
+    opening_plan: dict[str, object] = {
+        "status": "entry_confirmed",
+        "source": "trusted_daemon",
+        "signal_id": signal_id,
+        "session": "2026-06-10",
+        "direction": "bull",
+        "setup_type": "fvg_retest",
+        "stop_pct": 0.15,
+        "target_r": 1.5,
+        "target_pct": 0.225,
+    }
+    managed_plan = {
+        **opening_plan,
+        "schema_version": "managed_signal_plan_v1",
+        "generator": "opening_range_fvg",
+        "admission_enabled": True,
+        "option_expiry": "20260610",
+    }
+    return {
+        "expected_value_model": PAPER_RULE_EXPECTED_VALUE_MODEL,
+        "expected_value": 18.0,
+        "terminal_expected_value": 20.0,
+        "estimated_round_trip_cost": 2.0,
+        "prob_profit": 0.60,
+        "opening_range_fvg": opening_plan,
+        "managed_signal_plan": managed_plan,
+    }
 
 
 def _assert_no_staged_side_effects(engine: Engine) -> None:
@@ -280,6 +326,94 @@ def test_stage_order_accepts_exact_timely_managed_candidate(tmp_db: Engine) -> N
 
     assert record.strategy_score_id == score_id
     assert record.intent == "open"
+
+
+def test_stage_order_accepts_explicit_paper_rule_only_with_runtime_authority(
+    tmp_db: Engine,
+) -> None:
+    legs = [
+        {
+            "symbol": "SPY", "side": "buy", "sec_type": "OPT",
+            "expiry": "20260610", "strike": 600.0, "right": "C", "quantity": 1,
+        }
+    ]
+    signal_id = "paper-rule-signal"
+    score_id = _insert_score(
+        tmp_db,
+        strategy="long_call",
+        legs=legs,
+        suggestion_extra=_paper_rule_packet(signal_id),
+    )
+    _insert_managed_binding(
+        tmp_db,
+        score_id,
+        captured_legs=legs,
+        signal_id=signal_id,
+    )
+
+    with pytest.raises(ValueError, match="runtime paper authorization"):
+        stage_order(tmp_db, score_id, now=NOW)
+    _assert_no_staged_side_effects(tmp_db)
+
+    record = stage_order(
+        tmp_db,
+        score_id,
+        now=NOW,
+        allow_paper_rule=True,
+    )
+
+    assert record.strategy_score_id == score_id
+
+
+def test_stage_order_rejects_paper_rule_without_immutable_binding(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_score(
+        tmp_db,
+        strategy="long_call",
+        suggestion_extra=_paper_rule_packet(),
+    )
+
+    with pytest.raises(ValueError, match="no immutable opportunity binding"):
+        stage_order(
+            tmp_db,
+            score_id,
+            now=NOW,
+            allow_paper_rule=True,
+        )
+    _assert_no_staged_side_effects(tmp_db)
+
+
+@pytest.mark.parametrize("status", ["unobservable", "resolved"])
+def test_stage_order_rejects_terminal_managed_binding_atomically(
+    tmp_db: Engine,
+    status: str,
+) -> None:
+    score_id = _insert_score(tmp_db, suggestion_extra=MANAGED_PACKET)
+    _insert_managed_binding(tmp_db, score_id, status=status)
+
+    with pytest.raises(ValueError, match="no longer active execution evidence"):
+        stage_order(tmp_db, score_id, now=NOW)
+    _assert_no_staged_side_effects(tmp_db)
+
+
+def test_stage_order_rejects_captured_leg_symbol_mismatch_atomically(
+    tmp_db: Engine,
+) -> None:
+    score_id = _insert_score(tmp_db, suggestion_extra=MANAGED_PACKET)
+    mismatched_legs = [
+        {**leg, "symbol": "QQQ"}
+        for leg in CONDOR_LEGS
+    ]
+    _insert_managed_binding(
+        tmp_db,
+        score_id,
+        captured_legs=mismatched_legs,
+    )
+
+    with pytest.raises(ValueError, match="option legs differ from the captured symbol"):
+        stage_order(tmp_db, score_id, now=NOW)
+    _assert_no_staged_side_effects(tmp_db)
 
 
 @pytest.mark.parametrize("bot_action", [None, "hold"])

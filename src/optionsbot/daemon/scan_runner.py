@@ -28,7 +28,13 @@ from optionsbot.analysis.opening_range_fvg import (
     detect_opening_range_fvg,
 )
 from optionsbot.analysis.types import Direction, IVRegime
-from optionsbot.daemon.alert_pipeline import enqueue_alert, sweep_retries
+from optionsbot.config import PAPER_PORTS
+from optionsbot.daemon.alert_pipeline import (
+    alert_candidate_passes_dedup,
+    enqueue_alert,
+    prepare_alert_candidate_evidence,
+    sweep_retries,
+)
 from optionsbot.daemon.context import DaemonContext
 from optionsbot.daemon.gateway_health import BUDGET_TIMEOUT_SUFFIX
 from optionsbot.daemon.market_hours import (
@@ -36,6 +42,10 @@ from optionsbot.daemon.market_hours import (
     is_market_open,
     nyse_session_close_utc,
     nyse_session_date,
+)
+from optionsbot.execution.managed_boundary import (
+    carries_managed_model_packet,
+    carries_paper_rule_packet,
 )
 from optionsbot.ibkr.history import HistoryClient
 from optionsbot.ibkr.positions import PositionsClient
@@ -190,7 +200,12 @@ def _managed_signal_ids(
     context: DaemonContext,
     picks: list[tuple[str, ScoredStrategy, int]],
 ) -> dict[tuple[int, str], str]:
-    """Bind persisted managed rows to their immutable thesis identity."""
+    """Bind managed rows and execution claims to their thesis identity.
+
+    A paper/model claim with a missing or terminal opportunity must still take
+    the managed evidence-and-freeze path. Otherwise it could emit an actionable
+    legacy alert before order staging predictably rejects the absent binding.
+    """
 
     snapshot_ids = {snapshot_id for _, _, snapshot_id in picks}
     if not snapshot_ids:
@@ -209,11 +224,36 @@ def _managed_signal_ids(
             .where(strategy_scores.c.snapshot_id.in_(snapshot_ids))
             .where(managed_opportunities.c.admission_eligible == 1)
             .where(managed_opportunities.c.shadow_only == 0)
+            .where(managed_opportunities.c.status.in_(("pending_entry", "active")))
         ).all()
-    return {
+        score_rows = conn.execute(
+            select(
+                strategy_scores.c.snapshot_id,
+                strategy_scores.c.strategy,
+                strategy_scores.c.suggestion_json,
+            ).where(strategy_scores.c.snapshot_id.in_(snapshot_ids))
+        ).all()
+    signal_ids = {
         (int(row.snapshot_id), str(row.strategy)): str(row.signal_id)
         for row in rows
     }
+    for row in score_rows:
+        suggestion = row.suggestion_json
+        if not isinstance(suggestion, Mapping) or not (
+            carries_managed_model_packet(suggestion)
+            or carries_paper_rule_packet(suggestion)
+        ):
+            continue
+        key = (int(row.snapshot_id), str(row.strategy))
+        plan = suggestion.get("managed_signal_plan")
+        claimed_signal_id = plan.get("signal_id") if isinstance(plan, Mapping) else None
+        signal_ids.setdefault(
+            key,
+            claimed_signal_id
+            if isinstance(claimed_signal_id, str) and claimed_signal_id
+            else f"managed-claim:{key[0]}:{key[1]}",
+        )
+    return signal_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,27 +477,33 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
                 except Exception as exc:  # noqa: BLE001 -- research capture never blocks scans
                     log.exception("managed shadow registration failed for %s", sym)
                     errors.append(f"{sym}/managed_capture: {type(exc).__name__}: {exc}")
-                # A checksum-verified, prospectively promoted *base* model is
-                # the sole source of managed-path EV. Applying it only after
-                # capture freezes the raw candidate prevents model output from
-                # leaking back into its own training features.
-                try:
-                    from optionsbot.daemon.managed_admission import (
-                        apply_promoted_managed_model,
-                    )
+                # Paper admission stays deterministic. Managed models continue
+                # to train and evaluate in the background, but cannot overwrite
+                # the paper rule's EV or veto its candidates.
+                if not (
+                    context.settings.execution.paper_only
+                    and context.settings.ibkr.paper
+                    and context.settings.ibkr.port in PAPER_PORTS
+                ):
+                    try:
+                        from optionsbot.daemon.managed_admission import (
+                            apply_promoted_managed_model,
+                        )
 
-                    result = replace(
-                        result,
-                        scored=apply_promoted_managed_model(
-                            context.engine,
-                            context.settings,
-                            result.snapshot_id,
-                            result.scored,
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001 -- fail closed on no managed EV
-                    log.exception("managed admission model failed for %s", sym)
-                    errors.append(f"{sym}/managed_admission: {type(exc).__name__}: {exc}")
+                        result = replace(
+                            result,
+                            scored=apply_promoted_managed_model(
+                                context.engine,
+                                context.settings,
+                                result.snapshot_id,
+                                result.scored,
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- fail closed on no managed EV
+                        log.exception("managed admission model failed for %s", sym)
+                        errors.append(
+                            f"{sym}/managed_admission: {type(exc).__name__}: {exc}"
+                        )
                 for scored in result.scored:
                     all_picks.append((sym, scored, result.snapshot_id))
 
@@ -482,39 +528,151 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
             except Exception:  # noqa: BLE001 -- net-liq is advisory (incl. timeout); never abort a tick
                 log.exception("net-liq fetch failed/timed out; affordability filter off this tick")
 
-        # Freeze OptionsBot's own deterministic scan-admission disposition
-        # before an alert can expose the opportunity to Hermes.  This records
-        # association with the scan policy, not a claim that downstream order
-        # liquidity/margin/fill gates passed.
+        signal_ids = _managed_signal_ids(context, all_picks)
+        managed_keys = set(signal_ids)
+        fresh_picks: dict[tuple[int, str], ScoredStrategy] = {}
+        forced_holds: dict[tuple[int, str], str] = {}
+        alert_candidates: list[tuple[str, ScoredStrategy, int]] = []
+        candidate_slots: set[tuple[str, str]] = set()
+        prepared_managed_candidates: set[tuple[int, str]] = set()
+        if not context.alerting_paused:
+            ranked = rank_alert_candidates(
+                all_picks,
+                context.settings.scan.score_threshold,
+                account_value_usd,
+                context.settings.execution.max_single_trade_risk_pct,
+                signal_ids=signal_ids,
+            )
+            if not ranked and any(
+                scored.score >= context.settings.scan.score_threshold
+                for _, scored, _ in all_picks
+            ):
+                log.info(
+                    "no-edge tick: pick(s) passed the score floor but none had "
+                    "positive edge; suppressing alerts"
+                )
+            for sym, scored, snap_id in ranked:
+                if len(alert_candidates) >= context.settings.scan.alert_top_n:
+                    break
+                slot = (sym, scored.strategy_name)
+                if slot in candidate_slots or not alert_candidate_passes_dedup(
+                    context, sym, scored, snap_id
+                ):
+                    continue
+                key = (snap_id, scored.strategy_name)
+                if key not in managed_keys:
+                    alert_candidates.append((sym, scored, snap_id))
+                    candidate_slots.add(slot)
+                    continue
+                try:
+                    prepared, evidence = await prepare_alert_candidate_evidence(
+                        context,
+                        sym,
+                        scored,
+                        snap_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- managed entries fail closed
+                    reason = f"candidate_evidence_capture_failed:{type(exc).__name__}"
+                    forced_holds[key] = reason
+                    log.exception(
+                        "managed candidate evidence capture failed for %s/%s",
+                        sym,
+                        scored.strategy_name,
+                    )
+                    errors.append(
+                        f"{sym}/{scored.strategy_name}/evidence: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                fresh_picks[key] = prepared
+                fresh_blockers = candidate_admission_blockers(
+                    prepared,
+                    context.settings.scan.score_threshold,
+                    account_value_usd,
+                    context.settings.execution.max_single_trade_risk_pct,
+                )
+                if evidence.get("ready") is not True:
+                    reasons = evidence.get("readiness_issues")
+                    detail = (
+                        ",".join(str(reason) for reason in reasons)
+                        if isinstance(reasons, list)
+                        else "unspecified"
+                    )
+                    fresh_blockers.append(f"execution_evidence_not_ready({detail})")
+                if fresh_blockers:
+                    forced_holds[key] = ";".join(fresh_blockers)
+                    continue
+                alert_candidates.append((sym, prepared, snap_id))
+                candidate_slots.add(slot)
+                prepared_managed_candidates.add(key)
+
+        # Fresh evidence must persist before managed rows freeze the strategy
+        # score. The disposition is still immutable before alert dispatch or
+        # automatic execution can expose or use the candidate.
         dispositions_by_snapshot: dict[int, dict[str, tuple[str, str]]] = {}
         for _symbol, scored, snapshot_id in all_picks:
+            key = (snapshot_id, scored.strategy_name)
+            scored = fresh_picks.get(key, scored)
             blockers = candidate_admission_blockers(
                 scored,
                 context.settings.scan.score_threshold,
                 account_value_usd,
                 context.settings.execution.max_single_trade_risk_pct,
             )
-            dispositions_by_snapshot.setdefault(snapshot_id, {})[scored.strategy_name] = (
-                "hold" if blockers else "candidate",
-                ";".join(blockers) if blockers else "scan_admission_passed",
-            )
-        if dispositions_by_snapshot:
-            try:
-                from optionsbot.daemon.managed_capture import (
-                    record_snapshot_bot_dispositions,
+            forced_reason = forced_holds.get(key)
+            if key in managed_keys and key not in prepared_managed_candidates:
+                forced_reason = forced_reason or (
+                    "alerting_paused"
+                    if context.alerting_paused
+                    else "not_selected_for_execution"
                 )
+            dispositions_by_snapshot.setdefault(snapshot_id, {})[scored.strategy_name] = (
+                "hold" if blockers or forced_reason else "candidate",
+                forced_reason
+                or (";".join(blockers) if blockers else "scan_admission_passed"),
+            )
+        frozen_snapshots: set[int] = set()
+        if dispositions_by_snapshot:
+            from optionsbot.daemon.managed_capture import (
+                record_snapshot_bot_dispositions,
+            )
 
-                for snapshot_id, dispositions in dispositions_by_snapshot.items():
-                    record_snapshot_bot_dispositions(
+            for snapshot_id, dispositions in dispositions_by_snapshot.items():
+                try:
+                    recorded = record_snapshot_bot_dispositions(
                         context.engine,
                         snapshot_id,
                         dispositions,
                         policy_version=(context.settings.managed_learning.outcome_policy_version),
                         account_value_usd=account_value_usd,
                     )
-            except Exception as exc:  # noqa: BLE001 -- shadow attribution cannot block alerts
-                log.exception("managed baseline disposition persistence failed")
-                errors.append(f"managed_capture/disposition: {type(exc).__name__}: {exc}")
+                    expected_managed = sum(
+                        (snapshot_id, strategy) in managed_keys
+                        for strategy in dispositions
+                    )
+                    if expected_managed and recorded == expected_managed:
+                        frozen_snapshots.add(snapshot_id)
+                    elif expected_managed:
+                        errors.append(
+                            "managed_capture/disposition/"
+                            f"{snapshot_id}: recorded={recorded}/expected={expected_managed}"
+                        )
+                        log.error(
+                            "managed disposition freeze incomplete for snapshot %s: "
+                            "recorded=%d expected=%d",
+                            snapshot_id,
+                            recorded,
+                            expected_managed,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- managed entries fail closed
+                    log.exception(
+                        "managed baseline disposition persistence failed for snapshot %s",
+                        snapshot_id,
+                    )
+                    errors.append(
+                        "managed_capture/disposition/"
+                        f"{snapshot_id}: {type(exc).__name__}: {exc}"
+                    )
 
         # Alert the day's best: floor by score, rank desc, enqueue the top N that
         # pass dedup. Counting only successful (dedup-passed) enqueues means a
@@ -522,25 +680,25 @@ async def run_scan_tick(context: DaemonContext) -> ScanRunSummary:
         alerts_enqueued = 0
         alerted = []
         if not context.alerting_paused:
-            candidates = rank_alert_candidates(
-                all_picks,
-                context.settings.scan.score_threshold,
-                account_value_usd,
-                context.settings.execution.max_single_trade_risk_pct,
-                signal_ids=_managed_signal_ids(context, all_picks),
-            )
-            if not candidates and any(
-                scored.score >= context.settings.scan.score_threshold for _, scored, _ in all_picks
-            ):
-                log.info(
-                    "no-edge tick: pick(s) passed the score floor but none had "
-                    "positive edge; suppressing alerts"
-                )
-            for sym, scored, snap_id in candidates:
+            for sym, scored, snap_id in alert_candidates:
                 if alerts_enqueued >= context.settings.scan.alert_top_n:
                     break
+                key = (snap_id, scored.strategy_name)
+                if key in managed_keys and snap_id not in frozen_snapshots:
+                    log.error(
+                        "managed alert held because disposition did not freeze: %s/%s",
+                        sym,
+                        scored.strategy_name,
+                    )
+                    continue
                 try:
-                    if await enqueue_alert(context, sym, scored, snap_id):
+                    if await enqueue_alert(
+                        context,
+                        sym,
+                        scored,
+                        snap_id,
+                        evidence_prepared=key in managed_keys,
+                    ):
                         alerts_enqueued += 1
                         alerted.append((sym, scored, snap_id))
                 except Exception as e:  # noqa: BLE001

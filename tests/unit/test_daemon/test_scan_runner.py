@@ -7,13 +7,19 @@ import time
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+import pytest
 from sqlalchemy import insert, select
 
 from optionsbot.analysis.types import MarketView
 from optionsbot.daemon.context import DaemonContext
-from optionsbot.daemon.scan_runner import _resolve_scan_symbols, run_scan_tick
+from optionsbot.daemon.scan_runner import (
+    _managed_signal_ids,
+    _resolve_scan_symbols,
+    run_scan_tick,
+)
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
 from optionsbot.scan.types import ScanResult
-from optionsbot.storage.schema import scan_runs, watchlist
+from optionsbot.storage.schema import scan_runs, snapshots, strategy_scores, watchlist
 
 
 def _fake_scan_result(symbol: str = "SPY") -> ScanResult:
@@ -229,6 +235,316 @@ async def test_managed_capture_registration_runs_before_any_alert_candidate(
     )
     enqueue.assert_not_awaited()
     assert summary.alerts_enqueued == 0
+
+
+def test_unbound_paper_claim_still_requires_managed_freeze(
+    daemon_context: DaemonContext,
+) -> None:
+    """A registration failure cannot downgrade a paper claim to legacy alerting."""
+    signal_id = "2026-05-27:SPY:bull:fvg-retest"
+    with daemon_context.engine.begin() as conn:
+        snapshot_id = conn.execute(
+            insert(snapshots).values(
+                symbol="SPY",
+                ts=datetime(2026, 5, 27, 15, 30, tzinfo=UTC),
+                spot=500.0,
+                raw_json={},
+            )
+        ).inserted_primary_key[0]
+        conn.execute(
+            insert(strategy_scores).values(
+                snapshot_id=snapshot_id,
+                strategy="long_call",
+                score=80.0,
+                rationale="paper claim without managed binding",
+                legs_json=[],
+                suggestion_json={
+                    "expected_value_model": PAPER_RULE_EXPECTED_VALUE_MODEL,
+                    "managed_signal_plan": {"signal_id": signal_id},
+                },
+            )
+        )
+    scored = MagicMock(strategy_name="long_call")
+
+    result = _managed_signal_ids(
+        daemon_context,
+        [("SPY", scored, int(snapshot_id))],
+    )
+
+    assert result == {(int(snapshot_id), "long_call"): signal_id}
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected_events"),
+    [
+        (1, ["prepare", "disposition", "enqueue"]),
+        (0, ["prepare", "disposition"]),
+    ],
+)
+async def test_managed_candidate_requires_evidence_and_complete_freeze_before_enqueue(
+    daemon_context: DaemonContext,
+    recorded: int,
+    expected_events: list[str],
+) -> None:
+    """Fresh economics persist before the managed score becomes immutable."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    suggestion = MagicMock(
+        legs=(),
+        credit_or_debit=-100.0,
+        max_loss=100.0,
+        max_profit=150.0,
+        prob_profit=0.60,
+        suggested_quantity=1,
+        defined_risk=True,
+        risk_normalized_expectancy=0.10,
+        expected_value=10.0,
+    )
+    scored = ScoredStrategy(
+        strategy_name="long_call",
+        score=80.0,
+        factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        suggestion=suggestion,
+        rationale="managed paper candidate",
+    )
+    base = _fake_scan_result("SPY")
+    result = ScanResult(
+        symbol="SPY",
+        snapshot_id=99,
+        snapshot_ts=base.snapshot_ts,
+        view=base.view,
+        scored=(scored,),
+    )
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC))
+        )
+
+    positions = MagicMock()
+    positions.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("50000"),
+            buying_power=None,
+            available_funds=Decimal("50000"),
+            currency="USD",
+        )
+    )
+    events: list[str] = []
+
+    async def prepare(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        events.append("prepare")
+        return scored, {"ready": True}
+
+    def freeze(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        events.append("disposition")
+        return recorded
+
+    async def enqueue(*_args, **kwargs):  # type: ignore[no-untyped-def]
+        events.append("enqueue")
+        assert kwargs["evidence_prepared"] is True
+        return True
+
+    with (
+        patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True),
+        patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(return_value=result),
+        ),
+        patch(
+            "optionsbot.daemon.managed_capture.register_snapshot_opportunities",
+            return_value=1,
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner._managed_signal_ids",
+            return_value={(99, "long_call"): "managed-signal"},
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner.prepare_alert_candidate_evidence",
+            new=AsyncMock(side_effect=prepare),
+        ),
+        patch(
+            "optionsbot.daemon.managed_capture.record_snapshot_bot_dispositions",
+            side_effect=freeze,
+        ) as record_dispositions,
+        patch(
+            "optionsbot.daemon.scan_runner.enqueue_alert",
+            new=AsyncMock(side_effect=enqueue),
+        ) as enqueue_alert,
+        patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=positions),
+    ):
+        summary = await run_scan_tick(daemon_context)
+
+    assert events == expected_events
+    record_dispositions.assert_called_once()
+    assert record_dispositions.call_args.args[2] == {
+        "long_call": ("candidate", "scan_admission_passed")
+    }
+    if recorded:
+        enqueue_alert.assert_awaited_once()
+        assert summary.alerts_enqueued == 1
+        assert summary.errors == []
+    else:
+        enqueue_alert.assert_not_awaited()
+        assert summary.alerts_enqueued == 0
+        assert summary.errors == [
+            "managed_capture/disposition/99: recorded=0/expected=1"
+        ]
+
+
+async def test_managed_candidate_outside_top_n_is_frozen_as_hold_without_evidence(
+    daemon_context: DaemonContext,
+) -> None:
+    """A managed row cannot gain candidate authority without fresh evidence."""
+    from decimal import Decimal
+
+    from optionsbot.ibkr.types import AccountSummary
+    from optionsbot.scoring import ScoredStrategy
+    from optionsbot.scoring.types import FactorBreakdown
+
+    def candidate(name: str, expected_value: float) -> ScoredStrategy:
+        suggestion = MagicMock(
+            legs=(),
+            credit_or_debit=-100.0,
+            max_loss=100.0,
+            max_profit=150.0,
+            prob_profit=0.60,
+            suggested_quantity=1,
+            defined_risk=True,
+            risk_normalized_expectancy=expected_value / 100.0,
+            expected_value=expected_value,
+        )
+        return ScoredStrategy(
+            strategy_name=name,
+            score=80.0,
+            factors=FactorBreakdown(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+            suggestion=suggestion,
+            rationale="managed paper candidate",
+        )
+
+    top = candidate("long_call", 20.0)
+    lower = candidate("long_put", 10.0)
+    base = _fake_scan_result()
+    results = {
+        "SPY": ScanResult(
+            symbol="SPY",
+            snapshot_id=99,
+            snapshot_ts=base.snapshot_ts,
+            view=base.view,
+            scored=(top,),
+        ),
+        "AAPL": ScanResult(
+            symbol="AAPL",
+            snapshot_id=100,
+            snapshot_ts=base.snapshot_ts,
+            view=base.view,
+            scored=(lower,),
+        ),
+    }
+    daemon_context.settings.scan.alert_top_n = 1
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(watchlist),
+            [
+                {"symbol": "SPY", "added_at": datetime.now(UTC)},
+                {"symbol": "AAPL", "added_at": datetime.now(UTC)},
+            ],
+        )
+    positions = MagicMock()
+    positions.get_account_summary = AsyncMock(
+        return_value=AccountSummary(
+            net_liquidation=Decimal("50000"),
+            buying_power=None,
+            available_funds=Decimal("50000"),
+            currency="USD",
+        )
+    )
+
+    async def prepare(
+        _context: DaemonContext,
+        _symbol: str,
+        scored: ScoredStrategy,
+        _snapshot_id: int,
+    ) -> tuple[ScoredStrategy, dict[str, object]]:
+        return scored, {"ready": True}
+
+    with (
+        patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True),
+        patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(side_effect=lambda symbol, *_args, **_kwargs: results[symbol]),
+        ),
+        patch(
+            "optionsbot.daemon.managed_capture.register_snapshot_opportunities",
+            return_value=1,
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner._managed_signal_ids",
+            return_value={
+                (99, "long_call"): "managed-top",
+                (100, "long_put"): "managed-lower",
+            },
+        ),
+        patch(
+            "optionsbot.daemon.scan_runner.prepare_alert_candidate_evidence",
+            new=AsyncMock(side_effect=prepare),
+        ) as prepare_evidence,
+        patch(
+            "optionsbot.daemon.managed_capture.record_snapshot_bot_dispositions",
+            return_value=1,
+        ) as record_dispositions,
+        patch(
+            "optionsbot.daemon.scan_runner.enqueue_alert",
+            new=AsyncMock(return_value=True),
+        ) as enqueue_alert,
+        patch("optionsbot.daemon.scan_runner.PositionsClient", return_value=positions),
+    ):
+        summary = await run_scan_tick(daemon_context)
+
+    prepare_evidence.assert_awaited_once()
+    assert prepare_evidence.await_args.args[1:] == ("SPY", top, 99)
+    dispositions = {
+        call.args[1]: call.args[2] for call in record_dispositions.call_args_list
+    }
+    assert dispositions[99] == {
+        "long_call": ("candidate", "scan_admission_passed")
+    }
+    assert dispositions[100] == {
+        "long_put": ("hold", "not_selected_for_execution")
+    }
+    enqueue_alert.assert_awaited_once()
+    assert summary.alerts_enqueued == 1
+
+
+async def test_recognized_paper_runtime_never_applies_promoted_managed_model(
+    daemon_context: DaemonContext,
+) -> None:
+    """A promoted research artifact cannot overwrite deterministic paper EV."""
+    daemon_context.settings.execution.paper_only = True
+    daemon_context.settings.ibkr.paper = True
+    daemon_context.settings.ibkr.port = 4002
+    with daemon_context.engine.begin() as conn:
+        conn.execute(
+            insert(watchlist).values(symbol="SPY", added_at=datetime.now(UTC))
+        )
+
+    with (
+        patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True),
+        patch(
+            "optionsbot.daemon.scan_runner.scan_symbol",
+            new=AsyncMock(return_value=_fake_scan_result("SPY")),
+        ),
+        patch(
+            "optionsbot.daemon.managed_admission.apply_promoted_managed_model"
+        ) as apply_model,
+    ):
+        summary = await run_scan_tick(daemon_context)
+
+    apply_model.assert_not_called()
+    assert summary.tickers_scanned == 1
 
 
 async def test_run_scan_tick_records_per_symbol_errors_without_aborting_tick(
@@ -717,9 +1033,26 @@ async def test_run_scan_tick_suppresses_alerts_when_paused(
     with patch("optionsbot.daemon.scan_runner.is_market_open", return_value=True), \
          patch("optionsbot.daemon.scan_runner.scan_symbol",
                new=AsyncMock(return_value=_scan_result_for("SPY", scored))), \
+         patch(
+             "optionsbot.daemon.scan_runner._managed_signal_ids",
+             return_value={(7, "a"): "managed-paused"},
+         ), \
+         patch(
+             "optionsbot.daemon.scan_runner.prepare_alert_candidate_evidence",
+             new=AsyncMock(),
+         ) as prepare_evidence, \
+         patch(
+             "optionsbot.daemon.managed_capture.record_snapshot_bot_dispositions",
+             return_value=1,
+         ) as record_dispositions, \
          patch("optionsbot.daemon.scan_runner.enqueue_alert", new=AsyncMock()) as mock_enq:
         summary = await run_scan_tick(daemon_context)
 
+    prepare_evidence.assert_not_awaited()
+    record_dispositions.assert_called_once()
+    assert record_dispositions.call_args.args[2] == {
+        "a": ("hold", "alerting_paused")
+    }
     mock_enq.assert_not_awaited()       # paused → no enqueue
     assert summary.alerts_enqueued == 0
     assert summary.tickers_scanned == 1  # but scanning still happened

@@ -11,8 +11,10 @@ from optionsbot.execution.risk_structure import (
     structural_max_profit_dollars,
 )
 from optionsbot.opening_range_economics import (
+    PAPER_RULE_EXPECTED_VALUE_MODEL,
     managed_expected_value,
     managed_path_expected_values,
+    paper_rule_expected_value,
 )
 
 
@@ -134,8 +136,22 @@ def reconcile_entry_economics(
         )
         managed_ev_lcb = managed_ev
     round_trip_cost = _finite_number(estimated_round_trip_cost)
+    paper_rule = (
+        suggestion.get("expected_value_model") == PAPER_RULE_EXPECTED_VALUE_MODEL
+    )
+    paper_expected_value = paper_rule_expected_value(
+        terminal_expected_value=terminal_expected_value,
+        credit_or_debit=fresh_cashflow,
+        plan=opening_range_plan,
+        estimated_round_trip_cost=round_trip_cost,
+        maximum_profit=max_profit,
+    )
     expected_value = (
-        managed_ev_lcb if opening_range_candidate else terminal_expected_value
+        paper_expected_value
+        if opening_range_candidate and paper_rule
+        else managed_ev_lcb
+        if opening_range_candidate
+        else terminal_expected_value
     )
     reward_risk = (
         max_profit / max_loss

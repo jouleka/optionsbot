@@ -23,6 +23,7 @@ from optionsbot.config import Settings
 from optionsbot.learning.features import model_features
 from optionsbot.learning.managed_model import ManagedPrediction, predict_managed_outcome
 from optionsbot.learning.repository import load_promoted_model
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
 from optionsbot.storage.schema import managed_opportunities, snapshots, strategy_scores
 
 
@@ -37,6 +38,7 @@ _MANAGED_PACKET_IDENTITY_FIELDS = (
     "managed_outcome_policy_version",
     "managed_model_trained_through",
 )
+_ACTIVE_MANAGED_STATUSES = ("pending_entry", "active")
 
 
 def carries_managed_model_packet(suggestion: Mapping[str, object]) -> bool:
@@ -45,6 +47,11 @@ def carries_managed_model_packet(suggestion: Mapping[str, object]) -> bool:
         suggestion.get(name) is not None and suggestion.get(name) != ""
         for name in _MANAGED_PACKET_IDENTITY_FIELDS
     )
+
+
+def carries_paper_rule_packet(suggestion: Mapping[str, object]) -> bool:
+    """Return whether a suggestion claims deterministic paper-rule authority."""
+    return suggestion.get("expected_value_model") == PAPER_RULE_EXPECTED_VALUE_MODEL
 
 
 def _utc_timestamp(value: object, *, name: str) -> datetime:
@@ -62,6 +69,8 @@ def _managed_binding_rows(conn: Connection, score_id: int) -> list[RowMapping]:
         conn.execute(
             select(
                 managed_opportunities.c.strategy_score_id,
+                managed_opportunities.c.signal_id,
+                managed_opportunities.c.status,
                 managed_opportunities.c.symbol,
                 managed_opportunities.c.session,
                 managed_opportunities.c.direction,
@@ -103,6 +112,10 @@ def _validate_bound_row(
     now: datetime,
 ) -> None:
     """Validate immutable score identity and its first admission disposition."""
+    if row["status"] not in _ACTIVE_MANAGED_STATUSES:
+        raise ManagedExecutionError(
+            "managed opportunity is no longer active execution evidence"
+        )
     if row["admission_eligible"] != 1 or row["shadow_only"] != 0:
         raise ManagedExecutionError(
             "managed opportunity is immutable research-only evidence"
@@ -145,6 +158,11 @@ def _validate_bound_row(
     current_legs = _canonical_option_legs(row["score_legs_json"])
     if not captured_legs or not current_legs:
         raise ManagedExecutionError("managed opportunity option structure is malformed")
+    captured_symbol = str(row["symbol"]).strip().upper()
+    if any(leg["symbol"] != captured_symbol for leg in captured_legs):
+        raise ManagedExecutionError(
+            "managed opportunity option legs differ from the captured symbol"
+        )
     captured_hash = _structure_hash(captured_legs)
     if captured_hash != row["structure_hash"]:
         raise ManagedExecutionError("captured option structure hash is invalid")
@@ -158,6 +176,7 @@ def validate_managed_stage_authorization(
     suggestion: Mapping[str, object],
     *,
     now: datetime,
+    allow_paper_rule: bool = False,
 ) -> bool:
     """Enforce a managed admission binding in the order-insert transaction.
 
@@ -167,9 +186,11 @@ def validate_managed_stage_authorization(
     """
     rows = _managed_binding_rows(conn, score_id)
     if not rows:
-        if carries_managed_model_packet(suggestion):
+        if carries_managed_model_packet(suggestion) or carries_paper_rule_packet(
+            suggestion
+        ):
             raise ManagedExecutionError(
-                "managed model packet has no immutable opportunity binding"
+                "managed admission packet has no immutable opportunity binding"
             )
         return False
     if len(rows) != 1:
@@ -177,14 +198,143 @@ def validate_managed_stage_authorization(
             "managed order staging requires exactly one immutable opportunity"
         )
     _validate_bound_row(rows[0], score_id, now=now)
-    if not carries_managed_model_packet(suggestion):
+    model_claim = carries_managed_model_packet(suggestion)
+    paper_claim = carries_paper_rule_packet(suggestion)
+    if model_claim and paper_claim:
         raise ManagedExecutionError(
-            "managed candidate lacks a complete managed model packet"
+            "managed model identity cannot also claim deterministic paper authority"
         )
-    for name in _MANAGED_PACKET_IDENTITY_FIELDS:
-        _required_text(suggestion, name)
-    _validate_three_event_packet(suggestion)
-    return True
+    if model_claim:
+        for name in _MANAGED_PACKET_IDENTITY_FIELDS:
+            _required_text(suggestion, name)
+        _validate_three_event_packet(suggestion)
+        return True
+    if allow_paper_rule and paper_claim:
+        _validate_paper_rule_packet(suggestion, rows[0])
+        return True
+    if paper_claim:
+        raise ManagedExecutionError(
+            "deterministic paper candidate lacks the runtime paper authorization"
+        )
+    raise ManagedExecutionError(
+        "managed candidate lacks a complete managed model packet"
+    )
+
+
+def _validate_paper_rule_packet(
+    payload: Mapping[str, object],
+    row: RowMapping,
+) -> None:
+    """Validate explicit, non-model OR/FVG paper admission evidence."""
+    if carries_managed_model_packet(payload):
+        raise ManagedExecutionError(
+            "managed model identity cannot fall back to deterministic paper authority"
+        )
+    opening_plan = payload.get("opening_range_fvg")
+    managed_plan = payload.get("managed_signal_plan")
+    if not isinstance(opening_plan, Mapping) or not isinstance(managed_plan, Mapping):
+        raise ManagedExecutionError("deterministic paper plan is missing")
+    signal_id = opening_plan.get("signal_id")
+    session = opening_plan.get("session")
+    direction = opening_plan.get("direction")
+    setup_type = opening_plan.get("setup_type")
+    session_expiry = str(row["session"]).replace("-", "")
+    captured_legs = _canonical_option_legs(row["legs_json"])
+    allowed_strategies = {
+        "bull": {"bull_call_spread", "long_call"},
+        "bear": {"bear_put_spread", "long_put"},
+    }
+    if (
+        opening_plan.get("status") != "entry_confirmed"
+        or opening_plan.get("source") != "trusted_daemon"
+        or managed_plan.get("schema_version") != "managed_signal_plan_v1"
+        or managed_plan.get("status") != "entry_confirmed"
+        or managed_plan.get("source") != "trusted_daemon"
+        or managed_plan.get("generator") != "opening_range_fvg"
+        or managed_plan.get("admission_enabled") is not True
+        or not isinstance(signal_id, str)
+        or not signal_id
+        or managed_plan.get("signal_id") != signal_id
+        or managed_plan.get("session") != session
+        or managed_plan.get("direction") != direction
+        or managed_plan.get("setup_type") != setup_type
+        or signal_id != row["signal_id"]
+        or session != row["session"]
+        or direction != row["direction"]
+        or setup_type != row["setup_type"]
+        or managed_plan.get("option_expiry") != session_expiry
+        or not captured_legs
+        or {str(leg["expiry"]) for leg in captured_legs} != {session_expiry}
+        or direction not in allowed_strategies
+        or row["strategy"] not in allowed_strategies[str(direction)]
+    ):
+        raise ManagedExecutionError(
+            "deterministic paper plan lacks trusted OR/FVG identity"
+        )
+    expected_value = _finite(payload.get("expected_value"))
+    terminal_value = _finite(payload.get("terminal_expected_value"))
+    costs = _finite(payload.get("estimated_round_trip_cost"))
+    prob_profit = _finite(payload.get("prob_profit"))
+    opening_stop = _finite(opening_plan.get("stop_pct"))
+    opening_target = _finite(opening_plan.get("target_pct"))
+    opening_target_r = _finite(opening_plan.get("target_r"))
+    managed_stop = _finite(managed_plan.get("stop_pct"))
+    managed_target = _finite(managed_plan.get("target_pct"))
+    managed_target_r = _finite(managed_plan.get("target_r"))
+    row_stop = _finite(row["stop_pct"])
+    row_target = _finite(row["target_pct"])
+    plan_numbers = (
+        opening_stop,
+        opening_target,
+        opening_target_r,
+        managed_stop,
+        managed_target,
+        managed_target_r,
+        row_stop,
+        row_target,
+    )
+    if (
+        expected_value is None
+        or expected_value <= 0.0
+        or terminal_value is None
+        or costs is None
+        or costs < 0.0
+        or prob_profit is None
+        or not 0.0 < prob_profit < 1.0
+        or any(value is None for value in plan_numbers)
+        or not math.isclose(
+            expected_value,
+            terminal_value - costs,
+            rel_tol=1e-9,
+            abs_tol=1e-6,
+        )
+    ):
+        raise ManagedExecutionError(
+            "deterministic paper expectancy is missing, non-positive, or inconsistent"
+        )
+    assert opening_stop is not None
+    assert opening_target is not None
+    assert opening_target_r is not None
+    assert managed_stop is not None
+    assert managed_target is not None
+    assert managed_target_r is not None
+    assert row_stop is not None
+    assert row_target is not None
+    if (
+        not math.isclose(opening_stop, managed_stop, rel_tol=1e-9)
+        or not math.isclose(opening_stop, row_stop, rel_tol=1e-9)
+        or not math.isclose(opening_target, managed_target, rel_tol=1e-9)
+        or not math.isclose(opening_target, row_target, rel_tol=1e-9)
+        or not math.isclose(opening_target_r, managed_target_r, rel_tol=1e-9)
+        or not math.isclose(
+            opening_target,
+            opening_stop * opening_target_r,
+            rel_tol=1e-9,
+        )
+    ):
+        raise ManagedExecutionError(
+            "deterministic paper stop/target plan differs from its immutable binding"
+        )
 
 
 def _finite(value: object) -> float | None:

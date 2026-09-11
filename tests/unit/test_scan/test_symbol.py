@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 from sqlalchemy import select
 
+from optionsbot.opening_range_economics import PAPER_RULE_EXPECTED_VALUE_MODEL
 from optionsbot.scan import ScanResult, scan_symbol
 from optionsbot.storage.schema import snapshots, strategy_scores, symbol_news
 
@@ -476,7 +477,7 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
     from optionsbot.strategies import Leg, StrategySuggestion
 
     scan_settings.scan.opening_range_fvg_enabled = True
-    terminal_ev = -20.0
+    terminal_ev = 20.0
     suggestion = StrategySuggestion(
         strategy_name="long_call",
         legs=(
@@ -544,9 +545,10 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
         opening_range_signal=signal,
     )
 
-    # Terminal PoP is not a target-before-stop probability. Until a calibrated
-    # managed-path model is promoted, the exact 0DTE candidate is shadow-only.
-    assert result.scored[0].suggestion.expected_value is None
+    # Terminal EV remains separate from target-before-stop modeling. The
+    # explicit paper rule may use it only after current round-trip costs.
+    paper_ev = terminal_ev - 11.4
+    assert result.scored[0].suggestion.expected_value == pytest.approx(paper_ev)
     with scan_engine.connect() as conn:
         stored = conn.execute(
             select(strategy_scores).where(
@@ -556,14 +558,14 @@ async def test_orb_scan_persists_managed_ev_and_retains_terminal_ev(
         snapshot = conn.execute(
             select(snapshots).where(snapshots.c.id == result.snapshot_id)
         ).one()
-    assert stored.suggestion_json["expected_value"] is None
+    assert stored.suggestion_json["expected_value"] == pytest.approx(paper_ev)
     assert stored.suggestion_json["gross_managed_expected_value"] is None
     assert stored.suggestion_json["managed_target_hit_probability_lcb"] is None
     assert stored.suggestion_json["managed_break_even_probability"] is not None
     assert stored.suggestion_json["estimated_round_trip_cost"] == pytest.approx(11.4)
     assert stored.suggestion_json["terminal_expected_value"] == terminal_ev
     assert stored.suggestion_json["expected_value_model"] == (
-        "managed_outcome_calibration_required_v3"
+        PAPER_RULE_EXPECTED_VALUE_MODEL
     )
     quality = stored.suggestion_json["opening_range_fvg"]["quality"]
     assert quality["schema_version"] == "opening_range_quality_v1"

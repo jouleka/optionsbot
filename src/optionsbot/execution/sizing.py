@@ -1,9 +1,10 @@
 """Dynamic position sizing (IBK-133): how professionals size, bounded.
 
 Computed at EXECUTE time from live equity + the bot's own realized history:
-base risk × edge tilt (quarter-Kelly from the pick's own PoP and payoff,
-clamped ×0.5–×2.0) × drawdown governor (anti-martingale: NEVER sizes up
-after losses), then capped by portfolio heat and a single-trade ceiling.
+base risk × edge tilt (quarter-Kelly from a path-matched PoP and payoff,
+clamped ×0.5–×2.0; explicit deterministic paper rules use neutral ×1.0)
+× drawdown governor (anti-martingale: NEVER sizes up after losses), then
+capped by portfolio heat and a single-trade ceiling.
 Small accounts get a minimum-viable 1 lot when the trade fits the caps —
 fractional contracts don't exist.
 """
@@ -307,15 +308,24 @@ def dynamic_quantity(
     base_risk_pct: float,
     heat_cap_pct: float,
     single_trade_cap_pct: float,
+    neutral_edge_tilt: bool = False,
 ) -> SizeDecision:
     if equity <= 0 or max_loss_unit <= 0:
         return SizeDecision(0, "no equity/defined risk basis")
 
     base = equity * base_risk_pct
 
-    # Edge tilt: quarter-Kelly from the pick's own numbers, bounded.
-    tilt = 0.5
-    if max_profit_unit and prob_profit and max_profit_unit > 0 and 0 < prob_profit < 1:
+    # Edge tilt: quarter-Kelly only when probability and payoff describe the
+    # same exit path. The deterministic paper rule has terminal-expiry PoP but
+    # an intraday first-hit stop/target, so it explicitly stays neutral.
+    tilt = 1.0 if neutral_edge_tilt else 0.5
+    if (
+        not neutral_edge_tilt
+        and max_profit_unit
+        and prob_profit
+        and max_profit_unit > 0
+        and 0 < prob_profit < 1
+    ):
         b = max_profit_unit / max_loss_unit
         kelly = prob_profit - (1 - prob_profit) / b
         if kelly > 0:

@@ -26,19 +26,59 @@ BACKOFF_MINUTES: tuple[int, ...] = (1, 5, 15, 60, 240)
 MAX_RETRIES: int = len(BACKOFF_MINUTES)
 
 
-async def enqueue_alert(
+async def prepare_alert_candidate_evidence(
+    context: DaemonContext,
+    symbol: str,
+    scored: ScoredStrategy,
+    snapshot_id: int,
+) -> tuple[ScoredStrategy, dict[str, object]]:
+    """Persist fresh candidate evidence before managed disposition freezes it."""
+    from optionsbot.daemon.candidate_evidence import (
+        capture_candidate_evidence,
+        with_reconciled_economics,
+    )
+
+    strategy_score_id = _strategy_score_id_for(
+        context, snapshot_id, scored.strategy_name
+    )
+    if strategy_score_id is None:
+        raise RuntimeError(
+            f"missing exact persisted score for snapshot={snapshot_id} "
+            f"strategy={scored.strategy_name}"
+        )
+    evidence = await capture_candidate_evidence(
+        context,
+        score_id=strategy_score_id,
+        symbol=symbol,
+        legs=[
+            {
+                "symbol": leg.symbol,
+                "side": leg.side,
+                "sec_type": leg.sec_type,
+                "expiry": leg.expiry,
+                "strike": leg.strike,
+                "right": leg.right,
+                "quantity": leg.quantity,
+            }
+            for leg in scored.suggestion.legs
+        ],
+    )
+    return (
+        replace(
+            scored,
+            suggestion=with_reconciled_economics(scored.suggestion, evidence),
+        ),
+        evidence,
+    )
+
+
+def alert_candidate_passes_dedup(
     context: DaemonContext,
     symbol: str,
     scored: ScoredStrategy,
     snapshot_id: int,
 ) -> bool:
-    """Dedup-check, insert pending row, dispatch.
-
-    Returns True when an alerts row was inserted (and dispatch was attempted),
-    False when the dedup gate suppressed it. The caller increments its
-    enqueued counter only on True so dedup-skipped attempts don't pad
-    scan_runs.alerts_fired with phantom rows.
-    """
+    """Preflight the same signal and cooldown gates used during enqueue."""
     opening_signal_id = _opening_signal_id_for(context, snapshot_id)
     if opening_signal_id is not None and _opening_signal_was_alerted(
         context,
@@ -47,9 +87,27 @@ async def enqueue_alert(
         signal_id=opening_signal_id,
     ):
         return False
-    if not should_alert(
+    return should_alert(
         context.engine, context.settings, symbol, scored.strategy_name, scored.score
-    ):
+    )
+
+
+async def enqueue_alert(
+    context: DaemonContext,
+    symbol: str,
+    scored: ScoredStrategy,
+    snapshot_id: int,
+    *,
+    evidence_prepared: bool = False,
+) -> bool:
+    """Dedup-check, insert pending row, dispatch.
+
+    Returns True when an alerts row was inserted (and dispatch was attempted),
+    False when the dedup gate suppressed it. The caller increments its
+    enqueued counter only on True so dedup-skipped attempts don't pad
+    scan_runs.alerts_fired with phantom rows.
+    """
+    if not alert_candidate_passes_dedup(context, symbol, scored, snapshot_id):
         return False
     now = datetime.now(UTC)
     strategy_score_id = _strategy_score_id_for(context, snapshot_id, scored.strategy_name)
@@ -72,35 +130,16 @@ async def enqueue_alert(
         alert_id = cast(int, result.inserted_primary_key[0])  # type: ignore[index]
     # Hermes is deliberately broker-isolated. Capture the exact live quote,
     # account, and risk packet before the alert becomes visible as sent.
-    try:
-        from optionsbot.daemon.candidate_evidence import (
-            capture_candidate_evidence,
-            with_reconciled_economics,
-        )
-
-        evidence = await capture_candidate_evidence(
-            context,
-            score_id=strategy_score_id,
-            symbol=symbol,
-            legs=[
-                {
-                    "symbol": leg.symbol,
-                    "side": leg.side,
-                    "sec_type": leg.sec_type,
-                    "expiry": leg.expiry,
-                    "strike": leg.strike,
-                    "right": leg.right,
-                    "quantity": leg.quantity,
-                }
-                for leg in scored.suggestion.legs
-            ],
-        )
-        scored = replace(
-            scored,
-            suggestion=with_reconciled_economics(scored.suggestion, evidence),
-        )
-    except Exception:  # noqa: BLE001 - alert still delivers; Hermes fails closed
-        log.exception("candidate evidence capture failed for score %s", strategy_score_id)
+    if not evidence_prepared:
+        try:
+            scored, _evidence = await prepare_alert_candidate_evidence(
+                context,
+                symbol,
+                scored,
+                snapshot_id,
+            )
+        except Exception:  # noqa: BLE001 - alert still delivers; Hermes fails closed
+            log.exception("candidate evidence capture failed for score %s", strategy_score_id)
     await dispatch_alert(context, alert_id, snapshot_id, scored)
     return True
 

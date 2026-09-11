@@ -120,6 +120,30 @@ def _seed_snapshot(
     return snapshot_id
 
 
+def _shadow_suggestion(signal_id: str) -> dict[str, Any]:
+    generator = "late_session_momentum"
+    return {
+        "shadow_only": True,
+        "admission_enabled": False,
+        "managed_signal_plan": {
+            "schema_version": "managed_signal_plan_v1",
+            "status": "shadow_confirmed",
+            "source": "trusted_daemon",
+            "authority": "shadow_research_only_no_order_or_halt_authority",
+            "admission_enabled": False,
+            "signal_id": signal_id,
+            "session": SESSION,
+            "direction": "bull",
+            "generator": generator,
+            "setup_type": generator,
+            "option_expiry": "20260527",
+            "stop_pct": 0.15,
+            "target_r": 1.5,
+            "target_pct": 0.225,
+        },
+    }
+
+
 def _quote(
     now: datetime,
     *,
@@ -207,9 +231,7 @@ def _record_candidate_dispositions(context: DaemonContext, snapshot_id: int) -> 
     with context.engine.connect() as conn:
         detected_at = conn.scalar(select(snapshots.c.ts).where(snapshots.c.id == snapshot_id))
         strategies = conn.scalars(
-            select(strategy_scores.c.strategy).where(
-                strategy_scores.c.snapshot_id == snapshot_id
-            )
+            select(strategy_scores.c.strategy).where(strategy_scores.c.snapshot_id == snapshot_id)
         ).all()
     assert isinstance(detected_at, datetime)
     recorded = record_snapshot_bot_dispositions(
@@ -389,6 +411,117 @@ def test_capacity_reclaims_a_surplus_structure_for_an_independent_signal(
     assert (
         rows[1].resolution_reason == "managed_capture_capacity_reallocated_for_independent_signal"
     )
+
+
+def test_production_reclaims_shadow_capacity_even_for_an_existing_signal(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.validation.managed_capture_max_active = 2
+    signal_id = "2026-05-27:SPY:bull:shared-signal"
+    shadow_strategy = "shadow_grid_v1:long_call_d50:capacity-shared"
+    shadow_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id=signal_id,
+        strategies=[(shadow_strategy, [_leg(strike=499.0)])],
+        suggestions={shadow_strategy: _shadow_suggestion(signal_id)},
+    )
+    assert (
+        register_snapshot_opportunities(
+            daemon_context.engine,
+            daemon_context.settings,
+            shadow_snapshot,
+        )
+        == 1
+    )
+    other_shadow_signal = "2026-05-27:SPY:bull:other-shadow"
+    other_shadow_strategy = "shadow_grid_v1:long_call_d50:capacity-other"
+    other_shadow_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id=other_shadow_signal,
+        strategies=[(other_shadow_strategy, [_leg(strike=498.0)])],
+        suggestions={other_shadow_strategy: _shadow_suggestion(other_shadow_signal)},
+        detected=datetime(2026, 5, 27, 14, 0, 30, tzinfo=UTC),
+    )
+    register_snapshot_opportunities(
+        daemon_context.engine,
+        daemon_context.settings,
+        other_shadow_snapshot,
+    )
+
+    production_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id=signal_id,
+        strategies=[
+            ("long_call", [_leg(strike=500.0)]),
+            (
+                "bull_call_spread",
+                [_leg(strike=500.0), _leg(strike=501.0, side="sell")],
+            ),
+        ],
+        detected=datetime(2026, 5, 27, 14, 1, tzinfo=UTC),
+    )
+    assert (
+        register_snapshot_opportunities(
+            daemon_context.engine,
+            daemon_context.settings,
+            production_snapshot,
+        )
+        == 2
+    )
+
+    with daemon_context.engine.connect() as conn:
+        rows = conn.execute(
+            select(managed_opportunities).order_by(managed_opportunities.c.id)
+        ).fetchall()
+    assert all(row.shadow_only == 1 for row in rows[:2])
+    assert all(row.status == "unobservable" for row in rows[:2])
+    assert all(
+        row.resolution_reason == "managed_capture_capacity_reallocated_for_production"
+        for row in rows[:2]
+    )
+    assert all(row.admission_eligible == 1 for row in rows[2:])
+    assert all(row.shadow_only == 0 for row in rows[2:])
+    assert all(row.status == "pending_entry" for row in rows[2:])
+
+
+def test_shadow_never_reclaims_production_capacity(
+    daemon_context: DaemonContext,
+) -> None:
+    daemon_context.settings.validation.managed_capture_max_active = 1
+    production_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id="2026-05-27:SPY:bull:production",
+    )
+    register_snapshot_opportunities(
+        daemon_context.engine,
+        daemon_context.settings,
+        production_snapshot,
+    )
+
+    shadow_signal = "2026-05-27:SPY:bull:research"
+    shadow_strategy = "shadow_grid_v1:long_call_d50:no-preempt"
+    shadow_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id=shadow_signal,
+        strategies=[(shadow_strategy, [_leg(strike=499.0)])],
+        suggestions={shadow_strategy: _shadow_suggestion(shadow_signal)},
+        detected=datetime(2026, 5, 27, 14, 1, tzinfo=UTC),
+    )
+    register_snapshot_opportunities(
+        daemon_context.engine,
+        daemon_context.settings,
+        shadow_snapshot,
+    )
+
+    with daemon_context.engine.connect() as conn:
+        rows = conn.execute(
+            select(managed_opportunities).order_by(managed_opportunities.c.id)
+        ).fetchall()
+    assert rows[0].admission_eligible == 1
+    assert rows[0].status == "pending_entry"
+    assert rows[1].shadow_only == 1
+    assert rows[1].status == "unobservable"
+    assert rows[1].resolution_reason == "managed_capture_capacity_reached"
 
 
 @pytest.mark.asyncio
@@ -1010,6 +1143,79 @@ async def test_poll_rotation_selects_complete_signal_bundles(
     ]
     assert second.usable_marks == 1
     assert second.unusable_marks == 1
+
+
+@pytest.mark.asyncio
+async def test_quote_budget_always_spends_on_production_before_shadow(
+    daemon_context: DaemonContext,
+) -> None:
+    shadow_signal = "2026-05-27:SPY:bull:research-budget"
+    shadow_strategy = "shadow_grid_v1:long_call_d50:budget"
+    shadow_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id=shadow_signal,
+        strategies=[(shadow_strategy, [_leg(strike=499.0)])],
+        suggestions={shadow_strategy: _shadow_suggestion(shadow_signal)},
+    )
+    register_snapshot_opportunities(
+        daemon_context.engine,
+        daemon_context.settings,
+        shadow_snapshot,
+    )
+    production_snapshot = _seed_snapshot(
+        daemon_context,
+        signal_id="2026-05-27:SPY:bull:production-budget",
+        strategies=[
+            (
+                "bull_call_spread",
+                [_leg(strike=500.0), _leg(strike=501.0, side="sell")],
+            )
+        ],
+        detected=datetime(2026, 5, 27, 14, 1, tzinfo=UTC),
+    )
+    register_snapshot_opportunities(
+        daemon_context.engine,
+        daemon_context.settings,
+        production_snapshot,
+    )
+    _record_candidate_dispositions(daemon_context, production_snapshot)
+    daemon_context.settings.validation.managed_capture_max_unique_legs = 2
+    daemon_context.settings.ibkr.max_market_data_lines = 2
+    now = datetime(2026, 5, 27, 14, 1, 5, tzinfo=UTC)
+    feed = _QuoteFeed(
+        {
+            ("SPY", "20260527", strike, "C"): _quote(
+                now,
+                bid=1.0 if strike == 500.0 else 0.5,
+                ask=1.1 if strike == 500.0 else 0.6,
+                strike=strike,
+            )
+            for strike in (499.0, 500.0, 501.0)
+        }
+    )
+
+    summary = await run_managed_capture_tick(
+        daemon_context,
+        now=now,
+        md=feed,  # type: ignore[arg-type]
+    )
+
+    assert feed.calls == [
+        ("SPY", "20260527", 500.0, "C"),
+        ("SPY", "20260527", 501.0, "C"),
+    ]
+    assert summary.usable_marks == 1
+    assert summary.unusable_marks == 1
+    with daemon_context.engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                managed_opportunities.c.admission_eligible,
+                managed_opportunities.c.status,
+                managed_opportunities.c.valid_marks,
+            ).order_by(managed_opportunities.c.admission_eligible.desc())
+        ).fetchall()
+    assert tuple(rows[0]) == (1, "active", 1)
+    assert tuple(rows[1]) == (0, "pending_entry", 0)
 
 
 @pytest.mark.asyncio

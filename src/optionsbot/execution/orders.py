@@ -166,6 +166,7 @@ def stage_order(
     intent: str = "open",
     quantity: int | None = None,
     now: datetime | None = None,
+    allow_paper_rule: bool = False,
 ) -> OrderRecord:
     """Stage an order intent from a persisted pick.
 
@@ -203,6 +204,7 @@ def stage_order(
                 int(row.id),
                 suggestion,
                 now=ts,
+                allow_paper_rule=allow_paper_rule,
             )
         qty = quantity if quantity is not None else int(suggestion.get("suggested_quantity") or 0)
         if qty < 1:

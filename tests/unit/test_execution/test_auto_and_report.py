@@ -31,6 +31,7 @@ from optionsbot.storage.schema import fills, orders, position_settlements
 from optionsbot.validation.execution_report import execution_report
 from tests.unit.test_execution.test_engine import (
     CONDOR_LEGS,
+    MANAGED_PACKET,
     _deps,
     _insert_pick,
     _managed_prediction,
@@ -157,6 +158,7 @@ async def test_zero_dte_physical_settlement_caps_quantity_before_margin_fallback
         credit_or_debit=450.0,
         max_loss=50.0,
         max_profit=450.0,
+        suggestion_extra=MANAGED_PACKET,
     )
     deps = _deps(
         tmp_db,
@@ -181,6 +183,10 @@ async def test_zero_dte_physical_settlement_caps_quantity_before_margin_fallback
             "optionsbot.execution.engine.refresh_managed_prediction",
             return_value=_managed_prediction(),
         ) as refresh,
+        patch(
+            "optionsbot.execution.orders.validate_managed_stage_authorization",
+            return_value=True,
+        ),
     ):
         outcome = await execute_pick(deps, score_id, now=ENGINE_NOW)
 
@@ -361,6 +367,16 @@ def test_dynamic_sizing_matrix() -> None:
         single_trade_cap_pct=0.10,
     )
     assert d.quantity == 5
+
+    # A deterministic paper rule has terminal PoP but an intraday first-hit
+    # exit path. Its explicit neutral tilt ignores that mismatched PoP:
+    # $150 base × 1.0 / $60 max loss = 2 contracts.
+    d = dynamic_quantity(
+        equity=5_000, max_loss_unit=60, max_profit_unit=120, prob_profit=0.99,
+        open_heat=0, recent_pnls=[], base_risk_pct=0.03, heat_cap_pct=0.15,
+        single_trade_cap_pct=0.10, neutral_edge_tilt=True,
+    )
+    assert d.quantity == 2 and "edge ×1.0" in d.note
 
     # Anti-martingale: 3 straight losses halve the budget.
     d = dynamic_quantity(

@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 
 _ACTIVE_STATUSES = ("pending_entry", "active")
 _CAPACITY_REALLOCATION_REASON = "managed_capture_capacity_reallocated_for_independent_signal"
+_PRODUCTION_PRIORITY_REALLOCATION_REASON = "managed_capture_capacity_reallocated_for_production"
 _MAX_CONCURRENT_QUOTE_REQUESTS = 4
 _PER_QUOTE_TIMEOUT_SECONDS = 1.0
 _MANAGED_PLAN_SCHEMA_VERSION = "managed_signal_plan_v1"
@@ -263,20 +264,24 @@ def _capacity_reservation(
     signal_id: str,
     policy_version: str,
     max_active: int,
+    admission_eligible: bool,
+    shadow_only: bool,
 ) -> tuple[bool, Any | None]:
-    """Reserve one row while preferring independent signals over structures.
+    """Reserve one row with production ahead of observational research.
 
-    Alternative structures may use otherwise idle capacity, but a newly seen
-    signal can reclaim the newest surplus row from a signal that already has
-    another active representative.  The oldest active row for every signal is
-    retained, so capacity is deterministic and independent-signal coverage is
-    maximal up to ``max_active``.
+    Production opportunities may reclaim research capacity even when their
+    signal already has another production structure. Research can never evict
+    production. Within the same tier, alternative structures may use otherwise
+    idle capacity, while a newly seen signal can reclaim the newest surplus row
+    from a signal that already has another active representative.
     """
     rows = conn.execute(
         select(
             managed_opportunities.c.id,
             managed_opportunities.c.signal_id,
             managed_opportunities.c.status,
+            managed_opportunities.c.admission_eligible,
+            managed_opportunities.c.shadow_only,
         )
         .where(managed_opportunities.c.status.in_(_ACTIVE_STATUSES))
         .where(managed_opportunities.c.policy_version == policy_version)
@@ -285,8 +290,32 @@ def _capacity_reservation(
     if len(rows) < max_active:
         return True, None
 
+    incoming_is_production = admission_eligible and not shadow_only
+
+    def is_production(row: Any) -> bool:
+        return int(row.admission_eligible) == 1 and int(row.shadow_only) == 0
+
+    def victim_from(candidates: Sequence[Any]) -> Any:
+        return min(
+            candidates,
+            key=lambda row: (
+                0 if row.status == "pending_entry" else 1,
+                -int(row.id),
+            ),
+        )
+
+    if incoming_is_production:
+        research_rows = [row for row in rows if not is_production(row)]
+        if research_rows:
+            return True, victim_from(research_rows)
+        same_tier_rows = rows
+    else:
+        # Research must neither displace production nor count production as a
+        # same-signal representative when allocating observational capacity.
+        same_tier_rows = [row for row in rows if not is_production(row)]
+
     grouped: dict[str, list[Any]] = defaultdict(list)
-    for row in rows:
+    for row in same_tier_rows:
         grouped[str(row.signal_id)].append(row)
     if signal_id in grouped:
         # The signal is already represented. At capacity, another structure
@@ -299,14 +328,7 @@ def _capacity_reservation(
         surplus.extend(group[1:])
     if not surplus:
         return False, None
-    victim = min(
-        surplus,
-        key=lambda row: (
-            0 if row.status == "pending_entry" else 1,
-            -int(row.id),
-        ),
-    )
-    return True, victim
+    return True, victim_from(surplus)
 
 
 def _terminalize_capacity_victim(
@@ -314,13 +336,14 @@ def _terminalize_capacity_victim(
     victim: Any,
     *,
     now: datetime,
+    reason: str = _CAPACITY_REALLOCATION_REASON,
 ) -> None:
     """Truthfully end a surplus observational path reclaimed for a signal."""
     if victim.status == "pending_entry":
         values: dict[str, Any] = {
             "status": "unobservable",
             "training_eligible": 0,
-            "resolution_reason": _CAPACITY_REALLOCATION_REASON,
+            "resolution_reason": reason,
         }
     else:
         values = {
@@ -328,7 +351,7 @@ def _terminalize_capacity_victim(
             "outcome": "censored",
             "resolved_at": now,
             "training_eligible": 0,
-            "resolution_reason": _CAPACITY_REALLOCATION_REASON,
+            "resolution_reason": reason,
         }
     result = conn.execute(
         update(managed_opportunities)
@@ -604,6 +627,8 @@ def register_snapshot_opportunities(
                     signal_id=signal_id,
                     policy_version=policy_version,
                     max_active=settings.validation.managed_capture_max_active,
+                    admission_eligible=admission_eligible,
+                    shadow_only=shadow_only,
                 )
                 if not admitted:
                     reasons.append("managed_capture_capacity_reached")
@@ -619,7 +644,19 @@ def register_snapshot_opportunities(
             )
             result = conn.execute(statement)
             if result.rowcount and victim is not None:
-                _terminalize_capacity_victim(conn, victim, now=created_at)
+                victim_is_research = not (
+                    int(victim.admission_eligible) == 1 and int(victim.shadow_only) == 0
+                )
+                _terminalize_capacity_victim(
+                    conn,
+                    victim,
+                    now=created_at,
+                    reason=(
+                        _PRODUCTION_PRIORITY_REALLOCATION_REASON
+                        if admission_eligible and not shadow_only and victim_is_research
+                        else _CAPACITY_REALLOCATION_REASON
+                    ),
+                )
         inserted += int(result.rowcount or 0)
     return inserted
 
@@ -668,6 +705,7 @@ def record_snapshot_bot_dispositions(
                 .where(managed_opportunities.c.policy_version == policy_version)
                 .where(managed_opportunities.c.admission_eligible == 1)
                 .where(managed_opportunities.c.shadow_only == 0)
+                .where(managed_opportunities.c.status.in_(_ACTIVE_STATUSES))
                 .where(managed_opportunities.c.bot_action.is_(None))
                 .where(managed_opportunities.c.bot_reason.is_(None))
                 .where(managed_opportunities.c.bot_decided_at.is_(None))
@@ -778,8 +816,8 @@ def _poll_bucket(now: datetime, interval_seconds: int) -> int:
     return int(now.timestamp()) // interval_seconds
 
 
-def _signal_round_robin_rows(rows: Sequence[Any], *, bucket: int) -> list[Any]:
-    """Interleave structures by signal and rotate which signal starts a poll."""
+def _round_robin_tier(rows: Sequence[Any], *, bucket: int) -> list[Any]:
+    """Interleave one priority tier and rotate which signal starts a poll."""
     grouped: dict[str, list[Any]] = {}
     for row in rows:
         signal_id = str(row.signal_id) if row.signal_id else f"opportunity:{row.id}"
@@ -793,6 +831,20 @@ def _signal_round_robin_rows(rows: Sequence[Any], *, bucket: int) -> list[Any]:
     for depth in range(max(len(grouped[signal]) for signal in signals)):
         ordered.extend(grouped[signal][depth] for signal in signals if depth < len(grouped[signal]))
     return ordered
+
+
+def _signal_round_robin_rows(rows: Sequence[Any], *, bucket: int) -> list[Any]:
+    """Return production first, with fair signal rotation inside each tier."""
+    production = [
+        row for row in rows if int(row.admission_eligible) == 1 and int(row.shadow_only) == 0
+    ]
+    research = [
+        row for row in rows if not (int(row.admission_eligible) == 1 and int(row.shadow_only) == 0)
+    ]
+    return _round_robin_tier(production, bucket=bucket) + _round_robin_tier(
+        research,
+        bucket=bucket,
+    )
 
 
 def _requested_specs_for_rows(
@@ -1244,7 +1296,12 @@ async def run_managed_capture_tick(
             .where(managed_opportunities.c.status.in_(_ACTIVE_STATUSES))
             .where(managed_opportunities.c.policy_version == policy_version)
             .where(managed_opportunities.c.session_close_at >= observed_at)
-            .order_by(managed_opportunities.c.created_at, managed_opportunities.c.id)
+            .order_by(
+                managed_opportunities.c.admission_eligible.desc(),
+                managed_opportunities.c.shadow_only,
+                managed_opportunities.c.created_at,
+                managed_opportunities.c.id,
+            )
             .limit(settings.validation.managed_capture_max_active)
         ).fetchall()
     if not rows:
