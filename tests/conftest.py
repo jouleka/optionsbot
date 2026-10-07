@@ -33,3 +33,14 @@ def tmp_db(tmp_path: Path) -> Engine:
     db_path = tmp_path / "test.db"
     apply_migrations(db_path)
     return create_engine_for_path(db_path)
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Never load a developer's broker credentials or trading settings during tests."""
+    from optionsbot import config
+
+    monkeypatch.setattr(config, "DEFAULT_CONFIG_FILE", tmp_path / "isolated-config.toml")
+    config.get_settings.cache_clear()
+    yield
+    config.get_settings.cache_clear()
